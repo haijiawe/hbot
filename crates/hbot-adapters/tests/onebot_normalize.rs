@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use hbot_adapters::platforms::onebot::{MessageType, OneBotEvent, fallback_external_id, normalize};
+use hbot_adapters::platforms::onebot::{
+    MessageType, OneBotEvent, fallback_external_id, fallback_fingerprint, normalize,
+};
 use hbot_core::domain::{ConversationKind, Timestamp};
 use hbot_core::ids::{BotId, ConversationId, MessageId};
 
@@ -77,22 +79,46 @@ fn missing_message_id_uses_stable_fallback_key() {
     let event = parse(raw.clone());
     let first = normalize(&event, raw.clone(), Timestamp::from_unix_millis(1))
         .expect("normalizes without message_id");
-    let second = normalize(&event, raw, Timestamp::from_unix_millis(2))
+    let second = normalize(&event, raw.clone(), Timestamp::from_unix_millis(2))
         .expect("normalizes without message_id");
 
     assert_eq!(first.platform_message_id, None);
     // 同一事件重放（不同接收时间）→ 幂等键必须一致，否则去重失效。
     assert_eq!(first.external_id, second.external_id);
-    // 键的形状与文档一致：`{user_id}-{time}-{fnv1a64:016x}`。
+    // 键的形状没变：`{user_id}-{time}-{fnv1a64:016x}`。
+    // 但哈希输入是**整条事件的规范化 JSON**（`fallback_fingerprint`），
+    // 不再是 `raw_message` —— 后者会让"同人同秒同文本"的两条消息撞成一个键。
+    let fingerprint =
+        fallback_fingerprint(&raw, Some("这条没有 message_id"), "这条没有 message_id");
     assert_eq!(
         first.external_id,
-        fallback_external_id(20004, 1731653100, "这条没有 message_id")
+        fallback_external_id(20004, 1731653100, &fingerprint)
     );
     assert_eq!(first.external_id.matches('-').count(), 2);
 
+    // 关键回归：同样没有 `message_id`、同一人、同一秒、文本一模一样，
+    // 但这是**另一条真实消息**（事件里 `real_id` 不同，NapCat/go-cqhttp 会给）。
+    // 旧实现只哈希 raw_message，这里会得到同一个键、后一条被 UNIQUE 静默丢掉。
+    let mut distinct = raw.clone();
+    distinct["real_id"] = serde_json::json!(9001);
+    let second_arrival = normalize(
+        &parse(distinct.clone()),
+        distinct,
+        Timestamp::from_unix_millis(3),
+    )
+    .expect("normalizes the second arrival");
+    assert_eq!(
+        second_arrival.platform_message_id, None,
+        "回归前提：这条同样没有平台 message_id"
+    );
+    assert_ne!(
+        first.external_id, second_arrival.external_id,
+        "same user + same second + same text must NOT collapse when the events differ"
+    );
+
     // 不同用户 / 不同秒 / 不同文本 → 不同键（不相等冲突）。
-    let other_user = fallback_external_id(20005, 1731653100, "这条没有 message_id");
-    let other_time = fallback_external_id(20004, 1731653101, "这条没有 message_id");
+    let other_user = fallback_external_id(20005, 1731653100, &fingerprint);
+    let other_time = fallback_external_id(20004, 1731653101, &fingerprint);
     let other_text = fallback_external_id(20004, 1731653100, "另一条消息");
     for other in [other_user, other_time, other_text] {
         assert_ne!(first.external_id, other);

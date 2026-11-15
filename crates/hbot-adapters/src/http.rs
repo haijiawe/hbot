@@ -9,8 +9,9 @@
 //!
 //! - 只允许 `http://` / `https://`；其它 scheme（`file:`、`ftp:`、`data:` …）
 //!   直接 `Blocked`。
-//! - `https://` 需要 TLS 后端，本 crate 没链接 → `Unsupported`。
-//!   要支持就换带 rustls 的实现，别在这里假装成功。
+//! - `https://` 走 rustls，与 `wss://`（`crate::tls`）共用同一份配置：
+//!   **证书校验始终开启**，校验失败报 [`AdapterError::Tls`]，不会退回明文；
+//!   私有 CA 用 [`FetchOptions::extra_roots`] 追加信任根，没有"跳过校验"的开关。
 //! - 不跟随重定向：3xx 直接报错。跟随会把 SSRF 校验绕过去（跳到内网），
 //!   需要的话由调用方决定是否重新抓下一个 URL。
 //! - 拒绝 userinfo（`http://user:pass@host/`）、内网/回环/链路本地/保留地址、
@@ -24,7 +25,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::error::AdapterError;
@@ -41,7 +42,7 @@ pub const USER_AGENT: &str = "hbot/0.1";
 pub enum Scheme {
     /// 明文 HTTP。
     Http,
-    /// HTTPS（当前无 TLS 后端，抓取时明确报 `Unsupported`）。
+    /// HTTPS over TLS（rustls，证书校验始终开启）。
     Https,
 }
 
@@ -53,6 +54,33 @@ impl Scheme {
             Self::Https => 443,
         }
     }
+}
+
+/// 抓取策略。`Default` 就是**生产默认值**，生产路径不要改它。
+///
+/// 加这个结构而不是给 `http_fetch` 加参数，是为了让"生产默认严格"这件事有类型
+/// 层面的位置：`http_fetch` 签名不变、永远按 `Default` 跑；需要放开时的调用点
+/// 必须显式构造并写清理由。
+#[derive(Clone, Debug, Default)]
+pub struct FetchOptions {
+    /// 追加信任根（DER 字节），与公共根证书**并存**（不替换）。
+    ///
+    /// 自签/私有 CA 的 `https://` 部署用；不提供"跳过校验"。
+    pub extra_roots: Vec<Vec<u8>>,
+    /// 额外放行的字面主机名（大小写不敏感，**精确匹配**，不支持通配/后缀）。
+    ///
+    /// 生产默认空：`127.0.0.1`、`10/8`、`localhost` 等一律拒绝。这个口子只给
+    /// 测试用 —— `tests/tls_sockets.rs` 必须在**回环**上起真实 TLS 监听器，而
+    /// 本机没有公网地址可绑，所以选了"可注入精确名单"而不是"放宽生产默认"：
+    ///
+    /// - 生产默认仍是 `[]` ⇒ 所有检查（[`check_host_name`]、[`is_blocked_ip`]、
+    ///   纯数字主机、DNS 后逐地址复核）原样全跑；
+    /// - 名字命中名单时，正是对该**这一个**主机名跳过上述四项内网判定（否则回环
+    ///   监听器永远连不上，测试就没法证明 TLS 真的通了）。名单按字面比较，
+    ///   不做后缀匹配，所以 `evil.127.0.0.1` 之类不会蹭到放行；
+    /// - 这是"显式点名一个目标"，不是"关掉 SSRF 校验"的布尔开关：没有通配、
+    ///   没有环境变量、生产代码路径里也没有任何地方会填它。
+    pub allowed_hosts: Vec<String>,
 }
 
 /// 解析后的目标。
@@ -69,7 +97,14 @@ pub struct HttpTarget {
 }
 
 /// 解析并校验 URL 的静态部分（不做 DNS）。
+///
+/// 生产路径永远走这个：等同于 `allowed_hosts` 为空、所有检查全跑。
 pub fn parse_target(url: &str) -> Result<HttpTarget, AdapterError> {
+    parse_target_with(url, &[])
+}
+
+/// 同 [`parse_target`]，但接受一份显式放行名单（见 [`FetchOptions::allowed_hosts`]）。
+fn parse_target_with(url: &str, allowed_hosts: &[String]) -> Result<HttpTarget, AdapterError> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err(AdapterError::blocked("url must not be empty"));
@@ -132,21 +167,24 @@ pub fn parse_target(url: &str) -> Result<HttpTarget, AdapterError> {
             "host `{host}` contains characters that are not allowed"
         )));
     }
-    check_host_name(&host)?;
+    let host_allowed = is_host_allowed(&host, allowed_hosts);
+    if !host_allowed {
+        check_host_name(&host)?;
 
-    // 字面 IP 先查一遍，省掉 DNS；域名等解析后再查全部地址。
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip(ip) {
+        // 字面 IP 先查一遍，省掉 DNS；域名等解析后再查全部地址。
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_blocked_ip(ip) {
+                return Err(AdapterError::blocked(format!(
+                    "refusing to fetch a private/loopback address: {ip}"
+                )));
+            }
+        } else if is_numeric_host(&host) {
+            // `http://2130706433/`、`http://0x7f.1/` 这类"看起来像主机其实像 IP"的写法，
+            // 各平台解析规则不一致，直接拒绝。
             return Err(AdapterError::blocked(format!(
-                "refusing to fetch a private/loopback address: {ip}"
+                "ambiguous numeric host `{host}` is not allowed; use a dotted-decimal ip or a name"
             )));
         }
-    } else if is_numeric_host(&host) {
-        // `http://2130706433/`、`http://0x7f.1/` 这类"看起来像主机其实像 IP"的写法，
-        // 各平台解析规则不一致，直接拒绝。
-        return Err(AdapterError::blocked(format!(
-            "ambiguous numeric host `{host}` is not allowed; use a dotted-decimal ip or a name"
-        )));
     }
 
     let path = build_path(
@@ -195,6 +233,13 @@ fn parse_port(text: &str) -> Result<u16, AdapterError> {
     }
     text.parse::<u16>()
         .map_err(|_| AdapterError::blocked(format!("port `{text}` is out of range")))
+}
+
+/// 主机名是否在显式放行名单里（**精确匹配**，大小写不敏感，不做后缀/通配）。
+fn is_host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
+    allowed_hosts
+        .iter()
+        .any(|allowed| allowed.trim().eq_ignore_ascii_case(host))
 }
 
 /// 主机名策略：本机名一律拒绝。
@@ -300,29 +345,41 @@ pub async fn http_fetch(
     timeout: Duration,
     max_bytes: usize,
 ) -> Result<String, AdapterError> {
+    http_fetch_with(url, timeout, max_bytes, &FetchOptions::default()).await
+}
+
+/// 同 [`http_fetch`]，可带 TLS 信任根与放行名单（见 [`FetchOptions`]）。
+///
+/// 生产调用点应当继续用 [`http_fetch`]：它等于 `FetchOptions::default()`，
+/// 也就是校验最严的那一档。
+pub async fn http_fetch_with(
+    url: &str,
+    timeout: Duration,
+    max_bytes: usize,
+    options: &FetchOptions,
+) -> Result<String, AdapterError> {
     if max_bytes == 0 {
         return Err(AdapterError::unsupported(
             "max_bytes must be greater than 0",
         ));
     }
-    let target = parse_target(url)?;
-    if target.scheme == Scheme::Https {
-        return Err(AdapterError::unsupported(
-            "https:// requires a TLS backend, which hbot-adapters does not link",
-        ));
-    }
+    let target = parse_target_with(url, &options.allowed_hosts)?;
     if timeout.is_zero() {
         return Err(AdapterError::timeout("http fetch", timeout));
     }
-    match tokio::time::timeout(timeout, fetch_inner(&target, max_bytes)).await {
+    match tokio::time::timeout(timeout, fetch_inner(&target, max_bytes, options)).await {
         Ok(result) => result,
         Err(_) => Err(AdapterError::timeout("http fetch", timeout)),
     }
 }
 
-async fn fetch_inner(target: &HttpTarget, max_bytes: usize) -> Result<String, AdapterError> {
-    let addresses = resolve(&target.host, target.port).await?;
-    let mut stream = connect_any(&addresses).await?;
+async fn fetch_inner(
+    target: &HttpTarget,
+    max_bytes: usize,
+    options: &FetchOptions,
+) -> Result<String, AdapterError> {
+    let addresses = resolve(&target.host, target.port, &options.allowed_hosts).await?;
+    let stream = connect_any(&addresses).await?;
     let host_header = if target.port == target.scheme.default_port() {
         target.host.clone()
     } else {
@@ -333,6 +390,22 @@ async fn fetch_inner(target: &HttpTarget, max_bytes: usize) -> Result<String, Ad
          Accept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
         target.path
     );
+    // 明文与 TLS 只在"拿到哪个流"这一步不同，之后的写请求/读响应完全共用：
+    // 两种 scheme 的协议行为必须一致，否则 https 会悄悄多出/少掉一些限制。
+    match target.scheme {
+        Scheme::Http => exchange(stream, &request, max_bytes).await,
+        Scheme::Https => {
+            let stream = wrap_tls(stream, &target.host, &options.extra_roots).await?;
+            exchange(stream, &request, max_bytes).await
+        }
+    }
+}
+
+/// 写请求 + 读响应。泛型是为了让明文 `TcpStream` 与 TLS 流走**同一段**代码。
+async fn exchange<S>(mut stream: S, request: &str, max_bytes: usize) -> Result<String, AdapterError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     stream
         .write_all(request.as_bytes())
         .await
@@ -344,8 +417,40 @@ async fn fetch_inner(target: &HttpTarget, max_bytes: usize) -> Result<String, Ad
     read_response(&mut stream, max_bytes).await
 }
 
+/// `https://` 的 TLS 握手。
+///
+/// 校验策略与 `wss://`（`crate::tls`）**是同一份 `ClientConfig`**：服务端证书
+/// 必须能链到公共根证书或调用方显式追加的根。失败分两类，都不是静默降级：
+///
+/// - 证书/主机名不匹配 → [`AdapterError::Tls`]（`crate::tls::classify_tls_failure`
+///   能把 tokio-rustls 包在 `io::Error` 里的 `rustls::Error` 取出来）；
+/// - 其它 IO 原因（对端 RST 等）→ `Transport`。
+async fn wrap_tls(
+    stream: TcpStream,
+    host: &str,
+    extra_roots: &[Vec<u8>],
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, AdapterError> {
+    let config = crate::tls::client_config(extra_roots)?;
+    // `ServerName` 支持 DNS 名与 IP 字面量（IP 走 IP SAN 校验）。
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|_| AdapterError::tls(format!("`{host}` is not a valid TLS server name")))?;
+    tokio_rustls::TlsConnector::from(config)
+        .connect(server_name, stream)
+        .await
+        .map_err(
+            |err| match crate::tls::classify_tls_failure("https handshake failed", &err) {
+                Some(tls) => tls,
+                None => AdapterError::transport(format!("https handshake failed: {err}")),
+            },
+        )
+}
+
 /// 解析主机名并**校验所有**地址；任何一个落在内网就整体拒绝。
-async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, AdapterError> {
+async fn resolve(
+    host: &str,
+    port: u16,
+    allowed_hosts: &[String],
+) -> Result<Vec<SocketAddr>, AdapterError> {
     let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .map_err(|err| AdapterError::transport(format!("dns lookup failed for `{host}`: {err}")))?
@@ -355,11 +460,15 @@ async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, AdapterError>
             "dns lookup returned no address for `{host}`"
         )));
     }
-    if let Some(blocked) = addresses.iter().find(|addr| is_blocked_ip(addr.ip())) {
-        return Err(AdapterError::blocked(format!(
-            "host `{host}` resolves to a private/loopback address ({})",
-            blocked.ip()
-        )));
+    // 名单命中的主机名跳过逐地址复核（回环监听器的测试需要它）；默认空名单 ⇒
+    // 这里的行为与"没有这个参数"逐字相同。
+    if !is_host_allowed(host, allowed_hosts) {
+        if let Some(blocked) = addresses.iter().find(|addr| is_blocked_ip(addr.ip())) {
+            return Err(AdapterError::blocked(format!(
+                "host `{host}` resolves to a private/loopback address ({})",
+                blocked.ip()
+            )));
+        }
     }
     Ok(addresses)
 }
@@ -728,12 +837,14 @@ mod tests {
             .expect_err("file scheme must be blocked");
         assert!(matches!(file, AdapterError::Blocked { .. }), "{file:?}");
 
-        let https = http_fetch("https://example.com/", Duration::from_millis(200), 1024)
+        // `https://` 不再报"缺 TLS 后端"：它现在真的会去握手。这里只断言
+        // 静态守卫仍然先把它拦住（不联网，也不依赖 TLS 实现细节）。
+        let https_loopback = http_fetch("https://127.0.0.1:9/", Duration::from_millis(200), 1024)
             .await
-            .expect_err("https needs TLS");
+            .expect_err("https loopback must still be blocked");
         assert!(
-            matches!(https, AdapterError::Unsupported { .. }),
-            "{https:?}"
+            matches!(https_loopback, AdapterError::Blocked { .. }),
+            "{https_loopback:?}"
         );
 
         let zero_limit = http_fetch("http://example.com/", Duration::from_millis(200), 0)

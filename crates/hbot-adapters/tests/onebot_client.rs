@@ -263,8 +263,15 @@ async fn action_fails_when_server_reports_error() {
 
 #[tokio::test]
 async fn invalid_urls_are_rejected_before_starting() {
-    assert!(validate_ws_url("wss://example.com/ws").is_err());
-    assert!(OneBotClient::start(OneBotConfig::new("wss://example.com/ws")).is_err());
+    // `wss://` 自本次改动起是合法 URL（TLS 由 connect 阶段负责，
+    // 真正的握手/证书校验见 `tests/tls_sockets.rs`）。
+    assert!(validate_ws_url("wss://example.com/ws").is_ok());
+    assert!(validate_ws_url("ws://127.0.0.1:6700/").is_ok());
+    assert!(validate_ws_url("WSS://example.com/ws").is_ok());
+    // 但 URL 校验仍然拒绝别的东西：不是"什么 scheme 都收"。
+    assert!(validate_ws_url("").is_err());
+    assert!(validate_ws_url("wss://").is_err());
+    assert!(validate_ws_url("http://127.0.0.1:1").is_err());
     assert!(
         OneBotClient::start(OneBotConfig::new("ws://127.0.0.1:1").with_capacities(0, 1)).is_err()
     );

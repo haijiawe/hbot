@@ -40,8 +40,10 @@ pub mod normalize;
 pub mod send;
 
 pub use backoff::{Backoff, Jitter, NoJitter, SeededJitter};
-pub use client::{ActionHandle, OneBotClient, OneBotConfig, validate_ws_url};
+pub use client::{ActionHandle, OneBotClient, OneBotConfig, probe_connection, validate_ws_url};
 pub use event::{MessageType, OneBotEvent, PostType, Sender};
 pub use message::{MessagePayload, Segment, SegmentKind, build_outbound, outbound_json};
-pub use normalize::{NormalizedInbound, fallback_external_id, fnv1a_64, normalize};
+pub use normalize::{
+    NormalizedInbound, fallback_external_id, fallback_fingerprint, fnv1a_64, normalize,
+};
 pub use send::{ActionSender, OutboundSender, RetryPolicy, SendAttempt, SendReceipt};

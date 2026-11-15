@@ -34,6 +34,17 @@ pub enum AdapterError {
         message: String,
     },
 
+    /// TLS 握手失败（证书链不可信、主机名不匹配、协议版本/算法不兼容）。
+    ///
+    /// 单独一类而不是塞进 [`AdapterError::Transport`]：证书问题与"连不上"的排查
+    /// 方向完全不同（前者要去补根证书/改主机名，后者要看网络与端口）。
+    /// **绝不**因为证书校验失败而回退成明文 —— 那等于把中间人攻击合法化。
+    #[error("tls error: {message}")]
+    Tls {
+        /// 具体原因（rustls 的错误描述，不含密钥）。
+        message: String,
+    },
+
     /// 被安全策略拒绝（内网地址、非 http/https scheme、重定向）。
     #[error("blocked: {message}")]
     Blocked {
@@ -83,6 +94,13 @@ impl AdapterError {
         }
     }
 
+    /// 构造 [`AdapterError::Tls`]。
+    pub fn tls(message: impl Into<String>) -> Self {
+        Self::Tls {
+            message: message.into(),
+        }
+    }
+
     /// 构造 [`AdapterError::Blocked`]。
     pub fn blocked(message: impl Into<String>) -> Self {
         Self::Blocked {
@@ -119,14 +137,18 @@ impl From<AdapterError> for HbotError {
     /// | [`AdapterError`] | [`HbotError`] | 码 |
     /// |---|---|---|
     /// | `Protocol` / `Limit` | `Invalid` | `-32002` |
-    /// | `Transport` | `Internal` | `-32006` |
+    /// | `Transport` / `Tls` | `Internal` | `-32006` |
     /// | `Blocked` / `Unsupported` | `Denied` | `-32005` |
     /// | `Timeout` | `Timeout` | `-32004` |
     fn from(err: AdapterError) -> Self {
         match err {
             AdapterError::Protocol { message } => HbotError::invalid(message),
             AdapterError::Limit { message } => HbotError::invalid(message),
-            AdapterError::Transport { message } => HbotError::internal(message),
+            // TLS 失败按传输层失败上报：对上层而言都是"这条链路现在用不了"，
+            // 具体证书原因留在适配器日志与错误消息里。
+            AdapterError::Transport { message } | AdapterError::Tls { message } => {
+                HbotError::internal(message)
+            }
             AdapterError::Blocked { message } => HbotError::denied(message),
             AdapterError::Unsupported { message } => HbotError::denied(message),
             AdapterError::Timeout {
@@ -156,6 +178,7 @@ mod tests {
             (AdapterError::protocol("x"), -32002),
             (AdapterError::limit("x"), -32002),
             (AdapterError::transport("x"), -32006),
+            (AdapterError::tls("x"), -32006),
             (AdapterError::blocked("x"), -32005),
             (AdapterError::unsupported("x"), -32005),
             (

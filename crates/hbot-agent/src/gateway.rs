@@ -19,12 +19,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use hbot_core::{ApprovalDecision, HbotError, SandboxMode, SessionId};
+use hbot_core::{ApprovalDecision, CommandRunner, HbotError, SandboxMode, SessionId};
 use hbot_workspace::Workspace;
 use serde_json::Value;
 
 use crate::approvals::{ApprovalKey, ApprovalPolicy, ApprovalRequest, ApprovalStore, Approver};
 use crate::cancel::CancellationToken;
+use crate::edits::EditProposer;
 use crate::provider::{ToolCallRequest, ToolSpec};
 use crate::tools::{
     Risk, Tool, ToolCtx, ToolOutput, ToolRegistry, clamp_output, normalize_relative, validate_args,
@@ -248,6 +249,8 @@ pub struct ToolGateway {
     level: SandboxMode,
     approvals: Arc<ApprovalStore>,
     audit: Arc<dyn AuditSink>,
+    edits: Option<Arc<dyn EditProposer>>,
+    command: Option<Arc<dyn CommandRunner>>,
 }
 
 impl ToolGateway {
@@ -265,7 +268,30 @@ impl ToolGateway {
             level,
             approvals,
             audit,
+            edits: None,
+            command: None,
         }
+    }
+
+    /// 装配受控命令执行端口：`run_command` 从"一律拒绝"变成按沙箱档执行。
+    ///
+    /// 不装配时工具**仍然存在**（模型看得见），但调用会以"没有装配命令执行器"
+    /// 拒绝——不是"平台不支持"：前者该由组合根补，后者换机器才有用。
+    #[must_use]
+    pub fn with_command_runner(mut self, runner: Arc<dyn CommandRunner>) -> Self {
+        self.command = Some(runner);
+        self
+    }
+
+    /// 装配待审编辑端口：写类工具从此**不直接落盘**，改为登记待审编辑
+    /// （由用户 `edit_apply` 落盘，见 [`crate::edits`]）。
+    ///
+    /// 只在真正的 Agent 回合里装配；网关自测与非 Agent 场景不装配，
+    /// 保持"工具直接写盘"的老行为。
+    #[must_use]
+    pub fn with_edit_proposer(mut self, proposer: Arc<dyn EditProposer>) -> Self {
+        self.edits = Some(proposer);
+        self
     }
 
     /// 当前沙箱档。
@@ -459,6 +485,8 @@ impl ToolGateway {
             cancel,
             session_id,
             call_id: &call.id,
+            edits: self.edits.as_deref(),
+            command: self.command.clone(),
         };
         let timeout = tool.timeout();
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
@@ -977,5 +1005,122 @@ mod tests {
             .expect("列目录");
         assert!(outcome.output.content.contains("a.txt"));
         assert!(!outcome.steps.contains(&GatewayStep::PathRealpath));
+    }
+
+    /// 假命令执行器：只数调用次数，返回固定成功输出。
+    ///
+    /// 网关层的判据是"装配了就真的被调用 / 没装配就诚实拒绝"，
+    /// 命令本身怎么跑由 `tools::shell` 的测试与 `hbot-command` 负责。
+    #[derive(Default)]
+    struct CountingRunner {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingRunner {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl hbot_core::CommandRunner for CountingRunner {
+        fn run(
+            &self,
+            _spec: hbot_core::CommandSpec,
+        ) -> Result<hbot_core::CommandOutput, hbot_core::CommandDenied> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(hbot_core::CommandOutput {
+                status: hbot_core::CommandStatus::Exited {
+                    code: Some(0),
+                    signal: None,
+                },
+                stdout: "wired".to_string(),
+                stderr: String::new(),
+                duration: std::time::Duration::from_millis(1),
+            })
+        }
+    }
+
+    /// 用指定沙箱档搭一个只注册 `run_command` 的网关。
+    fn command_fixture(
+        level: SandboxMode,
+        programs: &[&str],
+        runner: Arc<dyn hbot_core::CommandRunner>,
+    ) -> (ToolGateway, RecordingAudit, TestDir) {
+        let dir = TestDir::new("gateway-command");
+        let workspace = dir.workspace();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(
+            crate::tools::RunCommandTool::with_allowed_programs(programs.iter().copied()),
+        ));
+        let audit = RecordingAudit::new();
+        let gateway = ToolGateway::new(
+            Arc::new(registry),
+            workspace,
+            level,
+            Arc::new(ApprovalStore::new()),
+            Arc::new(audit.clone()),
+        )
+        .with_command_runner(runner);
+        (gateway, audit, dir)
+    }
+
+    #[tokio::test]
+    async fn command_runner_is_reached_through_the_sixth_step() {
+        let runner = Arc::new(CountingRunner::default());
+        let dynamic: Arc<dyn hbot_core::CommandRunner> = runner.clone();
+        let (gateway, audit, _dir) = command_fixture(SandboxMode::Danger, &["echo"], dynamic);
+        let approver = RecordingApprover::approving_once();
+        let cancel = CancellationToken::new();
+        let outcome = gateway
+            .call(
+                session_id(),
+                call("run_command", json!({ "command": "echo", "args": ["hi"] })),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect("装配了执行器 + danger 档应执行");
+
+        assert_eq!(runner.calls(), 1, "装配后必须真的调到执行器");
+        assert_eq!(
+            outcome.steps,
+            vec![
+                GatewayStep::ValidateArgs,
+                GatewayStep::ToolExists,
+                GatewayStep::SandboxMode,
+                GatewayStep::Approval,
+                GatewayStep::Execute,
+                GatewayStep::Audit,
+            ]
+        );
+        assert_eq!(approver.count(), 1, "run_command 是 mutation，必须走审批");
+        assert!(!outcome.output.is_error);
+        assert!(outcome.output.content.contains("wired"));
+        assert_eq!(audit.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_denies_run_command_before_approval_and_never_reaches_the_runner() {
+        let runner = Arc::new(CountingRunner::default());
+        let dynamic: Arc<dyn hbot_core::CommandRunner> = runner.clone();
+        let (gateway, audit, _dir) = command_fixture(SandboxMode::ReadOnly, &["echo"], dynamic);
+        let approver = RecordingApprover::approving_once();
+        let cancel = CancellationToken::new();
+        let error = gateway
+            .call(
+                session_id(),
+                call("run_command", json!({ "command": "echo" })),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect_err("只读档必须拒");
+
+        assert!(matches!(error.error, HbotError::Denied { .. }));
+        assert_eq!(error.error.code(), -32005);
+        assert_eq!(error.failed_at(), Some(GatewayStep::SandboxMode));
+        assert_eq!(approver.count(), 0, "沙箱档拒绝不得弹审批");
+        assert_eq!(runner.calls(), 0, "只读档一个进程都不许起");
+        assert_eq!(audit.len(), 1);
     }
 }

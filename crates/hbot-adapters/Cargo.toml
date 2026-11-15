@@ -16,3 +16,18 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tokio-tungstenite.workspace = true
 tracing.workspace = true
+# TLS：`wss://` 与 `https://` 共用同一套 rustls 栈（`tls.rs`）。
+#
+# **只开 `ring` 一个加密后端**：rustls 0.23 的 `CryptoProvider::get_default()`
+# 在同时启用 `ring` 与 `aws-lc-rs` 时会 panic（"multiple providers"），而
+# workspace 的 Cargo.lock 里现有的 `rustls` 只带 `ring`。所以这里显式
+# `default-features = false` —— 直接写 `rustls = "0.23"` 会拉进 aws-lc-rs。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# 公共根证书（Mozilla 打包），与 tokio-tungstenite 的 `rustls-tls-webpki-roots` 同一份数据。
+webpki-roots = "0.26"
+
+[dev-dependencies]
+# 集成测试在进程内生成自签 CA / 服务端证书，起真实 TLS 监听器（`tests/tls_sockets.rs`）。
+# 只用 `ring` 后端（rcgen 0.13 的默认 feature 就是 ring），不拉 aws-lc-rs 的 C 构建。
+rcgen = "0.13"

@@ -8,8 +8,9 @@
 //! - [`r#loop`]：**唯一的** Agent 循环（`AGENTS.md` §0.3），带步数 / token / 时长预算；
 //! - [`gateway`]：工具网关，固定闸门顺序（参数 → 存在 → 沙箱 → realpath → 审批 → 执行 → 审计）；
 //! - [`approvals`]：审批规则键 `(tool, 规范化参数, sandbox_mode)` 与策略存储；
-//! - [`tools`]：工具注册表与具体工具（`read_file` / `write_file` / `list_dir` / `search` + 两个壳）；
-//! - [`provider`]：LLM provider 抽象与 OpenAI 兼容 SSE 客户端；
+//! - [`edits`]：待审编辑（Agent 写入产出 Diff，由用户逐块接受/拒绝）；
+//! - [`tools`]：工具注册表与具体工具（`read_file` / `write_file` / `edit_file` / `list_dir` / `search` + 两个壳）；
+//! - [`provider`]：LLM provider 抽象、OpenAI 兼容 SSE 客户端与真实 HTTP 传输（[`provider::reqwest`]）；
 //! - [`prompt`]：system prompt 与"外部内容是不可信数据"区块；
 //! - [`cancel`]：贯穿 provider / 工具 / 搜索的取消令牌。
 //!
@@ -24,6 +25,7 @@
 
 pub mod approvals;
 pub mod cancel;
+pub mod edits;
 pub mod gateway;
 pub mod r#loop;
 pub mod prompt;
@@ -38,6 +40,7 @@ pub use approvals::{
     DenyAllApprover,
 };
 pub use cancel::{CancellationToken, cancelled_error};
+pub use edits::{EditHunk, EditProposer, ProposedEdit, apply_hunks, diff_hunks};
 pub use gateway::{
     AuditEvent, AuditOutcome, AuditSink, GatewayError, GatewayOutcome, GatewayStep, NullAudit,
     ToolGateway, sandbox_rank,
@@ -49,8 +52,8 @@ pub use r#loop::{
 };
 pub use prompt::{PromptContext, UNTRUSTED_TAG, escape_untrusted, system_prompt, untrusted_block};
 pub use provider::{
-    ChatMessage, Completion, CompletionRequest, FinishReason, NullSink, Provider, ProviderError,
-    StreamSink, ToolCallRequest, ToolSpec, Usage,
+    ChatMessage, Completion, CompletionRequest, FinishReason, NullSink, OpenAiProvider, Provider,
+    ProviderError, ReqwestTransport, StreamSink, ToolCallRequest, ToolSpec, Usage,
 };
 pub use tools::{
     DEFAULT_TOOL_TIMEOUT, MAX_TOOL_OUTPUT_BYTES, Risk, Tool, ToolCtx, ToolOutput, ToolRegistry,

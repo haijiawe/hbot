@@ -130,7 +130,11 @@ pub trait TurnSink: Send {
     fn on_step(&mut self, _step: u32) {}
     /// 文本增量。
     fn on_text_delta(&mut self, _delta: &str) {}
-    /// provider 声明了一个工具调用。
+    /// provider 声明了一个工具调用，循环**即将**执行它。
+    ///
+    /// 对每个调用**恰好一次**：流式 provider 在 SSE 里逐块报的调用会被
+    /// [`SinkBridge`] 吞掉（见那里的说明），统一由循环在"执行前"宣布，
+    /// 这样两种 provider 行为一致。
     fn on_tool_call(&mut self, _call: &ToolCallRequest) {}
     /// 工具结果回填。
     fn on_tool_result(&mut self, _call_id: &str, _output: &ToolOutput) {}
@@ -152,8 +156,10 @@ impl StreamSink for SinkBridge<'_> {
         self.sink.on_text_delta(delta);
     }
 
-    fn on_tool_call(&mut self, call: &ToolCallRequest) {
-        self.sink.on_tool_call(call);
+    fn on_tool_call(&mut self, _call: &ToolCallRequest) {
+        // 刻意不转发：`StreamSink::on_tool_call` 是"流里出现了这个调用的片段"，
+        // 而 `TurnSink::on_tool_call` 的语义是"即将执行"（由循环在执行前宣布）。
+        // 两者都转发会让每个调用被报两次。
     }
 
     fn on_usage(&mut self, _usage: Usage) {}
@@ -253,6 +259,11 @@ pub async fn run_turn(
 
         for tool_call in &completion.tool_calls {
             cancel.check()?;
+            // 通知输出口"要执行这个调用了"。流式 provider 已经在 SSE 里逐块报过
+            // （`StreamDecoder::finish` → `on_tool_call`），这里再报一次是为了让
+            // **非流式** provider（一次返回完整 completion）也有同一个回调，
+            // 否则 UI 侧的 `on_tool_result` 找不到对应的调用记录。
+            sink.on_tool_call(tool_call);
             let result = gateway
                 .call(input.session_id, tool_call.clone(), cancel, approver)
                 .await;

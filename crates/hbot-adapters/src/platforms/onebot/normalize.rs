@@ -20,20 +20,23 @@
 //!    这是平台给的单调 ID，天然唯一、重发也不变，是唯一推荐的去重键。
 //!
 //! 2. **缺 `message_id`（兜底）**：`"{user_id}-{time}-{fnv1a64:016x}"`，
-//!    其中 FNV-1a 覆盖 `raw_message`（缺失时用渲染后的纯文本）。
+//!    其中 FNV-1a 覆盖**整条事件的规范化 JSON**（`serde_json::Value` 重新序列化后的
+//!    字节序；`Value::Object` 在本 workspace 是 `BTreeMap`，键序稳定）。
+//!    - 为什么不是只哈希 `raw_message`：那样 `user_id` + 平台秒级 `time` + 文本
+//!      三者相同的两条消息会得到同一个键，而 `UNIQUE(bot_id, external_id)` 会把
+//!      **后一条当成重复丢掉**（丢消息，不是重复执行）。QQ 允许同一人同一秒发两条
+//!      相同文本，这不是理论风险 —— 2026-11 的复查里就是按这条复现的。
+//!    - 为什么整条 JSON 仍然满足"重投递要能去重"：同一事件的重投是**同一份
+//!      JSON**，规范化后逐字节相同 ⇒ 同一个键。而"同人同秒同文本"的两条不同消息
+//!      在 `message_seq` / `real_id` / 段数组 / `font` 等字段上必然不同（平台没有
+//!      两个字段都不给的可能）⇒ 键不同。
+//!    - **残余限制（必须知道）**：若某实现连 `message_seq`/`real_id` 都不给，且两帧
+//!      JSON 逐字节相同，则无法区分 —— 此时会按重复丢弃。这是刻意选择的失败方向：
+//!      重复处理一条消息的代价（一次多余回复）远小于静默丢一条用户消息。真遇到
+//!      这种实现，正解是让它发 `message_id`，而不是在这里做启发式猜测。
 //!    - 为什么不用 sha256/sha1/blake3：本 crate 的依赖里没有哈希库，
 //!      为兜底路径引入新依赖（以及它的供应链）不划算；FNV-1a 8 字节足够
-//!      区分「同一个人的相邻消息」。
-//!    - **碰撞风险（必须知道）**：`user_id` + 平台秒级 `time` + 文本三者相同
-//!      的两条消息会得到同一个键，而 `UNIQUE` 约束会把**后一条当成重复丢掉**
-//!      （丢消息，不是重复执行）。QQ 允许同一人同一秒发两条相同文本，
-//!      所以兜底路径是**有损**的。
-//!    - 因此约束是：**兜底键必须与平台 seq 一起去重**——一旦平台补发
-//!      `message_id`，同一事件会换键，此时应靠"短时间内同 send+同 text 且
-//!      平台 seq 相邻"判定为同一条，而不是只信 external_id。运行时的重复
-//!      投递判定应以 `message_id` 为第一优先，兜底键只用于平台确实不给 ID 的
-//!      实现；若部署里出现丢消息，应把该实现升级到给 `message_id`，或者把
-//!      去重键改成"平台 seq + 会话"（协议扩展，不在 MVP）。
+//!      区分"同一个人的相邻消息"（这里不是抗攻击场景，是防误撞）。
 //!
 //! 兜底键的值总是含 `-`，数字 `message_id` 不含，所以两条路径的键空间不会互相
 //! 误撞（这是个小但重要的性质，测试里有断言）。
@@ -66,10 +69,34 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 /// 缺 `message_id` 时的兜底幂等键。
 ///
-/// 形如 `"123456-1700000000-1f2e3d4c5b6a7980"`；碰撞风险见模块级说明。
-pub fn fallback_external_id(user_id: i64, time_seconds: i64, raw_message: &str) -> String {
-    let hash = fnv1a_64(raw_message.as_bytes());
+/// 形如 `"123456-1700000000-1f2e3d4c5b6a7980"`；`fingerprint` 见
+/// [`fallback_fingerprint`]，碰撞与重投递的性质见模块级说明。
+pub fn fallback_external_id(user_id: i64, time_seconds: i64, fingerprint: &str) -> String {
+    let hash = fnv1a_64(fingerprint.as_bytes());
     format!("{user_id}-{time_seconds}-{hash:016x}")
+}
+
+/// 兜底幂等键的哈希输入：整条事件的规范化 JSON。
+///
+/// 两个性质都是被测钉住的（`tests/onebot_normalize.rs`）：
+///
+/// - **重投递稳定**：同一事件的同一份 JSON，`serde_json::Value` 重新序列化后
+///   字节序固定（对象是 `BTreeMap`，键序与解析顺序无关）⇒ 同一个键。
+/// - **不同到达不撞**：同人同秒同文本的两条不同消息，在 `message_seq` /
+///   `real_id` / 段数组等字段上不同 ⇒ 不同的键（旧实现只哈希 `raw_message`，
+///   这两条会塌成同一个键、后一条被 `UNIQUE` 静默丢掉）。
+///
+/// `raw` 为 `Value::Null`（调用方没给原始 JSON）时退回 `raw_message`，再退回渲染
+/// 后的文本：保持对老调用方的兼容，这时行为与旧实现一致（有损，但不会 panic）。
+pub fn fallback_fingerprint(raw: &Value, raw_message: Option<&str>, text: &str) -> String {
+    match raw {
+        Value::Null => raw_message.unwrap_or(text).to_string(),
+        // `to_string` 对 `Value` 不会失败（JSON 一定能序列化回字符串），
+        // 但仍按 Result 处理：万一失败就退回文本，绝不 panic（兜底路径不求完美）。
+        value => {
+            serde_json::to_string(value).unwrap_or_else(|_| raw_message.unwrap_or(text).to_string())
+        }
+    }
 }
 
 /// 归一化后的入站消息：平台无关，交给 supervisor 落库 + 入队。
@@ -182,8 +209,9 @@ pub fn normalize(
         None => fallback_external_id(
             event.user_id,
             time_seconds,
-            // 兜底哈希覆盖 raw_message；平台没给时用渲染后的文本（同样稳定）。
-            event.raw_message.as_deref().unwrap_or(text.as_str()),
+            // 兜底哈希覆盖**整条事件**（见 fallback_fingerprint 的注释）：
+            // 只哈希 raw_message 会让"同人同秒同文本"的两条消息撞成同一个键。
+            &fallback_fingerprint(&raw, event.raw_message.as_deref(), text.as_str()),
         ),
     };
     Ok(NormalizedInbound {
@@ -293,5 +321,63 @@ mod tests {
         // 兜底键含 '-'，数字 message_id 不含：两条键空间不会误撞。
         assert!(first.external_id.contains('-'));
         assert!(!first.external_id.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn fallback_key_uses_whole_event_so_same_second_arrivals_do_not_collide() {
+        // 缺 message_id 的两种真实形态：同一人同一秒、同样文本，只有 `message_seq`
+        // 不同（NapCat / go-cqhttp 的群消息就带这个字段）。
+        let arrival = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "user_id": 42,
+            "time": 1700000000,
+            "raw_message": "same",
+            "font": 0,
+            "message_seq": 100
+        });
+        let first = normalize(
+            &parse(arrival.clone()),
+            arrival.clone(),
+            Timestamp::default(),
+        )
+        .expect("normalizes");
+        // 重投递：同一份 JSON（哪怕接收时间不同）→ 同一个键，去重仍然生效。
+        let redelivery = normalize(
+            &parse(arrival.clone()),
+            arrival.clone(),
+            Timestamp::default(),
+        )
+        .expect("normalizes");
+        assert_eq!(
+            first.external_id, redelivery.external_id,
+            "same raw event must dedupe on re-delivery"
+        );
+
+        // 第二条真实消息：文本、用户、秒全都一样，只有 seq 不同。
+        let mut next_arrival = arrival.clone();
+        next_arrival["message_seq"] = serde_json::json!(101);
+        let second = normalize(
+            &parse(next_arrival.clone()),
+            next_arrival,
+            Timestamp::default(),
+        )
+        .expect("normalizes");
+        assert_ne!(
+            first.external_id, second.external_id,
+            "distinct arrivals in the same second must not collapse into one key"
+        );
+
+        // 键序无关：`Value` 重新序列化走 BTreeMap，字段顺序不影响指纹。
+        let reordered: Value = serde_json::from_str(
+            r#"{"message_seq":100,"font":0,"raw_message":"same","time":1700000000,
+                "user_id":42,"message_type":"private","post_type":"message"}"#,
+        )
+        .expect("reordered json parses");
+        assert_eq!(
+            fallback_fingerprint(&reordered, Some("same"), "same"),
+            fallback_fingerprint(&arrival, Some("same"), "same"),
+            "field order must not change the fingerprint"
+        );
     }
 }

@@ -166,6 +166,8 @@ mod tests {
             cancel,
             session_id: session_id(),
             call_id: "call_test",
+            edits: None,
+            command: None,
         }
     }
 

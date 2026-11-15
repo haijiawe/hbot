@@ -9,8 +9,18 @@ license.workspace = true
 hbot-core = { path = "../hbot-core" }
 hbot-workspace = { path = "../hbot-workspace" }
 async-trait.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# 受控命令执行器的**真实实现**（进程树隔离 + 程序清单 + cwd 守卫）。
+#
+# 刻意只作为 dev-dependency：库代码只认 `hbot_core::CommandRunner` 这个端口，
+# 具体实现由组合根（`hbot-rpc`）装配进 `ToolCtx` —— 策略层不认识任何平台实现，
+# 反过来就能在测试里换成假执行器断言"只读档根本没 spawn 进程"。
+# 依赖方向 `agent → command → core` 已在 `xtask/src/deps.rs` 的 ALLOWED 里登记。
+hbot-command = { path = "../hbot-command" }

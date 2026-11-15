@@ -91,6 +91,8 @@ mod tests {
             cancel: &cancel,
             session_id: session_id(),
             call_id: "call",
+            edits: None,
+            command: None,
         };
         let error = HttpFetchTool
             .run(json!({ "url": "https://example.com" }), &ctx)

@@ -8,9 +8,14 @@
 //!   取消后不得再发新的网络请求。
 //!
 //! 具体实现见 [`openai`]（OpenAI 兼容 `/chat/completions` SSE）；SSE 解析被拆成纯函数
-//! 与纯状态机，测试不碰网络。
+//! 与纯状态机，测试不碰网络。真实传输在 [`reqwest`]（同样是"只接
+//! [`HttpTransport`]"，SSE 解析仍归 `openai`）。
 
 pub mod openai;
+pub mod reqwest;
+
+pub use openai::OpenAiProvider;
+pub use reqwest::ReqwestTransport;
 
 use async_trait::async_trait;
 use hbot_core::HbotError;

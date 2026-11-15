@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hbot_core::{HbotError, SandboxMode, SessionId};
+use hbot_core::{CommandRunner, HbotError, SandboxMode, SessionId};
 use hbot_workspace::Workspace;
 use serde_json::Value;
 
@@ -28,7 +28,7 @@ pub mod http;
 pub mod search;
 pub mod shell;
 
-pub use fs::{ListDirTool, ReadFileTool, WriteFileTool};
+pub use fs::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use http::HttpFetchTool;
 pub use search::SearchTool;
 pub use shell::RunCommandTool;
@@ -126,6 +126,17 @@ pub struct ToolCtx<'a> {
     pub session_id: SessionId,
     /// 本次工具调用 id。
     pub call_id: &'a str,
+    /// 待审编辑端口；`Some` 时写类工具**不落盘**，改为登记待审编辑。
+    ///
+    /// 装配方（`hbot-rpc` 的 Agent 会话）总会设置它；网关自测与非 Agent 场景
+    /// 保持 `None`（工具直接写盘）。
+    pub edits: Option<&'a dyn crate::edits::EditProposer>,
+    /// 受控命令执行端口（`Option` 是刻意的：装配缺失必须能被表达）。
+    ///
+    /// `None` 时 [`RunCommandTool`] 保持诚实拒绝，并且错误消息说的是
+    /// "没有装配命令执行器"——不是"平台不支持"：前者该由组合根修，后者换机器才有用，
+    /// 混成一句话就没法定位。
+    pub command: Option<Arc<dyn CommandRunner>>,
 }
 
 /// 一个可被模型调用的工具。
@@ -249,14 +260,35 @@ impl ToolRegistry {
     ///
     /// `run_command` 与 `http_fetch` 也在这里注册——能力矩阵要求"声明存在但
     /// 执行时明确拒绝"，而不是偷偷藏起来（藏起来模型会编造调用）。
+    ///
+    /// 这里的 `run_command` **没有程序清单**（空清单 = 一条都跑不了）。要真跑命令，
+    /// 用 [`ToolRegistry::default_tools_with_allowed_programs`]，让"允许跑什么"成为
+    /// 装配处的一次显式决定。
     pub fn default_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(ReadFileTool));
         registry.register(Arc::new(WriteFileTool));
+        registry.register(Arc::new(EditFileTool));
         registry.register(Arc::new(ListDirTool));
         registry.register(Arc::new(SearchTool));
-        registry.register(Arc::new(RunCommandTool));
+        registry.register(Arc::new(RunCommandTool::new()));
         registry.register(Arc::new(HttpFetchTool));
+        registry
+    }
+
+    /// 默认工具集，但 `run_command` 带上给定的程序清单。
+    ///
+    /// 组合根（`hbot-rpc` 的 Agent 装配点）用它把"允许跑什么"写成一次显式决定；
+    /// 策略层不自带任何清单（`docs/adr/0003-command-isolation.md` §5：清单是调用方的
+    /// 责任，工具实现不许内置一张含解释器的表）。清单为空等价于
+    /// [`ToolRegistry::default_tools`]——一条命令都不许跑。
+    pub fn default_tools_with_allowed_programs<I, S>(programs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut registry = Self::default_tools();
+        registry.register(Arc::new(RunCommandTool::with_allowed_programs(programs)));
         registry
     }
 }
@@ -450,5 +482,23 @@ mod tests {
     fn normalize_relative_uses_forward_slashes() {
         assert_eq!(normalize_relative("src\\main.rs"), "src/main.rs");
         assert_eq!(normalize_relative("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn default_tools_include_run_command_and_the_allow_list_only_swaps_it() {
+        let registry = ToolRegistry::default_tools();
+        let tool = registry
+            .get("run_command")
+            .expect("run_command 必须声明存在");
+        assert_eq!(tool.risk(), Risk::Command);
+        assert_eq!(tool.min_sandbox(), SandboxMode::WorkspaceWrite);
+
+        // 带清单的构造只替换 run_command，工具集合与顺序不变。
+        let declared = ToolRegistry::default_tools_with_allowed_programs(["git"]);
+        assert_eq!(declared.len(), registry.len());
+        assert_eq!(declared.names(), registry.names());
+        let swapped = declared.get("run_command").expect("run_command");
+        assert_eq!(swapped.name(), "run_command");
+        assert_eq!(swapped.risk(), Risk::Command);
     }
 }

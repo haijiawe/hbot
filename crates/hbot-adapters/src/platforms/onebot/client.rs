@@ -21,8 +21,9 @@
 //!    （`AGENTS.md` §7.1 的旧坑）。
 //! 3. **分类失败不杀连接**：单帧 JSON 坏掉只记日志并跳过（OneBot 实现
 //!    偶发发非标准帧），只有传输层/心跳超时才重连。
-//! 4. **wss 不支持**：本 crate 没有 TLS 后端，`wss://` 明确报
-//!    [`AdapterError::Unsupported`]，不静默降级成明文。
+//! 4. **TLS 只校验、不降级**：`wss://` 走 rustls（见 `crate::tls`），对端证书
+//!    校验失败报 [`AdapterError::Tls`]，**不会**退回明文、也没有跳过校验的开关。
+//!    私有 CA / 自签部署用 [`OneBotConfig::with_extra_root_certificates`] 追加信任根。
 //!
 //! 动作（`send_group_msg` 等）用 `echo` 与响应配对；`ActionHandle` 可以在
 //! 多个任务里 `clone`（内部同一个有界队列 + 单调 echo 计数器）。
@@ -42,7 +43,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use hbot_core::Clock;
 
@@ -65,17 +66,29 @@ pub const DEFAULT_ACTION_CAPACITY: usize = 64;
 /// 单帧文本上限（防对端发超大 JSON 撑爆内存）。
 const MAX_FRAME_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
+/// 默认连接/握手超时（TCP 连接 + TLS 握手 + WebSocket 升级合计）。
+///
+/// 没有这道闸，对端把 SYN 吞掉或 TLS 握手卡住时 `supervise` 会永远停在
+/// "正在连接"——既不报错也不重连，表现为"机器人上线了但收不到消息"。
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// 连接配置。
 #[derive(Clone)]
 pub struct OneBotConfig {
-    /// 正向 WebSocket 地址，必须 `ws://`（`wss://` 需要 TLS，当前不支持）。
+    /// 正向 WebSocket 地址：`ws://`（明文）或 `wss://`（TLS，证书必须可信）。
     pub ws_url: String,
-    /// access token；非空时以 `Authorization: Bearer <token>` 发送。
+    /// access token；非空时以 `Authorization: Bearer <token>` 发送（`ws://`/`wss://` 都发）。
     pub access_token: Option<String>,
     /// 心跳超时；`None` 表示不启用（例如对接不发 heartbeat 的实现）。
     pub heartbeat_timeout: Option<Duration>,
+    /// 连接/握手超时；`None` 表示不设上限（不推荐，仅在调试时用）。
+    pub connect_timeout: Option<Duration>,
+    /// 追加的信任根（DER 编码的证书），用于私有 CA / 自签部署。
+    ///
+    /// **只追加、不替代**公共根，也**不关闭校验** —— 没有"insecure"开关。
+    pub extra_root_certificates: Vec<Vec<u8>>,
     /// 事件通道容量（有界，必须 > 0）。
     pub event_capacity: usize,
     /// 动作通道容量（有界，必须 > 0）。
@@ -95,6 +108,8 @@ impl OneBotConfig {
             ws_url: ws_url.into(),
             access_token: None,
             heartbeat_timeout: Some(DEFAULT_HEARTBEAT_TIMEOUT),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            extra_root_certificates: Vec::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             action_capacity: DEFAULT_ACTION_CAPACITY,
             backoff: Backoff::reconnect_default(),
@@ -112,6 +127,25 @@ impl OneBotConfig {
     /// 设置心跳超时；`None` 关闭心跳检测。
     pub fn with_heartbeat_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.heartbeat_timeout = timeout;
+        self
+    }
+
+    /// 设置连接/握手超时；`None` 关闭（不推荐）。
+    pub fn with_connect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// 追加信任根（DER 编码），用于私有 CA / 自签证书部署。
+    ///
+    /// 追加的根与公共根**并存**：不会因为追加就让其他站点失去校验，也不会
+    /// 因为对端证书链不匹配就放行。给的是 PEM 的话先转成 DER
+    /// （`openssl x509 -in ca.crt -outform der -out ca.der`）。
+    pub fn with_extra_root_certificates(
+        mut self,
+        certificates: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self {
+        self.extra_root_certificates = certificates.into_iter().collect();
         self
     }
 
@@ -151,6 +185,12 @@ impl fmt::Debug for OneBotConfig {
                 &self.access_token.as_ref().map(|_| "<redacted>"),
             )
             .field("heartbeat_timeout", &self.heartbeat_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            // 只打张数：证书是几百字节的二进制，进日志既无用也难读。
+            .field(
+                "extra_root_certificates",
+                &format_args!("{} 张", self.extra_root_certificates.len()),
+            )
             .field("event_capacity", &self.event_capacity)
             .field("action_capacity", &self.action_capacity)
             .field("backoff", &self.backoff)
@@ -158,28 +198,31 @@ impl fmt::Debug for OneBotConfig {
     }
 }
 
-/// 校验 WebSocket 地址：只接受 `ws://`；`wss://` 明确报"缺 TLS 后端"。
+/// 校验 WebSocket 地址：接受 `ws://` 与 `wss://`，其它 scheme 一律拒绝。
+///
+/// 这里**不**做"证书/主机名是否能连上"的判断（那要真去连），只挡明显不成立的输入；
+/// 真正的 TLS 校验在 `connect_ws` 里由 rustls 完成，失败报 [`AdapterError::Tls`]。
 pub fn validate_ws_url(url: &str) -> Result<(), AdapterError> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err(AdapterError::protocol("ws url must not be empty"));
     }
     let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("ws://") {
-        if lower.len() <= "ws://".len() {
-            return Err(AdapterError::protocol("ws url has no host"));
-        }
-        return Ok(());
+    // 两个 scheme 长度不同（`wss://` 比 `ws://` 多一个字符），必须各算各的，
+    // 否则 `wss://` 这种"只有 scheme 没有主机"的输入会漏过去。
+    let scheme_len = if lower.starts_with("wss://") {
+        "wss://".len()
+    } else if lower.starts_with("ws://") {
+        "ws://".len()
+    } else {
+        return Err(AdapterError::blocked(format!(
+            "unsupported websocket scheme in `{trimmed}`: only ws:// and wss:// are allowed"
+        )));
+    };
+    if lower.len() <= scheme_len {
+        return Err(AdapterError::protocol("ws url has no host"));
     }
-    if lower.starts_with("wss://") {
-        return Err(AdapterError::unsupported(
-            "wss:// requires a TLS backend, which hbot-adapters does not link; \
-             use ws:// on a loopback/private link or add a TLS stack",
-        ));
-    }
-    Err(AdapterError::blocked(format!(
-        "unsupported websocket scheme in `{trimmed}`: only ws:// is allowed"
-    )))
+    Ok(())
 }
 
 /// 一条待发送的动作。
@@ -782,7 +825,17 @@ async fn dispatch_frame(
     None
 }
 
-/// 建立一次 WebSocket 连接。
+/// 地址是不是 `wss://`（大小写不敏感，容忍前后空白）。
+fn is_tls_url(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with("wss://")
+}
+
+/// 建立一次 WebSocket 连接：TCP 连接 →（`wss://` 时）TLS 握手 → WebSocket 升级。
+///
+/// 三段都算在 [`OneBotConfig::connect_timeout`] 里：对端吞掉 SYN、TLS 握手卡在
+/// 半路、WS 升级挂着不回，都会以 [`AdapterError::Timeout`] 结束并交给 `supervise`
+/// 走退避重连 —— 而不是永远停在"正在连接"（那种失败看起来像"机器人上线了但
+/// 一条消息都不来"，最难查）。
 async fn connect_ws(config: &OneBotConfig) -> Result<WsStream, AdapterError> {
     let mut request = config
         .ws_url
@@ -798,14 +851,66 @@ async fn connect_ws(config: &OneBotConfig) -> Result<WsStream, AdapterError> {
         let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
             AdapterError::protocol("access token cannot be encoded as an http header value")
         })?;
+        // `ws://` 与 `wss://` 都走这里：TLS 不改变认证方式。
         request.headers_mut().insert("authorization", value);
     }
     let ws_config = WebSocketConfig::default();
-    let (stream, _response) =
-        tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
+    // `wss://` 注入自己建的 rustls 配置（公共根 + 显式追加的根证书），
+    // `ws://` 不传 connector —— `Mode::Plain` 直接返回明文流，与加 TLS 之前一致。
+    let connector = if is_tls_url(&config.ws_url) {
+        Some(Connector::Rustls(crate::tls::client_config(
+            &config.extra_root_certificates,
+        )?))
+    } else {
+        None
+    };
+    let connecting = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        Some(ws_config),
+        false,
+        connector,
+    );
+    let (stream, _response) = match config.connect_timeout {
+        Some(limit) => tokio::time::timeout(limit, connecting)
             .await
-            .map_err(|err| AdapterError::transport(format!("ws connect failed: {err}")))?;
+            .map_err(|_| AdapterError::timeout("onebot ws connect", limit))?,
+        None => connecting.await,
+    }
+    .map_err(ws_connect_error)?;
     Ok(stream)
+}
+
+/// 连接失败的错误分类。
+///
+/// 证书问题必须报 [`AdapterError::Tls`]，不能混进笼统的 transport：
+/// tokio-tungstenite 把 rustls 的失败塞进 [`tungstenite::Error::Io`]（见其
+/// `tls.rs` 的 `Err(e) => Err(Error::Io(e))`），主机名不合法则给
+/// `Error::Tls(TlsError::InvalidDnsName)`。
+fn ws_connect_error(err: tokio_tungstenite::tungstenite::Error) -> AdapterError {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    match &err {
+        WsError::Io(io) => crate::tls::classify_tls_failure("wss handshake failed", io)
+            .unwrap_or_else(|| AdapterError::transport(format!("ws connect failed: {err}"))),
+        WsError::Tls(_) => AdapterError::tls(format!("wss handshake failed: {err}")),
+        _ => AdapterError::transport(format!("ws connect failed: {err}")),
+    }
+}
+
+/// 连一次、握手成功就断开：给"测试连接"这类命令用。
+///
+/// 为什么不复用 [`OneBotClient::start`]：`start` 是永续重连语义（spawn 一个后台
+/// 循环），证书不对它只会一直重连 + 打 warn 日志，调用方拿不到"确定失败"。
+/// 这个函数把"地址与证书能不能用"变成一次可以当场报出来的结果 —— 尤其是
+/// `wss://` 部署里最常见的两类问题（根证书没装、证书主机名对不上）。
+pub async fn probe_connection(config: &OneBotConfig) -> Result<(), AdapterError> {
+    validate_ws_url(&config.ws_url)?;
+    let mut stream = connect_ws(config).await?;
+    if let Err(err) = stream.close(None).await {
+        // 关闭失败不影响结论：握手已经成功，这里只是尽力礼貌地收掉连接。
+        tracing::debug!(error = %err, "onebot probe: close failed");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -814,21 +919,33 @@ mod tests {
     use crate::clock::SystemClock;
 
     #[test]
-    fn validate_allows_ws_and_rejects_everything_else() {
+    fn validate_allows_ws_and_wss_and_rejects_other_schemes() {
         assert!(validate_ws_url("ws://127.0.0.1:3001").is_ok());
         assert!(validate_ws_url("  WS://127.0.0.1:3001  ").is_ok());
-        assert!(validate_ws_url("wss://example.com/ws").is_err());
+        // TLS 只是一层传输：地址校验放行 `wss://`，证书校验交给 rustls。
+        assert!(validate_ws_url("wss://napcat.example.com/ws").is_ok());
+        assert!(validate_ws_url("WSS://napcat.example.com/ws").is_ok());
         assert!(validate_ws_url("http://127.0.0.1:3001").is_err());
         assert!(validate_ws_url("file:///etc/passwd").is_err());
         assert!(validate_ws_url("ws://").is_err());
+        assert!(validate_ws_url("wss://").is_err());
         assert!(validate_ws_url("").is_err());
     }
 
     #[test]
-    fn wss_error_says_tls_is_missing() {
-        let err = validate_ws_url("wss://example.com/ws").expect_err("wss must be rejected");
-        assert!(matches!(err, AdapterError::Unsupported { .. }));
-        assert!(err.to_string().contains("TLS"));
+    fn non_websocket_scheme_is_blocked_not_unsupported() {
+        let err = validate_ws_url("http://example.com/ws").expect_err("http must be rejected");
+        // `Blocked`（安全策略）而不是 `Unsupported`（能力缺口）：适配器现在**有** TLS 能力。
+        assert!(matches!(err, AdapterError::Blocked { .. }));
+        assert!(err.to_string().contains("ws:// and wss://"));
+    }
+
+    #[test]
+    fn tls_url_detection_is_case_insensitive() {
+        assert!(is_tls_url("wss://example.com/ws"));
+        assert!(is_tls_url("  WSS://example.com/ws  "));
+        assert!(!is_tls_url("ws://example.com/ws"));
+        assert!(!is_tls_url("http://example.com/ws"));
     }
 
     #[test]
