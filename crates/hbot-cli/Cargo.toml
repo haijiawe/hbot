@@ -1,0 +1,9 @@
+[package]
+name = "hbot-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hbot-core = { path = "../hbot-core" }`nhbot-store = { path = "../hbot-store" }`nhbot-bot = { path = "../hbot-bot" }`nhbot-agent = { path = "../hbot-agent" }`nhbot-rpc = { path = "../hbot-rpc" }`nanyhow.workspace = true`nserde.workspace = true`ntokio.workspace = true`ntracing.workspace = true`ntracing-subscriber.workspace = true

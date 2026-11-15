@@ -1,0 +1,231 @@
+# AGENTS.md
+
+给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
+
+当前阶段：**设计完成、代码未开始**（M0 见 `docs/04-implementation-plan.md` §9）。如果你被要求实现，从 M0 开始，不要跳过 Spike。
+
+---
+
+## 0. 三十秒硬规则
+
+1. **产品运行时不允许 Node**：不 `spawn node`、不加 `node_modules` 运行时依赖、不把 Agent 放回 V8。
+2. **不做节点/流程引擎**：没有画布、没有触发器解释器、没有 `flows` 表。
+3. **只有一个 Agent 循环**：`crates/hbot-agent/src/loop.rs`；不要为子代理/工作流再写第二套骨架。
+4. **只有一份契约**：`crates/hbot-rpc/src/dto.rs` → `ts-rs` 生成；不手写 TS DTO、不复制常量。
+5. **先落库再处理**：入站消息先写 `inbound`，再入队；不允许“内存里先跑，失败再说”。
+6. **每会话串行**：同一 `(bot_id, conversation_id)` 不得并发执行；不同会话可并行。
+7. **审批按完整动作**：规则键 `(tool, 规范化参数/路径, sandbox_mode)`；禁止按大类放行。
+8. **不静默吞错**：每个错误要么恢复、要么上报、要么显式降级并记录；空 catch 一律红。
+9. **代码是唯一真源**：多文件项目、相对 import；没有隐藏的 flow.json / 数据库里的逻辑。禁止裸包名与 npm。
+10. **Agent 写入必须走 Diff**：逐块接受/拒绝；用户未保存缓冲区冲突时拒绝自动应用；禁止静默覆盖。
+11. **IDE 只有三个 store**：`workspace` / `agent` / `run`；禁止一个 store 直接改另一个，跨域走命令或事件。
+
+---
+
+## 1. 先读什么
+
+| 顺序 | 文件 | 目的 |
+|---|---|---|
+| 1 | 本文件 | 规则与地图 |
+| 2 | `docs/03-directory.md` | 改动落点、命名、依赖方向 |
+| 3 | `docs/02-architecture.md` | 消息链路、Agent、沙箱、存储、安全 |
+| 4 | `docs/06-ide.md` | IDE 布局、编辑器、Agent Diff、运行/调试 |
+| 5 | `docs/05-quality-gates.md` | 命令与预算 |
+| 6 | `docs/adr/0002-agent-in-rust.md` | 为什么是 Rust、为什么无 Node |
+| 7 | `docs/00-assessment.md` | 旧项目的坑，作为“不变量”证据 |
+
+不要先读 `_research/`：那是旧项目的原始体检报告，是证据不是规范。
+
+---
+
+## 2. 目录地图
+
+| 路径 | 放什么 | 不能放什么 |
+|---|---|---|
+| `crates/hbot-core` | 实体、端口 trait、错误、ID | 任何 IO、任何 workspace 依赖 |
+| `crates/hbot-store` | SQLite、迁移、repository | 业务规则、Agent 逻辑 |
+| `crates/hbot-agent` | 循环、上下文、工具、审批、provider | Bot 生命周期、UI DTO |
+| `crates/hbot-code` | manifest、SWC 编译、QuickJS、宿主 API | 平台协议、Agent 循环 |
+| `crates/hbot-bot` | supervisor、会话队列、outbox、去重 | 具体平台协议 |
+| `crates/hbot-workspace` | 项目文件、监听、搜索、符号/源码映射、编辑事务 | UI、Agent 决策 |
+| `crates/hbot-adapters` | OneBot/Webhook/Telegram…、keyring、HTTP、fs | 业务编排 |
+| `crates/hbot-rpc` | Command/Event、dispatch、WS 服务 | 业务实现 |
+| `crates/hbot-cli` | `hbot` 二进制：serve/check/run | 库逻辑 |
+| `crates/hbot-desktop` | Tauri 命令、窗口、托盘、更新 | 业务规则 |
+| `crates/xtask` | 代码生成、依赖检查、基准 | 运行时逻辑 |
+| `apps/web/src/features/*` | explorer/editor/search/problems/agent/run/debug/logs/settings | 跨 feature 内部 import |
+| `apps/web/src/lib/layout.ts` | 布局唯一真源 | 组件写死宽度 |
+| `apps/web/src/lib/keybindings.ts` | 快捷键唯一真源 | 组件自己绑快捷键 |
+| `apps/web/src/stores` | workspace / agent / run 三个 store | store 之间直接 setter |
+| `apps/web/src/generated` | Rust 生成的 TS | **手改** |
+| `tests/integration` | 真 SQLite + mock 平台 | 真实账号 |
+| `tests/parity` | 旧项目行为场景 | 逐条搬旧测试 |
+| `docs/` | 设计、ADR、体检 | 运行日志、临时文件 |
+
+依赖方向与“改 X 去哪”见 `docs/03-directory.md` §2、§8。
+
+---
+
+## 3. 命令
+
+```bash
+./scripts/check.sh              # fmt + clippy + deny + deps + gen check + nextest + UI
+./scripts/check.sh --full       # 再加集成/E2E/打包
+cargo xtask gen                 # 重新生成 TS 契约与 hbot.d.ts（生成物要入库）
+cargo test -p hbot-agent        # 单 crate
+cargo clippy -p hbot-code -- -D warnings
+pnpm -C apps/web check          # tsc --noEmit + biome
+pnpm -C apps/web test
+```
+
+- 不要用 `npm`；UI 包管理是 pnpm。
+- 不要在核心 crate 里加 Node 工具链。
+- 生成物有 diff 就提交，别只改 Rust 不改 TS。
+
+---
+
+## 4. 四条不变量（改之前先确认没破坏）
+
+### 4.1 消息
+
+```text
+adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
+        → per-conversation bounded queue → isolate handler
+        → outbound row → sender retry → mark processed
+```
+
+- 队列有界；满时暂停读取，不丢。
+- 重复投递只执行一次；`ctx.messageId` 是幂等键。
+- 被动回复必须绑定 `reply_to`；主动消息不得冒用旧事件。
+
+### 4.2 Agent
+
+- 工具顺序：参数 → 存在 → 沙箱档 → 路径 realpath → 权限 → 审批 → 执行 → 审计。
+- 所有命令走 `CommandRunner`；没有“后台特批”。
+- 取消要贯穿 provider/工具/HTTP/命令；取消后不再发新请求。
+- 预算：步数、token、时长、金额；超限停，不静默续。
+
+### 4.3 契约
+
+- `Command`/`Event` 只在 `hbot-rpc/dto.rs` 定义。
+- 加字段要兼容旧 UI（serde default / Option）；删字段走版本化。
+- `apps/web/src/generated/` 由 `xtask gen` 产出，review 但不要手改。
+
+### 4.4 沙箱
+
+- 生成代码没有 `fs/net/process/require/import`；只有 `hbot.*` 白名单。
+- 每 isolate 有内存/时间/调用上限；超限中断，进程不死。
+- 命令隔离建不出来 → 拒绝执行；**不回退名字白名单**。
+- 密钥只经 keyring/环境；日志、错误、审计统一脱敏。
+
+---
+
+## 5. Rust 约定
+
+- edition 2024，`rustfmt` 默认；`clippy -D warnings`。
+- 库代码不用 `unwrap()`/`expect()`（测试、`main` 启动可例外）；错误用 `thiserror`，边界转 `ApiError`。
+- `unsafe` 必须有 `// SAFETY:` 说明不变量；核心 crate 默认禁止。
+- 公开 API 不暴露 `anyhow::Error`；内部可以用。
+- 异步：`tokio`；阻塞/CPU（SWC、QuickJS）放专用线程，不堵 reactor。
+- 通道一律有界；无界通道视为 bug。
+- 时间、随机、UUID 通过 trait 注入，便于测试。
+- 日志用 `tracing`，字段化；不要 `println!`。
+
+---
+
+## 6. UI 约定
+
+- 服务端状态用 TanStack Query；Zustand 只放纯 UI 状态。
+- 只经 `lib/api.ts`；不直接 `fetch`/WebSocket。
+- Monaco、图表等重依赖动态 `import`；首屏不静态引入。
+- 组件文件 PascalCase，其他 kebab-case；hook 用 `use-*.ts`。
+- 不用 `any`、`@ts-ignore`；确有需要写 `unknown` + 收窄。
+- 每个 feature 有错误边界与空状态；不把异常抛到白屏。
+
+---
+
+## 7. 已踩过的坑（来自旧项目，别再踩）
+
+1. **启动/重连窗口丢消息**：旧项目先连平台、后建订阅（`botManager.ts:250,256`），`eventBus.ts:806-827` 只遍历现存客户端。新项目必须先建 supervisor/队列，再 connect。
+2. **本地总线开成 socket**：旧 `eventBus.ts:684-687` 连接即加入，无鉴权，任意本机进程可冒充机器人。新项目内部总线**进程内**；对外只有 127.0.0.1 + token 的 RPC。
+3. **同会话并发**：旧 `FlowRuntime.ts:401` `void dispatch`，同会话两条消息并行、回复乱序。新项目每会话串行是硬约束。
+4. **等待表只在内存**：旧 `FlowInterpreter.ts:437-440` 重启即丢、超时靠下一条事件。新项目所有等待/定时落库，调度器主动结算。
+5. **审批 always 按大类放行**：旧 `aiAgentCoreApproval.ts:151-184` 对 a.txt 点“别再问”，同轮任意路径都放行。新项目规则键必须含规范化参数。
+6. **迁移先覆盖后校验**：旧 `flow.ts:222-232` 备份失败被空 catch 吞掉，覆盖后才 schema 校验。新项目顺序：读 → 校验 → 备份成功 → tmp → fsync → rename。
+7. **命令沙箱回退白名单**：旧非 Windows 直接退化名字白名单（`confine.ts:116`、`sandbox.ts:66`）。新项目建不出隔离就拒绝。
+8. **后台命令绕开沙箱**：旧 `job_start` 只查写档，`spawn(shell:true)`（`registry.ts:863-887`、`jobs.ts:184-188`）。新项目所有命令同一入口。
+9. **`node:vm` 当安全边界**：旧 `sandbox.ts:30-34` 自己承认不是。新项目用 QuickJS isolate，且限制内存/时间。
+10. **半成功批量写**：旧 `persistentStore.ts:622-672` 逐键 catch，全部报成功。新项目单事务，全有或全无。
+11. **契约三处手写**：旧 preload 1,421 行 / 类型 2,188 行 / 308 invoke，新增改 4–5 处。新项目 Rust 单一真源 + 生成。
+12. **首屏静态加载巨型目录**：旧 `nodeCatalog` 把 6,072 行文案拉进首屏。新项目动态 import + 预算。
+13. **按行数当复杂度**：旧项目已改为“函数能力分类”。新项目同样看职责，不搞行数 KPI。
+14. **Windows 原子替换 EPERM**：目标被占用时 rename 会失败。写入要重试 + 串行化；不要当成“写成功”。
+15. **密钥静默明文**：旧 `safeStorage` 不可用时直接写明文。新项目拒绝或显式确认 + 审计。
+16. **闸门本地与 CI 语义不同**：旧 `format` 闸门本地只查 `git diff --cached`，不改暂存区等于没查。新 `scripts/check.sh` 必须对全树判定，本地与 CI 同一条命令。
+17. **测试配置一收窄就假绿**：旧项目曾把 vitest include 改窄，364 个测试文件静默不跑。新项目的 nextest/Playwright 配置要有“期望测试数对账”，数量突变即红。
+18. **测试断言源码文本**：旧仓库 88 个测试读源码字符串，重命名会以离奇断言失败出现。新项目用类型/契约/行为；结构约束交给依赖图与 `cargo`。
+
+---
+
+## 8. 新增 X 的步骤
+
+### 新增平台适配器
+
+1. `crates/hbot-adapters/src/platforms/<name>.rs` 实现 `PlatformAdapter`。
+2. 在 `registry.rs` 注册；配置 schema 放 `hbot.json` 的平台段。
+3. mock 协议 fixture + 集成测试（连接、收、发、重连、去重）。
+4. 不改 supervisor/queue；若必须改，先改 trait 并说明。
+
+### 新增 Agent 工具
+
+1. `crates/hbot-agent/src/tools/<name>.rs`：参数 schema（`schemars`）、实现、超时、审计。
+2. 注册表登记；`approvals.rs` 归类（read/write/command/network/external）。
+3. 拒绝路径测试：无权限、路径逃逸、超时、取消。
+4. 更新 `docs/02-architecture.md` §5.2 的表。
+
+### 新增宿主 API
+
+1. `hbot-code/src/runtime/host_api.rs` 实现；参数/返回值 JSON。
+2. `dts.rs` 生成类型；跑 `cargo xtask gen`。
+3. `manifest.rs` 权限校验（默认拒绝）。
+4. 测试：无权限拒绝、超限中断、序列化往返。
+
+### 新增 Command / 表 / 页面
+
+见 `docs/03-directory.md` §8；契约改完必须 `cargo xtask gen`。
+
+---
+
+## 9. 提交前
+
+- [ ] `./scripts/check.sh` 绿。
+- [ ] 新行为有测试；bug 有回归测试。
+- [ ] 生成物已更新并入库。
+- [ ] 没有新增第二套循环/契约/装配。
+- [ ] 没有 Node 运行时依赖。
+- [ ] 安全边界有拒绝路径测试。
+- [ ] 文档/ADR 同步；不留 `TODO` 进库。
+
+提交信息：`type(scope): 说明`，如 `feat(agent): 增加 read_logs 工具`。
+
+---
+
+## 10. 当前未决（别自己拍）
+
+1. QuickJS async 桥接模型（S1 定）。
+2. `hbot.json` 权限字段最终形状。
+3. `onSchedule` 是否进 MVP。
+4. 多项目并发打开策略。
+5. 关窗继续跑的默认值。
+
+遇到这些，先看 `docs/04-implementation-plan.md` §10 与 ADR-0002 §7；仍不确定就问，不要默默选一个。
+
+---
+
+## 11. 给 Agent 的交付方式
+
+- 报告用“**改了什么 / 证据 / 没做什么 / 风险**”四段，不写流水账。
+- 给文件路径时带行号；给结论时区分“实测 / 读码 / 推测”。
+- 大改动先出计划（`update_plan`），再动手；不要边想边改十个文件。
+- 失败要说失败：哪一步、什么错误、试过什么、下一步建议。
+- 不要为了“让闸门变绿”改测试断言或基准 fixture。

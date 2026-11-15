@@ -1,0 +1,16 @@
+/target/
+**/target/
+node_modules/
+dist/
+apps/web/dist/
+apps/web/src/generated/*.ts
+!apps/web/src/generated/.gitkeep
+*.log
+.env
+.env.local
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.tsbuildinfo
+/.hbot/

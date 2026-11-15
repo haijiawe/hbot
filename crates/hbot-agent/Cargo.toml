@@ -1,0 +1,9 @@
+[package]
+name = "hbot-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hbot-core = { path = "../hbot-core" }`nserde.workspace = true`nserde_json.workspace = true`nthiserror.workspace = true`ntokio.workspace = true`ntracing.workspace = true
