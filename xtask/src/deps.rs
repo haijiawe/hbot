@@ -24,13 +24,17 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("hbot-code", &["hbot-core"]),
     // 项目文件访问、路径守卫、搜索。
     ("hbot-workspace", &["hbot-core"]),
+    ("hbot-command", &["hbot-core"]), // 受控命令执行：agent → command → core，不许反向
     // 平台协议适配（OneBot / Webhook），不含业务规则。
     ("hbot-adapters", &["hbot-core"]),
     // Bot 运行时：会话队列、outbox、supervisor。handler 由外部注入，
     // 所以它不认识 hbot-agent / hbot-code。
     ("hbot-bot", &["hbot-core", "hbot-store"]),
     // Agent：单循环 + ToolGateway + provider。不许依赖 bot/rpc/desktop。
-    ("hbot-agent", &["hbot-core", "hbot-workspace", "hbot-code"]),
+    (
+        "hbot-agent",
+        &["hbot-core", "hbot-workspace", "hbot-code", "hbot-command"],
+    ),
     // RPC：唯一编排层，把上面所有实现 crate 拼起来。
     (
         "hbot-rpc",
@@ -42,6 +46,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "hbot-adapters",
             "hbot-bot",
             "hbot-agent",
+            "hbot-command",
         ],
     ),
     // CLI：组合根之一。
@@ -60,6 +65,20 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ),
     // 桌面壳：只碰契约与 dispatch。
     ("hbot-desktop", &["hbot-core", "hbot-rpc"]),
+    // 跨 crate 集成回归套件：只含测试，必须能同时看见所有实现 crate 的接缝。
+    (
+        "hbot-parity",
+        &[
+            "hbot-core",
+            "hbot-store",
+            "hbot-code",
+            "hbot-bot",
+            "hbot-agent",
+            "hbot-workspace",
+            "hbot-adapters",
+            "hbot-rpc",
+        ],
+    ),
     // 开发期工具。
     ("xtask", &["hbot-rpc", "hbot-core"]),
 ];

@@ -18,6 +18,7 @@ hbot-bot = { path = "crates/hbot-bot", version = "0.1.0" }
 hbot-agent = { path = "crates/hbot-agent", version = "0.1.0" }
 hbot-workspace = { path = "crates/hbot-workspace", version = "0.1.0" }
 hbot-adapters = { path = "crates/hbot-adapters", version = "0.1.0" }
+hbot-command = { path = "crates/hbot-command", version = "0.1.0" }
 hbot-rpc = { path = "crates/hbot-rpc", version = "0.1.0" }
 
 anyhow = "1"
@@ -25,7 +26,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util"] }
-tokio-tungstenite = "0.24"
+# `rustls-tls-webpki-roots`：让 OneBot 的 `wss://` 走 rustls + 公共根证书，
+# 与 `reqwest` 的 `rustls-tls` 共用同一套 TLS 栈（不引入 openssl / native-tls）。
+# 注意：这个 feature 只带"连接器"，**不选加密后端** —— 后端由使用方的
+# `rustls` 依赖选（本 workspace 只开 `ring`，见 `crates/hbot-adapters/Cargo.toml`）。
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

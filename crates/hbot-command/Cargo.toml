@@ -1,0 +1,16 @@
+[package]
+name = "hbot-command"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 内部实现 crate，不发布（只给 hbot-agent / 组合根用）。
+publish = false
+
+[dependencies]
+# 只依赖 hbot-core（方向是 agent → command → core），见 docs/adr/0003-command-isolation.md。
+# 刻意**不引** windows-sys / libc / nix：作业对象与 setsid/kill 用 std + 手写 FFI 就够，
+# 少一个第三方依赖就少一次供应链审查与一次版本漂移。
+hbot-core = { path = "../hbot-core" }
+serde = { workspace = true }
+tracing = { workspace = true }
