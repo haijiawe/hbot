@@ -6,4 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-hbot-core = { path = "../hbot-core" }`nhbot-store = { path = "../hbot-store" }`nhbot-bot = { path = "../hbot-bot" }`nhbot-agent = { path = "../hbot-agent" }`nhbot-rpc = { path = "../hbot-rpc" }`nanyhow.workspace = true`nserde.workspace = true`ntokio.workspace = true`ntracing.workspace = true`ntracing-subscriber.workspace = true
+hbot-core = { path = "../hbot-core" }
+hbot-store = { path = "../hbot-store" }
+hbot-bot = { path = "../hbot-bot" }
+hbot-agent = { path = "../hbot-agent" }
+hbot-rpc = { path = "../hbot-rpc" }
+anyhow.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+

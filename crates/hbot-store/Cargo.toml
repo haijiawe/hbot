@@ -6,4 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-hbot-core = { path = "../hbot-core" }`nserde.workspace = true`nserde_json.workspace = true`nthiserror.workspace = true`nrusqlite.workspace = true`ntracing.workspace = true
+hbot-core = { path = "../hbot-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+
