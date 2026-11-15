@@ -11,7 +11,7 @@ const BOT_TEXT: Record<BotStatus, string> = {
   starting: 'bot 启动中',
   running: 'bot 运行中',
   stopping: 'bot 停止中',
-  error: 'bot 出错',
+  degraded: 'bot 降级',
 }
 
 interface StatusBarProps {
@@ -27,7 +27,7 @@ export function StatusBar({ notice }: StatusBarProps) {
   const dismissError = useWorkspaceStore((state) => state.dismissError)
   const tabCount = useWorkspaceStore((state) => state.tabs.length)
   const botStatus = useRunStore((state) => state.status)
-  const queueDepth = useRunStore((state) => state.queueDepth)
+  const botId = useRunStore((state) => state.botId)
 
   return (
     <footer className="status-bar" aria-label="状态栏">
@@ -43,7 +43,7 @@ export function StatusBar({ notice }: StatusBarProps) {
         <span className={`status-bar__item status-bar__bot status-bar__bot--${botStatus}`}>
           <span className={`status-dot status-dot--${botStatus}`} aria-hidden="true" />
           {BOT_TEXT[botStatus]}
-          {queueDepth > 0 ? `（队列 ${queueDepth}）` : ''}
+          {botId.length > 0 ? `（${botId}）` : ''}
         </span>
         {notice ? (
           <span className="status-bar__item status-bar__notice" role="status">

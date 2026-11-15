@@ -35,6 +35,14 @@ export const BOTTOM_PANEL_DEFAULT_HEIGHT = 220
 export const RESIZE_STEP = 8
 export const RESIZE_STEP_LARGE = 32
 
+/**
+ * 调试面板里"调用栈"一列的宽度（px）。
+ *
+ * 调试面板本体挂在底部面板的 `--bottom-panel-height` 上（尺寸与开合唯一真源仍是
+ * `resolveLayout`），这里只给内部分栏一个常量，免得组件里出现字面量像素。
+ */
+export const DEBUG_STACK_WIDTH = 240
+
 /** 可持久化的布局状态（只存"用户意图"，不存像素级派生值）。 */
 export interface LayoutState {
   sidebarWidth: number

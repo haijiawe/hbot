@@ -123,9 +123,9 @@ editId: EditId,
  */
 files: Array<EditFile>, } | { "type": "debug.paused", 
 /**
- * Agent 会话 ID。
+ * Bot ID。
  */
-sessionId: SessionId, 
+botId: BotId, 
 /**
  * 命中断点的文件。
  */
@@ -143,6 +143,6 @@ scopes: Array<DebugScope>,
  */
 callStack: Array<StackFrame>, } | { "type": "debug.resumed", 
 /**
- * Agent 会话 ID。
+ * Bot ID。
  */
-sessionId: SessionId, };
+botId: BotId, };

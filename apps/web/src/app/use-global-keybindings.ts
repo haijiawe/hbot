@@ -18,7 +18,13 @@ export interface ShortcutActions {
   toggleAgent: () => void
   toggleBottomPanel: () => void
   showProblems: () => void
-  notify: (message: string) => void
+  /** 打开全局搜索面板（底部的"搜索"页签 + 输入框抢焦点）。 */
+  showSearch: () => void
+  /** 调试：继续（未暂停时由 store 自己忽略，组件不必判）。 */
+  debugContinue: () => void
+  debugStepOver: () => void
+  debugStepInto: () => void
+  debugStepOut: () => void
 }
 
 export function useGlobalKeybindings(actions: ShortcutActions): void {
@@ -67,7 +73,19 @@ export function useGlobalKeybindings(actions: ShortcutActions): void {
           current.showProblems()
           break
         case 'global-search':
-          current.notify('全局搜索在 M3 提供')
+          current.showSearch()
+          break
+        case 'debug-continue':
+          current.debugContinue()
+          break
+        case 'debug-step-over':
+          current.debugStepOver()
+          break
+        case 'debug-step-into':
+          current.debugStepInto()
+          break
+        case 'debug-step-out':
+          current.debugStepOut()
           break
         default: {
           const exhaustive: never = binding.id

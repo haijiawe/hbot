@@ -20,11 +20,19 @@ export type Command = { "type": "app_info" } | { "type": "project_open",
 /**
  * 项目根目录绝对路径。
  */
-path: string, } | { "type": "agent_send", 
+path: string, } | { "type": "project_create", 
 /**
- * Agent 会话 ID。
+ * 新项目根目录路径（绝对路径；不存在时自动创建）。
  */
-sessionId: SessionId, 
+path: string, 
+/**
+ * 展示名，写进 `hbot.json` 的 `name`；空字符串回 `-32002`。
+ */
+name: string, } | { "type": "agent_send", 
+/**
+ * Agent 会话 ID；`None` 表示新建会话。
+ */
+sessionId: SessionId | null, 
 /**
  * 用户输入。
  */
@@ -140,9 +148,13 @@ conversationId: ConversationId,
 /**
  * 模拟的消息文本。
  */
-text: string, } | { "type": "debug_set_breakpoints", 
+text: string, } | { "type": "bot_list" } | { "type": "debug_set_breakpoints", 
 /**
- * 源文件路径。
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 源文件路径（项目内相对路径）。
  */
 file: string, 
 /**
@@ -150,13 +162,13 @@ file: string,
  */
 lines: Array<number>, } | { "type": "debug_resume", 
 /**
- * Agent 会话 ID。
+ * Bot ID。
  */
-sessionId: SessionId, } | { "type": "debug_step", 
+botId: BotId, } | { "type": "debug_step", 
 /**
- * Agent 会话 ID。
+ * Bot ID。
  */
-sessionId: SessionId, 
+botId: BotId, 
 /**
  * 步进方向。
  */

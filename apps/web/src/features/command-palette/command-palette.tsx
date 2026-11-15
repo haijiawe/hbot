@@ -8,6 +8,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { formatKeybinding, keybindingById } from '../../lib/keybindings'
 import { flattenFiles, fuzzyMatch } from '../../lib/paths'
+import { openSearch } from '../search/open-search'
+import { useDebugStore } from '../../stores/debug-store'
 import { useRunStore } from '../../stores/run-store'
 import { useWorkspaceStore } from '../../stores/workspace-store'
 
@@ -49,6 +51,9 @@ export function CommandPalette({ mode: initialMode, onClose, onNotice }: Command
   const setSidebarView = useWorkspaceStore((state) => state.setSidebarView)
   const start = useRunStore((state) => state.start)
   const stop = useRunStore((state) => state.stop)
+  const debugPaused = useDebugStore((state) => state.paused !== null)
+  const debugResume = useDebugStore((state) => state.resume)
+  const debugStep = useDebugStore((state) => state.step)
 
   useEffect(() => {
     inputRef.current?.focus()
@@ -91,6 +96,39 @@ export function CommandPalette({ mode: initialMode, onClose, onNotice }: Command
         run: () => void stop(),
       },
       {
+        id: 'debug.panel',
+        title: '打开调试面板',
+        run: () => setBottomPanelTab('debug'),
+      },
+      {
+        id: 'debug.continue',
+        title: '调试：继续',
+        keys: keys('debug-continue'),
+        disabled: !debugPaused,
+        run: () => void debugResume(),
+      },
+      {
+        id: 'debug.step-over',
+        title: '调试：单步跳过',
+        keys: keys('debug-step-over'),
+        disabled: !debugPaused,
+        run: () => void debugStep('over'),
+      },
+      {
+        id: 'debug.step-into',
+        title: '调试：单步进入',
+        keys: keys('debug-step-into'),
+        disabled: !debugPaused,
+        run: () => void debugStep('into'),
+      },
+      {
+        id: 'debug.step-out',
+        title: '调试：单步跳出',
+        keys: keys('debug-step-out'),
+        disabled: !debugPaused,
+        run: () => void debugStep('out'),
+      },
+      {
         id: 'view.agent',
         title: agentCollapsed ? '显示 Agent 栏' : '隐藏 Agent 栏',
         keys: keys('toggle-agent'),
@@ -117,14 +155,15 @@ export function CommandPalette({ mode: initialMode, onClose, onNotice }: Command
         id: 'search.global',
         title: '全局搜索',
         keys: keys('global-search'),
-        hint: 'M3 提供',
-        disabled: true,
-        run: () => onNotice('全局搜索在 M3 提供'),
+        run: () => openSearch(),
       },
     ]
   }, [
     agentCollapsed,
     bottomPanelCollapsed,
+    debugPaused,
+    debugResume,
+    debugStep,
     onNotice,
     saveActive,
     saveAll,

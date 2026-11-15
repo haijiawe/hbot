@@ -19,14 +19,17 @@ import {
 import { AgentPanel } from '../features/agent/agent-panel'
 import { EditorArea } from '../features/editor/editor-area'
 import { ExplorerView } from '../features/explorer/explorer-view'
+import { openSearch } from '../features/search/open-search'
 import { SettingsView } from '../features/settings/settings-view'
 import { useRunStore } from '../stores/run-store'
+import { useDebugStore } from '../stores/debug-store'
 import { useWorkspaceStore } from '../stores/workspace-store'
 import { ActivityBar } from './activity-bar'
 import { CommandPalette, type PaletteMode } from '../features/command-palette/command-palette'
 import { ErrorBoundary } from './error-boundary'
 import { Splitter } from '../components/splitter'
 import { StatusBar } from './status-bar'
+import { useCoreEvents } from './use-core-events'
 import { useGlobalKeybindings } from './use-global-keybindings'
 
 // 底部面板包含日志渲染与问题面板，首屏不加载（AGENTS.md §6）。
@@ -48,6 +51,12 @@ export function App() {
   const saveAll = useWorkspaceStore((state) => state.saveAll)
   const start = useRunStore((state) => state.start)
   const stop = useRunStore((state) => state.stop)
+  const runBotId = useRunStore((state) => state.botId)
+  // 调试的单位是 bot 而不是会话，所以 botId 由外壳从 runStore 注入 debugStore
+  // （两个 store 之间不互相 import，AGENTS.md §0.11）。
+  const setDebugBotId = useDebugStore((state) => state.setBotId)
+  const debugResume = useDebugStore((state) => state.resume)
+  const debugStep = useDebugStore((state) => state.step)
 
   const [paletteMode, setPaletteMode] = useState<PaletteMode | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -72,6 +81,14 @@ export function App() {
     void loadTree()
   }, [loadTree])
 
+  // 启停 bot 会换掉调试目标；断点与暂停现场都由 debugStore 自己处理这次切换。
+  useEffect(() => {
+    setDebugBotId(runBotId)
+  }, [runBotId, setDebugBotId])
+
+  // 核心事件（bot.status / run.log / agent.*）与 bot 列表播种都在这个 hook 里。
+  useCoreEvents()
+
   useGlobalKeybindings({
     openPalette: () => setPaletteMode('commands'),
     openQuickOpen: () => setPaletteMode('files'),
@@ -82,7 +99,11 @@ export function App() {
     toggleAgent: () => toggleAgent(),
     toggleBottomPanel: () => toggleBottomPanel(),
     showProblems: () => setBottomPanelTab('problems'),
-    notify,
+    showSearch: () => openSearch(),
+    debugContinue: () => void debugResume(),
+    debugStepOver: () => void debugStep('over'),
+    debugStepInto: () => void debugStep('into'),
+    debugStepOut: () => void debugStep('out'),
   })
 
   return (

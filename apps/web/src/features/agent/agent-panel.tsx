@@ -1,22 +1,32 @@
-/** Agent 栏：消息列表 + 输入框 + Diff 卡片。 */
+/**
+ * Agent 栏：消息列表 + 实时进度 + 审批卡片 + Diff 卡片 + 输入框。
+ *
+ * 所有内容都来自核心事件（见 `stores/agent-store.ts`），这里不编任何状态：
+ * 没有会话就没有"待审阅改动"占位按钮 —— 空就是空。
+ */
 
 import { useEffect, useRef } from 'react'
 import { formatClock } from '../../lib/format'
 import { useAgentStore } from '../../stores/agent-store'
 import { useWorkspaceStore } from '../../stores/workspace-store'
+import { ApprovalCard } from './approval-card'
 import { DiffCard } from './diff-card'
 
 export function AgentPanel() {
+  const sessionId = useAgentStore((state) => state.sessionId)
   const messages = useAgentStore((state) => state.messages)
   const draft = useAgentStore((state) => state.draft)
   const sending = useAgentStore((state) => state.sending)
-  const diff = useAgentStore((state) => state.diff)
+  const step = useAgentStore((state) => state.step)
+  const tool = useAgentStore((state) => state.tool)
+  const edit = useAgentStore((state) => state.edit)
   const approval = useAgentStore((state) => state.approval)
   const error = useAgentStore((state) => state.error)
   const setDraft = useAgentStore((state) => state.setDraft)
   const send = useAgentStore((state) => state.send)
-  const previewDiff = useAgentStore((state) => state.previewDiff)
-  const resolveDiff = useAgentStore((state) => state.resolveDiff)
+  const answerApproval = useAgentStore((state) => state.answerApproval)
+  const acceptEdit = useAgentStore((state) => state.acceptEdit)
+  const rejectEdit = useAgentStore((state) => state.rejectEdit)
   const dismissError = useAgentStore((state) => state.dismissError)
   const toggleAgent = useWorkspaceStore((state) => state.toggleAgent)
 
@@ -25,12 +35,15 @@ export function AgentPanel() {
   useEffect(() => {
     const list = listRef.current
     if (list) list.scrollTop = list.scrollHeight
-  }, [messages, sending])
+  }, [messages, sending, approval, edit])
 
   return (
     <section className="agent" aria-label="Agent">
       <header className="panel-header">
         <h2 className="panel-header__title">Agent</h2>
+        <span className="panel-header__hint" title={sessionId ?? '还没有会话'}>
+          {sessionId ? `会话 ${sessionId.slice(0, 8)}` : '新会话'}
+        </span>
         <button
           type="button"
           className="icon-button"
@@ -72,31 +85,28 @@ export function AgentPanel() {
       {error ? (
         <div className="inline-error" role="alert">
           <span>{error}</span>
-          <button type="button" className="icon-button" onClick={dismissError} aria-label="关闭错误提示">
+          <button
+            type="button"
+            className="icon-button"
+            onClick={dismissError}
+            aria-label="关闭错误提示"
+          >
             ×
           </button>
         </div>
       ) : null}
 
-      {diff ? (
-        <DiffCard diff={diff} onResolve={resolveDiff} />
-      ) : (
-        <div className="agent__diff-placeholder">
-          <p className="panel-hint">暂无待审阅改动。</p>
-          <button
-            type="button"
-            className="button"
-            onClick={previewDiff}
-            aria-label="预览 Diff 卡片（占位）"
-          >
-            预览 Diff 卡片
-          </button>
-        </div>
-      )}
+      {approval ? <ApprovalCard approval={approval} onAnswer={(decision, always) => void answerApproval(decision, always)} /> : null}
 
-      {approval === 'awaiting' ? (
-        <p className="agent__approval" role="status">
-          等待审阅：Agent 的写入被拦在审批这一步，接受后才由核心执行。
+      {edit ? (
+        <DiffCard edit={edit} onAccept={() => void acceptEdit()} onReject={() => void rejectEdit()} />
+      ) : null}
+
+      {step > 0 || tool ? (
+        <p className="agent__status" role="status">
+          {step > 0 ? `第 ${step} 步` : ''}
+          {step > 0 && tool ? ' · ' : ''}
+          {tool ? `工具 ${tool.name}（${tool.status}）` : ''}
         </p>
       ) : null}
 

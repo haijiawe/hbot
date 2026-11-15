@@ -1,4 +1,10 @@
-/** 启停控制：状态只来自 runStore，按钮防重复点击。 */
+/**
+ * 启停控制：状态只来自 runStore（由 `bot.status` 事件推进），按钮防重复点击。
+ *
+ * 错误必须显示在这里：`runStore.error` 以前只写进 store、没有任何组件渲染，
+ * 于是 `bot.start` 失败（例如核心回 `-32006 尚未实现：bot_start`）在界面上
+ * 看起来像"点了没反应"。失败就报错，不许当成成功。
+ */
 
 import type { BotStatus } from '../../lib/ipc'
 import { useRunStore } from '../../stores/run-store'
@@ -8,14 +14,16 @@ const STATUS_TEXT: Record<BotStatus, string> = {
   starting: '启动中',
   running: '运行中',
   stopping: '停止中',
-  error: '出错',
+  degraded: '降级运行',
 }
 
 export function RunControls() {
   const status = useRunStore((state) => state.status)
   const busy = useRunStore((state) => state.busy)
+  const error = useRunStore((state) => state.error)
   const start = useRunStore((state) => state.start)
   const stop = useRunStore((state) => state.stop)
+  const dismissError = useRunStore((state) => state.dismissError)
   const running = status === 'running' || status === 'starting'
 
   return (
@@ -40,6 +48,19 @@ export function RunControls() {
       >
         停止
       </button>
+      {error ? (
+        <div className="inline-error" role="alert">
+          <span>{error}</span>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={dismissError}
+            aria-label="关闭错误提示"
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
     </div>
   )
 }

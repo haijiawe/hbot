@@ -18,7 +18,26 @@ import {
 } from '../lib/layout'
 
 export type SidebarView = 'explorer' | 'settings'
-export type BottomPanelTab = 'logs' | 'problems'
+/**
+ * 底部面板页签。搜索结果、问题、调试暂停现场共用这一块区域
+ * （布局数值只来自 `lib/layout.ts`）。
+ */
+export type BottomPanelTab = 'logs' | 'problems' | 'search' | 'debug'
+
+/**
+ * "跳转到某文件的某一行"的意图。
+ *
+ * 为什么不直接从 `features/editor/editor-surface.tsx` 导出 `openAt`：那个文件静态
+ * `import * as monaco`，从任何组件静态 import 它都会把 Monaco 拉进入口 chunk
+ * （首屏体积 ≈ 266 kB → 1.5 MB）。所以跳行意图放 store，由编辑器自己消费 ——
+ * `seq` 让"同一行连点两次"也能再次触发（state 引用变化才会重跑 effect）。
+ */
+export interface RevealRequest {
+  path: string
+  /** 1-based 行号（核心的 `SearchMatch.line` 就是 1-based）。 */
+  line: number
+  seq: number
+}
 
 export interface EditorTab {
   path: string
@@ -41,9 +60,13 @@ export interface WorkspaceState {
   sidebarView: SidebarView
   bottomPanelTab: BottomPanelTab
   error: string | null
+  /** 待执行的"跳行"意图；编辑器消费后不清空（`seq` 保证重复点击也生效）。 */
+  reveal: RevealRequest | null
 
   loadTree: () => Promise<void>
   openFile: (path: string) => Promise<void>
+  /** 打开文件并把光标跳到 `line`（搜索结果点击用）。 */
+  openAt: (path: string, line: number) => Promise<void>
   closeTab: (path: string) => void
   activateTab: (path: string) => void
   updateContent: (path: string, content: string) => void
@@ -76,6 +99,7 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
   sidebarView: 'explorer',
   bottomPanelTab: 'logs',
   error: null,
+  reveal: null,
 
   async loadTree() {
     try {
@@ -104,6 +128,13 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
     } catch (error) {
       set({ error: `打开 ${path} 失败：${errorMessage(error)}` })
     }
+  },
+
+  async openAt(path, line) {
+    await get().openFile(path)
+    // 打开失败时 `openFile` 只设 error、不动 activePath —— 别再往编辑器发跳行意图。
+    if (get().activePath !== path) return
+    set((state) => ({ reveal: { path, line, seq: (state.reveal?.seq ?? 0) + 1 } }))
   },
 
   closeTab(path) {

@@ -8,7 +8,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "check": "tsc --noEmit && vite build"
+    "check:no-any": "node scripts/check-ipc-no-any.mjs",
+    "test": "vitest run",
+    "check": "tsc --noEmit && node scripts/check-ipc-no-any.mjs && vitest run && vite build"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
@@ -22,6 +24,7 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
     "typescript": "^7.0.2",
-    "vite": "^8.3.8"
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
   }
 }

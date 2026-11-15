@@ -1,5 +1,6 @@
 /** 活动栏：切换侧栏视图、打开底部面板页签、开关 Agent 栏。 */
 
+import { openSearch } from '../features/search/open-search'
 import { useWorkspaceStore } from '../stores/workspace-store'
 
 interface ActivityItem {
@@ -32,11 +33,11 @@ export function ActivityBar() {
     },
     {
       id: 'search',
-      label: '全局搜索（M3 提供）',
+      label: '全局搜索（Ctrl+Shift+F）',
       icon: '⌕',
-      active: false,
-      disabled: true,
-      onClick: () => {},
+      // `openSearch()` 自己会展开底部面板并抢焦点（与快捷键、命令面板同一入口）。
+      active: bottomPanelTab === 'search' && !bottomPanelCollapsed,
+      onClick: () => openSearch(),
     },
     {
       id: 'run',
@@ -51,6 +52,13 @@ export function ActivityBar() {
       icon: '⚠',
       active: bottomPanelTab === 'problems' && !bottomPanelCollapsed,
       onClick: () => setBottomPanelTab('problems'),
+    },
+    {
+      id: 'debug',
+      label: '调试',
+      icon: '◈',
+      active: bottomPanelTab === 'debug' && !bottomPanelCollapsed,
+      onClick: () => setBottomPanelTab('debug'),
     },
     {
       id: 'agent',
@@ -82,7 +90,7 @@ export function ActivityBar() {
           onClick={() => {
             item.onClick()
             // 侧栏展开 / 底部面板展开：被折叠时点活动栏应当重新显示。
-            if (item.id === 'run' || item.id === 'problems') {
+            if (item.id === 'run' || item.id === 'problems' || item.id === 'debug') {
               if (bottomPanelCollapsed) toggleBottomPanel(false)
             }
           }}

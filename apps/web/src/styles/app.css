@@ -153,6 +153,18 @@ body.is-resizing {
   text-overflow: ellipsis;
 }
 
+/* 标题旁的小字（目前是 Agent 栏的会话 ID）：不抢标题的位置，超长省略。 */
+.panel-header__hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .panel-scroll {
   flex: 1 1 auto;
   min-height: 0;
@@ -720,6 +732,92 @@ body.is-resizing {
   color: var(--fg-dim);
 }
 
+/* 一次编辑可能跨多个文件：逐文件列路径 + 块数，整份接受由核心落盘。 */
+.diff-card__files {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.diff-card__file {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+  border-bottom: 1px dashed var(--border);
+}
+
+.diff-card__file-hunks {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+}
+
+/* ---------- 审批卡片 ---------- */
+
+.approval-card {
+  margin: 8px;
+  padding: 8px;
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+}
+
+.approval-card__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.approval-card__tool {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.approval-card__risk {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--warn);
+}
+
+.approval-card__args {
+  margin: 6px 0 0;
+  max-height: 120px;
+  overflow: auto;
+  padding: 6px;
+  border-radius: 4px;
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.approval-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.approval-card__always {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+/* Agent 的实时进度行（步骤号 + 最近一次工具调用）。 */
+.agent__status {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  border-top: 1px solid var(--border);
+}
+
 .composer {
   flex: 0 0 auto;
   display: flex;
@@ -839,8 +937,9 @@ body.is-resizing {
   background: var(--warn);
 }
 
-.status-dot--error {
-  background: var(--danger);
+/* 降级：还在跑，但平台侧有问题（契约里没有 error 档，错误走 bot.status 的 error 文本）。 */
+.status-dot--degraded {
+  background: var(--warn);
 }
 
 /* ---------- 命令面板 ---------- */
@@ -943,4 +1042,365 @@ body.is-resizing {
   border-top: 1px solid var(--border);
   color: var(--fg-dim);
   font-size: 11px;
+}
+/* ---------- 全局搜索 ---------- */
+
+.search {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 10px;
+}
+
+.search-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.search-form__field {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.search-form__field--grow {
+  flex: 1 1 220px;
+}
+
+.search-form__field--globs {
+  flex: 0 1 200px;
+}
+
+.search-form__label {
+  color: var(--fg-dim);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.search-form__input {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+  outline: none;
+}
+
+.search-form__input:focus {
+  border-color: var(--accent);
+}
+
+.search-form__check {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding-bottom: 5px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.search-form__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.search__error {
+  margin: 0;
+}
+
+.search__status {
+  margin: 0;
+}
+
+.search-results {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.search-results__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0 6px;
+}
+
+.search-results__count {
+  flex: 1 1 auto;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+
+.search-results__hint {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.search-results__list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.search-file__path {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 0;
+  min-width: 0;
+}
+
+.search-file__name {
+  flex: 0 0 auto;
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.search-file__dir {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-dim);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-file__matches {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0 0 0 12px;
+  list-style: none;
+}
+
+.search-match {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 6px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.search-match:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.search-match__line {
+  flex: 0 0 auto;
+  min-width: 34px;
+  color: var(--fg-dim);
+  text-align: right;
+}
+
+.search-match__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+
+/* ---------- 调试面板 ---------- */
+
+/*
+ * 调试面板挂在底部面板的"调试"页签里：高度/开合由 `--bottom-panel-height` 决定
+ * （`lib/layout.ts` 是唯一真源），这里只排内部结构，不写面板级尺寸。
+ */
+.debug {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+  padding: 8px;
+  box-sizing: border-box;
+}
+
+.debug-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.debug-toolbar__status {
+  margin-left: auto;
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.debug-toolbar__status--paused {
+  color: var(--warn);
+}
+
+.debug__idle {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.debug__body {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: stretch;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: auto;
+}
+
+.debug__stack {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--border);
+}
+
+.debug__frame {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.debug__frame:hover {
+  background: var(--bg-hover);
+}
+
+.debug__frame--active {
+  background: var(--bg-active);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.debug__frame-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug__frame-location {
+  overflow: hidden;
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug__scopes {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 8px;
+  overflow: auto;
+}
+
+.debug__scope {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.debug__scope-title {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.debug__vars {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+
+.debug__var {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
+  padding: 1px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.debug__var-name {
+  margin: 0;
+  color: var(--fg-muted);
+}
+
+.debug__var-value {
+  margin: 0;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.debug__note {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+/* 底部面板"调试"页签上的暂停小圆点（暂停时即使停在别的页签也看得见）。 */
+.panel-tab__dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+/*
+ * 编辑器里的两块调试装饰。
+ * 断点圆点画在行号左侧的 glyph margin 里（`glyphMarginClassName`），尺寸是字形槽位
+ * 的一部分，不是布局数值；暂停行用整行底色 + 左侧竖条（`className` + isWholeLine）。
+ */
+.debug-breakpoint {
+  background: radial-gradient(circle at center, var(--danger) 0 4px, transparent 4.5px);
+  cursor: pointer;
+}
+
+.debug-paused-line {
+  background-color: rgba(224, 179, 65, 0.16);
+  box-shadow: inset 2px 0 0 var(--warn);
 }

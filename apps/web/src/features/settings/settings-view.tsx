@@ -29,7 +29,11 @@ export function SettingsView() {
           <dt>主题</dt>
           <dd>深色（固定）</dd>
           <dt>运行时后端</dt>
-          <dd>{mode === 'tauri' ? 'Tauri（window.__HBOT__ 已注入）' : '浏览器 mock（无后端）'}</dd>
+          <dd>
+            {mode === 'tauri'
+              ? 'Tauri（IPC：invoke("dispatch") + hbot://event 事件）'
+              : '浏览器 mock（无后端）'}
+          </dd>
           <dt>侧栏宽度</dt>
           <dd>
             {SIDEBAR_MIN_WIDTH}–{SIDEBAR_MAX_WIDTH}，默认 {SIDEBAR_DEFAULT_WIDTH}px

@@ -2,25 +2,37 @@
  * 浏览器 dev / 无 Tauri 时的内存后端（M0 占位）。
  *
  * 行为与真实核心对齐的部分：路径守卫（项目内、不写 `hbot.d.ts`、不写 `.hbot/`）、
- * 版本号单调递增、搜索按行返回。真实实现见 `crates/hbot-workspace`。
+ * 版本号单调递增、搜索（`search_start` 回 `data: null`、命中走 `file.search` 事件、
+ * `column` 恒 1、`text` 是整行）、`bot.list` / `agent.send` 的返回形状（含会话 ID）。
+ * 真实实现见 `crates/hbot-workspace` 与 `crates/hbot-rpc/src/app/commands/`。
+ *
+ * 这里没有 `hbot://event` 通道，所以自带一条**内存事件总线**（`subscribeMockEvents` /
+ * `emitMockEvent`）：`ipc.ts` 的 `onEvent` 在非 Tauri 分支订阅它，否则搜索面板在唯一
+ * 能跑的模式下永远是空的。目前只有 `file.search` 走这条总线；`bot.status` 仍靠
+ * `bot.list` 的返回值播种（与真机路径一致：UI 不自己编运行态）。
+ *
+ * 取消语义也照核心来：`search_cancel` 之后那条还没送出的事件**不再发**，也不补一条
+ * "假结果"（`crates/hbot-rpc/src/app/commands/files.rs` 的 `search` 在 cancelled 时直接返回）。
  */
 
-import type {
-  BotStatus,
-  BotTransition,
-  Command,
-  CommandOutputs,
-  CommandType,
-  FileNode,
-  LogLevel,
-  LogLine,
-  SearchHit,
-  SearchResult,
-} from './ipc'
+import type { Event as CoreEvent } from '../generated'
+import type { BotStatus, Command, CommandOutputs, CommandType, FileNode } from './ipc'
+import { searchMatches } from './mock-search'
 
 const BOT_ID = 'demo-bot'
-const MAX_SEARCH_HITS = 200
-const PREVIEW_MAX = 160
+const BOT_NAME = '演示 bot'
+const BOT_PLATFORM = 'onebot11'
+/** mock 的会话 ID：真机上由核心的 `state.ids()` 分配。 */
+const MOCK_SESSION_ID = 'mock-session'
+
+/**
+ * mock 里记下的断点（`file -> 行号`，与核心的 `Breakpoints` 同语义：全量覆盖、空集移除）。
+ *
+ * 只用来让"点了 gutter 之后命令确实发出去了"这件事在浏览器里可复现；mock **不伪造
+ * `debug.paused`**（docs/06-ide.md §6.2 的暂停语义要真跑起来才有），所以调试面板在 mock
+ * 下始终停在"未在调试"。
+ */
+const mockBreakpoints = new Map<string, number[]>()
 
 const HBOT_JSON = `{
   "name": "hbot-demo",
@@ -207,42 +219,59 @@ function assertWritable(path: string): void {
   }
 }
 
-function logLine(level: LogLevel, source: string, message: string, at: number): LogLine {
-  return { level, source, message, at }
-}
+/** mock 的 bot 运行态：只有 `bot.start` / `bot.stop` 能改它，UI 不参与。 */
+let mockStatus: BotStatus = 'stopped'
+let mockUpdatedAt = Date.now()
 
-function transition(status: BotStatus, queueDepth: number, lines: LogLine[]): BotTransition {
-  return { bot: { botId: BOT_ID, status, queueDepth }, lines }
-}
-
-function searchFiles(query: string, caseSensitive: boolean): SearchResult {
-  const needle = caseSensitive ? query : query.toLowerCase()
-  const hits: SearchHit[] = []
-  let truncated = false
-
-  for (const [path, content] of FILES) {
-    const lines = content.split('\n')
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index] ?? ''
-      const haystack = caseSensitive ? line : line.toLowerCase()
-      const columnIndex = haystack.indexOf(needle)
-      if (columnIndex === -1) continue
-      if (hits.length >= MAX_SEARCH_HITS) {
-        truncated = true
-        break
-      }
-      hits.push({
-        path,
-        line: index + 1,
-        column: columnIndex + 1,
-        preview: line.trim().slice(0, PREVIEW_MAX),
-      })
-    }
-    if (truncated) break
+function mockBotSummary() {
+  return {
+    botId: BOT_ID,
+    name: BOT_NAME,
+    platform: BOT_PLATFORM,
+    status: mockStatus,
+    updatedAt: mockUpdatedAt,
   }
-
-  return { query, hits, truncated }
 }
+
+function setMockStatus(status: BotStatus): void {
+  mockStatus = status
+  mockUpdatedAt = Date.now()
+}
+
+// ---------------------------------------------------------------------------
+// 事件总线（mock 没有 `hbot://event`，用内存订阅模拟）
+// ---------------------------------------------------------------------------
+
+type MockEventListener = (event: CoreEvent) => void
+
+const eventListeners = new Set<MockEventListener>()
+
+/** 订阅 mock 事件，返回取消订阅函数（`ipc.ts` 的 `onEvent` 用它兜住 mock 模式）。 */
+export function subscribeMockEvents(listener: MockEventListener): () => void {
+  eventListeners.add(listener)
+  return () => {
+    eventListeners.delete(listener)
+  }
+}
+
+function emitMockEvent(event: CoreEvent): void {
+  // 先复制再遍历：监听者在回调里退订不该影响本次派发。
+  for (const listener of [...eventListeners]) listener(event)
+}
+
+// ---------------------------------------------------------------------------
+// 搜索（`search_start` 回 `data: null`，命中合成一条 `file.search`）
+// ---------------------------------------------------------------------------
+
+let searchSeq = 0
+
+function nextSearchId(): string {
+  searchSeq += 1
+  return `mock-search-${searchSeq}`
+}
+
+/** 已取消、但事件还没送出的搜索 ID：送出前丢掉，模拟核心"取消后不再推"。 */
+const cancelledSearches = new Set<string>()
 
 /** mock 分发：与 `dispatch()` 的返回类型一致，由 ipc.ts 收窄。 */
 export async function mockDispatch(command: Command): Promise<CommandOutputs[CommandType]> {
@@ -266,33 +295,56 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
       return { path, version }
     }
 
-    case 'search':
-      return searchFiles(command.query, command.caseSensitive ?? false)
-
-    case 'bot.start': {
-      const now = Date.now()
-      return transition('running', 0, [
-        logLine('info', 'supervisor', `bot ${command.botId} 启动（mock）`, now),
-        logLine('info', 'supervisor', '平台适配器：onebot11（mock，未连接网络）', now),
-        logLine('debug', 'session', '会话队列就绪，容量 64', now),
-      ])
+    case 'search.start': {
+      // 命中先算出来（非法正则在这里抛，和核心一样走错误行），事件用 `queueMicrotask`
+      // 送出：保证它在 `dispatch` 的 Promise 结算之后到达，与真机的顺序一致。
+      const matches = searchMatches(FILES, command.query, command.regex, command.globs)
+      const searchId = nextSearchId()
+      if (cancelledSearches.size > 64) cancelledSearches.clear()
+      queueMicrotask(() => {
+        // `delete` 兼顾"已经取消过"的判定与集合清理。
+        if (cancelledSearches.delete(searchId)) return
+        emitMockEvent({ type: 'file.search', searchId, matches })
+      })
+      return null
     }
 
-    case 'bot.stop': {
-      const now = Date.now()
-      return transition('stopped', 0, [
-        logLine('info', 'supervisor', `bot ${command.botId} 已停止（mock）`, now),
-      ])
-    }
+    case 'search.cancel':
+      cancelledSearches.add(command.searchId)
+      return null
 
-    case 'bot.status':
-      return { botId: command.botId, status: 'stopped', queueDepth: 0 }
+    // 真机上是 `bot_list`：行来自 hbot-store 的 bot 表 + 本进程的 supervisor 状态。
+    case 'bot.list':
+      return [mockBotSummary()]
+
+    // 启停只回"命令已接受"（真机 `data: null`），运行态由 `bot.status` 事件推进；
+    // mock 的事件总线目前只发 `file.search`，所以这里直接改内部状态，下次 `bot.list` 才看得到。
+    case 'bot.start':
+      setMockStatus('running')
+      return null
+
+    case 'bot.stop':
+      setMockStatus('stopped')
+      return null
 
     case 'agent.send':
-      return {
-        messageId: `mock-${Date.now()}`,
-        reply: `（mock 回声）收到：「${command.text}」。真实 Agent 循环在 Rust 侧（crates/hbot-agent），M1 接入后替换这里。`,
-      }
+      return { sessionId: command.sessionId ?? MOCK_SESSION_ID }
+
+    case 'agent.cancel':
+    case 'agent.approve':
+    case 'edit.apply':
+    case 'edit.reject':
+      return null
+
+    case 'debug.set-breakpoints':
+      // 全量覆盖：空数组 = 移除该文件（与核心 `Breakpoints::set` 一致）。
+      mockBreakpoints.set(command.file, [...command.lines])
+      return null
+
+    case 'debug.resume':
+    case 'debug.step':
+      // mock 没有插桩执行器，收下命令即可；不会推 `debug.paused`。
+      return null
 
     default: {
       const exhaustive: never = command

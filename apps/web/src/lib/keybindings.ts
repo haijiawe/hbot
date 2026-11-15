@@ -15,8 +15,12 @@ export type KeybindingId =
   | 'toggle-agent'
   | 'toggle-bottom-panel'
   | 'problems-panel'
+  | 'debug-continue'
+  | 'debug-step-over'
+  | 'debug-step-into'
+  | 'debug-step-out'
 
-export type KeybindingCategory = '导航' | '文件' | '运行' | '查看'
+export type KeybindingCategory = '导航' | '文件' | '运行' | '查看' | '调试'
 
 export interface KeyChord {
   /** 物理按键，比较时忽略大小写；`Enter`、`.`、`F8` 等特殊键原样比较。 */
@@ -48,6 +52,11 @@ export const KEYBINDINGS: readonly Keybinding[] = [
   { id: 'toggle-agent', title: '切换 Agent 栏', category: '查看', chord: { key: 'a', primary: true, shift: true } },
   { id: 'toggle-bottom-panel', title: '切换底部面板', category: '查看', chord: { key: 'j', primary: true } },
   { id: 'problems-panel', title: '问题面板', category: '查看', chord: { key: 'm', primary: true, shift: true } },
+  // 调试（docs/06-ide.md §6.2）：F5/F10/F11/Shift+F11 与 VS Code 一致，不加 primary 修饰键。
+  { id: 'debug-continue', title: '继续', category: '调试', chord: { key: 'F5' } },
+  { id: 'debug-step-over', title: '单步跳过', category: '调试', chord: { key: 'F10' } },
+  { id: 'debug-step-into', title: '单步进入', category: '调试', chord: { key: 'F11' } },
+  { id: 'debug-step-out', title: '单步跳出', category: '调试', chord: { key: 'F11', shift: true } },
 ]
 
 /** 只取键盘事件里判断快捷键需要的字段，便于单测与复用。 */

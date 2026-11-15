@@ -11,7 +11,10 @@ export default defineConfig({
   },
   build: {
     target: 'es2022',
-    sourcemap: true,
+    // 不产出 .map：`tauri build` 会把整个 `dist/` 内嵌进安装包，实测 58.16 MiB
+    // 里有 44.20 MiB 是 sourcemap（见 docs/spikes/S5-packaging.md）。dev server
+    // 自己的 sourcemap 是内存里的，不受这里影响，调试体验不降级。
+    sourcemap: false,
     // Monaco 是 lazy chunk，体积大是预期内的；首屏 JS 预算见 docs/05-quality-gates.md。
     chunkSizeWarningLimit: 4096,
   },

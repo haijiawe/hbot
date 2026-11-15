@@ -1,12 +1,20 @@
 /**
- * agentStore：Agent 会话、待审阅 Diff、审批状态。
+ * agentStore：Agent 会话、流式输出、待审阅 Diff、审批。
  *
- * 不引用 workspaceStore / runStore；也不直接改文件——Diff 应用必须由核心执行
+ * 输入全部来自核心事件（`agent.delta` / `agent.step` / `agent.tool` /
+ * `approval.request` / `agent.diff`），用户动作全部经 `dispatch`：
+ * - 会话 ID：第一条消息带 `sessionId: null`（= 新建），把核心回的 ID 存下来续用；
+ * - 审批：`agent_approve`（`approvalId` + `decision` + `always`）；
+ * - 编辑：`edit_apply`（`editId` + `acceptHunks`）/ `edit_reject`。
+ *
+ * 不引用 workspaceStore / runStore；也不直接改文件——写入必须由核心执行
  * （AGENTS.md §0.10：Agent 写入必须走 Diff，逐块接受/拒绝）。
  */
 
 import { create } from 'zustand'
+import type { EditFile, RiskLevel, ToolCall } from '../generated'
 import { errorMessage } from '../lib/format'
+import type { CoreEvent } from '../lib/ipc'
 import { dispatch } from '../lib/ipc'
 
 export type AgentRole = 'user' | 'agent' | 'system'
@@ -20,30 +28,49 @@ export interface AgentMessage {
 
 export type AgentDiffStatus = 'pending' | 'accepted' | 'rejected'
 
-/** M0 的 Diff 卡片只展示摘要；真正的分块审阅需要 M1 的 `agent.diff` 事件负载。 */
-export interface AgentDiff {
-  id: string
-  path: string
-  summary: string
-  added: number
-  removed: number
+/** 待审阅的一次编辑（`agent.diff` 事件）：可能跨多个文件，按块接受。 */
+export interface PendingEdit {
+  editId: string
+  files: EditFile[]
   status: AgentDiffStatus
 }
 
-export type ApprovalState = 'idle' | 'awaiting'
+/** 待答复的审批（`approval.request` 事件）：问是非，不是问内容。 */
+export interface PendingApproval {
+  approvalId: string
+  tool: string
+  risk: RiskLevel
+  /** 工具参数原样展示（拓扑未知，渲染时再 stringify）。 */
+  args: unknown
+  /** 正在回传答复（防重复点击）。 */
+  busy: boolean
+}
+
+export type ApprovalDecisionInput = 'approve' | 'deny'
 
 export interface AgentState {
+  /** 核心分配的会话 ID；`null` = 还没发过消息（下一条会新建会话）。 */
+  sessionId: string | null
   messages: AgentMessage[]
   draft: string
+  /** 消息命令在途（只用于禁用按钮；回合结束契约里没有事件，见文件头注释）。 */
   sending: boolean
-  diff: AgentDiff | null
-  approval: ApprovalState
+  /** 最近一次 `agent.step` 的步号（0 = 还没有）。 */
+  step: number
+  /** 最近一次 `agent.tool` 的工具调用（含状态与结果）。 */
+  tool: ToolCall | null
+  edit: PendingEdit | null
+  approval: PendingApproval | null
   error: string | null
+  /** 正在追加的流式消息 id：`agent.delta` 往这条上拼。 */
+  streamId: string | null
 
   setDraft: (draft: string) => void
   send: (text: string) => Promise<void>
-  previewDiff: () => void
-  resolveDiff: (status: Exclude<AgentDiffStatus, 'pending'>) => void
+  ingestEvent: (event: CoreEvent) => void
+  answerApproval: (decision: ApprovalDecisionInput, always: boolean) => Promise<void>
+  acceptEdit: () => Promise<void>
+  rejectEdit: () => Promise<void>
   dismissError: () => void
 }
 
@@ -51,20 +78,44 @@ function nextId(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`
 }
 
+/** 统计一次编辑的增删行数（DiffHunk 的行以 `+`/`-` 开头，与统一 diff 一致）。 */
+export function editStats(files: EditFile[]): { added: number; removed: number } {
+  let added = 0
+  let removed = 0
+  for (const file of files) {
+    for (const hunk of file.hunks) {
+      for (const line of hunk.lines) {
+        if (line.startsWith('+')) added += 1
+        else if (line.startsWith('-')) removed += 1
+      }
+    }
+  }
+  return { added, removed }
+}
+
+/** 全部块序号（"整份接受"用；核心要求显式列出接受的块）。 */
+function allHunkIndices(files: EditFile[]): number[] {
+  return files.flatMap((file) => file.hunks.map((hunk) => hunk.index))
+}
+
 export const useAgentStore = create<AgentState>()((set, get) => ({
+  sessionId: null,
   messages: [
     {
       id: 'welcome',
       role: 'system',
-      text: 'M0 壳演示：这里的回复来自 ipc mock。真实 Agent 循环在 crates/hbot-agent（Rust），M1 接入。',
+      text: 'Agent 循环跑在核心（crates/hbot-agent）：这里显示它的流式输出，它的写入会以 Diff 卡片让你逐块审阅。',
       at: Date.now(),
     },
   ],
   draft: '',
   sending: false,
-  diff: null,
-  approval: 'idle',
+  step: 0,
+  tool: null,
+  edit: null,
+  approval: null,
   error: null,
+  streamId: null,
 
   setDraft(draft) {
     set({ draft })
@@ -74,6 +125,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     const trimmed = text.trim()
     if (trimmed.length === 0 || get().sending) return
 
+    const sessionId = get().sessionId
     set((state) => ({
       messages: [
         ...state.messages,
@@ -82,40 +134,113 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       draft: '',
       sending: true,
       error: null,
+      // 新一轮：上一次的流式消息不能再被追加（否则两轮的话会粘成一条）。
+      streamId: null,
+      step: 0,
+      tool: null,
     }))
 
     try {
-      const reply = await dispatch({ type: 'agent.send', text: trimmed })
-      set((state) => ({
-        messages: [
-          ...state.messages,
-          { id: reply.messageId, role: 'agent', text: reply.reply, at: Date.now() },
-        ],
-        sending: false,
-      }))
+      const result = await dispatch({ type: 'agent.send', text: trimmed, sessionId })
+      set({ sessionId: result.sessionId, sending: false })
     } catch (error) {
       set({ sending: false, error: `发送失败：${errorMessage(error)}` })
     }
   },
 
-  previewDiff() {
-    set({
-      diff: {
-        id: nextId('diff'),
-        path: 'src/lib/reply.ts',
-        summary: '把回复前缀从「收到：」改成「已收到：」',
-        added: 1,
-        removed: 1,
-        status: 'pending',
-      },
-      approval: 'awaiting',
-    })
+  ingestEvent(event) {
+    switch (event.type) {
+      case 'agent.delta': {
+        const state = get()
+        const id = state.streamId ?? nextId('agent')
+        const messages =
+          state.streamId === null
+            ? [
+                ...state.messages,
+                { id, role: 'agent' as const, text: event.text, at: Date.now() },
+              ]
+            : state.messages.map((message) =>
+                message.id === id ? { ...message, text: message.text + event.text } : message,
+              )
+        set({ streamId: id, messages })
+        return
+      }
+
+      case 'agent.step':
+        set({ step: event.step })
+        return
+
+      case 'agent.tool':
+        set({ tool: event.call })
+        return
+
+      case 'approval.request':
+        set({
+          approval: {
+            approvalId: event.approvalId,
+            tool: event.tool,
+            risk: event.risk,
+            args: event.args,
+            busy: false,
+          },
+        })
+        return
+
+      case 'agent.diff':
+        set({ edit: { editId: event.editId, files: event.files, status: 'pending' } })
+        return
+
+      default:
+        return
+    }
   },
 
-  resolveDiff(status) {
-    const diff = get().diff
-    if (!diff) return
-    set({ diff: { ...diff, status }, approval: 'idle' })
+  async answerApproval(decision, always) {
+    const approval = get().approval
+    if (!approval || approval.busy) return
+
+    set({ approval: { ...approval, busy: true }, error: null })
+    try {
+      await dispatch({
+        type: 'agent.approve',
+        approvalId: approval.approvalId,
+        decision,
+        always,
+      })
+      set({ approval: null })
+    } catch (error) {
+      // 保留卡片让用户重试：审批没送达时工具还卡在那里等。
+      set({ approval: { ...approval, busy: false }, error: `审批失败：${errorMessage(error)}` })
+    }
+  },
+
+  async acceptEdit() {
+    const edit = get().edit
+    if (!edit || edit.status !== 'pending') return
+
+    try {
+      await dispatch({
+        type: 'edit.apply',
+        editId: edit.editId,
+        acceptHunks: allHunkIndices(edit.files),
+      })
+      set({ edit: { ...edit, status: 'accepted' } })
+    } catch (error) {
+      // 核心拒绝（哈希过期 / 文件已被创建）时保留卡片：重新发起一次编辑即可。
+      set({ error: `应用改动失败：${errorMessage(error)}` })
+    }
+  },
+
+  async rejectEdit() {
+    const edit = get().edit
+    if (!edit || edit.status !== 'pending') return
+
+    try {
+      await dispatch({ type: 'edit.reject', editId: edit.editId })
+      set({ edit: { ...edit, status: 'rejected' } })
+    } catch (error) {
+      set({ error: `拒绝改动失败：${errorMessage(error)}` })
+    }
   },
 
   dismissError() {
