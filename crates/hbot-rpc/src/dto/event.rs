@@ -129,8 +129,8 @@ pub enum Event {
     /// 调试命中断点，worker 已阻塞等待。
     #[serde(rename = "debug.paused")]
     DebugPaused {
-        /// Agent 会话 ID。
-        session_id: SessionId,
+        /// Bot ID。
+        bot_id: BotId,
         /// 命中断点的文件。
         file: String,
         /// 命中行号（1-based）。
@@ -144,7 +144,7 @@ pub enum Event {
     /// 调试继续执行。
     #[serde(rename = "debug.resumed")]
     DebugResumed {
-        /// Agent 会话 ID。
-        session_id: SessionId,
+        /// Bot ID。
+        bot_id: BotId,
     },
 }

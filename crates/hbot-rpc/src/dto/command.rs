@@ -31,10 +31,28 @@ pub enum Command {
         path: String,
     },
 
+    /// 新建一个项目（写脚手架、登记到 `projects` 表、切到新项目）。
+    ///
+    /// 目标目录可以不存在（连父目录一起建），也可以是**空**目录；已存在且非空时
+    /// 回 `-32003 conflict` —— 本项目从不覆盖用户文件（`hbot_code::manifest::scaffold`
+    /// 的 `scaffold_never_overwrites` 保证这一点）。成功后后续 `file_list` /
+    /// `file_read` 直接可用：workspace 已经切到新项目。
+    ProjectCreate {
+        /// 新项目根目录路径（绝对路径；不存在时自动创建）。
+        path: String,
+        /// 展示名，写进 `hbot.json` 的 `name`；空字符串回 `-32002`。
+        name: String,
+    },
+
     /// 向 Agent 会话发送一条用户消息。
+    ///
+    /// `sessionId` 为 `null` / 缺省时表示"新建一个会话并用它"：核心用
+    /// [`IdGenerator`](hbot_core::ports::IdGenerator) 分配 ID，并在 `data.sessionId`
+    /// 里返回，UI 后续消息带同一个 ID 就能接上同一段上下文。
     AgentSend {
-        /// Agent 会话 ID。
-        session_id: SessionId,
+        /// Agent 会话 ID；`None` 表示新建会话。
+        #[serde(default)]
+        session_id: Option<SessionId>,
         /// 用户输入。
         text: String,
     },
@@ -161,9 +179,19 @@ pub enum Command {
         text: String,
     },
 
+    /// 列出当前项目的 bot 及其状态（UI 启动时播种运行态的唯一来源）。
+    ///
+    /// `data` 是 [`BotSummary`](super::BotSummary) 的数组；库里没有 bot 行时返回空数组，
+    /// 不补建、不编造。
+    BotList,
+
     /// 设置断点（调试构建）。
+    ///
+    /// 断点是**按 bot 的沙箱**生效的：同一份源码在不同 bot 的 isolate 里可以是不同版本。
     DebugSetBreakpoints {
-        /// 源文件路径。
+        /// Bot ID。
+        bot_id: BotId,
+        /// 源文件路径（项目内相对路径）。
         file: String,
         /// 行号（1-based）。
         lines: Vec<u32>,
@@ -171,14 +199,14 @@ pub enum Command {
 
     /// 继续执行（步进后的恢复）。
     DebugResume {
-        /// Agent 会话 ID。
-        session_id: SessionId,
+        /// Bot ID。
+        bot_id: BotId,
     },
 
     /// 单步执行。
     DebugStep {
-        /// Agent 会话 ID。
-        session_id: SessionId,
+        /// Bot ID。
+        bot_id: BotId,
         /// 步进方向。
         kind: StepKind,
     },
@@ -202,6 +230,7 @@ impl Command {
         match self {
             Self::AppInfo => "app_info",
             Self::ProjectOpen { .. } => "project_open",
+            Self::ProjectCreate { .. } => "project_create",
             Self::AgentSend { .. } => "agent_send",
             Self::AgentCancel { .. } => "agent_cancel",
             Self::AgentApprove { .. } => "agent_approve",
@@ -219,6 +248,7 @@ impl Command {
             Self::BotStart { .. } => "bot_start",
             Self::BotStop { .. } => "bot_stop",
             Self::BotInject { .. } => "bot_inject",
+            Self::BotList => "bot_list",
             Self::DebugSetBreakpoints { .. } => "debug_set_breakpoints",
             Self::DebugResume { .. } => "debug_resume",
             Self::DebugStep { .. } => "debug_step",

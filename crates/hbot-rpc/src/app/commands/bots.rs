@@ -1,42 +1,66 @@
-//! Bot 命令：`bot_start`、`bot_stop`、`bot_inject`、`logs_tail`。
+//! `bot_start` / `bot_stop` / `bot_inject` / `bot_list` / `logs_tail` 五个命令的实现。
 //!
-//! 启动要装配三样东西（适配器 / 执行器 / supervisor），所以真正的装配在
-//! [`crate::app::runtime`]；这里只做命令层的校验、登记与事件推送。
+//! ## 组合根就在这里
+//!
+//! 这几个函数是 daemon 里唯一把"平台适配器 + supervisor + 沙箱执行器 + outbox"接起来的
+//! 地方（`crates/hbot-bot` 与 `crates/hbot-adapters` 都不知道彼此的存在）。接线形状见
+//! [`crate::app::runtime`] 的模块文档：
+//!
+//! ```text
+//! OneBotAdapter ──events──► Supervisor ──► SessionQueues ──► SandboxHandler(QuickJS)
+//!        ▲                      │                                  │
+//!        └────── send ────── Outbox ◄── mpsc<OutboundRequest> ◄──── replies
+//! ```
+//!
+//! ## 配置从哪来（M0）
+//!
+//! 连接参数（ws 地址 / token / selfId / sandbox 限额）来自**项目根的 `bots.json`**，
+//! schema 与错误信息见 [`crate::app::runtime::config`]。库里没有 bot 行时会按配置补建
+//! （`projects` 行同样按项目根补建）——否则 `bots.project_id` 的外键根本没法满足，
+//! M0 也就没有"真机跑通"这条路径。等 IDE 有了建 bot 的界面，这段引导就可以删掉。
+//!
+//! ## 状态怎么反映出去
+//!
+//! * 启动成功：库里 `bots.status = running`，并推 [`Event::BotStatus`]。
+//! * 启动失败：库里 `bots.status = error`，推 `BotStatus::Stopped` + `error` 文本
+//!   （wire DTO 的 `BotStatus` 只有 5 个状态、没有 `Error`，见
+//!   `crates/hbot-rpc/src/dto/event.rs`；`error` 字段就是给这个场景留的）。
+//! * 停止：幂等，总是返回 ok，库里 `stopped`，推 `BotStatus::Stopped`。
 
-use super::unimplemented;
+use std::path::Path;
+use std::sync::Arc;
+
+use hbot_bot::{
+    BotSpec, ConversationRef, InjectOutcome, PlatformEvent, Supervisor, SupervisorDeps,
+};
+use hbot_core::{BotId, BotStatus, ConversationId, EventSink, HbotError, Timestamp};
+use hbot_store::{
+    BOT_STATUS_DEGRADED, BOT_STATUS_ERROR, BOT_STATUS_RUNNING, BOT_STATUS_STOPPED, Bot, Project,
+};
+use serde_json::json;
+use tokio::sync::mpsc;
+
 use crate::app::AppState;
-use crate::dto::{Command, Response};
+use crate::app::bots::running_bot;
+use crate::app::commands::{done, failed, unimplemented};
+use crate::app::runtime::config::{BotConfig, read_bot_config};
+use crate::app::runtime::onebot::PLATFORM;
+use crate::app::runtime::outbox_source::StorePendingOutbox;
+use crate::app::runtime::sandbox_handler::{REPLY_CAPACITY, SandboxHandler, SandboxHandlerConfig};
+use crate::app::runtime::{conversation_kind_from_str, conversation_kind_str};
+use crate::app::store_failed;
+use crate::dto::{BotSummary, Command, Event, LogLevel, Response, RunLog};
 
-/// `bot_start`。
-pub async fn start(state: &AppState, bot_id: hbot_core::BotId) -> Response {
-    let _ = (state, bot_id);
-    unimplemented("bot_start")
-}
+/// `bot_inject` 伪造的发送者 id。
+///
+/// 用固定值而不是随机值：注入消息在库里要一眼能认出来（`inbound.sender_id`），
+/// 与真实平台的数字 QQ 号不会撞。
+pub const INJECT_SENDER: &str = "inject";
 
-/// `bot_stop`。
-pub async fn stop(state: &AppState, bot_id: hbot_core::BotId) -> Response {
-    let _ = (state, bot_id);
-    unimplemented("bot_stop")
-}
+/// `logs_tail` 单次最多返回多少行（防止 UI 传个巨大的 limit 把内存打满）。
+pub const MAX_LOG_LIMIT: usize = 1000;
 
-/// `bot_inject`。
-pub async fn inject(
-    state: &AppState,
-    bot_id: hbot_core::BotId,
-    conversation_id: hbot_core::ConversationId,
-    text: String,
-) -> Response {
-    let _ = (state, bot_id, conversation_id, text);
-    unimplemented("bot_inject")
-}
-
-/// `logs_tail`。
-pub async fn logs_tail(state: &AppState, bot_id: hbot_core::BotId, limit: usize) -> Response {
-    let _ = (state, bot_id, limit);
-    unimplemented("logs_tail")
-}
-
-/// 路由入口。
+/// 按命令分发到各 handler（`dispatch.rs` 是本模块唯一调用方）。
 pub async fn handle(state: &AppState, command: Command) -> Response {
     match command {
         Command::BotStart { bot_id } => start(state, bot_id).await,
@@ -47,6 +71,661 @@ pub async fn handle(state: &AppState, command: Command) -> Response {
             text,
         } => inject(state, bot_id, conversation_id, text).await,
         Command::LogsTail { bot_id, limit } => logs_tail(state, bot_id, limit).await,
+        Command::BotList => bot_list(state).await,
         other => unimplemented(other.kind()),
+    }
+}
+
+/// 启动一个 bot：读配置 → 建适配器/执行器 → 起 supervisor → 登记到 registry。
+///
+/// 重复启动返回 -32003（conflict）。启动失败时释放占位、把失败落到库里并推事件，
+/// 然后把真错误返回给调用方（绝不"看起来起来了"）。
+pub async fn start(state: &AppState, bot_id: BotId) -> Response {
+    // 占位先于一切异步动作：两个并发 bot_start 里只有一个能走到下面，
+    // 否则两条路径都会订阅同一个适配器（第二条会撞 "只能订阅一次"）并留下半个 runtime。
+    if !state.bots().reserve(bot_id) {
+        return failed(HbotError::conflict(format!(
+            "bot {bot_id} 已在运行或正在启动：拒绝重复启动（-32003）"
+        )));
+    }
+
+    match start_inner(state, bot_id).await {
+        Ok(()) => done(),
+        Err(error) => {
+            state.bots().release(&bot_id);
+            report_start_failure(state, bot_id, &error.to_string()).await;
+            failed(error)
+        }
+    }
+}
+
+/// [`start`] 的实际接线（失败时由调用方统一收尾）。
+async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
+    let root = state.project_root().ok_or_else(|| {
+        HbotError::invalid(
+            "没有打开的项目：先发 project_open，再 bot_start（bots.json 位于项目根）",
+        )
+    })?;
+
+    // 配置先读：缺配置要报 -32002，而不是"先建了一堆行再告诉你没地址"。
+    let config_root = root.clone();
+    let config = state
+        .blocking(move || read_bot_config(&config_root, &bot_id))
+        .await?;
+
+    let bot = match load_bot(state, bot_id).await? {
+        Some(bot) => {
+            if !bot.enabled {
+                return Err(HbotError::denied(format!(
+                    "bot {bot_id} 在库里是禁用状态（enabled=0）：先在设置里启用它"
+                )));
+            }
+            bot
+        }
+        None => bootstrap_bot(state, &root, &config, bot_id).await?,
+    };
+
+    // 平台适配器：OneBot 走 `connect`（内含 `wss://` 的显式拒绝）。
+    let adapter = state.adapter_factory().create(&bot, &config)?;
+
+    // 沙箱执行器：回复先落在有界 channel 上，再由下面的搬运任务转进 outbox。
+    let (replies_tx, mut replies_rx) = mpsc::channel(REPLY_CAPACITY);
+    let executor = Arc::new(SandboxHandler::new(SandboxHandlerConfig {
+        bot_id,
+        project_root: root.clone(),
+        limits: config.limits,
+        store: Arc::clone(state.store()),
+        events: Arc::clone(state.events()),
+        clock: Arc::clone(state.clock()),
+        replies: replies_tx,
+    }));
+
+    let mut deps = SupervisorDeps::new(
+        Arc::clone(state.store()),
+        Arc::clone(state.ids()),
+        Arc::clone(state.clock()),
+        adapter,
+        executor,
+    );
+    // 续发来源：上次崩溃/关停留下的 pending outbound（按 bot 过滤，见 outbox_source）。
+    deps.pending_outbox = Arc::new(StorePendingOutbox::new(Arc::clone(state.store())));
+
+    let spec = BotSpec {
+        bot_id,
+        project_id: bot.project_id,
+        name: bot.name.clone(),
+        platform: bot.platform.clone(),
+        // token 绝不进库：config_json 只留非敏感字段（库文件会被备份/上传）。
+        config_json: json!({ "wsUrl": config.ws_url }).to_string(),
+    };
+
+    let supervisor = Arc::new(Supervisor::new(spec, deps));
+    supervisor.start().await?;
+
+    // 回复搬运：handler 产出 → supervisor.send() → outbox 行 → 适配器发送。
+    // supervisor 自己不会调 handler，这条单行道保证"回复必须经过 outbox"。
+    let replies_supervisor = Arc::clone(&supervisor);
+    tokio::spawn(async move {
+        while let Some(request) = replies_rx.recv().await {
+            if let Err(error) = replies_supervisor.send(request).await {
+                // 到这个点回复已经产出，但没进 outbox：留痕，不静默吞。
+                tracing::warn!(
+                    bot = %replies_supervisor.bot_id(),
+                    error = %error,
+                    "回复未能进入 outbox：这条回复丢了"
+                );
+            }
+        }
+    });
+
+    if let Err(error) = persist_status(state, bot_id, BOT_STATUS_RUNNING).await {
+        // 状态写不进去就别假装起来了：先停掉 supervisor，再报错。
+        if let Err(stop_error) = supervisor.stop().await {
+            tracing::warn!(bot = %bot_id, error = %stop_error, "启动收尾时停止 supervisor 失败");
+        }
+        return Err(error);
+    }
+
+    let started_at = state.clock().now();
+    state.bots().insert(
+        bot_id,
+        running_bot(bot.platform.clone(), started_at, supervisor),
+    );
+    state.events().emit(Event::BotStatus {
+        bot_id,
+        status: BotStatus::Running,
+        error: None,
+    });
+    tracing::info!(
+        bot = %bot_id,
+        platform = %bot.platform,
+        project = %bot.project_id,
+        "bot 已启动"
+    );
+    Ok(())
+}
+
+/// 停止一个 bot（幂等：没在跑也返回 ok）。
+pub async fn stop(state: &AppState, bot_id: BotId) -> Response {
+    let was_running = state.bots().stop(&bot_id).await;
+    if !was_running {
+        tracing::debug!(bot = %bot_id, "bot_stop 作用于未运行的 bot（幂等）");
+    }
+
+    let persisted = persist_status(state, bot_id, BOT_STATUS_STOPPED).await;
+    state.events().emit(Event::BotStatus {
+        bot_id,
+        status: BotStatus::Stopped,
+        error: None,
+    });
+    match persisted {
+        Ok(()) => done(),
+        Err(error) => failed(error),
+    }
+}
+
+/// 注入一条入站消息。
+///
+/// 走的是**适配器同一条路**：`Supervisor::inject` → 幂等落库 `inbound` → 会话队列 →
+/// 沙箱执行器。绝不直接调 handler —— 否则注入的消息绕过了去重、落库与串行队列，
+/// 测试会绿而真机仍然坏。
+pub async fn inject(
+    state: &AppState,
+    bot_id: BotId,
+    conversation_id: ConversationId,
+    text: String,
+) -> Response {
+    match inject_inner(state, bot_id, conversation_id, text).await {
+        Ok(outcome) => {
+            tracing::info!(bot = %bot_id, outcome = %outcome, "bot_inject");
+            done()
+        }
+        Err(error) => failed(error),
+    }
+}
+
+async fn inject_inner(
+    state: &AppState,
+    bot_id: BotId,
+    conversation_id: ConversationId,
+    text: String,
+) -> Result<String, HbotError> {
+    if text.trim().is_empty() {
+        return Err(HbotError::invalid("bot_inject: text 不能为空"));
+    }
+
+    let supervisor = state.bots().supervisor_of(&bot_id).ok_or_else(|| {
+        HbotError::conflict(format!(
+            "bot {bot_id} 未运行：先 bot_start 再 bot_inject（注入和真实流量走同一条队列）"
+        ))
+    })?;
+
+    let conversation = {
+        let store = Arc::clone(state.store());
+        state
+            .blocking(move || {
+                store
+                    .get_conversation(&conversation_id)
+                    .map_err(store_failed)
+            })
+            .await?
+    }
+    .ok_or_else(|| HbotError::not_found("conversation", conversation_id.to_string()))?;
+
+    // external_id 必须每次不同：`inbound` 表的唯一键是 (bot_id, external_id)，
+    // 复用同一个 id 会让第二次注入被当成重复投递直接丢掉。
+    let external_id = format!("{INJECT_SENDER}-{}", state.ids().message_id());
+    let kind = conversation_kind_from_str(&conversation.kind);
+    let payload = json!({
+        "text": text,
+        "senderId": INJECT_SENDER,
+        "conversationExternalId": conversation.external_id,
+        "kind": conversation_kind_str(kind),
+        "injected": true,
+    });
+    let event = PlatformEvent::new(
+        external_id,
+        ConversationRef::new(conversation.external_id.clone(), kind),
+        INJECT_SENDER,
+        payload,
+    )
+    .with_received_at(state.clock().now());
+
+    match supervisor.inject(event).await? {
+        InjectOutcome::Queued { message_id } => Ok(format!("queued {}", message_id)),
+        InjectOutcome::Duplicate { external_id } => {
+            // 走到这里说明 external_id 撞了（不该发生）；不吞：告诉调用方这条没执行。
+            Err(HbotError::conflict(format!(
+                "注入被去重丢弃：external_id `{external_id}` 已存在"
+            )))
+        }
+    }
+}
+
+/// 读取最近 `limit` 条日志行，数组内**最旧在前**（UI 直接往下追加）。
+pub async fn logs_tail(state: &AppState, bot_id: BotId, limit: usize) -> Response {
+    let capped = u32::try_from(limit.min(MAX_LOG_LIMIT)).unwrap_or(u32::MAX);
+    let store = Arc::clone(state.store());
+    let rows = match state
+        .blocking(move || store.list_logs(Some(&bot_id), capped).map_err(store_failed))
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return failed(error),
+    };
+
+    let mut logs: Vec<RunLog> = rows
+        .into_iter()
+        .map(|row| RunLog {
+            at: Timestamp::from_unix_millis(row.at),
+            level: log_level(&row.level),
+            line: row.line,
+        })
+        .collect();
+    // 仓储按 `ORDER BY id DESC` 返回（新→旧），DTO 要旧→新。
+    logs.reverse();
+
+    match serde_json::to_value(logs) {
+        Ok(value) => Response::with_data(value),
+        Err(error) => failed(HbotError::internal(format!(
+            "logs_tail 序列化失败：{error}"
+        ))),
+    }
+}
+
+/// 列出当前项目下的 bot 及其状态（UI 启动时用它播种运行态，之后只吃 `bot.status`）。
+///
+/// 语义三条：
+///
+/// * **没有打开项目** → `-32002`：没有"当前项目"就没有"当前项目的 bot"，返回空数组
+///   会让 UI 以为项目里真的没有 bot。
+/// * **项目还没登记 / 没有 bot 行** → 空数组：还没 `bot_start` 过是正常状态。
+/// * **`status` 以本进程活跃态优先**：registry 里有 supervisor 就是 `running`、占位中就是
+///   `starting`；否则回落到库里最后一次落盘的值。上一进程崩溃留下的 `running` / `error`
+///   行按 `stopped` 报——本进程没有它的 supervisor，报"在跑"就是骗 UI。
+pub async fn bot_list(state: &AppState) -> Response {
+    let Some(root) = state.project_root() else {
+        return failed(HbotError::invalid(
+            "没有打开的项目：bot_list 只能列出当前项目的 bot，先发 project_open",
+        ));
+    };
+    let path = root.to_string_lossy().into_owned();
+    // 项目行都没有 = 一个 bot 都没启动过（`bots.project_id` 有外键），空数组即可。
+    let Some(project) = (match lookup_project(state, &path).await {
+        Ok(project) => project,
+        Err(error) => return failed(error),
+    }) else {
+        return match serde_json::to_value(Vec::<BotSummary>::new()) {
+            Ok(value) => Response::with_data(value),
+            Err(error) => failed(HbotError::internal(format!("bot_list 序列化失败：{error}"))),
+        };
+    };
+
+    let store = Arc::clone(state.store());
+    let project_id = project.id;
+    // 一次 spawn_blocking 里把"该项目的 bot + 各自状态"读完：两次 await 之间
+    // 状态可能变，读成一个快照更不容易自相矛盾。
+    let rows = match state
+        .blocking(move || {
+            let bots = store.list_bots().map_err(store_failed)?;
+            let mut rows = Vec::new();
+            for bot in bots {
+                if bot.project_id != project_id {
+                    continue;
+                }
+                let status = store.get_bot_status(&bot.id).map_err(store_failed)?;
+                rows.push((bot, status));
+            }
+            Ok(rows)
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return failed(error),
+    };
+
+    let summaries: Vec<BotSummary> = rows
+        .into_iter()
+        .map(|(bot, status)| BotSummary {
+            bot_id: bot.id,
+            name: bot.name,
+            platform: bot.platform,
+            status: live_status(
+                state,
+                bot.id,
+                status.as_ref().map(|row| row.status.as_str()),
+            ),
+            updated_at: Timestamp::from_unix_millis(
+                status.as_ref().map(|row| row.updated_at).unwrap_or(0),
+            ),
+        })
+        .collect();
+
+    match serde_json::to_value(summaries) {
+        Ok(value) => Response::with_data(value),
+        Err(error) => failed(HbotError::internal(format!("bot_list 序列化失败：{error}"))),
+    }
+}
+
+/// `bots.status` 列（TEXT）→ DTO 的 [`BotStatus`]，先看本进程活跃态。
+///
+/// `degraded` 有对应档；`running` / `error` / `stopped` 在没有 supervisor 时一律
+/// `stopped`——DTO 的 `BotStatus` 没有 `Error`（见模块文档），失败原因走
+/// `bot.status` 事件的 `error` 字段与日志，不塞进状态枚举。
+fn live_status(state: &AppState, bot_id: BotId, persisted: Option<&str>) -> BotStatus {
+    if state.bots().is_running(&bot_id) {
+        return BotStatus::Running;
+    }
+    if state.bots().is_reserved(&bot_id) {
+        return BotStatus::Starting;
+    }
+    match persisted {
+        Some(BOT_STATUS_DEGRADED) => BotStatus::Degraded,
+        Some("stopped") | None => BotStatus::Stopped,
+        Some(other) => {
+            tracing::debug!(
+                bot = %bot_id,
+                status = other,
+                "库里这份状态没有对应的活跃 supervisor，按 stopped 返回"
+            );
+            BotStatus::Stopped
+        }
+    }
+}
+
+/// `logs.level` 列（TEXT）→ DTO 的 [`LogLevel`]；未知值按 info 处理并留痕。
+fn log_level(raw: &str) -> LogLevel {
+    match raw {
+        "trace" => LogLevel::Trace,
+        "debug" => LogLevel::Debug,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        "info" => LogLevel::Info,
+        other => {
+            tracing::debug!(level = other, "日志行的 level 不在枚举内，按 info 返回");
+            LogLevel::Info
+        }
+    }
+}
+
+/// 读库里的 bot 行（阻塞调用包进 `state.blocking`）。
+async fn load_bot(state: &AppState, bot_id: BotId) -> Result<Option<Bot>, HbotError> {
+    let store = Arc::clone(state.store());
+    state
+        .blocking(move || store.get_bot(&bot_id).map_err(store_failed))
+        .await
+}
+
+/// 库里没有 bot 行时按 `bots.json` + 项目根补建（不落库，交给 supervisor 的 `ensure_bot_row`）。
+async fn bootstrap_bot(
+    state: &AppState,
+    root: &Path,
+    config: &BotConfig,
+    bot_id: BotId,
+) -> Result<Bot, HbotError> {
+    let project = ensure_project(state, root).await?;
+    let name = config.name.clone().unwrap_or_else(|| project_name(root));
+    let platform = config
+        .platform
+        .clone()
+        .unwrap_or_else(|| PLATFORM.to_owned());
+    tracing::info!(
+        bot = %bot_id,
+        project = %project.id,
+        platform = %platform,
+        "库里还没有这个 bot：按 bots.json 补建 bots 行（M0 引导路径）"
+    );
+    Ok(Bot {
+        id: bot_id,
+        project_id: project.id,
+        name,
+        platform,
+        // 真值在 bots.json；库里这份只是占位（token 永不入库）。
+        config_json: "{}".to_owned(),
+        enabled: true,
+        created_at: state.clock().now().unix_millis(),
+    })
+}
+
+/// 确保项目根在 `projects` 里有一行（`bots.project_id` 的外键依赖它）。
+async fn ensure_project(state: &AppState, root: &Path) -> Result<Project, HbotError> {
+    let path = root.to_string_lossy().into_owned();
+    if let Some(project) = lookup_project(state, &path).await? {
+        return Ok(project);
+    }
+
+    let project = Project {
+        id: state.ids().project_id(),
+        name: project_name(root),
+        path: path.clone(),
+        created_at: state.clock().now().unix_millis(),
+    };
+    let inserted = {
+        let store = Arc::clone(state.store());
+        let to_insert = project.clone();
+        state
+            .blocking(move || store.insert_project(&to_insert).map_err(store_failed))
+            .await
+    };
+    match inserted {
+        Ok(()) => {
+            tracing::info!(project = %project.id, path = %path, "项目根已登记到 projects 表");
+            Ok(project)
+        }
+        Err(error) => {
+            // 并发启动两个 bot 时两边都会走到这里，后到的那次撞 UNIQUE(path)：
+            // 重查一次，拿到先到者写的行；还是没有就把原错误抛出去。
+            match lookup_project(state, &path).await? {
+                Some(project) => Ok(project),
+                None => Err(error),
+            }
+        }
+    }
+}
+
+async fn lookup_project(state: &AppState, path: &str) -> Result<Option<Project>, HbotError> {
+    let store = Arc::clone(state.store());
+    let path = path.to_owned();
+    state
+        .blocking(move || store.get_project_by_path(&path).map_err(store_failed))
+        .await
+}
+
+/// 项目根的目录名（用作 `projects.name` / `bots.name` 的缺省值）。
+fn project_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// 写 `bots.status`（失败映射成 `store_failed`）。
+async fn persist_status(
+    state: &AppState,
+    bot_id: BotId,
+    status: &'static str,
+) -> Result<(), HbotError> {
+    let now = state.clock().now().unix_millis();
+    let store = Arc::clone(state.store());
+    state
+        .blocking(move || {
+            store
+                .update_bot_status(&bot_id, status, now)
+                .map_err(store_failed)
+        })
+        .await?;
+    Ok(())
+}
+
+/// 启动失败的收尾：库记 `error`、推 `BotStatus`（带原因），自己不再返回错误。
+async fn report_start_failure(state: &AppState, bot_id: BotId, message: &str) {
+    tracing::error!(bot = %bot_id, error = message, "bot 启动失败");
+    if let Err(error) = persist_status(state, bot_id, BOT_STATUS_ERROR).await {
+        tracing::warn!(bot = %bot_id, error = %error, "启动失败后写 bots.status 也失败了");
+    }
+    state.events().emit(Event::BotStatus {
+        bot_id,
+        status: BotStatus::Stopped,
+        error: Some(message.to_owned()),
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbot_core::ProjectId;
+
+    use crate::app::test_support::{async_temp_state_with_project, temp_state};
+
+    const AT: i64 = 1_700_000_000_000;
+
+    /// 取 `bot_list` 的 data 并断言它是数组。
+    fn array_of(response: Response) -> Vec<serde_json::Value> {
+        let data = response
+            .into_result()
+            .expect("bot_list 不该失败")
+            .expect("bot_list 必须带 data");
+        match data {
+            serde_json::Value::Array(items) => items,
+            other => panic!("bot_list 的 data 应该是 JSON 数组，实际是 {other}"),
+        }
+    }
+
+    /// 在库里插一行项目（`bots.project_id` 的外键依赖它）。
+    async fn insert_project(state: &AppState, root: &Path) -> Project {
+        let project = Project {
+            id: state.ids().project_id(),
+            name: "测试项目".to_owned(),
+            path: root.to_string_lossy().into_owned(),
+            created_at: state.clock().now().unix_millis(),
+        };
+        let store = Arc::clone(state.store());
+        let to_insert = project.clone();
+        state
+            .blocking(move || store.insert_project(&to_insert).map_err(store_failed))
+            .await
+            .expect("insert_project");
+        project
+    }
+
+    /// 在库里插一行 bot，返回它的 id。
+    async fn insert_bot(state: &AppState, project: ProjectId, name: &str) -> BotId {
+        let bot = Bot {
+            id: state.ids().bot_id(),
+            project_id: project,
+            name: name.to_owned(),
+            platform: PLATFORM.to_owned(),
+            config_json: "{}".to_owned(),
+            enabled: true,
+            created_at: state.clock().now().unix_millis(),
+        };
+        let bot_id = bot.id;
+        let store = Arc::clone(state.store());
+        state
+            .blocking(move || store.insert_bot(&bot).map_err(store_failed))
+            .await
+            .expect("insert_bot");
+        bot_id
+    }
+
+    /// 写 `bots.status`（模拟上一进程落盘的状态）。
+    async fn persist(state: &AppState, bot_id: BotId, status: &'static str, at: i64) {
+        let store = Arc::clone(state.store());
+        state
+            .blocking(move || {
+                store
+                    .update_bot_status(&bot_id, status, at)
+                    .map(|_| ())
+                    .map_err(store_failed)
+            })
+            .await
+            .expect("update_bot_status");
+    }
+
+    // 没打开项目 = 没有"当前项目的 bot"：必须报 -32002，而不是给一个空数组让 UI 以为项目里真没 bot。
+    #[tokio::test]
+    async fn bot_list_without_an_open_project_is_invalid() {
+        let (_dir, state) = temp_state();
+
+        match bot_list(&state).await.into_result() {
+            Ok(data) => panic!("没打开项目时 bot_list 必须报错，实际返回 {data:?}"),
+            Err(error) => assert_eq!(error.code, -32002, "没打开项目应该是 -32002：{error:?}"),
+        }
+    }
+
+    // 项目打开了但一次都没 bot_start 过：projects/bots 里都没有行，空数组是正常状态。
+    #[tokio::test]
+    async fn bot_list_is_empty_before_any_bot_was_started() {
+        let (_dir, state, _root) = async_temp_state_with_project().await;
+
+        assert!(array_of(bot_list(&state).await).is_empty());
+    }
+
+    // 只有当前项目的 bot 进列表；键集与线上驼峰名必须与契约一字不差。
+    #[tokio::test]
+    async fn bot_list_reports_rows_of_the_current_project_only() {
+        let (_dir, state, _root) = async_temp_state_with_project().await;
+        // 用 `project_root()` 而不是夹具给的原始路径：`Workspace::open` 会把根规范化，
+        // `bot_list` 查库用的也是这个值（用原始路径会查不到项目行）。
+        let root = state.project_root().expect("已打开项目");
+        let project = insert_project(&state, &root).await;
+        // 另一个项目（路径不必真实存在：这里只是库里一行，用来验证过滤）。
+        let other = insert_project(&state, Path::new("D:/hbot-another-project")).await;
+        let bot_id = insert_bot(&state, project.id, "演示 bot").await;
+        insert_bot(&state, other.id, "别的项目的 bot").await;
+        persist(&state, bot_id, BOT_STATUS_DEGRADED, AT).await;
+
+        let rows = array_of(bot_list(&state).await);
+        assert_eq!(rows.len(), 1, "只该列出当前项目的 bot：{rows:?}");
+
+        let row = &rows[0];
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .expect("每一行必须是 JSON 对象")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["botId", "name", "platform", "status", "updatedAt"],
+            "键集必须与 BotSummary 的线上形状一致"
+        );
+        assert_eq!(row["botId"], json!(bot_id.to_string()));
+        assert_eq!(row["name"], json!("演示 bot"));
+        assert_eq!(row["platform"], json!(PLATFORM));
+        // degraded 没有对应的活跃 supervisor 也照样报出来：它是平台侧的状态，不是本进程的。
+        assert_eq!(row["status"], json!("degraded"));
+        assert_eq!(row["updatedAt"], json!(AT));
+    }
+
+    // 库里残留 running 但本进程没有 supervisor：不能报"在跑"（那是骗 UI）；占位中报 starting。
+    #[tokio::test]
+    async fn bot_list_prefers_the_live_registry_state() {
+        let (_dir, state, _root) = async_temp_state_with_project().await;
+        let root = state.project_root().expect("已打开项目");
+        let project = insert_project(&state, &root).await;
+        let bot_id = insert_bot(&state, project.id, "崩溃残留的 bot").await;
+        persist(&state, bot_id, BOT_STATUS_RUNNING, AT).await;
+
+        assert_eq!(
+            array_of(bot_list(&state).await)[0]["status"],
+            json!("stopped"),
+            "本进程没有它的 supervisor，残留的 running 必须按 stopped 报"
+        );
+
+        assert!(state.bots().reserve(bot_id), "占位应该成功");
+        assert_eq!(
+            array_of(bot_list(&state).await)[0]["status"],
+            json!("starting"),
+            "启动中的占位要报 starting"
+        );
+
+        state.bots().release(&bot_id);
+        assert_eq!(
+            array_of(bot_list(&state).await)[0]["status"],
+            json!("stopped")
+        );
     }
 }

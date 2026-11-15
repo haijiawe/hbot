@@ -39,8 +39,8 @@ use crate::error::{Result, StoreError};
 use crate::ids::{BotId, ConversationId, InboundId, OutboundId};
 use crate::migrations;
 use crate::models::{
-    BOT_STATUSES, Bot, BotStatusRow, Conversation, InboundRow, LogRow, NewInbound, NewLog,
-    NewOutbound, OutboundRow, OutboundTarget, Project, is_valid_bot_status,
+    BOT_STATUSES, Bot, BotStatusRow, Conversation, InboundReplayRow, InboundRow, LogRow,
+    NewInbound, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project, is_valid_bot_status,
 };
 use crate::repositories;
 
@@ -67,6 +67,13 @@ enum StoreOp {
     InsertProject {
         project: Project,
         reply: Reply<()>,
+    },
+    /// 按 `projects.path` 查项目：`bot_start` 需要判断"这个项目根是否已登记过"。
+    ///
+    /// 为什么不能"先 list 再在内存里筛"：项目行数没有上限，而 `bot_start` 每次都会调它。
+    GetProjectByPath {
+        path: String,
+        reply: Reply<Option<Project>>,
     },
     InsertBot {
         bot: Bot,
@@ -119,6 +126,11 @@ enum StoreOp {
         limit: u32,
         reply: Reply<Vec<OutboundRow>>,
     },
+    ListPendingOutboundForBot {
+        bot_id: BotId,
+        limit: u32,
+        reply: Reply<Vec<OutboundRow>>,
+    },
     CountPendingOutbound {
         reply: Reply<u32>,
     },
@@ -129,6 +141,16 @@ enum StoreOp {
     ListUnprocessedInbound {
         limit: u32,
         reply: Reply<Vec<InboundRow>>,
+    },
+    /// 启动补偿：按 `(received_at, rowid)` 分批取某个 bot 的未处理入站消息。
+    ///
+    /// `after` 是上一批最后一行的游标（`None` = 从头开始）。必须走 db 线程（与写同序），
+    /// 否则刚插入的 inbound 行可能看不到，补偿会漏行。
+    ListInboundReplay {
+        bot_id: BotId,
+        after: Option<(i64, i64)>,
+        limit: u32,
+        reply: Reply<Vec<InboundReplayRow>>,
     },
     GetConversation {
         id: ConversationId,
@@ -199,6 +221,12 @@ impl Store {
     pub fn insert_project(&self, project: &Project) -> Result<()> {
         let project = project.clone();
         self.submit(|reply| StoreOp::InsertProject { project, reply })
+    }
+
+    /// 按 `projects.path` 查项目；不存在返回 `Ok(None)`。
+    pub fn get_project_by_path(&self, path: &str) -> Result<Option<Project>> {
+        let path = path.to_owned();
+        self.submit(|reply| StoreOp::GetProjectByPath { path, reply })
     }
 
     /// 插入 bot（`bots`）。
@@ -370,13 +398,33 @@ impl Store {
         })
     }
 
-    /// 列出待发送的出站消息（`state='pending'`），按 `id` 升序取前 `limit` 条。
+    /// 列出待发送的出站消息（`state='pending'`），按**产生顺序**取前 `limit` 条。
     ///
-    /// 进程重启后用它续发：这些行是“已落库但还没确认发出”的消息
-    /// （`docs/02-architecture.md` §4.1 `outbound row → sender retry`）。
+    /// 排序是 `(created_at, rowid)`：先产生时间，再插入顺序。进程重启后用它续发
+    /// （`docs/02-architecture.md` §4.1 `outbound row → sender retry`），同一会话的回复
+    /// 必须按产生顺序发出，所以不能按 `id`（UUID 字典序无时间含义）。
     /// 与写同序执行：本方法返回时，调用方此前 `enqueue_*` 的行一定已在结果里。
     pub fn list_pending_outbound(&self, limit: u32) -> Result<Vec<OutboundRow>> {
         self.submit(|reply| StoreOp::ListPendingOutbound { limit, reply })
+    }
+
+    /// 列出某个 bot 的待发送出站消息（`state='pending'`），按 `(created_at, rowid)` 取前
+    /// `limit` 条。
+    ///
+    /// 与 [`Store::list_pending_outbound`] 只差 `bot_id` 过滤：`bot_start` 恢复未发消息时
+    /// 只知道自己的 `BotId`，不能先取全局窗口再过滤（别的 bot 的积压会把本 bot 的行挤出去，
+    /// 等于静默丢消息）。
+    pub fn list_pending_outbound_for_bot(
+        &self,
+        bot_id: &BotId,
+        limit: u32,
+    ) -> Result<Vec<OutboundRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ListPendingOutboundForBot {
+            bot_id,
+            limit,
+            reply,
+        })
     }
 
     /// 待发送条数（指标与背压用）。条件与 [`Store::list_pending_outbound`] 完全相同。
@@ -397,6 +445,29 @@ impl Store {
     /// 重新入队（不丢消息，`docs/02-architecture.md` §4.1）。
     pub fn list_unprocessed_inbound(&self, limit: u32) -> Result<Vec<InboundRow>> {
         self.submit(|reply| StoreOp::ListUnprocessedInbound { limit, reply })
+    }
+
+    /// 启动补偿：分批取某个 bot 的未处理入站消息，按 `(received_at, rowid)` 升序。
+    ///
+    /// `after` 是上一批最后一行的 `(received_at, rowid)`；`None` 表示从最早一条开始。
+    /// **这是 `bot_start` 唯一合法的补偿入口**：`list_unprocessed_inbound` 没有 bot 过滤，
+    /// 拿它补偿会把别的 bot 的消息塞进本 bot 的队列（`conversation_id` 对不上，等于串号）。
+    ///
+    /// 语义是 at-least-once（`docs/02-architecture.md` §5.1）：调用方处理成功后必须
+    /// `mark_inbound_processed`，否则下次启动还会再补偿一次。
+    pub fn list_inbound_replay_for_bot(
+        &self,
+        bot_id: &BotId,
+        after: Option<(i64, i64)>,
+        limit: u32,
+    ) -> Result<Vec<InboundReplayRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ListInboundReplay {
+            bot_id,
+            after,
+            limit,
+            reply,
+        })
     }
 
     /// 按主键读会话；不存在返回 `Ok(None)`。
@@ -540,6 +611,12 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
             StoreOp::InsertProject { project, reply } => {
                 reply_send(reply, repositories::project::insert(&connection, &project));
             }
+            StoreOp::GetProjectByPath { path, reply } => {
+                reply_send(
+                    reply,
+                    repositories::project::get_by_path(&connection, &path),
+                );
+            }
             StoreOp::InsertBot { bot, reply } => {
                 reply_send(reply, repositories::bot::insert(&connection, &bot));
             }
@@ -623,6 +700,16 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                     repositories::outbound::list_pending(&connection, limit),
                 );
             }
+            StoreOp::ListPendingOutboundForBot {
+                bot_id,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::outbound::list_pending_for_bot(&connection, &bot_id, limit),
+                );
+            }
             StoreOp::CountPendingOutbound { reply } => {
                 reply_send(reply, repositories::outbound::count_pending(&connection));
             }
@@ -633,6 +720,17 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::inbound::list_unprocessed(&connection, limit),
+                );
+            }
+            StoreOp::ListInboundReplay {
+                bot_id,
+                after,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::inbound::list_replay_for_bot(&connection, &bot_id, after, limit),
                 );
             }
             StoreOp::GetConversation { id, reply } => {

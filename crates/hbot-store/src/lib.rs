@@ -79,7 +79,7 @@ pub use error::{Result, StoreError};
 pub use ids::{BotId, ConversationId, InboundId, OutboundId, ProjectId};
 pub use models::{
     BOT_STATUS_DEGRADED, BOT_STATUS_ERROR, BOT_STATUS_RUNNING, BOT_STATUS_STOPPED, BOT_STATUSES,
-    Bot, BotStatusRow, Conversation, InboundRow, LogRow, NewInbound, NewLog, NewOutbound,
-    OUTBOUND_STATE_FAILED, OUTBOUND_STATE_PENDING, OUTBOUND_STATE_SENT, OutboundRow,
+    Bot, BotStatusRow, Conversation, InboundReplayRow, InboundRow, LogRow, NewInbound, NewLog,
+    NewOutbound, OUTBOUND_STATE_FAILED, OUTBOUND_STATE_PENDING, OUTBOUND_STATE_SENT, OutboundRow,
     OutboundTarget, Project, is_valid_bot_status,
 };

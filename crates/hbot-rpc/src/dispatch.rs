@@ -115,6 +115,10 @@ impl Dispatcher {
             Command::ProjectOpen { path } => {
                 crate::app::commands::system::project_open(state, path.clone()).await
             }
+            Command::ProjectCreate { path, name } => {
+                crate::app::commands::system::project_create(state, path.clone(), name.clone())
+                    .await
+            }
             Command::FileRead { .. }
             | Command::FileWrite { .. }
             | Command::FileList { .. }
@@ -129,6 +133,7 @@ impl Dispatcher {
             Command::BotStart { .. }
             | Command::BotStop { .. }
             | Command::BotInject { .. }
+            | Command::BotList
             | Command::LogsTail { .. } => crate::app::commands::bots::handle(state, command).await,
             Command::AgentSend { .. }
             | Command::AgentCancel { .. }
@@ -236,15 +241,19 @@ mod tests {
         T::from_str(raw).expect("测试 UUID 必须合法")
     }
 
-    /// 23 条命令各一条样例；与 `Command` 的变体一一对应。
+    /// 25 条命令各一条样例；与 `Command` 的变体一一对应。
     fn sample_commands() -> Vec<Command> {
         vec![
             Command::AppInfo,
             Command::ProjectOpen {
                 path: "C:\\work\\demo".to_owned(),
             },
+            Command::ProjectCreate {
+                path: "C:\\work\\created".to_owned(),
+                name: "created".to_owned(),
+            },
             Command::AgentSend {
-                session_id: parse(SESSION),
+                session_id: Some(parse(SESSION)),
                 text: "hello".to_owned(),
             },
             Command::AgentCancel {
@@ -303,15 +312,15 @@ mod tests {
                 conversation_id: parse(CONVERSATION),
                 text: "ping".to_owned(),
             },
+            Command::BotList,
             Command::DebugSetBreakpoints {
+                bot_id: parse(BOT),
                 file: "src/main.rs".to_owned(),
                 lines: vec![3, 7],
             },
-            Command::DebugResume {
-                session_id: parse(SESSION),
-            },
+            Command::DebugResume { bot_id: parse(BOT) },
             Command::DebugStep {
-                session_id: parse(SESSION),
+                bot_id: parse(BOT),
                 kind: crate::dto::StepKind::Over,
             },
             Command::LogsTail {
@@ -326,7 +335,7 @@ mod tests {
         let commands = sample_commands();
         assert_eq!(
             commands.len(),
-            23,
+            25,
             "命令数与 Command 变体数不一致：新增/删除命令时同步这张表"
         );
         for command in commands {

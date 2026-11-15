@@ -279,7 +279,7 @@ struct ConnHandle {
 /// 事件通道分类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventClass {
-    /// 不可丢：`approval.request` / `agent.diff`。
+    /// 不可丢：`approval.request` / `agent.diff` / `debug.paused` / `debug.resumed`。
     Critical,
     /// 可丢弃（记录并计数）：状态类与可合并增量。
     Bulk,
@@ -287,9 +287,16 @@ enum EventClass {
 
 impl EventClass {
     /// 按 `docs/02-architecture.md` §9.2 分类。
+    ///
+    /// `debug.paused` / `debug.resumed` 必须走 critical：暂停事件丢了，UI 就再也
+    /// 不知道 bot 正卡在断点上（表现为「点了运行但没反应」），而它本身是低频事件，
+    /// 占不住 64 格 critical 队列。
     fn classify(event: &Event) -> Self {
         match event {
-            Event::ApprovalRequest { .. } | Event::AgentDiff { .. } => Self::Critical,
+            Event::ApprovalRequest { .. }
+            | Event::AgentDiff { .. }
+            | Event::DebugPaused { .. }
+            | Event::DebugResumed { .. } => Self::Critical,
             _ => Self::Bulk,
         }
     }
@@ -1261,6 +1268,34 @@ mod tests {
             EventClass::classify(&status),
             EventClass::Bulk,
             "bot.status 属于状态类"
+        );
+
+        // 调试暂停丢了 UI 就永远停在「点了运行但没反应」，而它本身低频，
+        // 所以两条调试事件都归 critical。
+        let paused = Event::DebugPaused {
+            bot_id: "22222222-2222-4222-8222-222222222222"
+                .parse()
+                .expect("测试 UUID"),
+            file: "src/main.ts".to_owned(),
+            line: 12,
+            scopes: Vec::new(),
+            call_stack: Vec::new(),
+        };
+        assert_eq!(
+            EventClass::classify(&paused),
+            EventClass::Critical,
+            "debug.paused 不可丢：丢了 UI 不知道 bot 正卡在断点上"
+        );
+
+        let resumed = Event::DebugResumed {
+            bot_id: "22222222-2222-4222-8222-222222222222"
+                .parse()
+                .expect("测试 UUID"),
+        };
+        assert_eq!(
+            EventClass::classify(&resumed),
+            EventClass::Critical,
+            "debug.resumed 不可丢：丢了 UI 会一直显示暂停中"
         );
     }
 

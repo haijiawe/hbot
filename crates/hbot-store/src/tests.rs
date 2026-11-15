@@ -16,7 +16,8 @@ use crate::models::{
 };
 use crate::test_support::{
     TempDir, bot_id, bot_id_at, conversation_id, inbound_id, new_inbound, new_inbound_at, new_log,
-    new_outbound, open_store, outbound_id, outbound_target, project_id, project_id_at, raw, seed,
+    new_outbound, new_outbound_at, open_store, outbound_id, outbound_target, project_id,
+    project_id_at, raw, seed,
 };
 use crate::{BUSY_TIMEOUT_MS, Store};
 
@@ -521,13 +522,18 @@ fn seeding_twice_is_rejected() {
 // 读取 API（续发 / 补偿 / 状态面板）：pending 队列、未处理入站、会话、状态、日志。
 // ---------------------------------------------------------------------------
 
-/// 待发送队列按 `id` 升序返回（不是入队顺序），且 `limit` 生效；路由信息一并带出。
+/// 待发送队列按**产生顺序**（`created_at`, `rowid`）返回，且 `limit` 生效；路由信息一并带出。
+///
+/// 这条测试原先断言“按 `id` 升序”（并且刻意乱序入队来证明是按 id 而不是入队顺序）。
+/// 那是**旧行为，且是缺陷**：`id` 是 UUID v4，字典序与时间无关，重启续发会把同一会话的
+/// 回复打乱成随机顺序，违反 `AGENTS.md` §4.1 “回复按产生顺序发出”。现在按
+/// `(created_at, rowid)` 排，本用例的三行 `created_at` 相同，因此结果就是插入顺序。
 #[test]
-fn pending_outbound_is_listed_in_id_order_and_limited() {
+fn pending_outbound_is_listed_in_production_order_and_limited() {
     let dir = TempDir::new("pending-order");
     let store = open_store(&dir);
 
-    // 故意乱序入队：11 最后写，但 id 最小，必须排第一。
+    // 故意乱序入队：id 最小的 11 反而最后写。现在顺序跟随插入顺序（12, 11, 13）。
     store
         .enqueue_outbound_with_target(
             new_outbound(12),
@@ -543,9 +549,13 @@ fn pending_outbound_is_listed_in_id_order_and_limited() {
 
     let all = store.list_pending_outbound(10).expect("list pending");
     let ids: Vec<_> = all.iter().map(|row| row.id).collect();
-    assert_eq!(ids, vec![outbound_id(11), outbound_id(12), outbound_id(13)]);
+    assert_eq!(
+        ids,
+        vec![outbound_id(12), outbound_id(11), outbound_id(13)],
+        "同一毫秒产生的行必须按插入顺序返回，不能按 UUID 字典序"
+    );
 
-    let routed = &all[1];
+    let routed = &all[0];
     assert_eq!(routed.target_json, "{\"group\":\"42\"}");
     assert_eq!(routed.reply_to.as_deref(), Some("ext-msg-7"));
     assert_eq!(routed.attempts, 0, "新入队行 attempts 从 0 开始");
@@ -553,13 +563,54 @@ fn pending_outbound_is_listed_in_id_order_and_limited() {
     assert_eq!(routed.bot_id, bot_id());
     assert_eq!(routed.conversation_id, conversation_id());
 
-    let plain = &all[0];
+    let plain = &all[1];
     assert_eq!(plain.target_json, "{}", "未知目标落库为 '{{}}'");
     assert!(plain.reply_to.is_none(), "主动消息不带 reply_to");
 
     let limited = store.list_pending_outbound(2).expect("list pending limit");
     let limited_ids: Vec<_> = limited.iter().map(|row| row.id).collect();
-    assert_eq!(limited_ids, vec![outbound_id(11), outbound_id(12)]);
+    assert_eq!(limited_ids, vec![outbound_id(12), outbound_id(11)]);
+}
+
+/// 恢复顺序：`created_at` 相同（同一毫秒）时按插入顺序，不同时按时间升序。
+///
+/// 这是 `D4` 的核心断言：UUID 主键 + 同一毫秒的连续回复，只有 `rowid` 能保住生产顺序。
+#[test]
+fn pending_outbound_recovery_keeps_production_order_for_equal_timestamps() {
+    let dir = TempDir::new("pending-fifo");
+    let store = open_store(&dir);
+
+    // 四条回复：前两条同一毫秒、后两条另一个毫秒；id 故意与时间顺序相反。
+    let mut ids = Vec::new();
+    for (index, (id, created_at)) in [(40_u128, 5_000_i64), (41, 5_000), (42, 6_000), (43, 6_000)]
+        .into_iter()
+        .enumerate()
+    {
+        store
+            .enqueue_outbound(new_outbound_at(id, &format!("reply-{index}"), created_at))
+            .expect("enqueue reply");
+        ids.push(outbound_id(id));
+    }
+
+    let rows = store.list_pending_outbound(10).expect("list pending");
+    let recovered: Vec<_> = rows.iter().map(|row| row.id).collect();
+    assert_eq!(
+        recovered, ids,
+        "恢复必须还原产生顺序：先 created_at，再插入顺序"
+    );
+    let texts: Vec<_> = rows.iter().map(|row| row.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec!["reply-0", "reply-1", "reply-2", "reply-3"],
+        "正文顺序与 id 顺序一致（同一毫秒内靠 rowid 保持）"
+    );
+
+    // 按 bot 过滤的同一视图也必须保持同一顺序（`bot_start` 续发走这一条）。
+    let for_bot = store
+        .list_pending_outbound_for_bot(&bot_id(), 10)
+        .expect("list pending for bot");
+    let recovered_for_bot: Vec<_> = for_bot.iter().map(|row| row.id).collect();
+    assert_eq!(recovered_for_bot, ids);
 }
 
 /// 死信（`failed`）不再出现在待发送队列里，但行保留，`get_outbound` 仍读得到最终 attempts。

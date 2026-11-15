@@ -30,6 +30,12 @@ pub struct OutboundEnvelope {
     pub conversation: ConversationRef,
     /// 待发送文本。
     pub text: String,
+    /// 被动回复要引用的平台消息 ID（`None` = 主动消息）。
+    ///
+    /// 适配器按平台约定把它翻译成“引用段/回复段”：OneBot 走 `reply` 消息段
+    /// （`hbot_adapters::platforms::onebot::message::build_outbound`），其它平台按各自协议。
+    /// **不要在这里重新生成 ID，也不要复用无关的旧事件 ID**（`AGENTS.md` §4.1）。
+    pub reply_to: Option<String>,
     /// 本条消息已尝试次数（含本次）；用于适配器侧日志与死信判定。
     pub attempts: u32,
 }

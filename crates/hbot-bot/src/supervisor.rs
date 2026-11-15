@@ -30,12 +30,18 @@
 //! 2. conversations   ensure_conversation —— inbound 的 FK 指向 conversations
 //! 3. 订阅适配器       adapter.subscribe   —— 先有队列再收事件（AGENTS.md §7.1）
 //! 4. 恢复 outbox     outbox.recover      —— 上次崩溃留下的 pending 先续发
-//! 5. 开始读事件       read_loop           —— 最后才把事件放进队列
+//! 5. 重放入站         replay_unprocessed  —— 上次没处理完的 inbound 重新入队
+//! 6. 开始读事件       read_loop           —— 最后才把事件放进队列
 //! ```
 //!
 //! 换成别的顺序的后果是具体的：先订阅后建会话 → 第一条消息写 `inbound` 撞外键；先读事件
 //! 后恢复 outbox → 新消息的回复排在旧 pending 之前；先订阅后建队列 → 事件在内存里堆着、
-//! 队列满时无处背压。
+//! 队列满时无处背压；先读事件后重放 → 同一会话里旧消息排在新消息之后（违背会话内 FIFO）。
+//!
+//! 第 5 步是 **at-least-once**：重放只保证"不丢"，不保证"不重复"（进程在
+//! `on_message` 成功与 `processed_at` 落库之间被杀时，那条消息会二次执行）。重复投递
+//! 的兜底是 `inbound` 的 `(bot_id, external_id)` 唯一约束 + 适配器侧的消息 id 去重。
+//! 代价换来的是"进程崩了消息还在"，这比"宁可丢也不重"重要得多。
 //!
 //! ## 停止顺序（不可换）
 //!
@@ -47,12 +53,17 @@
 //! 5. 标记 Stopped      状态与快照更新（finally 语义，不卡 Stopping）
 //! ```
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hbot_core::{BotId, BotStatus, Clock, HbotError, IdGenerator, MessageId, ProjectId};
-use hbot_store::{Bot as StoreBot, Store};
+use hbot_core::{
+    BotId, BotStatus, Clock, ConversationKind, HbotError, IdGenerator, InboundMessage, MessageId,
+    ProjectId, Timestamp,
+};
+use hbot_store::{Bot as StoreBot, NewLog, Store};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
@@ -78,6 +89,11 @@ pub enum StartupStep {
     Subscribe,
     /// 恢复未发送的 outbound 行。
     RecoverOutbox,
+    /// 补偿上次运行遗留的未处理入站消息（`processed_at IS NULL`）。
+    ///
+    /// 排在这里是因为它必须先有 queues（重放要走与实时流量完全相同的入队路径），
+    /// 且必须在 `Reading` 之前完成——否则新事件会插到旧消息前面，破坏会话内顺序。
+    ReplayInbound,
     /// 开始读取事件（状态进入 `Running`）。
     Reading,
 }
@@ -90,6 +106,7 @@ impl StartupStep {
             Self::Conversations => "conversations",
             Self::Subscribe => "subscribe",
             Self::RecoverOutbox => "recover_outbox",
+            Self::ReplayInbound => "replay_inbound",
             Self::Reading => "reading",
         }
     }
@@ -537,7 +554,7 @@ impl Supervisor {
             handler,
             Arc::clone(&self.failures),
         ));
-        let (stop_tx, stop_rx) = watch::channel(false);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
         let read_task = tokio::spawn(read_loop(
             bot_id,
             subscription,
@@ -552,6 +569,20 @@ impl Supervisor {
             stop_tx.clone(),
             self.deps.failure_threshold,
         ));
+
+        // 5. 补偿上次运行遗留的未处理入站消息。必须在 `Reading` 之前、队列就绪之后：
+        //    队列没就绪无处入队；在 `Reading` 之后则新事件会插到旧消息前面。
+        let replayed = self
+            .replay_unprocessed_inbound(&queues, &mut stop_rx)
+            .await?;
+        if replayed > 0 {
+            tracing::info!(
+                bot = %bot_id,
+                replayed,
+                "replayed unprocessed inbound messages after restart"
+            );
+        }
+        self.record_step(StartupStep::ReplayInbound);
         self.record_step(StartupStep::Reading);
 
         Ok(Runtime {
@@ -562,6 +593,132 @@ impl Supervisor {
             read_task,
             watcher_task,
         })
+    }
+
+    /// 启动补偿：把上次运行遗留的未处理入站行（`processed_at IS NULL`）重新入队。
+    ///
+    /// ## 为什么必须补偿
+    ///
+    /// `AGENTS.md` §4.1 的顺序是“先落库再处理”，所以 `inbound` 行可能就是唯一证据：
+    /// 落库之后、handler 执行之前进程被 kill / 崩溃 / 因为 [`QueueError::Closed`] 丢掉入队，
+    /// 那行永远停在 `processed_at IS NULL`。不补偿就是**静默丢消息**（这正是
+    /// `read_loop` 里那句“下次启动会重放”承诺的东西）。
+    ///
+    /// ## 走的是同一条路
+    ///
+    /// 每行都构造成 [`MessageCtx`] 后交给 [`SessionQueues::enqueue`]，与实时流量完全一致：
+    /// 同样受每会话串行、吞吐上限与背压约束，同样经 `RecordingHandler` 写 `processed_at`
+    /// （所以在 handler 成功后才会被标记，中途崩溃会再次补偿）。
+    ///
+    /// ## 语义：at-least-once（`docs/02-architecture.md` §5.1）
+    ///
+    /// 这是有意接受的成本，不是缺陷：如果进程在“handler 执行完、写 `processed_at` 之前”
+    /// 崩溃，重启后这条消息会再执行一次，**生成代码可能重复回复**。要换成 exactly-once
+    /// 就得把标记与副作用放进同一个事务，而副作用在平台侧（QQ），做不到。
+    ///
+    /// ## 分批
+    ///
+    /// 按 `(received_at, rowid)` keyset 分页，每批 [`REPLAY_BATCH_SIZE`] 条；游标前进后
+    /// 继续，直到空批或不足一批。不用一次取全量：崩溃时积压可能有几十万行，一次取回
+    /// 会把整个结果集压在内存里（同 `AGENTS.md` §5 “通道/批处理一律有界”）。
+    async fn replay_unprocessed_inbound(
+        &self,
+        queues: &Arc<SessionQueues>,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<usize, HbotError> {
+        let bot_id = self.spec.bot_id;
+        let mut cursor: Option<(i64, i64)> = None;
+        let mut replayed = 0usize;
+        // 一次启动内同一条消息只入队一次：批边界可能让同一行出现两次（游标在
+        // `received_at` 相同的行之间靠 rowid，理论上不会，但这里不依赖那个推理）。
+        let mut seen: HashSet<MessageId> = HashSet::new();
+
+        loop {
+            if *stop.borrow() {
+                // 启动途中被要求停止（例如 handler 已经连续失败进入 Degraded）。
+                break;
+            }
+            let store = Arc::clone(&self.deps.store);
+            let batch = run_store("list_inbound_replay", move || {
+                store.list_inbound_replay_for_bot(&bot_id, cursor, REPLAY_BATCH_SIZE)
+            })
+            .await?;
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+            for row in batch {
+                let message_id = MessageId::from_uuid(*row.message.id.as_uuid());
+                cursor = Some((row.message.received_at, row.rowid));
+                if !seen.insert(message_id) {
+                    tracing::warn!(
+                        bot = %bot_id,
+                        message = %message_id,
+                        "replay 游标重复覆盖同一行：跳过，避免一次启动内重复执行"
+                    );
+                    continue;
+                }
+                // payload 由我们自己 `serde_json::to_string` 写入，解析失败说明内存/HBOT 版本
+                // 不一致。这里**不**中断启动、也**不**标记已处理：保持可见（下轮启动还会再试），
+                // 只记一条错误日志，避免一行坏数据把整个 bot 钉死在 StartFailed 上。
+                let payload = match serde_json::from_str::<Value>(&row.message.payload_json) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        tracing::error!(
+                            bot = %bot_id,
+                            message = %message_id,
+                            error = %error,
+                            "replay: inbound payload 不是合法 JSON，跳过（保持未处理）"
+                        );
+                        continue;
+                    }
+                };
+                let message = InboundMessage {
+                    id: message_id,
+                    bot_id,
+                    conversation_id: row.message.conversation_id,
+                    external_id: row.message.external_id.clone(),
+                    sender_id: row.message.sender_id.clone(),
+                    payload,
+                    received_at: Timestamp::from_unix_millis(row.message.received_at),
+                    processed_at: None,
+                };
+                let conversation = ConversationRef::new(
+                    row.conversation_external_id.clone(),
+                    conversation_kind_of(&row.conversation_kind),
+                );
+                let ctx = MessageCtx::new(bot_id, message, conversation);
+                match queues.enqueue(ctx, stop).await {
+                    Ok(()) => replayed += 1,
+                    // 停止中：行仍是未处理态，下次启动继续补偿。
+                    Err(QueueError::Closed { .. }) => return Ok(replayed),
+                    Err(error) => return Err(error.into_hbot_error()),
+                }
+            }
+            if batch_len < REPLAY_BATCH_SIZE as usize {
+                break;
+            }
+        }
+
+        if replayed > 0 {
+            // 一条可观测记录：重启后补偿了未处理消息说明上次是非正常退出，值得让人看见
+            // （`AGENTS.md` §5：不许静默吞）。
+            let store = Arc::clone(&self.deps.store);
+            let at = self.deps.clock.now().unix_millis();
+            let line = format!(
+                "重启补偿：重新入队 {replayed} 条未处理入站消息（at-least-once，可能重复回复）"
+            );
+            run_store("append_log", move || {
+                store.append_log(NewLog {
+                    bot_id,
+                    level: "warn".to_owned(),
+                    line,
+                    at,
+                })
+            })
+            .await?;
+        }
+        Ok(replayed)
     }
 
     async fn ensure_bot_row(&self) -> Result<(), HbotError> {
@@ -752,6 +909,29 @@ fn millis_u64(duration: Duration) -> u64 {
 
 /// 适配器事件的订阅容量（适配器写不进去就自己背压）。
 pub const ADAPTER_EVENT_CAPACITY: usize = 256;
+
+/// 启动补偿时每批从 `inbound` 取多少行。
+///
+/// 取 256 的理由：单条消息的 `payload_json` 通常几 KB，256 条的量级是 ~1MB 内存与一次
+/// 批量的 SQL；同时它比常见的崩溃积压（几十条）大得多，正常情况一批就追平，
+/// 只有真正的大积压才会走到第二轮。
+pub const REPLAY_BATCH_SIZE: u32 = 256;
+
+/// 把 `conversations.kind` 的存储字符串还原成领域枚举。
+///
+/// 取值与 `hbot-rpc` 的 `conversation_kind_from_str` 完全一致（`private` / `group` /
+/// `channel`，其它一律 `Unknown`）。**刻意重复 6 行而不建共享函数**：`hbot-bot` 是比
+/// `hbot-rpc` 更低的一层，不能反过来依赖 rpc；而 `hbot-adapters` 提供的映射会把
+/// `AppState` 之外的 adapter 语义塞进 supervisor。存储侧的唯一真源是
+/// `conversations.kind` 这一列本身（写入方是 `hbot-bot::ids` 与适配器）。
+fn conversation_kind_of(raw: &str) -> ConversationKind {
+    match raw {
+        "private" => ConversationKind::Private,
+        "group" => ConversationKind::Group,
+        "channel" => ConversationKind::Channel,
+        _ => ConversationKind::Unknown,
+    }
+}
 
 /// 建一个订阅通道，返回（交给适配器的发送端, 交给 supervisor 的订阅句柄）。
 ///

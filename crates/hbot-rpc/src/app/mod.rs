@@ -15,12 +15,15 @@
 //! | `store` | 所有持久化命令 | 进程级（单 writer 线程在 `Store` 内部） |
 //! | `workspace` | 文件 / 搜索 / 编译 / 诊断 | 随 `project_open` 更换 |
 //! | `events` | 所有要推事件的能力 | 进程级（广播，无订阅者时丢弃） |
+//! | `searches` | `search_start` / `search_cancel` | 逐次搜索（登记表里只有正在跑的） |
+//! | `agent` | `agent_send` / `agent_cancel` / `agent_approve` | 进程级（会话表在它内部） |
+//! | `adapter_factory` | `bot_start` | 进程级；测试换成假适配器，生产是 OneBot |
 //! | `clock` / `ids` | 需要"现在"和关联键的命令 | 进程级，测试可注入固定值 |
 //!
 //! ## 不持有的东西
 //!
 //! * 正在跑的 bot supervisor（在 [`crate::app::bots`]，按 `BotId` 索引，可启停）；
-//! * Agent 会话（M1，随 `agent_send` 建立）；
+//! * Agent 会话表 / 待审编辑 / 审批通道（在 [`crate::app::agent`]，按会话索引）；
 //! * UI 连接（在 [`crate::ws`]，它从 `events` 订阅）。
 //!
 //! ## 阻塞约定
@@ -30,12 +33,15 @@
 //! （`crates/hbot-store/src/lib.rs` 的调用约定）。本模块提供
 //! [`AppState::blocking`] 把这个包装成一句，避免每个命令各写一遍。
 
+pub mod agent;
 pub mod bots;
 pub mod commands;
+pub mod debug;
 pub mod events;
 pub mod files;
 pub mod ids;
 pub mod runtime;
+pub mod search;
 
 #[cfg(test)]
 pub mod test_support;
@@ -59,7 +65,10 @@ pub struct AppState {
     workspace: RwLock<Option<Arc<Workspace>>>,
     files: RwLock<ActiveFiles>,
     events: Arc<EventBus>,
+    searches: search::SearchRegistry,
     bots: bots::BotRegistry,
+    agent: Arc<agent::AgentManager>,
+    adapter_factory: Arc<dyn runtime::AdapterFactory>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
 }
@@ -108,16 +117,52 @@ impl AppState {
         })?;
         let store = Store::open(data_dir.join("hbot.db")).map_err(store_failed)?;
 
+        // 事件出口与 ID/时钟先建好再共享：`agent` 也要用同一份（否则 UI 收不到
+        // agent.delta，且 EditId 会与别处撞号）。
+        let events = Arc::new(EventBus::new());
+        let agent = Arc::new(agent::AgentManager::new(
+            data_dir.clone(),
+            Arc::clone(&events),
+            Arc::clone(&ids),
+            Arc::clone(&clock),
+        ));
+
         Ok(Self {
             data_dir,
             store: Arc::new(store),
             workspace: RwLock::new(None),
             files: RwLock::new(ActiveFiles::default()),
-            events: Arc::new(EventBus::new()),
+            events,
+            searches: search::SearchRegistry::new(),
             bots: bots::BotRegistry::new(),
+            agent,
+            adapter_factory: Arc::new(runtime::onebot::OneBotAdapterFactory),
             clock,
             ids,
         })
+    }
+
+    /// 换掉适配器工厂。
+    ///
+    /// 生产装配不调用它（缺省就是真 OneBot）；测试用它注入假适配器，从而在不连真 socket
+    /// 的前提下跑通 store → 队列 → 沙箱 → outbox 的**同一条**链路。
+    pub fn with_adapter_factory(mut self, factory: Arc<dyn runtime::AdapterFactory>) -> Self {
+        self.adapter_factory = factory;
+        self
+    }
+
+    /// 换掉 Agent 装配层。
+    ///
+    /// 生产装配不调用它（缺省读环境变量 / `agent.json`）；测试用它注入固定配置与假
+    /// provider，从而在无网络的前提下把 `agent_send` → `run_turn` 的整条链跑通。
+    pub fn with_agent(mut self, agent: Arc<agent::AgentManager>) -> Self {
+        self.agent = agent;
+        self
+    }
+
+    /// 适配器工厂（`bot_start` 用它按平台造 `BotAdapter`）。
+    pub fn adapter_factory(&self) -> &Arc<dyn runtime::AdapterFactory> {
+        &self.adapter_factory
     }
 
     /// 应用数据目录（`hbot.db` 所在）。
@@ -135,6 +180,11 @@ impl AppState {
         &self.events
     }
 
+    /// 正在跑的搜索登记表（`search_cancel` 用它把取消落到搜索线程上）。
+    pub fn searches(&self) -> &search::SearchRegistry {
+        &self.searches
+    }
+
     /// 时钟。
     pub fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
@@ -148,6 +198,21 @@ impl AppState {
     /// 正在跑的 bot（启停入口）。
     pub fn bots(&self) -> &bots::BotRegistry {
         &self.bots
+    }
+
+    /// Agent 装配层（会话表、待审编辑、审批通道、provider 工厂）。
+    pub fn agent(&self) -> &Arc<agent::AgentManager> {
+        &self.agent
+    }
+
+    /// 调试登记表（断点 + 暂停中的等待者，见 [`debug::DebugRegistry`]）。
+    ///
+    /// 返回 `Arc` 而不是 `&`：它现在是进程级单例（[`debug::registry`] 里有原因说明——
+    /// `SandboxHandlerConfig` 那条装配缝由别的单元持有，本单元塞不进字段）。
+    /// 等那条缝能改之后，这里改成 `&Arc<debug::DebugRegistry>`（`AppState` 自己持有），
+    /// 调用方一行都不用动。
+    pub fn debug(&self) -> Arc<debug::DebugRegistry> {
+        debug::registry()
     }
 
     /// 已打开的项目根；没打开项目时 `None`。
@@ -169,6 +234,12 @@ impl AppState {
         let root = workspace.root().to_path_buf();
 
         self.bots.stop_all().await;
+        // 上一轮的 Agent 回合还在跑（或在等审批）时不能让新项目接手：它会拿着旧项目
+        // 的路径继续写。待审编辑同理——旧项目的 Diff 不该落到新项目里。
+        self.agent.cancel_all();
+        self.agent.clear_edits();
+        // 旧搜索扫的是上一个项目的目录，结果推给 UI 只会造成"打开 B 却看到 A 的命中"。
+        self.searches.cancel_all();
         *self
             .files
             .write()

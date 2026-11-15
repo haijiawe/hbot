@@ -86,6 +86,12 @@ pub struct OutboundRequest {
     pub conversation: ConversationRef,
     /// 待发送文本。
     pub text: String,
+    /// 触发这条回复的**平台消息 ID**（被动回复必须绑定，`AGENTS.md` §4.1）。
+    ///
+    /// `None` = 主动消息（定时任务、主动推送），没有可引用的历史事件，**不得**冒用旧 ID。
+    /// `Some(id)` 时一路带到适配器：QQ/OneBot 用它组 `reply` 消息段，平台据此把回复
+    /// 归属到原消息并计入被动回复配额（超配额会被拒发）。
+    pub reply_to: Option<String>,
 }
 
 /// 已完成落库、等待发送的条目（跨重启恢复时由 [`PendingOutboxSource`] 提供）。
@@ -101,6 +107,11 @@ pub struct PendingOutbound {
     pub text: String,
     /// 已尝试次数（来自库）。
     pub attempts: u32,
+    /// 被动回复绑定的平台消息 ID（`outbound.reply_to`）。
+    ///
+    /// 重启恢复必须把它读回来：丢了这个字段，续发的消息就变成“主动消息”，
+    /// 平台会拒发或在群里脱离上下文（`AGENTS.md` §4.1）。
+    pub reply_to: Option<String>,
 }
 
 /// 跨重启恢复未发 `outbound` 的注入点。
@@ -225,13 +236,20 @@ impl Outbox {
             created_at: self.clock.now().unix_millis(),
         };
         let store = Arc::clone(&self.store);
-        run_store("enqueue_outbound", move || store.enqueue_outbound(row)).await?;
+        // 必须用 `enqueue_outbound_with_target`：`enqueue_outbound` 走的是
+        // `OutboundTarget::unknown()`，`reply_to` 会永远落成 NULL（被动回复退化成主动消息）。
+        let target = hbot_store::OutboundTarget::new("{}", request.reply_to.clone());
+        run_store("enqueue_outbound", move || {
+            store.enqueue_outbound_with_target(row, target)
+        })
+        .await?;
         let envelope = OutboundEnvelope {
             id: outbound_id,
             bot_id: self.bot_id,
             conversation_id,
             conversation: request.conversation,
             text: request.text,
+            reply_to: request.reply_to,
             attempts: 0,
         };
         self.send_envelope(envelope).await?;
@@ -251,6 +269,7 @@ impl Outbox {
                 ),
                 conversation: item.conversation,
                 text: item.text,
+                reply_to: item.reply_to,
                 attempts: item.attempts,
             };
             self.send_envelope(envelope).await?;

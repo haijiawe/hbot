@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{Result, StoreError};
 use crate::ids::InboundId;
 use crate::mappers::{INBOUND_COLUMNS, row_to_inbound};
-use crate::models::{InboundRow, NewInbound};
+use crate::models::{InboundReplayRow, InboundRow, NewInbound};
 
 /// 插入入站消息；`(bot_id, external_id)` 已存在时**不**插入并返回 `None`。
 ///
@@ -85,6 +85,63 @@ pub(crate) fn list_unprocessed(conn: &Connection, limit: u32) -> Result<Vec<Inbo
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map([i64::from(limit)], row_to_inbound)?;
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(row?);
+    }
+    Ok(messages)
+}
+
+/// 启动补偿：按 `(received_at, rowid)` 分批取**某个 bot** 的未处理入站消息。
+///
+/// `after` 是上一批最后一行的游标（`None` = 从最早一条开始）。用 keyset 分页而不是
+/// `LIMIT/OFFSET`：补偿期间新消息还在入库，`OFFSET` 会随插入漂移，可能漏行或重复。
+///
+/// 语义是 **at-least-once**（`docs/02-architecture.md` §5.1）：行在 handler 成功后被
+/// `mark_processed` 打标，因此崩溃窗口内可能同一条执行两次——这比“静默丢消息”好，
+/// 代价是可能重复回复，代码里不许假装是 exactly-once。
+pub(crate) fn list_replay_for_bot(
+    conn: &Connection,
+    bot_id: &crate::ids::BotId,
+    after: Option<(i64, i64)>,
+    limit: u32,
+) -> Result<Vec<InboundReplayRow>> {
+    // 列名必须逐列限定：JOIN 后 `id` / `external_id` 在两张表里都有，不限定会被
+    // SQLite 判为 ambiguous。顺序与 `INBOUND_COLUMNS` 一致，这样 `row_to_inbound`
+    // 的下标映射不用改。
+    let sql = "SELECT inbound.id, inbound.bot_id, inbound.external_id,
+                      inbound.conversation_id, inbound.sender_id, inbound.payload_json,
+                      inbound.received_at, inbound.rowid, c.external_id, c.kind
+         FROM inbound
+         JOIN conversations AS c ON c.id = inbound.conversation_id
+         WHERE inbound.bot_id = ?1
+           AND inbound.processed_at IS NULL
+           AND (?2 IS NULL OR inbound.received_at > ?2
+                OR (inbound.received_at = ?2 AND inbound.rowid > ?3))
+         ORDER BY inbound.received_at, inbound.rowid
+         LIMIT ?4";
+    let (cursor_received_at, cursor_rowid) = match after {
+        Some((received_at, rowid)) => (Some(received_at), rowid),
+        None => (None, 0),
+    };
+    let mut statement = conn.prepare(sql)?;
+    let rows = statement.query_map(
+        params![
+            bot_id.to_string(),
+            cursor_received_at,
+            cursor_rowid,
+            i64::from(limit)
+        ],
+        |row| {
+            let message = row_to_inbound(row)?;
+            Ok(InboundReplayRow {
+                message,
+                rowid: row.get(7)?,
+                conversation_external_id: row.get(8)?,
+                conversation_kind: row.get(9)?,
+            })
+        },
+    )?;
     let mut messages = Vec::new();
     for row in rows {
         messages.push(row?);

@@ -11,7 +11,10 @@ use std::str::FromStr;
 use rusqlite::Row;
 use rusqlite::types::Type;
 
-use crate::models::{Bot, BotStatusRow, Conversation, InboundRow, LogRow, OutboundRow};
+use crate::models::{Bot, BotStatusRow, Conversation, InboundRow, LogRow, OutboundRow, Project};
+
+/// `projects` 表的显式列清单（顺序见 [`row_to_project`]）。
+pub(crate) const PROJECT_COLUMNS: &str = "id, name, path, created_at";
 
 /// `bots` 表的显式列清单；避免 `SELECT *` 在加列后静默错位。
 pub(crate) const BOT_COLUMNS: &str =
@@ -33,6 +36,16 @@ pub(crate) const OUTBOUND_COLUMNS: &str =
 
 /// `logs` 表的显式列清单。
 pub(crate) const LOG_COLUMNS: &str = "id, bot_id, level, line, at";
+
+/// 把一行 `projects` 读成 [`Project`]。
+pub(crate) fn row_to_project(row: &Row<'_>) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: parse_id(0, row.get::<_, String>(0)?)?,
+        name: row.get(1)?,
+        path: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
 
 /// 把一行 `bots` 读成 [`Bot`]。
 pub(crate) fn row_to_bot(row: &Row<'_>) -> rusqlite::Result<Bot> {

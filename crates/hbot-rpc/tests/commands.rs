@@ -1,9 +1,9 @@
-//! 命令契约测试：23 个 `Command` 的 `type` 值与字段名（命令一律 camelCase 字段）。
+//! 命令契约测试：25 个 `Command` 的 `type` 值与字段名（命令一律 camelCase 字段）。
 
 mod support;
 
-use hbot_core::ApprovalDecision;
-use hbot_rpc::{AppInfo, Command, DirEntry, FileContent, LogLevel, RunLog, StepKind};
+use hbot_core::{ApprovalDecision, BotStatus};
+use hbot_rpc::{AppInfo, BotSummary, Command, DirEntry, FileContent, LogLevel, RunLog, StepKind};
 use serde_json::json;
 use support::{
     APPROVAL_UUID, AT, BOT_UUID, CONVERSATION_UUID, EDIT_UUID, SEARCH_UUID, SESSION_UUID, approval,
@@ -22,14 +22,40 @@ fn app_project_and_agent_commands_use_camel_case_fields() {
         json!({ "type": "project_open", "path": "E:\\demo" }),
     );
 
+    // 新建项目：`data` 是 `ProjectSummary`（path/name/entry），不是 `AppInfo`。
+    assert_command(
+        Command::ProjectCreate {
+            path: "E:\\demo-new".to_string(),
+            name: "演示项目".to_string(),
+        },
+        json!({
+            "type": "project_create",
+            "path": "E:\\demo-new",
+            "name": "演示项目",
+        }),
+    );
+
     assert_command(
         Command::AgentSend {
-            session_id: session(),
+            session_id: Some(session()),
             text: "你好".to_string(),
         },
         json!({
             "type": "agent_send",
             "sessionId": SESSION_UUID,
+            "text": "你好",
+        }),
+    );
+
+    // 新建会话：`sessionId: null`（UI 第一次发消息就是这条），核心回 `data.sessionId`。
+    assert_command(
+        Command::AgentSend {
+            session_id: None,
+            text: "你好".to_string(),
+        },
+        json!({
+            "type": "agent_send",
+            "sessionId": null,
             "text": "你好",
         }),
     );
@@ -204,31 +230,31 @@ fn bot_debug_and_log_commands_use_camel_case_fields() {
 
     assert_command(
         Command::DebugSetBreakpoints {
+            bot_id: bot(),
             file: "src/main.rs".to_string(),
             lines: vec![10, 20],
         },
         json!({
             "type": "debug_set_breakpoints",
+            "botId": BOT_UUID,
             "file": "src/main.rs",
             "lines": [10, 20],
         }),
     );
 
     assert_command(
-        Command::DebugResume {
-            session_id: session(),
-        },
-        json!({ "type": "debug_resume", "sessionId": SESSION_UUID }),
+        Command::DebugResume { bot_id: bot() },
+        json!({ "type": "debug_resume", "botId": BOT_UUID }),
     );
 
     assert_command(
         Command::DebugStep {
-            session_id: session(),
+            bot_id: bot(),
             kind: StepKind::Out,
         },
         json!({
             "type": "debug_step",
-            "sessionId": SESSION_UUID,
+            "botId": BOT_UUID,
             "kind": "out",
         }),
     );
@@ -244,15 +270,19 @@ fn bot_debug_and_log_commands_use_camel_case_fields() {
 
 #[test]
 fn command_fields_never_serialize_as_snake_case() {
-    // 覆盖全部 23 个命令：任何一个字段漏改 camelCase 都会在这里红。
+    // 覆盖全部 25 个命令：任何一个字段漏改 camelCase 都会在这里红。
     // 与上面的形状断言重复构造是有意的——这里只关心"没有 `_` 字段名"。
     let commands = vec![
         Command::AppInfo,
         Command::ProjectOpen {
             path: "p".to_string(),
         },
+        Command::ProjectCreate {
+            path: "p".to_string(),
+            name: "n".to_string(),
+        },
         Command::AgentSend {
-            session_id: session(),
+            session_id: Some(session()),
             text: "t".to_string(),
         },
         Command::AgentCancel {
@@ -309,15 +339,15 @@ fn command_fields_never_serialize_as_snake_case() {
             conversation_id: conversation(),
             text: "t".to_string(),
         },
+        Command::BotList,
         Command::DebugSetBreakpoints {
+            bot_id: bot(),
             file: "f".to_string(),
             lines: vec![1],
         },
-        Command::DebugResume {
-            session_id: session(),
-        },
+        Command::DebugResume { bot_id: bot() },
         Command::DebugStep {
-            session_id: session(),
+            bot_id: bot(),
             kind: StepKind::Over,
         },
         Command::LogsTail {
@@ -325,7 +355,7 @@ fn command_fields_never_serialize_as_snake_case() {
             limit: 1,
         },
     ];
-    assert_eq!(commands.len(), 23, "命令数量变化时同步这张表");
+    assert_eq!(commands.len(), 25, "命令数量变化时同步这张表");
 
     for command in &commands {
         let value = serde_json::to_value(command).expect("ser");
@@ -368,6 +398,20 @@ fn optional_command_fields_may_be_omitted_by_old_ui() {
     let diagnostics: Command =
         serde_json::from_value(json!({ "type": "diagnostics" })).expect("de");
     assert!(matches!(diagnostics, Command::Diagnostics { path: None }));
+
+    // `agentSend` 的 `sessionId` 也是可缺省的：不传 = 新建会话。
+    let created: Command = serde_json::from_value(json!({
+        "type": "agent_send",
+        "text": "hi",
+    }))
+    .expect("de");
+    assert!(matches!(
+        created,
+        Command::AgentSend {
+            session_id: None,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -478,4 +522,61 @@ fn request_ids_must_be_uuid_strings() {
             "always": false,
         }),
     );
+}
+
+#[test]
+fn bot_list_command_has_no_fields() {
+    // 无字段命令：线格式里只有 `type`，多一个键都算契约漂移。
+    assert_command(Command::BotList, json!({ "type": "bot_list" }));
+}
+
+#[test]
+fn bot_summary_wire_shape_is_exact() {
+    // `bot_list` 的行：键集固定（少一个 UI 就漏字段，多一个说明造了库里没有的列）。
+    let summary = BotSummary {
+        bot_id: bot(),
+        name: "演示 bot".to_string(),
+        platform: "onebot11".to_string(),
+        status: BotStatus::Running,
+        updated_at: at(),
+    };
+
+    let value = serde_json::to_value(&summary).expect("ser");
+    let object = value.as_object().expect("BotSummary 必须是对象");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["botId", "name", "platform", "status", "updatedAt"],
+        "BotSummary 的键集是契约"
+    );
+    assert_eq!(
+        value,
+        json!({
+            "botId": BOT_UUID,
+            "name": "演示 bot",
+            "platform": "onebot11",
+            "status": "running",
+            "updatedAt": AT,
+        })
+    );
+
+    // 状态枚举与 `bot.status` 事件共用同一个 `BotStatus`：值必须是 snake_case。
+    for (status, wire) in [
+        (BotStatus::Stopped, "stopped"),
+        (BotStatus::Starting, "starting"),
+        (BotStatus::Running, "running"),
+        (BotStatus::Stopping, "stopping"),
+        (BotStatus::Degraded, "degraded"),
+    ] {
+        let mut row = summary.clone();
+        row.status = status;
+        let value = serde_json::to_value(&row).expect("ser");
+        assert_eq!(value["status"], json!(wire));
+    }
+
+    // 往返 + 无 snake_case 键。
+    assert_camel_case_keys(&value, "botSummary");
+    let parsed: BotSummary = serde_json::from_value(value).expect("de");
+    assert_eq!(parsed, summary);
 }

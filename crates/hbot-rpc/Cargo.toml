@@ -13,6 +13,7 @@ hbot-code = { path = "../hbot-code" }
 hbot-bot = { path = "../hbot-bot" }
 hbot-adapters = { path = "../hbot-adapters" }
 hbot-agent = { path = "../hbot-agent" }
+hbot-command = { path = "../hbot-command" }
 async-trait.workspace = true
 anyhow.workspace = true
 uuid.workspace = true

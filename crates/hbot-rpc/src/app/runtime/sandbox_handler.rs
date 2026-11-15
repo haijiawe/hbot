@@ -1,47 +1,1572 @@
-//! [`HandlerExecutor`](hbot_bot::HandlerExecutor) 的 QuickJS 实现。
+//! [`HandlerExecutor`] 的真实现：把一条消息编译 + 丢进 QuickJS isolate，再把
+//! `ctx.reply()` 的结果送回 outbox。
 //!
-//! 一条入站消息进来时：
+//! ## 数据流（与 `docs/02-architecture.md` §6.3 对齐）
 //!
-//! 1. 取（或编译）项目里的生成代码 → [`hbot_code::Sandbox`]，每 bot 固定几个 isolate；
-//! 2. 把 [`MessageCtx`] 变成一次 `dispatch` 的事件 JSON；
-//! 3. 把 `reply(...)` 收集成出站文本（由 outbox 负责真正发送）。
+//! ```text
+//! MessageCtx ─► 事件 JSON ─► worker[k]（每 bot ≤2 个 isolate）─► Sandbox::dispatch
+//!                                                                   │
+//!                      replies ─► mpsc<OutboundRequest> ─► Supervisor::send ─► outbox
+//!                      logs    ─► 日志表 + Event::RunLog
+//! ```
 //!
-//! ## 线程约定
+//! ## 三条硬约束
 //!
-//! [`hbot_code::Sandbox::dispatch`](hbot_code::Sandbox::dispatch) 是**阻塞**调用（它
-//! 在 isolate 线程上跑并等结果），所以必须走 `spawn_blocking`，否则会占住 tokio worker
-//! ——这正是旧项目里"Agent 流式输出停顿、心跳超时"的成因
-//! （`docs/00-assessment.md` P0-4 的同源问题）。
+//! 1. **编译与 dispatch 都是阻塞的**（SWC 解析 + QuickJS 单线程运行时），必须走
+//!    `tokio::task::spawn_blocking`，否则会把整个 tokio reactor 卡住。
+//! 2. **会话亲和**：`conversation_id` 稳定哈希到固定 worker，同一会话永远落在同一个
+//!    isolate 上（§6.3）；一个 worker 同时只跑一个 dispatch，所以同会话不可能并发。
+//! 3. **不绕过沙箱**：沙箱起不来、handler 超时一律返回真错误，让 supervisor 不标记
+//!    inbound 已处理（重启后可重放）。不要在这里"先回个 ok 让它过"。
 //!
-//! ## 当前状态（M0，**未接线**）
+//! ## 内容指纹（D1：热路径零内容读）
 //!
-//! 返回明确错误而不是空回复：handler 返回 `Err` 会让 supervisor 计入连续失败并进入
-//! `Degraded`，UI 上能看出"这个 bot 没跑起来"；返回空回复只会让人以为 bot 在装死。
+//! 判断"代码变了没有"用的是 [`FingerprintCache`]：元数据 TTL（默认 2s）内只 `stat`，
+//! 内容地板（默认 5s）才重读文件内容。**稳态每条消息不读任何文件内容**——
+//! 旧实现每条消息都 `blake3` 全部源码，1000 msg/min 就是每分钟几万次文件读。
+//! 盲区与兜底写在 [`crate::app::runtime::fingerprint_cache`] 的模块文档里。
+//!
+//! ## 热重载语义（D2：§6.2 / §6.4）
+//!
+//! * **编译失败不换版本**：记 error 日志（日志表 + `Event::RunLog`），继续用上一次编译
+//!   成功的项目服务；`onMessage` 不失败（否则一个错别字会让之后每条消息都失败）。
+//! * **第一次编译就失败**（还没有任何可用版本）：这条消息确实处理不了，返回真错误让它
+//!   保持未处理并在修好代码后重试，错误文案里明确写出这一点。
+//! * **去抖 300ms**：连续保存只编译一次（[`HOT_RELOAD_DEBOUNCE`]）。
+//! * **崩溃预算**：同一指纹连续 3 次 isolate 崩溃就停止自动重启，写 error 日志与事件，
+//!   改代码（新指纹）自动重置（[`CRASH_BUDGET_LIMIT`]，风格对齐 `queue.rs` 的
+//!   `FailureTracker`）。
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use hbot_bot::{HandlerExecutor, MessageCtx};
-use hbot_core::HbotError;
+use hbot_bot::{HandlerExecutor, MessageCtx, OutboundRequest};
+use hbot_code::{CodeError, CompiledProject, Limits, Sandbox};
+use hbot_core::{BotId, Clock, EventSink, HbotError};
+use hbot_store::{NewLog, Store};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
-/// 用 QuickJS 沙箱跑生成代码的执行器。
+use crate::app::debug::sink::BotDebugSink;
+use crate::app::debug::{BreakpointTarget, DebugRegistry};
+use crate::app::runtime::conversation_kind_str;
+use crate::app::runtime::fingerprint_cache::FingerprintCache;
+use crate::app::{EventBus, store_failed};
+use crate::dto::{Event, LogLevel};
+
+/// 每个 bot 最多几个 isolate（§6.3：默认 2 个 worker）。
 ///
-/// 现在还没有字段：接上项目路径与 isolate 池之后，这里会持有
-/// `CompiledProject` 缓存与每 bot 的 `Sandbox` 池（`docs/02-architecture.md` §6.3）。
+/// 2 个 isolate = 2×32 MiB 堆上限；再多只会放大会话争抢 CPU 的窗口，不会提高吞吐
+/// （一个 bot 的流量本质上是一个群/一个私聊的串行对话）。
+pub const MAX_ISOLATES: usize = 2;
+
+/// 回复通道容量。outbox 自己是串行单 worker，这里只负责解耦
+/// "handler 产出一个回复" 与 "发送器把它写进 outbound 表"。
+pub const REPLY_CAPACITY: usize = 64;
+
+/// 热重载去抖窗口（§6.4）。
+///
+/// 编辑器的连番保存（或"保存全部"）在 300ms 内会连续改变指纹；每次变化都编译 + 预热新
+/// isolate 是纯浪费。新指纹第一次被观测到后先等这么久，再取**当次**指纹编译一次。
+pub const HOT_RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// 同一指纹允许的连续 isolate 崩溃次数（§6.4：连续 3 次就停止自动重启）。
+pub const CRASH_BUDGET_LIMIT: u32 = 3;
+
+/// 沙箱执行器的装配参数（字段全公开：`bot_start` 处一眼能看到都接了什么）。
+pub struct SandboxHandlerConfig {
+    /// 这个执行器属于哪个 bot（写日志行时要用）。
+    pub bot_id: BotId,
+    /// 生成代码的项目根（`src/main.ts` 所在目录）。
+    pub project_root: std::path::PathBuf,
+    /// 每 isolate 的堆/栈/超时限额（来自 `bots.json`，缺省 32 MiB / 2 s）。
+    pub limits: Limits,
+    /// 日志落库用（`logs_tail` 从这张表读）。
+    pub store: Arc<Store>,
+    /// `Event::RunLog` 推给 UI。
+    pub events: Arc<EventBus>,
+    /// 日志时间戳来源。
+    pub clock: Arc<dyn Clock>,
+    /// `ctx.reply()` 产出的回复发到这里；由 supervisor 的 drain 任务转成 outbox 行。
+    pub replies: mpsc::Sender<OutboundRequest>,
+}
+
+/// 一个 worker 槽位：指纹一致就复用，不一致说明代码变了，换新 isolate。
+struct Worker {
+    fingerprint: String,
+    /// isolate 句柄。**故意不加锁**：串行化由本模块的槽位守卫负责（`run()` 在
+    /// dispatch 期间一直持有 `workers[i]` 的锁 + 会话稳定哈希绑定，见本模块第 2 条
+    /// 硬约束），不是靠这把锁。`Sandbox::dispatch` 本身是 `&self` + `Sync`，多个线程
+    /// 同时调它**不会 UB**——worker 会串行执行并按到达顺序回复，但突发超过指令通道
+    /// 深度会退化成一串 [`CodeError::SandboxDead`]（`hbot-code` 的 `dispatch` 文档
+    /// 原话是"不要依赖这个类型做串行化"）。
+    /// **所以别以为这里没有锁就可以并发 dispatch 同一个 isolate**；真要并行请加
+    /// worker 槽位（`MAX_ISOLATES`），不要给这个句柄加锁。
+    ///
+    /// 历史上这里曾经是 `Arc<Mutex<Sandbox>>`，唯一原因是当时 `Sandbox` 持有一个裸
+    /// `std::sync::mpsc::Receiver<()>` 而失去 `Sync`；`crates/hbot-code` 把那个字段改成
+    /// `Mutex<Option<..>>` 之后 `Sandbox: Send + Sync`（该 crate 内有断言测试），
+    /// 这把锁就成了纯粹的额外开销（还多一次跨线程取锁），已撤掉。
+    sandbox: Arc<Sandbox>,
+}
+
+/// 上一次编译成功的项目。
+struct CachedProject {
+    fingerprint: String,
+    project: Arc<CompiledProject>,
+}
+
+/// isolate 崩溃预算（风格对齐 `crates/hbot-bot/src/queue.rs` 的 `FailureTracker`）。
+///
+/// 只记"同一指纹的连续崩溃"：改代码产生新指纹就清零，因为新代码是新的诊断对象——
+/// 把旧指纹的崩溃次数算到新版本头上会让用户改一次代码就永远起不来。
 #[derive(Debug, Default)]
-pub struct SandboxHandler;
+struct CrashBudget {
+    fingerprint: Option<String>,
+    consecutive: u32,
+    blocked: bool,
+}
+
+impl CrashBudget {
+    /// 记一次崩溃；本次让预算转为"已封顶"时返回 `true`（只转换一次）。
+    fn record_crash(&mut self, fingerprint: &str) -> bool {
+        if self.fingerprint.as_deref() != Some(fingerprint) {
+            // 新指纹：新的诊断对象，计数与封顶状态全部重置（§6.4）。
+            self.fingerprint = Some(fingerprint.to_owned());
+            self.consecutive = 0;
+            self.blocked = false;
+        }
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= CRASH_BUDGET_LIMIT && !self.blocked {
+            self.blocked = true;
+            return true;
+        }
+        false
+    }
+
+    /// 记一次成功（isolate 正常跑完一条消息）：清连续计数，但**不**解除封顶。
+    ///
+    /// 与 `FailureTracker::record_success` 一致：封顶之后只有新指纹能解锁，否则
+    /// "崩三次 → 成功一次 → 再崩三次"会变成无限重启。
+    fn record_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// 该指纹是否已经封顶（停止自动重启）。
+    fn is_blocked(&self, fingerprint: &str) -> bool {
+        self.blocked && self.fingerprint.as_deref() == Some(fingerprint)
+    }
+
+    /// 当前连续崩溃次数（日志用）。
+    fn consecutive(&self) -> u32 {
+        self.consecutive
+    }
+}
+
+/// 热重载状态机：上次成功版本 + 失败指纹 + 去抖窗口 + 崩溃预算。
+#[derive(Default)]
+struct HotReload {
+    /// 上一次编译成功的项目（编译失败时继续用它服务）。
+    compiled: Option<CachedProject>,
+    /// 最近一次编译失败的指纹（同指纹不再反复重试编译）。
+    failed_fingerprint: Option<String>,
+    /// 去抖：某个待编译指纹第一次被观测到的时刻。
+    pending: Option<(String, Instant)>,
+    /// isolate 崩溃预算。
+    crashes: CrashBudget,
+}
+
+impl HotReload {
+    /// 指纹与当前编译产物一致 → 直接命中。
+    fn hit(&self, fingerprint: &str) -> Option<(String, Arc<CompiledProject>)> {
+        let cached = self.compiled.as_ref()?;
+        if cached.fingerprint != fingerprint {
+            return None;
+        }
+        Some((cached.fingerprint.clone(), Arc::clone(&cached.project)))
+    }
+
+    /// 这个指纹已经确认编译失败：有上一版就复用它（**不再重编译**）。
+    fn fallback_on_failure(&self, fingerprint: &str) -> Option<(String, Arc<CompiledProject>)> {
+        if self.failed_fingerprint.as_deref() != Some(fingerprint) {
+            return None;
+        }
+        self.last_good()
+    }
+
+    /// 上一次编译成功的版本。
+    fn last_good(&self) -> Option<(String, Arc<CompiledProject>)> {
+        self.compiled
+            .as_ref()
+            .map(|cached| (cached.fingerprint.clone(), Arc::clone(&cached.project)))
+    }
+
+    /// 记录一次编译失败（同指纹后续请求直接走上一版）。
+    fn mark_failed(&mut self, fingerprint: &str) {
+        self.failed_fingerprint = Some(fingerprint.to_owned());
+        self.pending = None;
+    }
+
+    /// 记录一次编译成功：缓存换新，失败指纹清空，去抖窗口关闭。
+    fn mark_compiled(&mut self, fingerprint: &str, project: Arc<CompiledProject>) {
+        self.compiled = Some(CachedProject {
+            fingerprint: fingerprint.to_owned(),
+            project,
+        });
+        self.failed_fingerprint = None;
+        self.pending = None;
+    }
+
+    /// 去抖：返回"等到这个时刻再编译"的 deadline；`None` 表示不必等。
+    ///
+    /// 同一指纹只记第一次观测的时刻（连番保存时不断有更新的指纹覆盖它，所以窗口从
+    /// **最后一次**变化起算）。已经等够窗口就返回 `None`。
+    fn debounce(&mut self, fingerprint: &str, now: Instant, window: Duration) -> Option<Instant> {
+        if window.is_zero() {
+            return None;
+        }
+        let started = match &self.pending {
+            Some((pending, at)) if pending == fingerprint => *at,
+            Some((pending, at)) if pending != fingerprint => {
+                self.pending = Some((fingerprint.to_owned(), now));
+                return Some(now + window);
+            }
+            _ => {
+                self.pending = Some((fingerprint.to_owned(), now));
+                return Some(now + window);
+            }
+        };
+        let deadline = started + window;
+        if now >= deadline {
+            None
+        } else {
+            Some(deadline)
+        }
+    }
+}
+
+/// QuickJS 沙箱执行器（每 bot 一个实例）。
+pub struct SandboxHandler {
+    bot_id: BotId,
+    project_root: std::path::PathBuf,
+    limits: Limits,
+    store: Arc<Store>,
+    events: Arc<EventBus>,
+    clock: Arc<dyn Clock>,
+    replies: mpsc::Sender<OutboundRequest>,
+    /// 内容指纹缓存（D1：稳态零内容读）。
+    fingerprints: Arc<FingerprintCache>,
+    /// 热重载状态（D2：旧版本兜底 / 去抖 / 崩溃预算）。
+    hot: Mutex<HotReload>,
+    /// 编译串行化：并发消息同时发现缓存失效时，只让一个去编译，其余等结果。
+    compile_lock: tokio::sync::Mutex<()>,
+    /// 去抖窗口（生产恒为 [`HOT_RELOAD_DEBOUNCE`]；测试可缩短以免拖慢用例）。
+    debounce: Duration,
+    /// 真正执行过几次编译（测试断言"连番保存只编译一次"用）。
+    compiles: AtomicU64,
+    workers: Vec<tokio::sync::Mutex<Option<Worker>>>,
+    /// 调试登记表：新 isolate 出生时从这里取断点，dispatch 时把
+    /// [`BotDebugSink`] 挂上去（§6.5.1）。
+    ///
+    /// 存的是进程级单例（[`crate::app::debug::registry`]），不是配置注入的字段：
+    /// [`SandboxHandlerConfig`] 由 `commands::bots` 用完整结构体字面量构造，那条装配缝
+    /// 属于别的单元（见 `crate::app::debug` 的模块文档）。
+    debug: Arc<DebugRegistry>,
+}
 
 impl SandboxHandler {
-    /// 建一个执行器。
-    pub fn new() -> Self {
-        Self
+    /// 用装配参数构造（不编译、不建 isolate：第一条消息到来时才做）。
+    pub fn new(config: SandboxHandlerConfig) -> Self {
+        let fingerprints = Arc::new(FingerprintCache::new(config.project_root.clone()));
+        let workers = (0..MAX_ISOLATES)
+            .map(|_| tokio::sync::Mutex::new(None))
+            .collect();
+        Self {
+            bot_id: config.bot_id,
+            project_root: config.project_root,
+            limits: config.limits,
+            store: config.store,
+            events: config.events,
+            clock: config.clock,
+            replies: config.replies,
+            fingerprints,
+            hot: Mutex::new(HotReload::default()),
+            compile_lock: tokio::sync::Mutex::new(()),
+            debounce: HOT_RELOAD_DEBOUNCE,
+            compiles: AtomicU64::new(0),
+            workers,
+            debug: crate::app::debug::registry(),
+        }
+    }
+
+    /// 覆盖去抖窗口（测试用；生产不要调，§6.4 的 300ms 是验过的值）。
+    pub fn with_debounce(mut self, debounce: Duration) -> Self {
+        self.debounce = debounce;
+        self
+    }
+
+    /// 覆盖指纹缓存的两个 TTL（测试用）。
+    ///
+    /// 生产恒为 [`DEFAULT_METADATA_TTL`]（2s）/ [`DEFAULT_CONTENT_FLOOR`]（5s）。用例里把
+    /// 元数据 TTL 设成零（每轮都 stat）可以把"改文件后多久被看见"从秒级压到即时，否则每个
+    /// 改文件的用例都要真等 2 秒。
+    #[cfg(test)]
+    pub fn with_fingerprint_ttls(
+        mut self,
+        metadata_ttl: Duration,
+        content_floor: Duration,
+    ) -> Self {
+        self.fingerprints = Arc::new(FingerprintCache::with_ttls(
+            self.project_root.clone(),
+            metadata_ttl,
+            content_floor,
+        ));
+        self
+    }
+
+    /// 测试用：累计读过的文件内容次数（D1「稳态零内容读」的观测点）。
+    #[cfg(test)]
+    pub fn content_reads(&self) -> u64 {
+        self.fingerprints.content_reads()
+    }
+
+    /// 项目根（诊断用）。
+    pub fn project_root(&self) -> &std::path::Path {
+        &self.project_root
+    }
+
+    /// 已执行编译次数（测试观测点：[`FingerprintCache::content_reads`] 的编译侧对应物）。
+    pub fn compile_count(&self) -> u64 {
+        self.compiles.load(Ordering::Relaxed)
+    }
+
+    /// 当前项目内容指纹（走 [`FingerprintCache`]，稳态不读内容）。
+    async fn fingerprint(&self) -> Result<String, HbotError> {
+        let cache = Arc::clone(&self.fingerprints);
+        tokio::task::spawn_blocking(move || cache.current())
+            .await
+            .map_err(|error| {
+                HbotError::internal(format!(
+                    "计算项目指纹任务失败（bot {}）：{error}",
+                    self.bot_id
+                ))
+            })?
+    }
+
+    /// 取（必要时编译）当前代码的编译产物。
+    ///
+    /// 返回的指纹**一定是实际服务的那一版的指纹**：编译失败时它是上一版成功版本的指纹，
+    /// 所以 `worker()` 的"指纹变了就换 isolate"逻辑不会被一次失败带偏。
+    async fn compiled(&self) -> Result<(String, Arc<CompiledProject>), HbotError> {
+        let mut fingerprint = self.fingerprint().await?;
+
+        if let Some(hit) = lock(&self.hot).hit(&fingerprint) {
+            return Ok(hit);
+        }
+        if let Some(fallback) = lock(&self.hot).fallback_on_failure(&fingerprint) {
+            return Ok(fallback);
+        }
+
+        // 去抖：新指纹先等窗口，等连番保存落定后再取一次指纹（可能又变了）。
+        let deadline = {
+            let mut hot = lock(&self.hot);
+            hot.debounce(&fingerprint, Instant::now(), self.debounce)
+        };
+        if let Some(deadline) = deadline {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            fingerprint = self.fingerprint().await?;
+            if let Some(hit) = lock(&self.hot).hit(&fingerprint) {
+                return Ok(hit);
+            }
+            if let Some(fallback) = lock(&self.hot).fallback_on_failure(&fingerprint) {
+                return Ok(fallback);
+            }
+        }
+
+        // 串行编译：并发消息在这里排队，前一个编译完后面的直接命中缓存。
+        let _guard = self.compile_lock.lock().await;
+        if let Some(hit) = lock(&self.hot).hit(&fingerprint) {
+            return Ok(hit);
+        }
+        if let Some(fallback) = lock(&self.hot).fallback_on_failure(&fingerprint) {
+            return Ok(fallback);
+        }
+
+        self.compiles.fetch_add(1, Ordering::Relaxed);
+        let root = self.project_root.clone();
+        // **恒用 Debug 构建**：只有 Debug 构建里才插了 `__hbot_trace` 探针，断点才可能命中。
+        // 代价靠"没断点就不 arm"抵消 —— 探针快路径是一句 `if (__hbot_dbg && …)`，
+        // 未 arm 时每条语句多一次全局读，实测 10 文件 24µs vs release 27µs（噪声内）；
+        // arm 后 probe-dense 最坏 4.64×（`crates/hbot-code/tests/s1_debug_instrument.rs`）。
+        // 若这里退回 `compile_project`（release），`debug_set_breakpoints` 会**静默永不命中**。
+        let compiled = tokio::task::spawn_blocking(move || hbot_code::compile_project_debug(&root))
+            .await
+            .map_err(|error| {
+                HbotError::internal(format!("编译任务失败（bot {}）：{error}", self.bot_id))
+            })?;
+
+        match compiled {
+            Ok(project) => {
+                let project = Arc::new(project);
+                tracing::info!(
+                    bot = %self.bot_id,
+                    root = %self.project_root.display(),
+                    modules = project.modules().len(),
+                    fingerprint = %fingerprint,
+                    "生成代码已编译（缓存已更新）"
+                );
+                lock(&self.hot).mark_compiled(&fingerprint, Arc::clone(&project));
+                Ok((fingerprint, project))
+            }
+            Err(error) => {
+                // 编译错误是"用户代码有问题"：写进日志表 + RunLog（UI 的诊断面板从这两处读），
+                // 然后决定是继续服务上一版还是如实报错。
+                self.record_error_line(format!("生成代码编译失败：{error}"))
+                    .await;
+                tracing::warn!(
+                    bot = %self.bot_id,
+                    root = %self.project_root.display(),
+                    error = %error,
+                    fingerprint = %fingerprint,
+                    "生成代码编译失败"
+                );
+
+                // 先把"上一版"取出来放语句里（守卫随之释放）：`match lock(&self.hot)...`
+                // 这种写法会让守卫活到整个 `match` 结尾，分支里再 `lock(&self.hot)` 就是
+                // 同一个 std Mutex 的二次加锁——同线程直接死锁（曾经真的挂住过用例）。
+                let last_good = lock(&self.hot).last_good();
+                match last_good {
+                    Some((last_good_fingerprint, project)) => {
+                        // §6.2 / §6.4：编译失败**不替换**正在运行的版本，消息继续被处理。
+                        lock(&self.hot).mark_failed(&fingerprint);
+                        tracing::warn!(
+                            bot = %self.bot_id,
+                            serving = %last_good_fingerprint,
+                            "编译失败：继续使用上一版已编译代码服务"
+                        );
+                        Ok((last_good_fingerprint, project))
+                    }
+                    None => Err(HbotError::invalid(format!(
+                        "生成代码编译失败，且当前没有可用的已编译版本：{error}。\
+                         这条消息保持未处理状态（inbound 未标记 processed），修好代码后会自动重试"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// 取（必要时创建/替换）某个 worker 的 isolate，并返回持有该槽位锁的守卫。
+    ///
+    /// 守卫生存期 = 一次 `dispatch`：同一个 isolate 永远不会被两条消息同时使用
+    /// （QuickJS 运行时是单线程的，并发投递只会让超时判定失真）。
+    async fn worker(
+        &self,
+        index: usize,
+        fingerprint: &str,
+        project: &Arc<CompiledProject>,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<Worker>>, HbotError> {
+        // 崩溃预算封顶：不再自动重启（§6.4），明确报错而不是静默重试。
+        if lock(&self.hot).crashes.is_blocked(fingerprint) {
+            return Err(HbotError::internal(format!(
+                "isolate 连续崩溃 {CRASH_BUDGET_LIMIT} 次（指纹 {fingerprint}），已停止自动重启；\
+                 改代码会产生新指纹并自动重置预算，或查看日志定位代码问题"
+            )));
+        }
+
+        let slot = self.workers.get(index).ok_or_else(|| {
+            HbotError::internal(format!("worker 槽位 {index} 越界（bot {}）", self.bot_id))
+        })?;
+        let mut guard = slot.lock().await;
+
+        let stale = guard
+            .as_ref()
+            .map(|worker| worker.fingerprint != fingerprint)
+            .unwrap_or(true);
+        if stale {
+            // 旧 isolate 的 Drop 会 `recv_timeout(handler_timeout + 1s)` 等它的 OS 线程
+            // 退出（默认最多 3 秒），必须在阻塞线程里丢。
+            //
+            // 必须把**整个 `Worker`** move 进去，不能只 clone 一个 `Arc` 进去丢：join
+            // 发生在最后一个强引用被 drop 的那一刻，而 `guard.take()` 之后最后那个引用
+            // 就在 `previous` 里——只丢 clone 的话，真正触发 join 的是 `previous` 在
+            // async 线程上的析构，等于没搬，reactor 照样卡满整个预算。
+            if let Some(previous) = guard.take() {
+                tokio::task::spawn_blocking(move || drop(previous))
+                    .await
+                    .map_err(|error| {
+                        HbotError::internal(format!(
+                            "回收旧 isolate 失败（bot {}）：{error}",
+                            self.bot_id
+                        ))
+                    })?;
+            }
+
+            let limits = self.limits;
+            let project = Arc::clone(project);
+            let spawned =
+                tokio::task::spawn_blocking(move || Sandbox::spawn((*project).clone(), limits))
+                    .await
+                    .map_err(|error| {
+                        HbotError::internal(format!(
+                            "isolate 启动任务失败（bot {}）：{error}",
+                            self.bot_id
+                        ))
+                    })?;
+            let sandbox = match spawned {
+                Ok(sandbox) => Arc::new(sandbox),
+                Err(error) => {
+                    tracing::error!(bot = %self.bot_id, error = %error, "isolate 启动失败");
+                    return Err(sandbox_start_error(error));
+                }
+            };
+            tracing::debug!(
+                bot = %self.bot_id,
+                worker = index,
+                fingerprint = %fingerprint,
+                "isolate 已就绪"
+            );
+            // 新 isolate 出生时把当前断点补上去（"先设断点、后启动 bot"这条路径）：
+            // `debug_set_breakpoints` 只能推给**已经存在**的沙箱，而 sandbox 是第一条消息
+            // 到来时才建的，漏了这一步用户会看到"断点设了但没停住"。
+            //
+            // 必须先于把 `sandbox` move 进 `Worker`，所以要 clone 一个句柄给登记表。
+            self.debug.attach(
+                self.bot_id,
+                Arc::clone(&sandbox) as Arc<dyn BreakpointTarget>,
+            );
+            *guard = Some(Worker {
+                fingerprint: fingerprint.to_owned(),
+                sandbox,
+            });
+        }
+
+        Ok(guard)
+    }
+
+    /// 把 `EventOutcome.logs` 落到日志表并推 `RunLog` 事件。
+    ///
+    /// 日志写失败不改变 handler 结果（回复已经产出），但必须留痕——不许静默吞。
+    async fn record_logs(&self, logs: Vec<String>) {
+        if logs.is_empty() {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
+        let at = self.clock.now().unix_millis();
+        // 落库用副本：`lines` 之后还要拿去推 `RunLog`，不能 move 进阻塞任务。
+        let to_write = logs.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            for line in &to_write {
+                store.append_log(NewLog {
+                    bot_id,
+                    level: "info".to_owned(),
+                    line: line.clone(),
+                    at,
+                })?;
+            }
+            Ok::<(), hbot_store::StoreError>(())
+        })
+        .await;
+        match written {
+            Err(error) => tracing::error!(bot = %bot_id, error = %error, "日志写入任务失败"),
+            Ok(Err(error)) => {
+                tracing::error!(bot = %bot_id, error = %store_failed(error), "日志写入失败");
+            }
+            Ok(Ok(())) => {}
+        }
+        let at = self.clock.now();
+        for line in logs {
+            self.events.emit(Event::RunLog {
+                bot_id,
+                level: LogLevel::Info,
+                line,
+                at,
+            });
+        }
+    }
+
+    /// 写一条 `error` 级日志（日志表 + `Event::RunLog`）。
+    ///
+    /// 平台自身的问题（编译失败、崩溃预算封顶）走这里：UI 的日志面板与
+    /// `bot_logs_tail` 读的是同一份数据。写失败只 warn，但 warn 本身不会被吞。
+    async fn record_error_line(&self, line: String) {
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
+        let at = self.clock.now().unix_millis();
+        let to_write = line.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            store.append_log(NewLog {
+                bot_id,
+                level: "error".to_owned(),
+                line: to_write,
+                at,
+            })
+        })
+        .await;
+        match written {
+            Err(error) => tracing::error!(bot = %bot_id, error = %error, "错误日志写入任务失败"),
+            Ok(Err(error)) => {
+                tracing::error!(bot = %bot_id, error = %store_failed(error), "错误日志写入失败");
+            }
+            Ok(Ok(())) => {}
+        }
+        self.events.emit(Event::RunLog {
+            bot_id,
+            level: LogLevel::Error,
+            line,
+            at: self.clock.now(),
+        });
+    }
+
+    /// 记一次 isolate 崩溃；连续崩溃达到预算时写 error 日志与事件（停止自动重启）。
+    async fn record_crash(&self, fingerprint: &str) {
+        let (exhausted, consecutive) = {
+            let mut hot = lock(&self.hot);
+            let exhausted = hot.crashes.record_crash(fingerprint);
+            (exhausted, hot.crashes.consecutive())
+        };
+        if exhausted {
+            tracing::error!(
+                bot = %self.bot_id,
+                consecutive,
+                limit = CRASH_BUDGET_LIMIT,
+                "isolate crash budget exhausted; auto-restart disabled"
+            );
+            self.record_error_line(format!(
+                "isolate 连续崩溃 {consecutive} 次（指纹 {fingerprint}）：已停止自动重启，\
+                 请查看日志定位代码问题；改动代码（新指纹）会自动重置预算"
+            ))
+            .await;
+        } else {
+            tracing::warn!(
+                bot = %self.bot_id,
+                consecutive,
+                limit = CRASH_BUDGET_LIMIT,
+                "isolate 崩溃，丢弃后重建"
+            );
+        }
+    }
+
+    /// 把 handler 产出的回复交给 supervisor 的 outbox 通道。
+    ///
+    /// 每条回复都带上触发它的**平台消息 ID**（`AGENTS.md` §4.1 被动回复语义）：
+    /// 缺了它，OneBot 侧无法组 `reply` 段，也就无法计入被动回复配额。
+    async fn deliver_replies(
+        &self,
+        ctx: &MessageCtx,
+        replies: Vec<String>,
+    ) -> Result<(), HbotError> {
+        let reply_to = passive_reply_id(ctx);
+        for text in replies {
+            let request = OutboundRequest {
+                conversation: ctx.conversation.clone(),
+                text,
+                reply_to: reply_to.clone(),
+            };
+            self.replies.send(request).await.map_err(|_| {
+                HbotError::internal(format!(
+                    "回复通道已关闭（bot {}）：supervisor 已停止，这条回复没有进入 outbox",
+                    self.bot_id
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// 这条消息的回复应该挂在哪个平台消息 ID 上。
+///
+/// 真实入站事件的 `external_id` 就是平台消息 ID；**调试注入**（`bot_inject`）不是平台
+/// 事件，它的 `external_id` 是合成的去重键（`inject-…`），拿去当 `reply_to` 会被平台
+/// 拒发，所以返回 `None`（按主动消息发）。判定依据是注入方写进 payload 的 `injected`
+/// 标记（见 `crate::app::commands::bots::inject`）。
+fn passive_reply_id(ctx: &MessageCtx) -> Option<String> {
+    let injected = ctx
+        .payload()
+        .get("injected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if injected {
+        return None;
+    }
+    Some(ctx.external_id().to_owned())
+}
+
+/// 把一个（崩溃的）worker 在阻塞线程里释放。
+///
+/// 必须整包 move 进 `spawn_blocking`：`Worker` 里那个 `Arc<Sandbox>` 的最后一次 drop
+/// 会 join 隔离线程，在 reactor 线程上做会卡住整个运行时。
+async fn release_isolate(worker: Worker) {
+    if let Err(error) = tokio::task::spawn_blocking(move || drop(worker)).await {
+        tracing::error!(error = %error, "崩溃 isolate 回收任务失败");
     }
 }
 
 #[async_trait]
 impl HandlerExecutor for SandboxHandler {
     async fn on_message(&self, ctx: MessageCtx) -> Result<(), HbotError> {
-        let _ = ctx;
-        Err(HbotError::internal(
-            "sandbox handler 尚未接线：需要 isolate 池与生成代码编译（docs/02-architecture.md §6.3）",
-        ))
+        match self.run(&ctx).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // 失败必须留痕：supervisor 只会把 inbound 留在"未处理"并累计连续失败，
+                // 它不写日志表。这里补一条 error 日志 + RunLog，`logs_tail` 才能回答
+                // "为什么这条消息没被处理"。
+                self.record_failure(&ctx, &error).await;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl SandboxHandler {
+    /// 一条消息的完整处理：编译 → 取 worker → dispatch → 日志 → 回复。
+    async fn run(&self, ctx: &MessageCtx) -> Result<(), HbotError> {
+        let event = event_json(ctx);
+        let conversation_id = ctx.conversation_id();
+        let worker_index = stable_index(&conversation_id.to_string(), self.workers.len());
+
+        let (fingerprint, project) = self.compiled().await?;
+        let mut guard = self.worker(worker_index, &fingerprint, &project).await?;
+        let sandbox = guard
+            .as_ref()
+            .map(|worker| Arc::clone(&worker.sandbox))
+            .ok_or_else(|| HbotError::internal("worker 槽位在持有期间被清空"))?;
+
+        let started = Instant::now();
+        let bot_id = self.bot_id;
+        let debug = Arc::clone(&self.debug);
+        let events = Arc::clone(&self.events);
+        // **没有断点就不 arm**：`dispatch_with_debug(Some(sink))` 会让隔离区里的
+        // `__hbot_dbg` 为真，每条语句都走一次探针（probe-dense handler 实测 4.64×）。
+        // 平时不给 sink，探针快路径退化成一次全局读（≈release），断点是"要用才付钱"。
+        let has_breakpoints = !self.debug.breakpoints_of(&bot_id).is_empty();
+        let dispatched = tokio::task::spawn_blocking(move || {
+            // 守卫活到 dispatch 结束：调用方在 await 期间一直持有槽位锁，所以这里不会
+            // 有第二个 dispatch 抢同一个 isolate（见本模块第 2 条硬约束）。
+            //
+            // **sink 必须在 blocking 线程里构造并使用**：`DebugSink::paused` 会同步阻塞
+            // 到用户在 UI 点"继续"或 5 分钟超时。放到 reactor 线程上就绪会被钉死 5 分钟
+            // （症状是整个应用没反应，而不是这个 bot 不回话）——见 `app::debug::sink`
+            // 的模块文档「线程约束」。
+            if !has_breakpoints {
+                // `*_collecting`：失败路径也要拿回 handler 已经写出的 `ctx.log` 行，
+                // 否则用户看到的是"我的 bot 出错了，但出错前那三行 log 一条都没有"。
+                return sandbox.dispatch_collecting(&event);
+            }
+            let sink = BotDebugSink::new(bot_id, debug, events);
+            let sink: Option<&dyn hbot_core::debug::DebugSink> = Some(&sink);
+            sandbox.dispatch_with_debug_collecting(&event, sink)
+        })
+        .await
+        .map_err(|error| {
+            HbotError::internal(format!("dispatch 任务失败（bot {}）：{error}", self.bot_id))
+        })?;
+        let outcome = match dispatched {
+            Ok(outcome) => {
+                drop(guard);
+                lock(&self.hot).crashes.record_success();
+                outcome
+            }
+            Err(failure) => {
+                let mapped = remap_error(&failure.error, &project);
+                let crash = is_crash_class(&failure.error);
+                // 崩溃类的 isolate 已经不可用：必须丢掉，否则下一条消息继续撞同一个死运行时。
+                // 先把槽位清空、放开槽位锁，再去阻塞线程里 drop（isolate 的 Drop 会 join
+                // 它的 OS 线程，不能在 reactor 线程上做，也不能持锁做）。
+                let dead = if crash { guard.take() } else { None };
+                drop(guard);
+                // **失败路径也要落日志**，而且必须排在错误行之前：`on_message` 在
+                // `run` 返回 Err 之后才写 "消息 … 处理失败" 那行，这里先 await 完
+                // `record_logs`，日志表与 `RunLog` 流里"出错前打的那几行"就天然在前，
+                // 用户读到的因果顺序才是对的。
+                self.record_logs(failure.logs).await;
+                if let Some(dead) = dead {
+                    release_isolate(dead).await;
+                }
+                if crash {
+                    self.record_crash(&fingerprint).await;
+                }
+                tracing::warn!(
+                    bot = %self.bot_id,
+                    conversation = %conversation_id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %mapped,
+                    "handler 执行失败"
+                );
+                return Err(mapped);
+            }
+        };
+
+        let reply_count = outcome.replies.len();
+        // 先落日志（诊据），再交付回复：回复进 outbox 后 RecordingHandler 才会标记
+        // inbound 已处理，所以这两步的顺序是 "证据先于结果"。
+        self.record_logs(outcome.logs).await;
+        self.deliver_replies(ctx, outcome.replies).await?;
+
+        tracing::debug!(
+            bot = %self.bot_id,
+            conversation = %conversation_id,
+            replies = reply_count,
+            elapsed_ms = started.elapsed().as_millis(),
+            "handler 执行完成"
+        );
+        Ok(())
+    }
+
+    /// 把一次失败写成一行 `error` 日志，并推 `RunLog`（供 `logs_tail` 与 UI 查看）。
+    async fn record_failure(&self, ctx: &MessageCtx, error: &HbotError) {
+        self.record_error_line(format!("消息 {} 处理失败：{error}", ctx.message_id()))
+            .await;
+    }
+}
+
+impl std::fmt::Debug for SandboxHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxHandler")
+            .field("bot_id", &self.bot_id)
+            .field("project_root", &self.project_root)
+            .field("isolates", &self.workers.len())
+            .field("limits", &self.limits)
+            .field("compiles", &self.compile_count())
+            .finish_non_exhaustive()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 会话 → worker 的稳定映射（FNV-1a，非加密；只要求同会话恒定）。
+fn stable_index(key: &str, modulo: usize) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if modulo == 0 {
+        0
+    } else {
+        usize::try_from(hash % modulo as u64).unwrap_or(0)
+    }
+}
+
+/// `ctx` → 交给 `onMessage(event)` 的 JSON。
+///
+/// 沙箱会把 `reply` / `log` / `sleep` 三个宿主函数挂到这个对象上，所以这里给的就是
+/// **事件对象本身**的字段（`text`、`kind`、`senderId`……），代码里写 `ctx.text`。
+fn event_json(ctx: &MessageCtx) -> Value {
+    json!({
+        "botId": ctx.bot_id.to_string(),
+        "conversationId": ctx.conversation_id().to_string(),
+        "messageId": ctx.message_id().to_string(),
+        "externalId": ctx.external_id(),
+        "senderId": ctx.message.sender_id,
+        "text": ctx.text(),
+        "kind": conversation_kind_str(ctx.conversation_kind()),
+        "conversationExternalId": ctx.conversation.external_id,
+        "receivedAt": ctx.received_at().unix_millis(),
+        "payload": ctx.payload(),
+    })
+}
+
+/// isolate 起不来：没有隔离就不执行代码（§6.3），错误码按原因区分。
+fn sandbox_start_error(error: CodeError) -> HbotError {
+    match error {
+        CodeError::MemoryLimit { .. } | CodeError::Timeout { .. } => {
+            HbotError::invalid(error.to_string())
+        }
+        other => HbotError::internal(other.to_string()),
+    }
+}
+
+/// 这次失败算不算"isolate 崩了"（要计崩溃预算、要丢弃 isolate）。
+///
+/// 只有运行时级的死亡算：超时被中断、内存超限、进程级死亡。用户代码抛异常（`JsException`）
+/// 是**消息级**失败，同一个 isolate 还能继续服务，不该被计进崩溃预算。
+fn is_crash_class(error: &CodeError) -> bool {
+    matches!(
+        error,
+        CodeError::SandboxDead { .. } | CodeError::Timeout { .. } | CodeError::MemoryLimit { .. }
+    )
+}
+
+/// dispatch 期错误 → wire 错误码。
+///
+/// 只做三件事：**超时 → -32004**（可重试的运行时问题）、**进程级死亡 → -32006**、
+/// 其余（语法/JS 异常/内存超限）→ -32002。不要把它们都塞进 internal，否则 UI 分不出
+/// "用户代码写错了"和"平台坏了"。
+fn remap_error(error: &CodeError, project: &CompiledProject) -> HbotError {
+    // 按引用匹配：`JsException` 里的 `stack` 要借用去重映射栈，move 出来会让
+    // `error` 变成部分移动，后面 `error.to_string()` 就用不了了。
+    match error {
+        CodeError::Timeout { .. } => timeout_error(error),
+        CodeError::SandboxDead { .. } => HbotError::internal(error.to_string()),
+        CodeError::JsException {
+            stack: Some(stack), ..
+        } => {
+            let remapped = project.remap_stack(stack);
+            HbotError::invalid(format!("{error}\n{remapped}"))
+        }
+        _ => HbotError::invalid(error.to_string()),
+    }
+}
+
+/// 超时 → `-32004`，**保留 `hbot-code` 的 `HBOT_TIMEOUT` 机器标识**。
+///
+/// 为什么不能只用 `HbotError::timeout("sandbox.dispatch", ms)`：那句的 Display 是
+/// `timeout after 4000ms: sandbox.dispatch`，运维按 `HBOT_TIMEOUT` grep 超时会一条都
+/// 搜不到（真正的原因文案在 `crates/hbot-code/src/error.rs` 的
+/// `CodeError::Timeout`，是 `HBOT_TIMEOUT: handler exceeded the …`）。
+///
+/// 所以把原始的 `CodeError` 文案整段括在操作名后面：
+/// `timeout after 4000ms: sandbox.dispatch (HBOT_TIMEOUT: handler exceeded the 4000 ms
+/// budget and was interrupted)`。这样四处都还能定位：
+/// * `HBOT_TIMEOUT` —— 运维/告警的机器标识（本函数存在的唯一理由）；
+/// * `timeout after` + 毫秒数 —— 老的 grep 与 `crates/hbot-parity` 的用例；
+/// * `sandbox.dispatch` —— 还看得出是 dispatch 阶段的超时，不是编译期。
+///
+/// 文案不在这里重抄：`{error}` 走 `CodeError` 的 Display，那段文字的唯一真源在
+/// `hbot-code`；在这边手写第二份会在对方改措辞时悄悄漂移。
+fn timeout_error(error: &CodeError) -> HbotError {
+    match error {
+        CodeError::Timeout { budget_ms } => HbotError::Timeout {
+            operation: format!("sandbox.dispatch ({error})"),
+            timeout_ms: *budget_ms,
+        },
+        // 只有 `Timeout` 会进来（上面的匹配臂决定）。保守回退成 internal 而不是 panic：
+        // 这条路径在"处理消息失败"的日志链上，辅助函数不该因为将来多一个变体就把
+        // bot 打死。
+        other => HbotError::internal(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use hbot_bot::ConversationRef;
+    use hbot_core::{ConversationId, MessageId, Timestamp};
+    use hbot_store::{Bot as StoreBot, Project, ProjectId};
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::app::test_support::TempDir;
+
+    /// 一版能跑的代码（回复 `v1`）。
+    const GOOD_V1: &str = "import { defineBot } from 'hbot';\n\
+                            export default defineBot({\n\
+                              onMessage(ctx) {\n\
+                                ctx.reply('v1');\n\
+                              },\n\
+                            });\n";
+
+    /// 第二版能跑的代码（回复 `v2`）：用来验证"修好之后真的换到新版本"。
+    const GOOD_V2: &str = "import { defineBot } from 'hbot';\n\
+                            export default defineBot({\n\
+                              onMessage(ctx) {\n\
+                                ctx.reply('v2');\n\
+                              },\n\
+                            });\n";
+
+    /// 编译期就失败：裸导入被 §6.1 的模块规则拒绝（`HBOT_BARE_IMPORT`）。
+    const BROKEN: &str = "import lodash from 'lodash';\nexport default lodash;\n";
+
+    /// 运行时死循环：只有超时中断能让它停下来，用来触发 isolate 崩溃预算。
+    const SPIN: &str = "import { defineBot } from 'hbot';\n\
+                        export default defineBot({\n\
+                          onMessage() {\n\
+                            for (;;) {}\n\
+                          },\n\
+                        });\n";
+
+    /// 先写一行日志、再抛错：P2 缺陷的最小复现（旧实现里那行日志随 error 分支被丢掉）。
+    const LOG_THEN_THROW: &str = "import { defineBot } from 'hbot';\n\
+                                  export default defineBot({\n\
+                                    onMessage(ctx) {\n\
+                                      ctx.log('before the throw');\n\
+                                      throw new Error('boom');\n\
+                                    },\n\
+                                  });\n";
+
+    /// 每条消息的测试硬超时：handler 挂住时让用例 10 秒内红掉，而不是让 CI 无限期卡住。
+    const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// 一个装配好的 handler 及其依赖（项目目录 + 真 SQLite + 回复通道）。
+    struct Env {
+        _dir: TempDir,
+        root: PathBuf,
+        store: Arc<Store>,
+        events: Arc<EventBus>,
+        bot_id: BotId,
+        conversation_id: ConversationId,
+        handler: Arc<SandboxHandler>,
+        replies: mpsc::Receiver<OutboundRequest>,
+    }
+
+    impl Env {
+        /// 默认夹具：默认 limits、元数据 TTL 归零（改文件立刻可见）、关闭去抖。
+        fn new(label: &str, main_ts: &str) -> Self {
+            Self::build(
+                label,
+                main_ts,
+                Limits::new(),
+                Duration::ZERO,
+                Duration::from_secs(60),
+                Duration::ZERO,
+            )
+        }
+
+        fn build(
+            label: &str,
+            main_ts: &str,
+            limits: Limits,
+            metadata_ttl: Duration,
+            content_floor: Duration,
+            debounce: Duration,
+        ) -> Self {
+            let dir = TempDir::new(label);
+            let root = dir.path().join("project");
+            std::fs::create_dir_all(root.join("src")).expect("建 src 目录");
+            std::fs::write(root.join("src").join("main.ts"), main_ts).expect("写 main.ts");
+
+            let store = Arc::new(Store::open(dir.path().join("hbot.db")).expect("打开测试库"));
+            let project_id = ProjectId::from_uuid(Uuid::from_u128(0x1000_0000_0000_0001));
+            let bot_id = BotId::from_uuid(Uuid::from_u128(0x2000_0000_0000_0002));
+            // 日志表有指向 `bots` 的外键：这两行必须先落库，否则 error 日志写不进去。
+            store
+                .insert_project(&Project {
+                    id: project_id,
+                    name: "test-project".to_owned(),
+                    path: root.display().to_string(),
+                    created_at: 1,
+                })
+                .expect("插入项目");
+            store
+                .insert_bot(&StoreBot {
+                    id: bot_id,
+                    project_id,
+                    name: "test-bot".to_owned(),
+                    platform: "onebot".to_owned(),
+                    config_json: "{}".to_owned(),
+                    enabled: true,
+                    created_at: 1,
+                })
+                .expect("插入 bot");
+
+            let events = Arc::new(EventBus::new());
+            let (reply_tx, reply_rx) = mpsc::channel(REPLY_CAPACITY);
+            let handler = Arc::new(
+                SandboxHandler::new(SandboxHandlerConfig {
+                    bot_id,
+                    project_root: root.clone(),
+                    limits,
+                    store: Arc::clone(&store),
+                    events: Arc::clone(&events),
+                    clock: Arc::new(hbot_adapters::SystemClock),
+                    replies: reply_tx,
+                })
+                .with_debounce(debounce)
+                .with_fingerprint_ttls(metadata_ttl, content_floor),
+            );
+
+            Self {
+                _dir: dir,
+                root,
+                store,
+                events,
+                bot_id,
+                conversation_id: ConversationId::from_uuid(Uuid::from_u128(0xc0_0000_0000_0003)),
+                handler,
+                replies: reply_rx,
+            }
+        }
+
+        /// 改写 `src/main.ts`（模拟用户在 IDE 里保存）。
+        fn write_main(&self, contents: &str) {
+            std::fs::write(self.root.join("src").join("main.ts"), contents).expect("改写 main.ts");
+        }
+
+        /// 造一条入站消息（`external_id` 就是平台消息 ID）。
+        fn ctx(&self, external_id: &str, text: &str) -> MessageCtx {
+            self.ctx_with_payload(external_id, json!({ "text": text }))
+        }
+
+        /// 造一条调试注入消息（`bot_inject` 的载荷：带 `injected` 标记）。
+        fn injected_ctx(&self, external_id: &str, text: &str) -> MessageCtx {
+            self.ctx_with_payload(external_id, json!({ "text": text, "injected": true }))
+        }
+
+        fn ctx_with_payload(&self, external_id: &str, payload: Value) -> MessageCtx {
+            let message = hbot_core::InboundMessage {
+                id: MessageId::from_uuid(Uuid::from_u128(0x3000_0000_0000_0004)),
+                bot_id: self.bot_id,
+                conversation_id: self.conversation_id,
+                external_id: external_id.to_owned(),
+                sender_id: "sender-1".to_owned(),
+                payload,
+                received_at: Timestamp::from_unix_millis(1_000),
+                processed_at: None,
+            };
+            MessageCtx::new(
+                self.bot_id,
+                message,
+                ConversationRef::new("chat-1", hbot_core::ConversationKind::Group),
+            )
+        }
+
+        /// 处理一条消息，带**硬超时**：挂住必须变成带位置的失败，不能把 CI 拖成永远。
+        ///
+        /// 回归价值来自一次真实事故：旧版 `compiled()` 写成
+        /// `match lock(&self.hot).last_good() { Some => … lock(&self.hot).mark_failed(…) }`，
+        /// `match` 的临时守卫活到整个 match 结尾，于是同一线程对同一个 std Mutex 二次加锁
+        /// → 编译失败并且已有上一版时**静默死锁**（用例 60 秒无输出、CPU 0%）。当时没有任何
+        /// 超时，所以表现为 CI 无限期卡住；这层 10 秒超时让同类问题在下一次就红。
+        async fn handle(&self, ctx: MessageCtx) -> Result<(), HbotError> {
+            match tokio::time::timeout(MESSAGE_TIMEOUT, self.handler.on_message(ctx)).await {
+                Ok(result) => result,
+                Err(_) => panic!("on_message 超过 {MESSAGE_TIMEOUT:?} 没有返回：handler 挂住了"),
+            }
+        }
+
+        /// 取走目前为止产出的全部回复。
+        fn take_replies(&mut self) -> Vec<OutboundRequest> {
+            let mut collected = Vec::new();
+            while let Ok(request) = self.replies.try_recv() {
+                collected.push(request);
+            }
+            collected
+        }
+
+        /// 日志表里以 `needle` 开头的 error 行数。
+        ///
+        /// 用"开头"而不是"包含"：消息失败那行也会带上编译错误原文
+        /// （`消息 … 处理失败：生成代码编译失败…`），包含匹配会把它数进来。
+        fn error_lines(&self, needle: &str) -> Vec<String> {
+            self.store
+                .list_logs(Some(&self.bot_id), 200)
+                .expect("读日志")
+                .into_iter()
+                .filter(|row| row.level == "error" && row.line.starts_with(needle))
+                .map(|row| row.line)
+                .collect()
+        }
+
+        /// 已产出的回复文本。
+        fn reply_texts(&mut self) -> Vec<String> {
+            self.take_replies()
+                .into_iter()
+                .map(|request| request.text)
+                .collect()
+        }
+    }
+
+    /// D2：第一次编译就失败（没有任何可用版本）——消息确实处理不了，必须返回真错误，
+    /// 让 inbound 保持未处理并在修好代码后重试。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn first_compile_failure_without_last_good_returns_error() {
+        let mut env = Env::new("first-compile-fails", BROKEN);
+
+        let error = env
+            .handle(env.ctx("evt-1", "hi"))
+            .await
+            .expect_err("没有可用版本时必须返回真错误");
+
+        assert_eq!(error.code(), -32002, "编译错误映射为 invalid：{error}");
+        let text = error.to_string();
+        assert!(
+            text.contains("没有可用的已编译版本"),
+            "错误文案必须说清「没有可用版本」：{text}"
+        );
+        assert!(
+            text.contains("修好代码后会自动重试"),
+            "错误文案必须说清「消息会重试」：{text}"
+        );
+        assert_eq!(
+            env.error_lines("生成代码编译失败").len(),
+            1,
+            "编译失败必须写一条 error 日志给 logs_tail / UI"
+        );
+        assert!(
+            env.reply_texts().is_empty(),
+            "没有可用版本时不该产出任何回复"
+        );
+    }
+
+    /// D2 核心：改坏代码后**继续用上一版服务**，消息不失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compile_failure_keeps_serving_last_good_version() {
+        let mut env = Env::new("keep-last-good", GOOD_V1);
+
+        env.handle(env.ctx("evt-1", "one"))
+            .await
+            .expect("第一版能跑");
+        assert_eq!(env.reply_texts(), vec!["v1".to_owned()]);
+
+        env.write_main(BROKEN);
+        let before = env.handler.compile_count();
+        env.handle(env.ctx("evt-2", "two"))
+            .await
+            .expect("一个错别字不许让每条消息都失败");
+        assert_eq!(
+            env.handler.compile_count(),
+            before + 1,
+            "新指纹要真的尝试编译一次"
+        );
+        assert_eq!(
+            env.reply_texts(),
+            vec!["v1".to_owned()],
+            "编译失败时继续用上一版代码回复"
+        );
+
+        // 同一条坏代码再来一条消息：不许再编译（否则每条消息都在烧 CPU）。
+        let after_typo = env.handler.compile_count();
+        env.handle(env.ctx("evt-3", "three"))
+            .await
+            .expect("继续用上一版服务");
+        assert_eq!(
+            env.handler.compile_count(),
+            after_typo,
+            "同一份坏代码只编译一次，之后直接复用上一版"
+        );
+        assert_eq!(env.reply_texts(), vec!["v1".to_owned()]);
+        assert_eq!(
+            env.error_lines("生成代码编译失败").len(),
+            1,
+            "同一指纹的失败只记一次，不许每条消息都刷一行 error 日志"
+        );
+    }
+
+    /// D2：改好代码后真的换到新版本（不是一直卡在上一版）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fixed_code_is_compiled_and_swapped_in() {
+        let mut env = Env::new("swap-in", GOOD_V1);
+        env.handle(env.ctx("evt-1", "one")).await.expect("v1");
+        assert_eq!(env.reply_texts(), vec!["v1".to_owned()]);
+
+        env.write_main(BROKEN);
+        env.handle(env.ctx("evt-2", "two"))
+            .await
+            .expect("坏代码期间继续服务 v1");
+        assert_eq!(env.reply_texts(), vec!["v1".to_owned()]);
+
+        env.write_main(GOOD_V2);
+        env.handle(env.ctx("evt-3", "three"))
+            .await
+            .expect("修好后应该编译成功");
+        assert_eq!(
+            env.reply_texts(),
+            vec!["v2".to_owned()],
+            "新指纹编译成功后必须换到新版本"
+        );
+    }
+
+    /// D1：代码没变时，连续 N 条消息**一次文件内容读都不做**。
+    ///
+    /// 旧实现每条消息都 blake3 全项目源码；这里用 `content_reads` 计数器钉住回归
+    /// （计数器是按"读了几个文件"累加的）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unchanged_code_is_not_reread_for_consecutive_messages() {
+        // 元数据 TTL 取生产值（2s）+ 内容地板拉长到 60s：整轮用例落在一个"信任期"里，
+        // 所以任何一次内容读都只可能来自热路径的旧实现。
+        let env = Env::build(
+            "no-content-reads",
+            GOOD_V1,
+            Limits::new(),
+            super::super::fingerprint_cache::DEFAULT_METADATA_TTL,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        );
+
+        env.handle(env.ctx("evt-0", "warmup"))
+            .await
+            .expect("首条消息需要编译一次");
+        let baseline = env.handler.content_reads();
+        assert_eq!(baseline, 1, "项目只有一个源文件，首轮应读一次内容");
+
+        for index in 0..20 {
+            env.handle(env.ctx(&format!("evt-{index}"), "hi"))
+                .await
+                .expect("代码没变，消息必须照常处理");
+        }
+        assert_eq!(
+            env.handler.content_reads(),
+            baseline,
+            "20 条消息、代码没变：热路径不许再读任何文件内容"
+        );
+        assert_eq!(env.handler.compile_count(), 1, "没变就不该重编译");
+    }
+
+    /// D2：崩溃预算 —— 同一指纹连崩 3 次封顶，新指纹重置（纯状态机）。
+    #[test]
+    fn crash_budget_blocks_after_three_and_resets_on_new_fingerprint() {
+        let mut budget = CrashBudget::default();
+        assert!(!budget.record_crash("fp-a"), "第 1 次不该封顶");
+        assert_eq!(budget.consecutive(), 1);
+        assert!(!budget.record_crash("fp-a"), "第 2 次不该封顶");
+        assert!(budget.record_crash("fp-a"), "第 3 次必须报告封顶");
+        assert_eq!(budget.consecutive(), 3);
+        assert!(budget.is_blocked("fp-a"), "封顶后该指纹不再自动重启");
+        assert!(!budget.is_blocked("fp-b"), "封顶只对被封的那个指纹生效");
+
+        assert!(
+            !budget.record_crash("fp-b"),
+            "新指纹是新的诊断对象：计数与封顶都清零"
+        );
+        assert_eq!(budget.consecutive(), 1);
+        assert!(!budget.is_blocked("fp-b"));
+        assert!(!budget.is_blocked("fp-a"), "换指纹后旧指纹的封顶也解除了");
+    }
+
+    /// D2：真跑 3 次 isolate 超时（`for(;;)` + 120ms 预算）→ 停止自动重启，第 4 条被拒绝。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_isolate_crashes_stop_auto_restart() {
+        let limits = Limits::new().with_handler_timeout(Duration::from_millis(120));
+        let env = Env::build(
+            "crash-budget",
+            SPIN,
+            limits,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        );
+
+        for attempt in 1..=CRASH_BUDGET_LIMIT {
+            let error = match env.handle(env.ctx(&format!("evt-{attempt}"), "spin")).await {
+                Ok(()) => panic!("第 {attempt} 次死循环必须超时"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.code(),
+                -32004,
+                "第 {attempt} 次超时必须映射为 -32004：{error}"
+            );
+        }
+
+        let error = env
+            .handle(env.ctx("evt-after", "spin"))
+            .await
+            .expect_err("封顶后必须明确报错，不许静默重启");
+        assert!(
+            error.to_string().contains("已停止自动重启"),
+            "第 4 条消息必须说明自动重启已停止：{error}"
+        );
+        assert_eq!(error.code(), -32006, "这是平台侧状态，不是用户代码错误");
+        assert!(
+            !env.error_lines("isolate 连续崩溃").is_empty(),
+            "停止自动重启必须写 error 日志，不能只在内存里沉默"
+        );
+    }
+
+    /// D2：封顶之后改代码（新指纹）自动恢复服务。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_fingerprint_resets_the_crash_budget() {
+        let limits = Limits::new().with_handler_timeout(Duration::from_millis(120));
+        let mut env = Env::build(
+            "crash-reset",
+            SPIN,
+            limits,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        );
+
+        for attempt in 1..=CRASH_BUDGET_LIMIT {
+            let error = env
+                .handle(env.ctx(&format!("evt-{attempt}"), "spin"))
+                .await
+                .expect_err("死循环必须超时");
+            assert_eq!(error.code(), -32004, "超时映射为 -32004：{error}");
+        }
+        assert!(
+            env.handle(env.ctx("evt-blocked", "spin")).await.is_err(),
+            "前提：此刻应该已经被封顶"
+        );
+
+        // 用户改代码 = 新指纹 = 新的诊断对象，预算必须重置。
+        env.write_main(GOOD_V2);
+        env.handle(env.ctx("evt-fixed", "hi"))
+            .await
+            .expect("新指纹必须重置崩溃预算并重新部署 isolate");
+        assert_eq!(env.reply_texts(), vec!["v2".to_owned()]);
+    }
+
+    /// D2：连番保存（5 条消息同时发现缓存失效）只编译一次。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn debounce_coalesces_concurrent_compiles() {
+        let env = Arc::new(Env::build(
+            "debounce",
+            GOOD_V1,
+            Limits::new(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Duration::from_millis(80),
+        ));
+
+        let mut tasks = Vec::new();
+        for index in 0..5 {
+            let handler = Arc::clone(&env.handler);
+            let ctx = env.ctx(&format!("evt-{index}"), "hi");
+            tasks.push(tokio::spawn(async move {
+                match tokio::time::timeout(MESSAGE_TIMEOUT, handler.on_message(ctx)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        panic!("on_message 超过 {MESSAGE_TIMEOUT:?} 没有返回：handler 挂住了")
+                    }
+                }
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("任务不该 panic")
+                .expect("每条消息都要被处理");
+        }
+        assert_eq!(
+            env.handler.compile_count(),
+            1,
+            "并发/连番保存期间只许编译一次（300ms 去抖窗口）"
+        );
+    }
+
+    /// D3：被动回复必须带上触发它的平台消息 ID。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replies_carry_the_platform_message_id() {
+        let mut env = Env::new("reply-to", GOOD_V1);
+        env.handle(env.ctx("msg-777", "hi"))
+            .await
+            .expect("处理成功");
+
+        let replies = env.take_replies();
+        assert_eq!(replies.len(), 1, "一条消息一个回复");
+        assert_eq!(replies[0].text, "v1");
+        assert_eq!(
+            replies[0].reply_to.as_deref(),
+            Some("msg-777"),
+            "QQ/OneBot 被动回复靠这个 ID 组 reply 段并计入配额"
+        );
+    }
+
+    /// D3：调试注入的 `external_id` 是合成去重键，不能当 `reply_to` 用（会被平台拒发）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn injected_messages_do_not_reuse_a_synthetic_id_as_reply_to() {
+        let mut env = Env::new("injected", GOOD_V1);
+        env.handle(env.injected_ctx("inject-abc", "hi"))
+            .await
+            .expect("注入消息照常处理");
+
+        let replies = env.take_replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0].reply_to, None,
+            "合成的 inject-… 不是平台消息 ID，只能按主动消息发"
+        );
+    }
+
+    /// 超时重映射必须保留 `hbot-code` 的 `HBOT_TIMEOUT` 机器标识。
+    ///
+    /// 起因（parity 的 P3）：`HbotError::timeout("sandbox.dispatch", ms)` 的 Display 只有
+    /// `timeout after 4000ms: sandbox.dispatch`，运维按 `HBOT_TIMEOUT` grep 一条都搜不到。
+    /// 这条用例把四处可定位性一起钉住：机器标识、毫秒数、dispatch 阶段、既有 `timeout after`
+    /// 文案（`crates/hbot-parity/tests/parity_05_*.rs` 按它断言，别改掉）。
+    #[test]
+    fn timeout_keeps_the_hbot_code_marker() {
+        let error = CodeError::Timeout { budget_ms: 4000 };
+        let mapped = timeout_error(&error);
+        assert_eq!(mapped.code(), -32004, "超时必须是可重试的 -32004");
+        let text = mapped.to_string();
+        assert!(
+            text.contains("HBOT_TIMEOUT"),
+            "重映射后丢了 hbot-code 的机器标识（运维按它 grep）：{text}"
+        );
+        assert!(text.contains("4000"), "文案里必须带毫秒数：{text}");
+        assert!(
+            text.contains("sandbox.dispatch"),
+            "文案里要能看出是 dispatch 阶段超时：{text}"
+        );
+        assert!(
+            text.contains("timeout after"),
+            "既有 grep 与 parity 用例按 `timeout after` 断言，不能丢：{text}"
+        );
+        assert!(
+            text.contains("budget and was interrupted"),
+            "原 CodeError 的措辞应当整段保留（单一真源在 hbot-code）：{text}"
+        );
+    }
+
+    /// 防呆：上面用例里的 `env.store` / `env.events` 不是死字段（供后续用例扩展）。
+    #[test]
+    fn fixture_keeps_store_and_event_bus_alive() {
+        let env = Env::new("fixture", GOOD_V1);
+        assert!(env.store.schema_version().is_ok());
+        assert!(Path::new(&env.root).exists());
+        assert_eq!(env.events.receiver_count(), 0);
+    }
+
+    /// P2 回归：handler **抛错之前**用 `ctx.log` 写出的行必须留在日志表与
+    /// `RunLog` 流里，并且排在"处理失败"那行**之前**。
+    ///
+    /// 旧实现里 `finish` 的错误分支只返回 `CodeError`，`RawEvent.logs` 在
+    /// `hbot-code` 内部就被丢掉，rpc 侧 `record_logs` 只有成功路径会走 ——
+    /// 用户看到的是"我的 bot 出错了，但出错前那三行 log 一条都没有"。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn logs_written_before_a_throw_are_persisted_before_the_error_line() {
+        let mut env = Env::new("log-before-throw", LOG_THEN_THROW);
+        // 先订阅：`RunLog` 是广播事件，处理完再订阅就收不到已经发出去的那几条。
+        let mut run_log = env.events.subscribe();
+
+        let error = env
+            .handle(env.ctx("evt-1", "hi"))
+            .await
+            .expect_err("handler 抛错必须让消息失败");
+        assert_eq!(error.code(), -32002, "JS 异常映射为 invalid：{error}");
+        assert!(error.to_string().contains("boom"), "{error}");
+        assert!(
+            env.take_replies().is_empty(),
+            "失败路径不交付回复（回复只在成功路径 deliver）"
+        );
+
+        // 日志表：`list_logs` 最新在前，所以用户那行的下标必须更大（写得更早）。
+        let rows: Vec<(String, String)> = env
+            .store
+            .list_logs(Some(&env.bot_id), 200)
+            .expect("读日志")
+            .into_iter()
+            .map(|row| (row.level, row.line))
+            .collect();
+        let user_at = rows
+            .iter()
+            .position(|(level, line)| level == "info" && line == "before the throw")
+            .unwrap_or_else(|| panic!("用户日志行没有落进日志表：{rows:?}"));
+        let error_at = rows
+            .iter()
+            .position(|(level, line)| level == "error" && line.starts_with("消息 "))
+            .unwrap_or_else(|| panic!("失败的错误行没有落进日志表：{rows:?}"));
+        assert!(
+            user_at > error_at,
+            "用户那行必须先于错误行落库（最新在前：user_at={user_at}, error_at={error_at}）：{rows:?}"
+        );
+
+        // 事件流：`RunLog` 的到达顺序同样必须是"用户日志 → 错误行"。
+        let mut emitted: Vec<(bool, String)> = Vec::new();
+        while let Ok(event) = run_log.try_recv() {
+            if let Event::RunLog { level, line, .. } = event {
+                emitted.push((level == LogLevel::Error, line));
+            }
+        }
+        let user_event = emitted
+            .iter()
+            .position(|(is_error, line)| !is_error && line == "before the throw")
+            .unwrap_or_else(|| panic!("RunLog 流里没有用户日志：{emitted:?}"));
+        let error_event = emitted
+            .iter()
+            .position(|(is_error, line)| *is_error && line.starts_with("消息 "))
+            .unwrap_or_else(|| panic!("RunLog 流里没有失败错误行：{emitted:?}"));
+        assert!(
+            user_event < error_event,
+            "RunLog 流里用户日志必须先于错误行（user_event={user_event}, error_event={error_event}）：{emitted:?}"
+        );
     }
 }

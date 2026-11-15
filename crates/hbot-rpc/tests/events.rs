@@ -235,7 +235,7 @@ fn diff_and_debug_events_use_dotted_type_and_camel_case_fields() {
 
     assert_event(
         Event::DebugPaused {
-            session_id: session(),
+            bot_id: bot(),
             file: "src/main.rs".to_string(),
             line: 12,
             scopes: vec![DebugScope {
@@ -251,7 +251,7 @@ fn diff_and_debug_events_use_dotted_type_and_camel_case_fields() {
         },
         json!({
             "type": "debug.paused",
-            "sessionId": SESSION_UUID,
+            "botId": BOT_UUID,
             "file": "src/main.rs",
             "line": 12,
             "scopes": [{ "name": "locals", "variables": { "count": 3 } }],
@@ -265,10 +265,8 @@ fn diff_and_debug_events_use_dotted_type_and_camel_case_fields() {
     );
 
     assert_event(
-        Event::DebugResumed {
-            session_id: session(),
-        },
-        json!({ "type": "debug.resumed", "sessionId": SESSION_UUID }),
+        Event::DebugResumed { bot_id: bot() },
+        json!({ "type": "debug.resumed", "botId": BOT_UUID }),
     );
 }
 

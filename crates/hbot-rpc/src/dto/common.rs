@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use hbot_core::{HbotError, Timestamp};
+use hbot_core::{BotId, BotStatus, HbotError, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -69,6 +69,27 @@ pub enum FileChangeKind {
     Deleted,
     /// 重命名 / 移动（旧路径与新路径各发一次）。
     Renamed,
+}
+
+/// 一条 bot 摘要（`bot_list` 的 `data` 元素）。
+///
+/// 字段只取库里真的有的列：`bots` 表提供 `id` / `name` / `platform`，
+/// `bot_status` 表提供 `status` / `updated_at`（从未变更为 0）。`status` 是
+/// **本进程的活跃态优先**：supervisor 在跑就是 `running`，占位中就是 `starting`；
+/// 否则回落库里最后一次落盘的状态——崩溃残留的 `running` 行不会让 UI 以为它活着。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct BotSummary {
+    /// Bot ID。
+    pub bot_id: BotId,
+    /// 展示名（`bots.name`）。
+    pub name: String,
+    /// 平台（`bots.platform`，如 `onebot11`）。
+    pub platform: String,
+    /// 当前状态。
+    pub status: BotStatus,
+    /// 状态最后一次变更的时间（毫秒时间戳）；从未变更为 0。
+    pub updated_at: Timestamp,
 }
 
 /// 一条搜索匹配（`file.search.matches`）。
@@ -190,6 +211,21 @@ pub struct AppInfo {
     pub platform: String,
     /// 数据目录绝对路径（DB、日志、缓存）。
     pub data_dir: String,
+}
+
+/// `ProjectCreate` 命令的 data：刚建出来的那个项目的摘要。
+///
+/// **不要**复用它描述进程（版本 / 平台 / 数据目录是 [`AppInfo`] 的活）：这个类型
+/// 说的是"哪个项目"，给 UI 的是打开入口文件所需的三件事。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSummary {
+    /// 项目根目录绝对路径（规范化后的，可直接用作后续文件命令的根）。
+    pub path: String,
+    /// 展示名（`hbot.json` 的 `name`）。
+    pub name: String,
+    /// 入口文件的项目内相对路径（默认 `src/main.ts`，`/` 分隔）；UI 打开它即可。
+    pub entry: String,
 }
 
 /// `FileRead` / `FileWrite` / `FileCreate` 命令的 data：文件内容与内容哈希。

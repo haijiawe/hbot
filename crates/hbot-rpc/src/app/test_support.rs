@@ -79,3 +79,21 @@ pub fn temp_state_with_project() -> (TempDir, AppState, PathBuf) {
         .expect("open_project");
     (dir, state, project)
 }
+
+/// 同 [`temp_state_with_project`]，但**不**自己建 runtime。
+///
+/// `#[tokio::test]` 里不能调上面那个：它会 `block_on`，而当前线程已经在跑 runtime
+/// （"Cannot start a runtime from within a runtime"）。异步测试用这个版本。
+pub async fn async_temp_state_with_project() -> (TempDir, AppState, PathBuf) {
+    let dir = TempDir::new("project");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("建项目目录");
+    let state = AppState::open(
+        dir.path().join("data"),
+        Arc::new(SystemClock),
+        Arc::new(UuidIds),
+    )
+    .expect("AppState::open");
+    state.open_project(&project).await.expect("open_project");
+    (dir, state, project)
+}

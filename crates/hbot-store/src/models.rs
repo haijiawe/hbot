@@ -155,6 +155,27 @@ pub struct InboundRow {
     pub received_at: i64,
 }
 
+/// 启动补偿用的一行未处理入站消息：`inbound` 行 + 它的会话目标 + 游标。
+///
+/// 为什么把会话字段一起带出来：补偿要在启动时把每个 `MessageCtx` 的
+/// `ConversationRef` 还原完整（外部 ID + 类型），逐行再查一次 `conversations` 就是
+/// N+1 次 db 往返；一条 JOIN 就够。
+///
+/// 为什么要 [`rowid`](Self::rowid)：分批取用 `(received_at, rowid)` 做 keyset 游标。
+/// 只按 `received_at` 分页时，同一毫秒的多条消息会缺一个可比较的位次，容易漏行或
+/// 反复取到同一批；`inbound.id` 是 TEXT 主键，但表不是 `WITHOUT ROWID`，隐式 `rowid`
+/// 就是插入顺序，单调且唯一。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundReplayRow {
+    pub message: InboundRow,
+    /// SQLite 隐式 `rowid`（插入顺序）。
+    pub rowid: i64,
+    /// 会话的外部 ID（平台侧群号 / 用户号）。
+    pub conversation_external_id: String,
+    /// 会话类型（`private` / `group` / `channel` / `unknown`）。
+    pub conversation_kind: String,
+}
+
 /// `logs` 行（行级 DTO）。`id` 是 SQLite AUTOINCREMENT，天然编码写入先后。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRow {

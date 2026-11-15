@@ -21,8 +21,8 @@ pub mod ws;
 pub use app::{AppState, EventBus};
 pub use dispatch::Dispatcher;
 pub use dto::{
-    ApiError, AppInfo, Command, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry,
-    EditFile, Event, FileChangeKind, FileContent, LogLevel, Response, RiskLevel, RunLog,
-    SearchMatch, StackFrame, StepKind,
+    ApiError, AppInfo, BotSummary, Command, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk,
+    DirEntry, EditFile, Event, FileChangeKind, FileContent, LogLevel, ProjectSummary, Response,
+    RiskLevel, RunLog, SearchMatch, StackFrame, StepKind,
 };
 pub use ws::{WsConfig, WsHandle, WsMetrics, WsServer, serve};

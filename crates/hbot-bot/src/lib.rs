@@ -35,8 +35,9 @@
 //!
 //! ## 启动/停止顺序
 //!
-//! 见 [`supervisor`] 的模块文档：先建 bot/conversation 行、再订阅、再恢复 outbox、最后
-//! 才读事件（`AGENTS.md` §7.1 的旧坑）；停止是停止读取 → 排空 → 取消 worker → flush。
+//! 见 [`supervisor`] 的模块文档：先建 bot/conversation 行、再订阅、再恢复 outbox、
+//! 再重放上次没处理完的入站消息、最后才读事件（`AGENTS.md` §7.1 的旧坑）；停止是
+//! 停止读取 → 排空 → 取消 worker → flush。
 //!
 //! ## 依赖注入
 //!

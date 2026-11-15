@@ -77,21 +77,54 @@ pub(crate) fn get(conn: &Connection, id: &OutboundId) -> Result<Option<OutboundR
         .optional()?)
 }
 
-/// 列出待发送的出站消息，按 `id` 升序取前 `limit` 条。
+/// 列出待发送的出站消息，按**产生顺序**取前 `limit` 条。
 ///
-/// **排序说明**：按 `id`（UUID 字符串）升序是调用方契约（续发顺序与落库顺序一致由
-/// 调用方保证 id 的生成方式决定）。UUID v4 的字典序本身不含时间含义，若上游用 v4 随机
-/// 生成，续发顺序只是“确定但不一定按时间”——要按时间续发请看 `created_at` 字段。
+/// **排序说明**：先 `created_at`（生产时刻），再 `rowid`（插入顺序）。
+/// 为什么不是 `id`：`id` 是 UUID（`ids.rs` 用 `Uuid::new_v4`），字典序与时间无关，
+/// 按它续发会把同一会话的回复打乱成随机顺序——而 `AGENTS.md` §4.1 的契约是
+/// “一个会话的回复按产生顺序发出”。
+///
+/// 为什么还要 `rowid`：同一毫秒内产生的多条回复 `created_at` 相同，必须靠插入顺序
+/// 兜底。`outbound.id` 是 TEXT 主键，但 SQLite 对非 `WITHOUT ROWID` 表仍维护隐式
+/// `rowid`，且它随插入单调递增，正好就是“入库顺序”。
 pub(crate) fn list_pending(conn: &Connection, limit: u32) -> Result<Vec<OutboundRow>> {
     let sql = format!(
         "SELECT {OUTBOUND_COLUMNS} FROM outbound
          WHERE state = ?1
-         ORDER BY id
+         ORDER BY created_at, rowid
          LIMIT ?2"
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(
         params![OUTBOUND_STATE_PENDING, i64::from(limit)],
+        row_to_outbound,
+    )?;
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(row?);
+    }
+    Ok(messages)
+}
+
+/// 列出某个 bot 的待发送出站消息，按**产生顺序**（`created_at`, `rowid`）取前 `limit` 条。
+///
+/// 与 [`list_pending`] 的区别只有 `bot_id` 过滤：进程重启续发时是**按 bot** 恢复的
+/// （`hbot_bot::PendingOutboxSource::pending` 只收到一个 `bot_id`），先取全局前 N 条再
+/// 在内存里过滤，会被别的 bot 的积压挤出窗口——那等于静默丢消息。
+pub(crate) fn list_pending_for_bot(
+    conn: &Connection,
+    bot_id: &crate::ids::BotId,
+    limit: u32,
+) -> Result<Vec<OutboundRow>> {
+    let sql = format!(
+        "SELECT {OUTBOUND_COLUMNS} FROM outbound
+         WHERE state = ?1 AND bot_id = ?2
+         ORDER BY created_at, rowid
+         LIMIT ?3"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(
+        params![OUTBOUND_STATE_PENDING, bot_id.to_string(), i64::from(limit)],
         row_to_outbound,
     )?;
     let mut messages = Vec::new();

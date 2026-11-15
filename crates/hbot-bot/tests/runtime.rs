@@ -26,6 +26,35 @@ fn event_ids(seen: &[common::Seen]) -> Vec<String> {
     seen.iter().map(|item| item.external_id.clone()).collect()
 }
 
+/// 直接往库里写一条**未处理**的入站行，模拟"上一个进程收了消息、还没处理就死了"。
+///
+/// 走 store 而不是 adapter：重放要覆盖的正是"库里已经有行、但 `processed_at` 还是
+/// NULL"这个状态，adapter 那条路会先经过 dedupe（那是另一条不变量的测试）。
+fn seed_unprocessed(
+    fixture: &Fixture,
+    seq: u128,
+    external_id: &str,
+    conversation: &str,
+    received_at: i64,
+    text: &str,
+) -> InboundId {
+    let id = InboundId::from_uuid(Uuid::from_u128(
+        0x5eed_0000_0000_0000_0000_0000_0000_0000 | seq,
+    ));
+    fixture
+        .store
+        .insert_inbound_if_new(NewInbound {
+            id,
+            bot_id: bot_id(),
+            external_id: external_id.to_owned(),
+            conversation_id: conversation_id_for(&bot_id(), conversation),
+            payload_json: serde_json::json!({ "text": text }).to_string(),
+            received_at,
+        })
+        .expect("seed unprocessed inbound");
+    id
+}
+
 /// 同一会话连发 100 条：执行顺序必须与入队顺序一致，且该会话内不并发。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_conversation_executes_in_arrival_order() {
@@ -201,6 +230,206 @@ async fn duplicate_delivery_executes_once_even_across_restart() {
     supervisor.stop().await.expect("stop");
 }
 
+// ---------------------------------------------------------------------------
+// D5：启动时重放未处理的 inbound（崩溃/关停窗口里的消息不能丢）
+// ---------------------------------------------------------------------------
+
+/// 库里留着 `processed_at IS NULL` 的行：重启后必须被执行，并补上 `processed_at`。
+///
+/// 这修的是"消息永久丢掉"：读循环在 `queues.enqueue` 上遇到 `Closed` 直接 break，
+/// 那时的消息已经落库但永远不会再被读——只有启动重放能把它们捡回来。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unprocessed_inbound_is_replayed_on_start() {
+    // 声明会话：重放要用 `inbound.conversation_id` 指向一行真实会话（外键）。
+    let fixture = Fixture::new(vec![ConversationRef::new(
+        "chat-replay",
+        ConversationKind::Group,
+    )]);
+    // 先起停一次：把 `bots` / `conversations` 行准备好（模拟"进程重启"）。
+    let supervisor = fixture.supervisor(bot_id(), fixture.deps());
+    supervisor.start().await.expect("first start");
+    supervisor.stop().await.expect("stop");
+
+    seed_unprocessed(&fixture, 1, "evt-replay", "chat-replay", 1_000, "hello");
+    assert_eq!(
+        fixture
+            .store
+            .list_unprocessed_inbound(10)
+            .expect("list")
+            .len(),
+        1,
+        "前提：库里确实有一行未处理"
+    );
+
+    supervisor.start().await.expect("restart");
+    wait_until("replayed message executed", || {
+        fixture.executor.seen().len() == 1
+    })
+    .await;
+
+    let seen = fixture.executor.seen();
+    assert_eq!(event_ids(&seen), vec!["evt-replay".to_owned()]);
+    assert_eq!(seen[0].text.as_deref(), Some("hello"));
+    assert!(
+        fixture
+            .store
+            .list_unprocessed_inbound(10)
+            .expect("list")
+            .is_empty(),
+        "重放成功后必须写 processed_at，否则下次启动会重复执行"
+    );
+    supervisor.stop().await.expect("stop");
+}
+
+/// 多条未处理行按 `received_at` 升序执行（不是按 UUID，也不是按插入顺序）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replayed_inbound_runs_in_received_order() {
+    let fixture = Fixture::new(vec![ConversationRef::new(
+        "chat-order",
+        ConversationKind::Group,
+    )]);
+    let supervisor = fixture.supervisor(bot_id(), fixture.deps());
+    supervisor.start().await.expect("first start");
+    supervisor.stop().await.expect("stop");
+
+    // 插入顺序与 received_at 顺序**故意相反**：只有真按时间排才会得到 1,2,3。
+    seed_unprocessed(&fixture, 11, "evt-third", "chat-order", 3_000, "third");
+    seed_unprocessed(&fixture, 12, "evt-first", "chat-order", 1_000, "first");
+    seed_unprocessed(&fixture, 13, "evt-second", "chat-order", 2_000, "second");
+
+    supervisor.start().await.expect("restart");
+    wait_until("all replayed messages executed", || {
+        fixture.executor.seen().len() == 3
+    })
+    .await;
+    assert_eq!(
+        event_ids(&fixture.executor.seen()),
+        vec![
+            "evt-first".to_owned(),
+            "evt-second".to_owned(),
+            "evt-third".to_owned()
+        ],
+        "重放必须按产生顺序，否则用户看到的是打乱的对话"
+    );
+    supervisor.stop().await.expect("stop");
+}
+
+/// 超过一个取批上限也不许丢：重放要一直追到没有未处理行为止。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_continues_past_one_batch_without_losing_messages() {
+    // 比 `REPLAY_BATCH_SIZE`（256）多几条：确保真的走了第二批。
+    const EXTRA: u64 = 8;
+    let total =
+        usize::try_from(hbot_bot::supervisor::REPLAY_BATCH_SIZE).expect("fits") + EXTRA as usize;
+
+    let fixture = Fixture::new(vec![ConversationRef::new(
+        "chat-batch",
+        ConversationKind::Group,
+    )]);
+    let supervisor = fixture.supervisor(bot_id(), fixture.deps());
+    supervisor.start().await.expect("first start");
+    supervisor.stop().await.expect("stop");
+
+    for seq in 0..total {
+        seed_unprocessed(
+            &fixture,
+            u128::try_from(seq).expect("fits") + 100,
+            &format!("evt-batch-{seq:04}"),
+            "chat-batch",
+            i64::try_from(seq).expect("small") + 1_000,
+            &format!("message {seq}"),
+        );
+    }
+
+    supervisor.start().await.expect("restart");
+    wait_until("every replayed message executed", || {
+        fixture.executor.seen().len() == total
+    })
+    .await;
+    assert!(
+        fixture
+            .store
+            .list_unprocessed_inbound(1_000)
+            .expect("list")
+            .is_empty(),
+        "一批装不下的剩余行必须在后续批次里继续重放"
+    );
+    assert_eq!(
+        fixture.executor.seen().len(),
+        total,
+        "不许因为分批而丢掉消息"
+    );
+    supervisor.stop().await.expect("stop");
+}
+
+/// 已经处理过的行绝不能被重放（否则每次重启都重复回复一遍历史消息）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn processed_inbound_is_not_replayed() {
+    let fixture = Fixture::new(vec![ConversationRef::new(
+        "chat-done",
+        ConversationKind::Group,
+    )]);
+    let supervisor = fixture.supervisor(bot_id(), fixture.deps());
+    supervisor.start().await.expect("first start");
+    supervisor.stop().await.expect("stop");
+
+    let id = seed_unprocessed(&fixture, 21, "evt-done", "chat-done", 1_000, "old");
+    assert!(
+        fixture
+            .store
+            .mark_inbound_processed(&id, 2_000)
+            .expect("mark processed"),
+        "前提：这一行要被标记为已处理"
+    );
+
+    supervisor.start().await.expect("restart");
+    // 没有实时消息，重放也不该捡它：给重放留出跑完的窗口。
+    wait_until("startup finished", || {
+        supervisor.snapshot().startup_steps.len() >= 6
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        fixture.executor.seen().is_empty(),
+        "processed_at 非 NULL 的行不许重放，实际执行了 {:?}",
+        event_ids(&fixture.executor.seen())
+    );
+    supervisor.stop().await.expect("stop");
+}
+
+/// 重放与实时事件并存：同一个 `external_id` 不会被执行两次（去重仍由库保证）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_and_live_event_do_not_execute_the_same_message_twice() {
+    let fixture = Fixture::new(vec![ConversationRef::new(
+        "chat-both",
+        ConversationKind::Group,
+    )]);
+    let supervisor = fixture.supervisor(bot_id(), fixture.deps());
+    supervisor.start().await.expect("first start");
+    supervisor.stop().await.expect("stop");
+
+    seed_unprocessed(&fixture, 31, "evt-both", "chat-both", 1_000, "from db");
+
+    supervisor.start().await.expect("restart");
+    wait_until("replayed", || fixture.executor.seen().len() == 1).await;
+
+    // 平台把同一条消息又推了一遍：必须被 dedupe 挡掉，不能执行第二次。
+    let outcome = supervisor
+        .inject(event("chat-both", "evt-both", "from adapter"))
+        .await
+        .expect("duplicate acknowledged");
+    assert!(
+        matches!(outcome, InjectOutcome::Duplicate { .. }),
+        "重放过的消息再来一次必须是 Duplicate，got {outcome:?}"
+    );
+    assert_eq!(
+        fixture.executor.seen().len(),
+        1,
+        "同一 external_id 只许执行一次"
+    );
+    supervisor.stop().await.expect("stop");
+}
+
 /// 启动顺序：bot 行 → conversations 行 → 订阅 → 恢复 outbox → 开始读取。
 ///
 /// 反证：启动前写 `inbound` 会因外键失败；`conversations` 行就绪后同一条写入成功。
@@ -246,6 +475,9 @@ async fn startup_orders_rows_before_subscription() {
             StartupStep::Conversations.as_str(),
             StartupStep::Subscribe.as_str(),
             StartupStep::RecoverOutbox.as_str(),
+            // D5：未处理入站的重放发生在"读事件循环已经起来"之后、"Reading"之前——
+            // 这样补偿消息和实时消息走同一条队列，实时流量不会因为重放而丢。
+            StartupStep::ReplayInbound.as_str(),
             StartupStep::Reading.as_str(),
         ],
         "startup order is a hard requirement"
@@ -379,6 +611,7 @@ async fn outbound_is_persisted_then_retried_until_sent() {
         .send(OutboundRequest {
             conversation: ConversationRef::new("chat-out", ConversationKind::Group),
             text: "reply".to_owned(),
+            reply_to: None,
         })
         .await
         .expect("persisted and queued");
@@ -429,6 +662,7 @@ async fn outbound_gives_up_after_max_attempts() {
         .send(OutboundRequest {
             conversation: ConversationRef::new("chat-dead", ConversationKind::Group),
             text: "never delivered".to_owned(),
+            reply_to: None,
         })
         .await
         .expect("persisted");

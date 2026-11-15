@@ -37,7 +37,8 @@
 //! |---|---|
 //! | `AppInfo` | [`AppInfo`] |
 //! | `ProjectOpen` | `null`（项目快照随后由 UI 查询/事件补齐） |
-//! | `AgentSend` | `null`（文本经 `agent.delta` 流式返回） |
+//! | `ProjectCreate` | [`ProjectSummary`]（新建项目的根、名字、入口文件） |
+//! | `AgentSend` | `{ sessionId }`（新建会话时返回；文本经 `agent.delta` 流式返回） |
 //! | `AgentCancel` | `null` |
 //! | `AgentApprove` | `null` |
 //! | `FileRead` | [`FileContent`] |
@@ -54,6 +55,7 @@
 //! | `BotStart` | `null`（状态经 `bot.status`） |
 //! | `BotStop` | `null`（状态经 `bot.status`） |
 //! | `BotInject` | `null` |
+//! | `BotList` | `Vec<`[`BotSummary`]`>`（UI 启动时的运行态播种） |
 //! | `DebugSetBreakpoints` | `null` |
 //! | `DebugResume` | `null`（结果经 `debug.resumed` / `debug.paused`） |
 //! | `DebugStep` | `null`（同上） |
@@ -68,8 +70,8 @@ pub mod event;
 
 pub use command::Command;
 pub use common::{
-    ApiError, AppInfo, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile,
-    FileChangeKind, FileContent, LogLevel, Response, RiskLevel, RunLog, SearchMatch, StackFrame,
-    StepKind,
+    ApiError, AppInfo, BotSummary, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry,
+    EditFile, FileChangeKind, FileContent, LogLevel, ProjectSummary, Response, RiskLevel, RunLog,
+    SearchMatch, StackFrame, StepKind,
 };
 pub use event::Event;

@@ -14,9 +14,9 @@ use ts_rs::{Config, TS};
 
 use super::{GeneratedFile, HEADER, INDEX_FILE, TsGenError};
 use crate::dto::{
-    ApiError, AppInfo, Command, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry,
-    EditFile, Event, FileChangeKind, FileContent, LogLevel, Response, RiskLevel, RunLog,
-    SearchMatch, StackFrame, StepKind,
+    ApiError, AppInfo, BotSummary, Command, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk,
+    DirEntry, EditFile, Event, FileChangeKind, FileContent, LogLevel, ProjectSummary, Response,
+    RiskLevel, RunLog, SearchMatch, StackFrame, StepKind,
 };
 
 /// 渲染结果：文件本身 + 它 import 的依赖（供悬空 import 检查）。
@@ -61,6 +61,10 @@ pub fn generated_files() -> Result<Vec<GeneratedFile>, TsGenError> {
         RiskLevel,
         LogLevel,
         FileChangeKind,
+        // `bot_list` 的行：UI 拿它播种运行态，必须与 `bot.status` 事件同一套枚举。
+        BotSummary,
+        // `project_create` 的结果：新项目的根 / 名字 / 入口文件。
+        ProjectSummary,
     );
     // 领域类型：事件载荷里出现的枚举 / 结构。
     export!(
