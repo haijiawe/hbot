@@ -1,0 +1,120 @@
+/* 设计令牌 + 全局重置。布局数值不在这里写死：宽度/高度由 layout.ts 输出成 CSS 变量。 */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #16181c;
+  --bg-elevated: #1b1d22;
+  --bg-panel: #1e2025;
+  --bg-hover: #26292f;
+  --bg-active: #2c3038;
+
+  --border: #2c2f36;
+  --border-strong: #3a3e47;
+
+  --fg: #d7dae0;
+  --fg-muted: #9aa0aa;
+  --fg-dim: #6b7280;
+
+  --accent: #4f8cff;
+  --accent-fg: #ffffff;
+  --ok: #52b788;
+  --warn: #e0b341;
+  --danger: #f06a6a;
+  --focus: #6ea8ff;
+
+  --font-ui: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
+
+  /* --activity-bar-width / --status-bar-height / --divider-size /
+     --sidebar-width / --agent-width / --bottom-panel-height
+     由 lib/layout.ts 的 layoutStyleVars() 写在 .ide 上。 */
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 var(--font-ui);
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+ul,
+ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+h1,
+h2,
+h3,
+p,
+dl,
+dd {
+  margin: 0;
+}
+
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+/* 可见焦点：键盘操作必须看得见（docs/06 §11）。 */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -1px;
+}
+
+::selection {
+  background: #2f4770;
+}
+
+/* 细滚动条，避免面板里出现两条粗滚动条。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3a3e47 transparent;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

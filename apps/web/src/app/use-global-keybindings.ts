@@ -1,0 +1,82 @@
+/**
+ * 全局快捷键：唯一入口。组件不再各自 `addEventListener('keydown')`（docs/06 §10）。
+ *
+ * 用捕获阶段拦截，确保焦点在 Monaco / 输入框里时快捷键仍然生效；命中即
+ * `preventDefault + stopPropagation`，避免 Monaco 与浏览器默认行为重复触发。
+ */
+
+import { useEffect, useRef } from 'react'
+import { keybindingFromEvent } from '../lib/keybindings'
+
+export interface ShortcutActions {
+  openPalette: () => void
+  openQuickOpen: () => void
+  save: () => void
+  saveAll: () => void
+  run: () => void
+  stop: () => void
+  toggleAgent: () => void
+  toggleBottomPanel: () => void
+  showProblems: () => void
+  notify: (message: string) => void
+}
+
+export function useGlobalKeybindings(actions: ShortcutActions): void {
+  const actionsRef = useRef(actions)
+
+  useEffect(() => {
+    actionsRef.current = actions
+  })
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent): void {
+      if (event.repeat) return
+      const binding = keybindingFromEvent(event)
+      if (!binding) return
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const current = actionsRef.current
+      switch (binding.id) {
+        case 'command-palette':
+          current.openPalette()
+          break
+        case 'quick-open':
+          current.openQuickOpen()
+          break
+        case 'save':
+          current.save()
+          break
+        case 'save-all':
+          current.saveAll()
+          break
+        case 'run-bot':
+          current.run()
+          break
+        case 'stop-bot':
+          current.stop()
+          break
+        case 'toggle-agent':
+          current.toggleAgent()
+          break
+        case 'toggle-bottom-panel':
+          current.toggleBottomPanel()
+          break
+        case 'problems-panel':
+          current.showProblems()
+          break
+        case 'global-search':
+          current.notify('全局搜索在 M3 提供')
+          break
+        default: {
+          const exhaustive: never = binding.id
+          throw new Error(`未处理的快捷键：${String(exhaustive)}`)
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown, true)
+    return () => window.removeEventListener('keydown', handleKeyDown, true)
+  }, [])
+}
