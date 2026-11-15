@@ -57,7 +57,8 @@ hbot-store hbot-code hbot-bot hbot-agent hbot-workspace
             │
         hbot-core              （实体 + 端口 + 错误）
 
-hbot-adapters 只依赖 hbot-core（实现端口），由组合根注入。
+hbot-adapters 只依赖 hbot-core（实现平台协议细节）；
+hbot-bot 只依赖 hbot-core + hbot-store（自己定义它需要的平台端口）。
 ```
 
 1. `hbot-core` 只依赖通用库（serde、thiserror、time、uuid），**不依赖 workspace 内其他 crate**。
@@ -65,9 +66,12 @@ hbot-adapters 只依赖 hbot-core（实现端口），由组合根注入。
 3. `hbot-bot` 不依赖 `hbot-agent`；`hbot-code` 不依赖 `hbot-agent`。
 4. `hbot-workspace` 只依赖 `hbot-core`；负责文件/搜索/监听/编辑事务，不含 UI、不含 Agent 决策。
 5. `hbot-adapters` 只依赖 `hbot-core`；不得 import 具体服务 crate。
+- **端口由消费方定义**：`hbot-bot` 里声明 `trait BotAdapter`（`crates/hbot-bot/src/adapter.rs`，`id/declared_conversations/subscribe/send`），`hbot-adapters` 只提供具体平台实现（`OneBotClient` 等）。两者之间的桥接（把 `OneBot` 的 `NormalizedInbound`/`OutboundSender` 适配成 `BotAdapter`）放在**组合根**（`hbot-rpc/src/bridge/` 或 `hbot-cli`），不放 bot、也不放 adapters —— 否则 bot 就得依赖 adapters，而 adapters 又可能想依赖 bot，形成双向。
 6. `hbot-rpc` 可以依赖五个实现 crate，但只做参数校验、编排、错误映射；业务规则不下沉。
 7. `hbot-desktop` 不含业务规则；只做“Tauri ↔ core”的适配与窗口/托盘/更新。
-8. 禁止循环依赖；`cargo xtask deps` 在 CI 拦截。
+9. **ID 只有一份**：`hbot-core::ids`。`hbot-store` 重导出 core 的 ID 类型，不自己定义。
+10. **行级 DTO 与领域实体分层**：`hbot-store` 出的是行级 DTO（`config_json: String`、`enabled: bool` 这类落库形状），`hbot-core::domain` 是领域实体；两者之间的 `row_to_domain` 映射放在**使用方**（`hbot-bot`/`hbot-rpc`），不放 store、也不放 core（store 不认识领域规则，core 不认识 SQL）。
+11. **写 inbound 前必须有 bot 行与会话行**（外键开着，`PRAGMA foreign_keys=ON`）；适配器落地顺序固定 `bot → conversation → inbound → 入队`，顺序错了就是 `FOREIGN KEY constraint failed`。
 
 ### 2.2 每个 crate 的内部结构
 
@@ -130,7 +134,10 @@ hbot-adapters/src/
   fs.rs
 
 hbot-rpc/src/
-  dto.rs           Command / Event / ApiError
+  dto/mod.rs       重导出 + 序列化规则 + 命令→data 形状表
+  dto/command.rs   Command 枚举（唯一）
+  dto/event.rs     Event 枚举（唯一）
+  dto/common.rs    Response / ApiError / 载荷结构
   dispatch.rs      唯一入口
   ws.rs            后台模式（auth、限流、背压）
 
@@ -220,7 +227,7 @@ apps/web/
 
 | 事实 | 唯一位置 |
 |---|---|
-| Command / Event / 错误码 | `crates/hbot-rpc/src/dto.rs` → 生成 `apps/web/src/generated/` |
+| Command / Event / 错误码 | `crates/hbot-rpc/src/dto/` → 生成 `apps/web/src/generated/` |
 | 宿主 API 类型 | `crates/hbot-code/src/dts.rs` → 生成 `hbot.d.ts` |
 | DB schema | `crates/hbot-store/src/migrations/*.sql` |
 | 平台协议 | `crates/hbot-adapters/src/platforms/*` |
@@ -230,7 +237,7 @@ apps/web/
 | 性能预算 | `docs/05-quality-gates.md` |
 | IDE 布局 | `apps/web/src/lib/layout.ts` |
 | 快捷键 | `apps/web/src/lib/keybindings.ts` |
-| IDE 命令清单 | `crates/hbot-rpc/src/dto.rs`（Command）+ `apps/web/src/lib/commands.ts` |
+| IDE 命令清单 | `crates/hbot-rpc/src/dto/`（Command）+ `apps/web/src/lib/commands.ts` |
 | 平台能力矩阵 | `crates/hbot-adapters/src/platforms/capabilities.rs` |
 | 目录规则 | 本文件 |
 
@@ -271,12 +278,12 @@ apps/web/
 | 新增宿主 API | `hbot-code/src/runtime/host_api.rs` + `dts.rs` + 权限校验 | UI |
 | 新增 DB 表 | 新迁移 + `repositories/` + 需要时加 DTO | 旧迁移 |
 | 新增 UI 页面 | `features/<name>/` + 路由 + 命令 | 其他 feature 内部 |
-| 新增 IDE 命令 | `hbot-rpc/src/dto.rs` 加 Command + `dispatch.rs` + `apps/web/src/lib/commands.ts` + 快捷键表 | 在各组件里自己写 IPC |
+| 新增 IDE 命令 | `hbot-rpc/src/dto/` 加 Command + `dispatch.rs` + `apps/web/src/lib/commands.ts` + 快捷键表 | 在各组件里自己写 IPC |
 | 新增编辑器能力 | `features/editor/` + `lib/monaco/`；文件操作走 `hbot-workspace` | 直接调 `fs`/`invoke` |
 | 新增调试能力 | `hbot-code/src/runtime/debug.rs` + `hbot-rpc` 事件 + `features/debug/` | 改动 release 构建 |
 | 新增平台模板 | `hbot-adapters/src/platforms/<name>/` + 能力矩阵 + 模板夹具 | 在 Agent 提示里硬编码平台分支 |
 | 改 Agent 上下文 | `hbot-agent/src/context/assemble.rs` + 评测集 | 在 UI 里拼上下文 |
-| 改协议 | `hbot-rpc/src/dto.rs` → `pnpm gen` → UI 修编译错误 | 手写 DTO |
+| 改协议 | `hbot-rpc/src/dto/` → `pnpm gen` → UI 修编译错误 | 手写 DTO |
 | 换 LLM 供应商 | `hbot-agent/src/providers/` + 预设 + 测试 | 工具层 |
 | 改沙箱限制 | `hbot-code/src/runtime/limits.rs` + 预算文档 | 宿主 API 白名单 |
 | 加命令 | `tools/shell.rs` + 审批 + OS 隔离测试 | 另起执行通道 |
@@ -333,7 +340,7 @@ apps/web/src/generated/ 生成但入库（便于 review 与离线构建）
 | `src/main/services/ai/tools/` | `crates/hbot-agent/src/tools/` |
 | `src/main/services/ai/tools/registry.ts`（1620 行） | 拆到各工具文件 + 一个注册表 |
 | `src/main/services/infra/`（SQLite/文件） | `crates/hbot-store/` + `hbot-adapters/fs.rs` |
-| `src/preload/index.ts` + `src/renderer/src/types/ipc.ts` | `hbot-rpc/dto.rs` + 生成 TS |
+| `src/preload/index.ts` + `src/renderer/src/types/ipc.ts` | `hbot-rpc/src/dto/` + 生成 TS |
 | `src/renderer/src/components/blocks/`（节点） | 删除 |
 | `src/renderer/src/stores/flow/`（19 个 slice） | 删除；编辑器只编辑文件 |
 | `src/main/vendor/dsh/` | 按需重写为 Rust（jobs/goal/lsp 不直接搬） |

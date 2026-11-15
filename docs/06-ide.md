@@ -114,7 +114,8 @@
 
 ### 4.2 文件操作
 
-- 创建/重命名/删除/移动前检查路径：必须在项目根内、不能是 `.hbot/`、不能是 `hbot.d.ts`。
+- 创建/重命名/删除/移动前检查路径：必须在项目根内、不能是 `.hbot/`。
+- `hbot.d.ts` 是**核心生成物**：UI 置只读，Agent 工具层拒写（`workspace` 层不拦，否则生成器自己写不了）；被外部改坏时下次启动重新生成。
 - 重命名文件时重写相对 import（Monaco 的 TS 服务给 edits；核心落盘前二次校验）。
 - 删除文件进入“待确认”状态，不直接进回收站；项目内 `.hbot/trash/` 保留 7 天。
 - 二进制/超大文件（>2MB）只读，不在 Monaco 打开，提示用外部工具。
@@ -218,7 +219,7 @@ Store 划分（Zustand，三个，不交叉写）：
 | `agentStore` | 会话、消息、工具卡、审批、Diff、计划 | 文件内容（只读引用） |
 | `runStore` | bot 状态、队列、日志、调试会话、回放 | 文件与布局 |
 
-跨 store 只通过**事件**（`bot.status`、`diagnostic.changed`、`agent.diff`）与**命令**协作；禁止一个 store 直接调另一个的 setter。旧项目 19 个 flow slice 互相编排的复杂度，不在新项目重演。
+跨 store 只通过**事件**（`bot.status`、`diagnostics`、`agent.diff`）与**命令**协作；禁止一个 store 直接调另一个的 setter。旧项目 19 个 flow slice 互相编排的复杂度，不在新项目重演。
 
 持久化：
 

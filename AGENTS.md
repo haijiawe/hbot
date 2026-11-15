@@ -11,7 +11,7 @@
 1. **产品运行时不允许 Node**：不 `spawn node`、不加 `node_modules` 运行时依赖、不把 Agent 放回 V8。
 2. **不做节点/流程引擎**：没有画布、没有触发器解释器、没有 `flows` 表。
 3. **只有一个 Agent 循环**：`crates/hbot-agent/src/loop.rs`；不要为子代理/工作流再写第二套骨架。
-4. **只有一份契约**：`crates/hbot-rpc/src/dto.rs` → `ts-rs` 生成；不手写 TS DTO、不复制常量。
+4. **只有一份契约**：`crates/hbot-rpc/src/dto/`（`command.rs`/`event.rs`/`common.rs`）→ `ts-rs` 生成；不手写 TS DTO、不复制常量。
 5. **先落库再处理**：入站消息先写 `inbound`，再入队；不允许“内存里先跑，失败再说”。
 6. **每会话串行**：同一 `(bot_id, conversation_id)` 不得并发执行；不同会话可并行。
 7. **审批按完整动作**：规则键 `(tool, 规范化参数/路径, sandbox_mode)`；禁止按大类放行。
@@ -107,7 +107,7 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 
 ### 4.3 契约
 
-- `Command`/`Event` 只在 `hbot-rpc/dto.rs` 定义。
+- `Command`/`Event` 只在 `hbot-rpc/src/dto/` 定义（`command.rs`/`event.rs`），别在 `common.rs` 或别处加第二个枚举。
 - 加字段要兼容旧 UI（serde default / Option）；删字段走版本化。
 - `apps/web/src/generated/` 由 `xtask gen` 产出，review 但不要手改。
 
@@ -135,12 +135,13 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 
 ## 6. UI 约定
 
-- 服务端状态用 TanStack Query；Zustand 只放纯 UI 状态。
-- 只经 `lib/api.ts`；不直接 `fetch`/WebSocket。
-- Monaco、图表等重依赖动态 `import`；首屏不静态引入。
-- 组件文件 PascalCase，其他 kebab-case；hook 用 `use-*.ts`。
+- 服务端状态用 TanStack Query；Zustand 只放纯 UI 状态。**已定三个 store：**`workspaceStore`（文件/标签/脏/布局）、`agentStore`（消息/Diff/审批）、`runStore`（bot 状态/日志）。三者只经 `lib/ipc` 的 `dispatch`/事件协作，**禁止互相 import 或直接改对方状态**。
+- 只经 `lib/ipc.ts` 的 `dispatch`；不直接 `fetch`/WebSocket。
+- Monaco、图表等重依赖动态 `import`；首屏不静态引入（当前入口 258 kB / gzip 81 kB，Monaco 走 lazy chunk）。
+- **文件命名 kebab-case**（`editor-surface.tsx`、`workspace-store.ts`），组件导出用 PascalCase（`EditorSurface`）；`App.tsx` 例外保留。hook 用 `use-*.ts`。
 - 不用 `any`、`@ts-ignore`；确有需要写 `unknown` + 收窄。
 - 每个 feature 有错误边界与空状态；不把异常抛到白屏。
+- 布局数值只从 `src/lib/layout.ts` 取，快捷键只从 `src/lib/keybindings.ts` 取；组件里不写死 px 与键名。
 
 ---
 

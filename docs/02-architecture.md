@@ -131,6 +131,7 @@ hbot-adapters 只依赖 hbot-core（实现端口），由组合根注入。
 - **先落库再入队**：进程崩溃后能重放未处理消息。
 - **每会话串行**：同一 `(bot_id, conversation_id)` 同时只有一个 handler 在跑；不同会话可并行。
 - **至少一次**：崩溃恢复可能重复投递；生成代码拿到的 `ctx.messageId` 是稳定幂等键，文档要求业务侧可重入。
+- **幂等键分层**（已实现于 `crates/hbot-adapters/src/platforms/onebot/normalize.rs`）：有平台 `message_id` 时 `external_id = message_id`；缺失时回落为 `"{user_id}-{time}-{fnv1a64(raw_message):016x}"`。**回落键有结构性碰撞**：同一人、同一秒、同一文本的两条真实消息会得到同一个键，`UNIQUE(bot_id, external_id)` 会把第二条静默丢弃。因此：① 有平台序号时**必须**用序号；② 回落键只用于确实没有序号的事件；③ supervisor 不得把“回落键已存在”直接当成“重复消息”跳过——需要记录 `id_source`（`platform` / `fallback`）并在 UI 与日志里可见。
 - **背压不丢**：队列到 80% 暂停适配器读取；到 100% 记录指标并继续暂停，不丢消息。
 - **回复上下文**：被动回复必须绑定触发消息的 `reply_to`；异步主动消息不得冒用旧 `event_id`。
 
@@ -148,6 +149,8 @@ pub trait PlatformAdapter: Send + Sync {
 - 新增平台 = 新 adapter + 注册；不改 supervisor、不改队列。
 - 适配器负责：鉴权、心跳、重连（指数退避 + 抖动）、协议解析、发送限流。
 - 去重、排序、持久化由运行时统一做，适配器不重复实现。
+- **端口归属**：`trait PlatformAdapter` 定义在 `hbot-adapters`，由 `hbot-bot` 消费（见 `03-directory.md` 规则 5 的例外）；`hbot-core` 只保留与平台无关的 `Clock`/`IdGenerator`/`EventSink`。
+- **现状（M0 实测）**：OneBot 11 正向 WebSocket 已实现（心跳看门狗 45s 可注入、`Authorization: Bearer`、串行出站最多 3 次重试、1/2/4…30s ±20% 退避）；**TLS 未接**——`wss://` 与 `https://` 一律返回 `AdapterError::Unsupported`（显式失败，不静默降级成明文）。远程 NapCat 必须先补 TLS 后端（`tokio-tungstenite` 的 `rustls` feature 或 `native-tls`），本机 `ws://127.0.0.1` 不受影响。HTTP 客户端同样只支持 `http://`，且只 HTTP/1.1、不跟随 3xx、不支持 gzip、无连接池/代理。
 
 ### 4.3 重连与恢复
 
@@ -379,38 +382,43 @@ interface MessageContext {
 
 ```rust
 #[derive(Serialize, Deserialize, TS)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum Command {
     AppInfo,
     ProjectOpen { path: String },
-    AgentSend { session_id: String, text: String },
-    AgentCancel { session_id: String },
-    AgentApprove { approval_id: String, decision: Decision, always: bool },
+    AgentSend { session_id: SessionId, text: String },
+    AgentCancel { session_id: SessionId },
+    AgentApprove { approval_id: ApprovalId, decision: ApprovalDecision, always: bool },
     FileRead { path: String },
     FileWrite { path: String, content: String, base_hash: Option<String> },
     FileList { path: String },
     FileCreate { path: String, content: String },
     FileRename { from: String, to: String },
     FileDelete { path: String, to_trash: bool },
-    EditApply { edit_id: String, accept_hunks: Vec<u32> },
-    EditReject { edit_id: String },
+    EditApply { edit_id: EditId, accept_hunks: Vec<u32> },
+    EditReject { edit_id: EditId },
     SearchStart { query: String, regex: bool, globs: Vec<String> },
-    SearchCancel { search_id: String },
+    SearchCancel { search_id: SearchId },
     Diagnostics { path: Option<String> },
-    BotStart { bot_id: String },
-    BotStop { bot_id: String },
-    BotInject { bot_id: String, conversation_id: String, text: String },
+    BotStart { bot_id: BotId },
+    BotStop { bot_id: BotId },
+    BotInject { bot_id: BotId, conversation_id: ConversationId, text: String },
     DebugSetBreakpoints { file: String, lines: Vec<u32> },
-    DebugResume { session_id: String },
-    DebugStep { session_id: String, kind: StepKind },
-    LogsTail { bot_id: String, limit: usize },
+    DebugResume { session_id: SessionId },
+    DebugStep { session_id: SessionId, kind: StepKind },
+    LogsTail { bot_id: BotId, limit: usize },
     // ...
 }
 ```
 
-- 桌面：Tauri `#[tauri::command] dispatch(cmd) -> Result<Response, ApiError>`。
+> Rust 源码里字段仍是 snake_case（`session_id`），**线上 JSON 是 camelCase**（`sessionId`），由 `rename_all_fields = "camelCase"` 保证。上面片段是按线上形状写的，便于 UI 侧读；实现以 `crates/hbot-rpc/src/dto/command.rs` 为准。
+
+- 桌面：Tauri `#[tauri::command] dispatch(cmd) -> Response`。
 - 后台/浏览器：JSON-RPC 2.0，唯一 method `dispatch`，`params = { command }`。
+- **唯一错误通道是 `Response` 的 `error` 变体**（`Response::into_result()` 供 Rust 侧使用）；不要在外面再包一层 `Result<Response, ApiError>`，否则 UI 要解析两种错误形状。
+- **字段风格**：`type` 值用 snake_case（`app_info`），**所有载荷字段用 camelCase**（`sessionId`、`baseHash`、`acceptHunks`）。Rust 侧靠 `#[serde(rename_all_fields = "camelCase")]` 保证，类型仍是 snake_case 字段名。
 - 类型由 Rust `ts-rs` 生成到 `apps/web/src/generated/`，UI 不手写 DTO。
+- 命令返回的 `data` 形状表在 `crates/hbot-rpc/src/dto/mod.rs` 顶部（`AppInfo`/`FileContent`/`DirEntry`/`RunLog` 等），加命令必须同时加一行。
 
 ### 9.2 事件
 
@@ -431,12 +439,29 @@ debug.resumed      { sessionId }
 
 - 每连接有界发送队列（1024）；`agent.delta` 可合并，`approval.request`/`bot.status` 优先。
 - UI 断线重连后先拉快照，再订阅增量；不做“只靠事件”的状态。
+- 事件名清单（UI 侧订阅用）：`agent.delta` `agent.step` `agent.tool` `agent.diff` `approval.request` `bot.status` `run.log` `project.changed` `file.search` `diagnostics` `debug.paused` `debug.resumed`。改名等于改协议。
 
 ### 9.3 鉴权与来源
 
 - 桌面 Tauri IPC：仅应用 WebView 可调用；不监听端口。
 - 后台 WS：绑定 `127.0.0.1`；首帧 `auth`（token，5s 超时）；Origin 白名单；帧上限 1 MiB；每连接 32 in-flight。
 - token 只经环境变量/启动参数传给子进程的**安全方式**（桌面不需要）；不写日志、不进 localStorage。
+
+### 9.4 错误码（唯一真源）
+
+| code | 名称 | 什么时候用 |
+|---|---|---|
+| `-32001` | not found | 项目/文件/bot/会话/审批不存在 |
+| `-32002` | invalid | 参数不合法、schema 不符、路径不合法 |
+| `-32003` | conflict | 乐观并发冲突（`baseHash` 不匹配）、重名、状态机不允许 |
+| `-32004` | timeout | 编译/执行/审批/网络超时 |
+| `-32005` | denied | 沙箱档、路径守卫、审批拒绝、权限不足 |
+| `-32006` | internal | 未分类内部错误（必须带 `requestId` 便于查日志） |
+
+- 实现位置：`crates/hbot-core/src/errors.rs` 的 `HbotError::code()`；这张表与代码注释必须一致。
+- 新错误类型先加一行再写代码；不要用 `internal` 兜一切，否则 UI 无法给出可操作提示。
+- **“功能尚未实现”也走 `-32006`**，但 `message` 必须以 `尚未实现：` 开头（实现在 `crates/hbot-rpc/src/dispatch.rs` 的 `UNIMPLEMENTED_CODE`）。UI 必须把这种回复显示成“该功能未上线”，**不能**当成参数错误提示——否则用户会去改参数而不是等版本。
+- 后台服务多一条：`-32003` 也用于“超过 `maxInflight` 的并发请求”，`data` 带 `{ "inFlight": N }`。
 
 ---
 
@@ -462,8 +487,29 @@ debug.resumed      { sessionId }
 | Agent 执行危险命令 | 命令默认审批 + OS 级隔离；无隔离则拒绝 |
 | 本机其他进程冒充 UI | 桌面无端口；后台 WS 绑 127.0.0.1 + token + Origin |
 | 密钥泄漏 | OS keychain；日志/错误/审计统一脱敏；不写 DB 明文 |
-| 路径逃逸 | realpath 后必须在项目根；拒绝符号链接 |
+| 路径逃逸 | realpath 后必须在项目根；拒绝符号链接（规则见下） |
 | 依赖供应链 | `cargo deny` + `cargo audit` + 锁文件；UI 依赖锁定 + audit |
+
+**路径守卫规则（`hbot-workspace` 的唯一实现，UI/Agent 都走它）**：
+
+输入一律是**相对路径**，按顺序判定，命中即拒（`HbotError::Invalid`，不落 IO）：
+
+1. 必须非空、合法 UTF-8、不含 NUL、长度 ≤ 4096 字节。
+2. `Path::is_absolute()` → 拒（POSIX `/x`、`C:\x`）。
+3. 以 `\\` 或 `//` 开头 → 拒（UNC、`\\?\C:\x`、`//server/share`）。
+4. 第 2 字节是 `:` 且首字节是字母 → 拒（Windows drive-relative `C:x`，`is_absolute` 不认）。
+5. 逐组件：`Prefix`/`RootDir` 拒；**任何位置的 `..` 都拒**（含 `a/../b`）；`.` 忽略。
+6. Windows 额外拒：以 `.` 或空格结尾的段、`<>:"|?*` 与控制字符（含 NTFS ADS 的 `:`）、保留设备名 `CON PRN AUX NUL COM1-9 LPT1-9`（按去扩展名的 stem 比较，`CON.txt` 也拒）。
+7. 保留目录：`.git`（`allow_git` 可放开）、`.hbot`（外部 API 一律拒；回收站等内部操作走 `Access::Internal`）。
+8. `resolve_existing`：`canonicalize` 后按**组件逐个**等于根前缀；符号链接指向根外、`..` 逃逸全部失败。
+9. `resolve_new`：父目录必须存在、真实路径在根内；目标若是符号链接，只允许指向根内，悬空链接拒绝——写操作替换链接本身，绝不写穿。
+10. 重命名/删除用 `resolve_entry`：最后一段**不跟随符号链接**（删链接只删链接）。
+11. 组件比较在 Windows/macOS 大小写不敏感；其余平台按字节。
+12. 列目录与搜索再兜一层：符号链接项解析后不在根内就跳过；搜索 `follow_links(false)`。
+
+- 已知缺口（M1 补）：`hbot.d.ts` 由核心生成、UI 置只读，**当前未在 workspace 层拦截**（否则生成器自己也写不了）；拦在 Agent 工具层。
+- TOCTOU：校验与真正 `open/rename` 之间有窗口；缓解是写操作串行化 + 已存在即 `Conflict`（不覆盖）。
+- 唯一改大小写的重命名（`a.txt` → `A.txt`）暂不支持；跨设备 `rename` 非原子（失败会留半个 trash 条目）。
 
 **外部内容规则（复核新增）**：
 

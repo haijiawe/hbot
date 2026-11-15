@@ -35,7 +35,7 @@
 | S0 | 旧 Electron、Tauri 空壳、Rust 核心的空闲 RSS；Windows 真实窗口 | `docs/spikes/S0-memory.md`，含测量命令 |
 | S1 | SWC 去类型 → QuickJS → `await ctx.reply()`；超时中断；内存上限；错误行号 | `docs/spikes/S1-quickjs.md` + 一个可跑的 spike crate |
 | S2 | Tauri 同进程 `dispatch` + 事件推送；UI 首屏 | `docs/spikes/S2-tauri.md` |
-| S3 | `rusqlite` bundled 迁移/WAL/并发；`keyring` 三平台 | `docs/spikes/S3-store.md` |
+| S3 | `rusqlite` bundled 迁移/WAL/并发；`keyring` 三平台 | `docs/spikes/S3-sqlite-keychain.md` |
 | S4 | OneBot 11 连接、心跳、重连、重复投递、无 `message_id` 事件 | `docs/spikes/S4-onebot.md` |
 
 **S 阶段出口**：S1 与 S2 必须过；S0 必须给数字；S4 允许“部分通过 + 已知缺口”。任一失败，先改 ADR，再进 M0。
