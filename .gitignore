@@ -2,9 +2,6 @@
 **/target/
 node_modules/
 dist/
-apps/web/dist/
-apps/web/src/generated/*.ts
-!apps/web/src/generated/.gitkeep
 *.log
 .env
 .env.local
@@ -14,3 +11,8 @@ Thumbs.db
 .vscode/
 *.tsbuildinfo
 /.hbot/
+
+# 生成物不入库（`cargo xtask gen` 重建，`gen --check` 防漂移）。
+# 注意：`apps/web/src/generated/*.ts` **要入库** —— 它让 UI 能独立 typecheck/构建，
+# 漂移由 CI 的 `cargo xtask gen --check` 拦住。别把它加回忽略列表。
+!apps/web/src/generated/.gitkeep

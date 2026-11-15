@@ -7,9 +7,10 @@ license.workspace = true
 
 [dependencies]
 hbot-core = { path = "../hbot-core" }
+hbot-workspace = { path = "../hbot-workspace" }
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-

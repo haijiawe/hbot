@@ -6,7 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-hbot-core = { path = "../hbot-core" }
-serde.workspace = true
-thiserror.workspace = true
-
+# 只依赖 hbot-core（workspace 内），见 docs/03-directory.md §2.1 第 4 条。
+hbot-core = { workspace = true }
+blake3.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
+memchr.workspace = true
+tracing.workspace = true
+uuid.workspace = true

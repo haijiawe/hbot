@@ -1,0 +1,23 @@
+{
+  "post_type": "message",
+  "message_type": "group",
+  "sub_type": "normal",
+  "time": 1731653000,
+  "self_id": 10000,
+  "message_id": 9012,
+  "user_id": 20003,
+  "group_id": 30001,
+  "raw_message": "[CQ:at,qq=10000] 在吗",
+  "font": 0,
+  "sender": {
+    "user_id": 20003,
+    "nickname": "小红"
+  },
+  "message": [
+    { "type": "at", "data": { "qq": "10000" } },
+    { "type": "text", "data": { "text": " 在吗" } },
+    { "type": "image", "data": { "file": "abc.jpg", "url": "https://example.com/abc.jpg" } },
+    { "type": "reply", "data": { "id": "9000" } },
+    { "type": "face", "data": { "id": "14" } }
+  ]
+}

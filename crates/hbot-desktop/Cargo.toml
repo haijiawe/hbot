@@ -4,11 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Tauri 桌面壳：只做窗口/托盘/单实例/更新，业务在 hbot-rpc 的 dispatch 后面"
 
 [dependencies]
 hbot-core = { path = "../hbot-core" }
+hbot-rpc = { path = "../hbot-rpc" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
+tauri = { version = "2", features = [] }
 tokio.workspace = true
+tracing.workspace = true
 
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

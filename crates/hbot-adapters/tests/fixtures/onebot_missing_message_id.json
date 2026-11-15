@@ -1,0 +1,16 @@
+{
+  "post_type": "message",
+  "message_type": "group",
+  "sub_type": "normal",
+  "time": 1731653100,
+  "self_id": 10000,
+  "user_id": 20004,
+  "group_id": 30002,
+  "raw_message": "这条没有 message_id",
+  "font": 0,
+  "sender": {
+    "user_id": 20004,
+    "nickname": "无 id 用户"
+  },
+  "message": "这条没有 message_id"
+}

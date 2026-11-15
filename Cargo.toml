@@ -10,15 +10,36 @@ license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/hbot"
 
 [workspace.dependencies]
+# 内部 crate：统一在这里写一次 path + version，子 crate 用 { workspace = true }。
+hbot-core = { path = "crates/hbot-core", version = "0.1.0" }
+hbot-store = { path = "crates/hbot-store", version = "0.1.0" }
+hbot-code = { path = "crates/hbot-code", version = "0.1.0" }
+hbot-bot = { path = "crates/hbot-bot", version = "0.1.0" }
+hbot-agent = { path = "crates/hbot-agent", version = "0.1.0" }
+hbot-workspace = { path = "crates/hbot-workspace", version = "0.1.0" }
+hbot-adapters = { path = "crates/hbot-adapters", version = "0.1.0" }
+hbot-rpc = { path = "crates/hbot-rpc", version = "0.1.0" }
+
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+blake3 = "1"
+memchr = "2"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+async-trait = "0.1"
 
 [profile.release]
 lto = "thin"

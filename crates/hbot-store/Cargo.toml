@@ -6,10 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# ID 类型的唯一真源（crates/hbot-core/src/ids.rs）。根 workspace 的
+# [workspace.dependencies] 目前没有 hbot-core 条目，所以这里用 path 依赖；
+# 等根清单补上 `hbot-core = { path = "crates/hbot-core" }` 后再换成 workspace = true。
 hbot-core = { path = "../hbot-core" }
-serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 rusqlite.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# 测试要构造固定 UUID（`Uuid::from_u128(1)`），避免随机 ID 让断言不可复现。
+uuid.workspace = true

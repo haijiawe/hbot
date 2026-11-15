@@ -7,8 +7,12 @@ license.workspace = true
 
 [dependencies]
 hbot-core = { path = "../hbot-core" }
+futures-util.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# `net`：`http.rs` 的 HTTP/1.1 客户端与 `tokio-tungstenite` 的 WS 连接都要 `TcpStream`；
+# `rt` 由 workspace 的 `rt-multi-thread` 隐含。
+tokio = { workspace = true, features = ["net"] }
+tokio-tungstenite.workspace = true
 tracing.workspace = true
-

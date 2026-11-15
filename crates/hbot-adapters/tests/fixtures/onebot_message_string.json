@@ -1,0 +1,17 @@
+{
+  "post_type": "message",
+  "message_type": "group",
+  "sub_type": "normal",
+  "time": 1731653300,
+  "self_id": 10000,
+  "message_id": 7788,
+  "user_id": 20006,
+  "group_id": 30004,
+  "raw_message": "纯字符串消息体",
+  "font": 0,
+  "sender": {
+    "user_id": 20006,
+    "nickname": "字符串消息"
+  },
+  "message": "纯字符串消息体"
+}

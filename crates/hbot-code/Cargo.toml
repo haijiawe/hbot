@@ -7,8 +7,19 @@ license.workspace = true
 
 [dependencies]
 hbot-core = { path = "../hbot-core" }
+# `futures` = async host functions / promise-aware isolate loop.
+# `loader`  = QuickJS native ES module loader (Resolver/Loader traits).
+# NOT enabled on purpose: `parallel`, `allocator`, `rust-alloc` (see docs/spikes/S1-quickjs.md).
+rquickjs = { version = "0.14", features = ["futures", "loader"] }
 serde.workspace = true
 serde_json.workspace = true
+swc_common = "27.0.0"
+swc_ecma_ast = "=30.0.2"
+swc_ecma_codegen = "=33.0.1"
+swc_ecma_parser = "=47.0.2"
+swc_ecma_transforms_base = "=51.0.2"
+swc_ecma_transforms_typescript = "57.0.3"
+swc_ecma_visit = "=30.0.0"
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
-

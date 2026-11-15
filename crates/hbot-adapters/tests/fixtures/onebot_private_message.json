@@ -1,0 +1,16 @@
+{
+  "post_type": "message",
+  "message_type": "private",
+  "sub_type": "friend",
+  "time": 1731652900,
+  "self_id": 10000,
+  "message_id": 5678,
+  "user_id": 20002,
+  "raw_message": "私聊一句",
+  "font": 0,
+  "sender": {
+    "user_id": 20002,
+    "nickname": "小明"
+  },
+  "message": [{ "type": "text", "data": { "text": "私聊一句" } }]
+}

@@ -5,15 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "hbot"
+path = "src/main.rs"
+
 [dependencies]
 hbot-core = { path = "../hbot-core" }
-hbot-store = { path = "../hbot-store" }
-hbot-bot = { path = "../hbot-bot" }
-hbot-agent = { path = "../hbot-agent" }
 hbot-rpc = { path = "../hbot-rpc" }
 anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
 serde.workspace = true
-tokio.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
