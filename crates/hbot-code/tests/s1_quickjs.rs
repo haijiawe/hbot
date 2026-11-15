@@ -322,9 +322,11 @@ fn missing_relative_module_is_reported() {
         )],
     );
     // Linking is static on purpose: a missing module is a *compile* error with
-    // the offending `import` position, not a loader hang inside QuickJS
-    // (rquickjs reports a failed load by setting an exception while the import
-    // promise stays pending — measured in S1).
+    // the offending `import` position, not a failure discovered half way through
+    // the isolate boot. Measured in S1: a rejected load settles the import
+    // promise with an exception (it does not stay pending), so catching it at
+    // compile time is about the error message and the position, not about
+    // avoiding a hang.
     let error = compile_project(root.path()).expect_err("./nope must not link");
     assert_eq!(code_of(&error), "HBOT_MODULE_NOT_FOUND", "{error}");
     let text = error.to_string();

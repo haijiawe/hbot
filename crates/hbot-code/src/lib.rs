@@ -6,6 +6,10 @@
 //!   back to the TypeScript source, cache by content hash. No bundler.
 //! * [`modules`] — resolve module specifiers. Only `hbot` and project-relative
 //!   `./`/`../` imports exist; every other bare specifier is `HBOT_BARE_IMPORT`.
+//! * [`manifest`] — parse `hbot.json` (the project's name, entry point, platform
+//!   and sandbox budget) and scaffold a new project.
+//! * [`dts`] — generate the project's `hbot.d.ts` from the same contract the
+//!   runtime exposes; drift between the two is a test failure.
 //! * [`runtime`] — one QuickJS isolate (`rquickjs`, `!Send`) on its own thread,
 //!   with `log`/`reply`/`sleep` bridged through promises, plus memory and
 //!   wall-clock limits.
@@ -16,26 +20,38 @@
 //! ```no_run
 //! use std::path::Path;
 //!
-//! let project = hbot_code::compile_project(Path::new(r"C:\bots\echo"))?;
-//! let sandbox = hbot_code::Sandbox::spawn(project, hbot_code::Limits::default())?;
+//! let root = Path::new(r"C:\bots\echo");
+//! let manifest = hbot_code::manifest::load(root)?;
+//! let project = hbot_code::compile_project_with_entry(root, &manifest.entry_name())?;
+//! let sandbox = hbot_code::Sandbox::spawn(project, manifest.sandbox_limits())?;
 //! let outcome = sandbox.dispatch(&serde_json::json!({ "text": "hi" }))?;
 //! println!("{:?}", outcome.replies);
 //! # Ok::<(), hbot_code::CodeError>(())
 //! ```
 //!
 //! S1 status: relative-import multi-file projects work end to end; `vendor/**`
-//! and `onStart`/`onSchedule` are out of scope (see `docs/spikes/S1-quickjs.md`).
+//! and lifecycle hooks (`onStart`/`onSchedule`) are out of scope (see
+//! `docs/spikes/S1-quickjs.md`). `hbot.d.ts` declares exactly what the runtime
+//! implements — nothing more (`docs/02-architecture.md` §6.1 status table).
 
 pub mod compile;
+mod dispatch;
+pub mod dts;
 pub mod error;
+mod instrument;
 pub mod limits;
+pub mod manifest;
 pub mod modules;
 pub mod runtime;
 
 pub use compile::{
-    CompileStats, CompiledModule, CompiledProject, Compiler, ENTRY_MODULE, LineMapping,
-    compile_project,
+    BuildMode, CompileStats, CompiledModule, CompiledProject, Compiler, DebugInfo, ENTRY_MODULE,
+    LineMapping, compile_project, compile_project_debug, compile_project_with_entry,
+    compile_project_with_entry_debug,
 };
+pub use dispatch::EventFailure;
 pub use error::{CodeError, ErrorLocation, SourcePos};
+pub use hbot_core::debug::{Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, PausedAt};
 pub use limits::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MEMORY_BYTES, Limits};
+pub use manifest::{Manifest, ManifestLimits, PlatformKind, PlatformSpec, ScaffoldReport};
 pub use runtime::{EventOutcome, HostOutput, MemoryReport, Sandbox};

@@ -38,6 +38,78 @@ pub const ENTRY_MODULE: &str = "src/main.ts";
 /// Source extensions that get compiled.
 const SOURCE_EXTENSIONS: [&str; 3] = [".ts", ".js", ".mjs"];
 
+/// Which build to produce.
+///
+/// Release is what a bot runs with in production: no probes, no overhead.
+/// Debug adds one `__hbot_trace` probe in front of every statement so a
+/// debugger can stop on a TypeScript line (`docs/02-architecture.md` §6.5).
+/// The two builds are otherwise identical, which is why they share one code
+/// path and differ only in [`crate::instrument`] being applied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BuildMode {
+    /// No instrumentation.
+    #[default]
+    Release,
+    /// Every statement gets a probe; a `fileId → path` table is attached.
+    Debug,
+}
+
+impl BuildMode {
+    /// Whether this build carries debug probes.
+    #[must_use]
+    pub fn is_debug(self) -> bool {
+        matches!(self, Self::Debug)
+    }
+}
+
+/// The `fileId → project-relative path` table baked into a debug build.
+///
+/// Probes carry only a number, never a string: a handler with a thousand
+/// statements would otherwise allocate a thousand path constants. The host
+/// looks the path up here, once, when a breakpoint actually fires.
+#[derive(Clone, Debug, Default)]
+pub struct DebugInfo {
+    files: Vec<String>,
+}
+
+impl DebugInfo {
+    /// The path for a probe's `fileId`.
+    #[must_use]
+    pub fn path(&self, file_id: u32) -> Option<&str> {
+        usize::try_from(file_id)
+            .ok()
+            .and_then(|index| self.files.get(index))
+            .map(String::as_str)
+    }
+
+    /// The id assigned to a module, for tests and for the debugger UI.
+    #[must_use]
+    pub fn id_of(&self, name: &str) -> Option<u32> {
+        self.files
+            .iter()
+            .position(|file| file == name)
+            .and_then(|index| u32::try_from(index).ok())
+    }
+
+    /// Every path, indexed by id.
+    #[must_use]
+    pub fn files(&self) -> &[String] {
+        &self.files
+    }
+
+    /// Number of instrumented files.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether there is nothing to look up.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
 /// One generated line mapped back to the TypeScript it came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineMapping {
@@ -111,6 +183,8 @@ pub struct CompiledProject {
     modules: BTreeMap<String, CompiledModule>,
     entry: String,
     stats: CompileStats,
+    /// `Some` only for [`BuildMode::Debug`].
+    debug: Option<DebugInfo>,
 }
 
 impl CompiledProject {
@@ -118,6 +192,29 @@ impl CompiledProject {
     #[must_use]
     pub fn modules(&self) -> &BTreeMap<String, CompiledModule> {
         &self.modules
+    }
+
+    /// The `fileId → path` table, or `None` for a release build.
+    #[must_use]
+    pub fn debug_info(&self) -> Option<&DebugInfo> {
+        self.debug.as_ref()
+    }
+
+    /// Whether this project was built with [`BuildMode::Debug`].
+    #[must_use]
+    pub fn is_debug(&self) -> bool {
+        self.debug.is_some()
+    }
+
+    /// Translate a 1-based generated line of `module` to a TypeScript position.
+    ///
+    /// This is the reverse of what [`CompiledModule::source_position`] does for a
+    /// module the caller already has a handle on, and is what lets a paused
+    /// call stack name the TypeScript line for *intermediate* frames (the walk
+    /// only knows module names and generated lines).
+    #[must_use]
+    pub fn source_position(&self, module: &str, generated_line: u32) -> Option<(u32, u32)> {
+        self.modules.get(module)?.source_position(generated_line)
     }
 
     /// The entry module name (`src/main.ts`).
@@ -190,6 +287,15 @@ fn split_position(tail: &str) -> Option<(u32, u32, &str)> {
     Some((line, column, rest))
 }
 
+/// Cache key.
+///
+/// The content hash alone is not enough: a debug build and a release build of
+/// the same bytes emit different JavaScript, and the `fileId` baked into every
+/// probe depends on which project the file belongs to. Keying on all four
+/// keeps a debug compile from ever serving a release module (or a module from a
+/// differently ordered project).
+type CacheKey = (String, u64, BuildMode, u32);
+
 /// Owns the content-hash cache.
 ///
 /// Reuse one `Compiler` for the lifetime of an editing session; create a fresh
@@ -197,7 +303,7 @@ fn split_position(tail: &str) -> Option<(u32, u32, &str)> {
 /// of the file content, so an edit is simply a different key.
 #[derive(Debug, Default)]
 pub struct Compiler {
-    cache: HashMap<(String, u64), StrippedFile>,
+    cache: HashMap<CacheKey, StrippedFile>,
     last_stats: CompileStats,
 }
 
@@ -220,34 +326,96 @@ impl Compiler {
     /// * [`CodeError::ModuleNotFound`] / [`CodeError::ImportEscape`] when an
     ///   import does not link.
     pub fn compile_project(&mut self, root: &Path) -> Result<CompiledProject, CodeError> {
+        self.compile_project_with_entry(root, ENTRY_MODULE)
+    }
+
+    /// Compile with an explicit [`BuildMode`], using [`ENTRY_MODULE`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::compile_project`].
+    pub fn compile_project_mode(
+        &mut self,
+        root: &Path,
+        mode: BuildMode,
+    ) -> Result<CompiledProject, CodeError> {
+        self.compile_project_with_entry_mode(root, ENTRY_MODULE, mode)
+    }
+
+    /// Compile every source file under `root/src` with a manifest-chosen entry.
+    ///
+    /// `entry` is a `/`-separated project-relative module name (see
+    /// [`crate::manifest::Manifest::entry_name`]). It must exist under `root/src`
+    /// and be reachable the same way any other module is; the filesystem layout is
+    /// still `src/**`, only *which* file is the entry changes
+    /// (`docs/06-ide.md`: 入口由 `hbot.json` 的 `entry` 指定).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::compile_project`]; [`CodeError::NoEntry`] names the
+    /// requested `entry`.
+    pub fn compile_project_with_entry(
+        &mut self,
+        root: &Path,
+        entry: &str,
+    ) -> Result<CompiledProject, CodeError> {
+        self.compile_project_with_entry_mode(root, entry, BuildMode::Release)
+    }
+
+    /// Compile with an explicit [`BuildMode`].
+    ///
+    /// Every other entry point in this module is one of the two modes; this is
+    /// the one the debugger uses. See [`Compiler::compile_project_with_entry`]
+    /// for the error cases.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::compile_project`].
+    pub fn compile_project_with_entry_mode(
+        &mut self,
+        root: &Path,
+        entry: &str,
+        mode: BuildMode,
+    ) -> Result<CompiledProject, CodeError> {
         let started = Instant::now();
         let mut stats = CompileStats::default();
 
         let sources = collect_sources(root)?;
-        if !sources.iter().any(|(name, _)| name == ENTRY_MODULE) {
+        if !sources.iter().any(|(name, _)| name == entry) {
             return Err(CodeError::NoEntry {
-                path: ENTRY_MODULE.to_owned(),
+                path: entry.to_owned(),
             });
         }
 
-        let mut stripped = BTreeMap::new();
-        let mut kept: HashMap<(String, u64), StrippedFile> = HashMap::new();
+        // Ids are the sorted position in the source list, so they are stable for
+        // a given project and never collide with another file's probes.
+        let debug = if mode.is_debug() {
+            Some(DebugInfo {
+                files: sources.iter().map(|(name, _)| name.clone()).collect(),
+            })
+        } else {
+            None
+        };
 
-        for (name, path) in &sources {
+        let mut stripped = BTreeMap::new();
+        let mut kept: HashMap<CacheKey, StrippedFile> = HashMap::new();
+
+        for (index, (name, path)) in sources.iter().enumerate() {
             let source = std::fs::read_to_string(path).map_err(|source| CodeError::Io {
                 path: path.clone(),
                 source,
             })?;
             stats.source_bytes += source.len();
 
+            let file_id = u32::try_from(index).unwrap_or(u32::MAX);
             let hash = content_hash(&source);
-            let key = (name.clone(), hash);
+            let key = (name.clone(), hash, mode, file_id);
             let file = if let Some(cached) = self.cache.get(&key) {
                 stats.cache_hits += 1;
                 cached.clone()
             } else {
                 stats.cache_misses += 1;
-                strip_module(name, &source)?
+                strip_module(name, &source, mode, file_id)?
             };
 
             stats.emitted_bytes += file.js.len();
@@ -263,8 +431,9 @@ impl Compiler {
 
         Ok(CompiledProject {
             modules,
-            entry: ENTRY_MODULE.to_owned(),
+            entry: entry.to_owned(),
             stats,
+            debug,
         })
     }
 
@@ -372,6 +541,41 @@ pub fn compile_project(root: &Path) -> Result<CompiledProject, CodeError> {
     Compiler::new().compile_project(root)
 }
 
+/// Convenience wrapper: compile with a throwaway cache and a manifest-chosen
+/// entry.
+///
+/// # Errors
+///
+/// See [`Compiler::compile_project_with_entry`].
+pub fn compile_project_with_entry(root: &Path, entry: &str) -> Result<CompiledProject, CodeError> {
+    Compiler::new().compile_project_with_entry(root, entry)
+}
+
+/// Convenience wrapper: compile a **debug** project (instrumented) with a
+/// throwaway cache.
+///
+/// This is the build the debugger runs; see [`BuildMode`].
+///
+/// # Errors
+///
+/// See [`Compiler::compile_project`].
+pub fn compile_project_debug(root: &Path) -> Result<CompiledProject, CodeError> {
+    Compiler::new().compile_project_mode(root, BuildMode::Debug)
+}
+
+/// Convenience wrapper: compile a **debug** project with a manifest-chosen
+/// entry.
+///
+/// # Errors
+///
+/// See [`Compiler::compile_project_with_entry`].
+pub fn compile_project_with_entry_debug(
+    root: &Path,
+    entry: &str,
+) -> Result<CompiledProject, CodeError> {
+    Compiler::new().compile_project_with_entry_mode(root, entry, BuildMode::Debug)
+}
+
 /// Recursively collect `root/src/**/*.{ts,js,mjs}`, excluding `.d.ts`.
 fn collect_sources(root: &Path) -> Result<Vec<(String, PathBuf)>, CodeError> {
     let source_root = root.join("src");
@@ -439,14 +643,24 @@ fn walk(directory: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) -> Resu
 }
 
 /// Compile a single module: parse → gate forbidden syntax → scan imports →
-/// strip types → emit + line map.
-fn strip_module(name: &str, source: &str) -> Result<StrippedFile, CodeError> {
+/// strip types → (debug only) instrument → emit + line map.
+fn strip_module(
+    name: &str,
+    source: &str,
+    mode: BuildMode,
+    file_id: u32,
+) -> Result<StrippedFile, CodeError> {
     GLOBALS.set(&Globals::default(), || {
-        strip_module_in_globals(name, source)
+        strip_module_in_globals(name, source, mode, file_id)
     })
 }
 
-fn strip_module_in_globals(name: &str, source: &str) -> Result<StrippedFile, CodeError> {
+fn strip_module_in_globals(
+    name: &str,
+    source: &str,
+    mode: BuildMode,
+    file_id: u32,
+) -> Result<StrippedFile, CodeError> {
     let cm: Lrc<SourceMap> = Default::default();
     let fm = cm.new_source_file(FileName::Custom(name.to_owned()).into(), source.to_owned());
 
@@ -478,10 +692,19 @@ fn strip_module_in_globals(name: &str, source: &str) -> Result<StrippedFile, Cod
 
     let unresolved_mark = Mark::new();
     let top_level_mark = Mark::new();
-    let program = program
+    let mut program = program
         .apply(resolver(unresolved_mark, top_level_mark, true))
         .apply(strip(unresolved_mark, top_level_mark))
         .apply(fixer(None));
+
+    // Debug builds get a probe in front of every statement. This runs *after*
+    // the type strip so the probes never have to understand TypeScript, and
+    // *before* codegen so the line map is built from the instrumented tree —
+    // each probe reuses its statement's span, so the map still lands on the
+    // line the author wrote.
+    if mode.is_debug() {
+        crate::instrument::instrument_program(&mut program, &cm, file_id);
+    }
 
     let mut buffer = Vec::new();
     let mut raw_map: Vec<(swc_common::BytePos, swc_common::LineCol)> = Vec::new();
@@ -679,6 +902,11 @@ impl Visit for ModuleGate<'_> {
 mod tests {
     use super::*;
 
+    /// Release build of one module — what every non-debug caller gets.
+    fn strip_release(name: &str, source: &str) -> Result<StrippedFile, CodeError> {
+        strip_module(name, source, BuildMode::Release, 0)
+    }
+
     fn temp_project(name: &str, files: &[(&str, &str)]) -> PathBuf {
         let root = std::env::temp_dir().join(format!("hbot-code-{name}"));
         let _ = std::fs::remove_dir_all(&root);
@@ -698,7 +926,7 @@ mod tests {
                       export function bump(value: number): number {\n\
                       \x20   return value + 1;\n\
                       }\n";
-        let module = strip_module("src/lib.ts", source).expect("strips");
+        let module = strip_release("src/lib.ts", source).expect("strips");
         assert!(!module.js.contains(": number"), "{}", module.js);
         assert!(module.js.contains("const answer = 41;"), "{}", module.js);
         assert_eq!(source_position(&module.lines, 1), Some((1, 1)));
@@ -716,7 +944,7 @@ mod tests {
     #[test]
     fn bare_imports_are_rejected_at_compile_time() {
         let error =
-            strip_module("src/main.ts", "import _ from 'lodash';\n").expect_err("must reject");
+            strip_release("src/main.ts", "import _ from 'lodash';\n").expect_err("must reject");
         assert_eq!(error.code(), "HBOT_BARE_IMPORT");
     }
 
@@ -728,7 +956,7 @@ mod tests {
             "const f = new Function('return 1'); export default f;",
             "const fs = require('fs'); export default fs;",
         ] {
-            let error = strip_module("src/main.ts", source).expect_err("must reject");
+            let error = strip_release("src/main.ts", source).expect_err("must reject");
             assert_eq!(error.code(), "HBOT_FORBIDDEN_SYNTAX", "source: {source}");
         }
     }
@@ -736,7 +964,7 @@ mod tests {
     #[test]
     fn syntax_errors_point_at_the_ts_line() {
         let error =
-            strip_module("src/main.ts", "const a = 1;\nconst = ;\n").expect_err("must fail");
+            strip_release("src/main.ts", "const a = 1;\nconst = ;\n").expect_err("must fail");
         assert_eq!(error.code(), "HBOT_COMPILE");
         let position = error.position().expect("position");
         assert_eq!(position.file, "src/main.ts");
@@ -793,6 +1021,50 @@ mod tests {
         let root = temp_project("no-entry", &[("src/lib.ts", "export const a = 1;\n")]);
         let error = compile_project(&root).expect_err("must fail");
         assert_eq!(error.code(), "HBOT_NO_ENTRY");
+    }
+
+    #[test]
+    fn a_manifest_chosen_entry_replaces_src_main_ts() {
+        // `docs/06-ide.md`: the entry comes from `hbot.json`, not from a hard
+        // coded `src/main.ts`. Everything under `src/**` is still compiled; only
+        // the module the host imports changes.
+        let root = temp_project(
+            "custom-entry",
+            &[
+                (
+                    "src/bot.ts",
+                    "import { greet } from './lib';\nexport default greet('bot');\n",
+                ),
+                (
+                    "src/lib.ts",
+                    "export const greet = (name: string) => `hi ${name}`;\n",
+                ),
+            ],
+        );
+
+        // No `src/main.ts` anywhere: the default entry must still fail...
+        assert_eq!(
+            compile_project(&root).expect_err("默认入口不存在").code(),
+            "HBOT_NO_ENTRY"
+        );
+
+        // ...but the manifest-chosen one compiles, links and is recorded.
+        let project = compile_project_with_entry(&root, "src/bot.ts").expect("清单指定入口应编过");
+        assert_eq!(project.entry(), "src/bot.ts");
+        assert_eq!(project.stats().files, 2);
+        assert!(project.contains("src/lib.ts"));
+        assert_eq!(
+            project
+                .module("src/bot.ts")
+                .map(|module| module.imports.as_slice()),
+            Some(["src/lib.ts".to_owned()].as_slice()),
+            "import 应链接到 src/lib.ts"
+        );
+
+        // A non-existent custom entry names itself in the error.
+        let error = compile_project_with_entry(&root, "src/nope.ts").expect_err("应报缺入口");
+        assert_eq!(error.code(), "HBOT_NO_ENTRY");
+        assert!(error.to_string().contains("src/nope.ts"), "{error}");
     }
 
     #[test]

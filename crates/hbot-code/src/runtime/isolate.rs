@@ -18,7 +18,7 @@
 //!
 //! [`LocalSet`]: tokio::task::LocalSet
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -31,10 +31,14 @@ use rquickjs::{
 };
 
 use crate::compile::CompiledProject;
+use crate::dispatch::EventFailure;
 use crate::error::CodeError;
+use crate::instrument;
 use crate::limits::{Deadline, Limits};
 use crate::modules;
+use hbot_core::debug::{Breakpoints, DebugSink};
 
+use super::debug_host::{DebugControl, DebugRuntime};
 use super::host_api::{self, HostOutput};
 use super::{EventOutcome, MemoryReport, js_error};
 
@@ -45,6 +49,18 @@ use super::{EventOutcome, MemoryReport, js_error};
 /// host memory without bound.
 const COMMAND_BUFFER: usize = 8;
 
+/// How long [`Sandbox::send`] waits between `try_send` retries once the inbox
+/// is full (`std`'s `SyncSender::send_timeout` is still unstable).
+const SEND_RETRY: Duration = Duration::from_millis(2);
+
+/// How often [`Sandbox::dispatch_with_debug`] re-checks whether the delay it is
+/// waiting on is a user looking at a paused frame or a genuinely wedged worker.
+///
+/// A normal dispatch answers immediately: `recv_timeout` returns as soon as the
+/// reply arrives, so this interval is only the granularity of that one check and
+/// never a per-event cost.
+const DEBUG_POLL: Duration = Duration::from_millis(50);
+
 /// Prefix that turns a project-relative module name into a relative specifier.
 ///
 /// QuickJS resolves the entry against an empty base when the import comes from
@@ -54,11 +70,51 @@ const ENTRY_SPECIFIER_PREFIX: &str = "./";
 
 /// A handle to a running isolate.
 ///
-/// Dropping the handle shuts the isolate down and joins its thread.
+/// Dropping the handle asks the isolate to stop and waits for it, but only for
+/// [`Limits::handler_timeout`] plus a grace second: a worker wedged inside
+/// QuickJS is detached and logged instead of hanging the host.
 pub struct Sandbox {
     commands: SyncSender<Command>,
+    /// Fires once the worker thread body is about to return.
+    ///
+    /// [`Drop`] uses it to bound its wait: the thread may be wedged inside
+    /// QuickJS (or awaiting a promise that never settles), and joining such a
+    /// thread hangs the host forever — the S1 bug this channel exists to kill.
+    ///
+    /// The receiver sits behind a [`Mutex`] only for auto-trait reasons:
+    /// [`Receiver`] is `!Sync`, which would make `Sandbox: !Sync`, which would
+    /// make `Arc<Sandbox>: !Send` and leave no `Send + Sync` executor able to
+    /// hold one (`crates/hbot-rpc/src/app/runtime/sandbox_handler.rs` needs
+    /// exactly that). The mutex is never a serialization point: the receiver is
+    /// taken out exactly once, by [`Drop`], which already has `&mut self`. If it
+    /// did serialize anything, that would defeat the per-conversation
+    /// parallelism the bot layer relies on.
+    finished: Mutex<Option<Receiver<()>>>,
     worker: Option<JoinHandle<()>>,
     limits: Limits,
+    /// Breakpoints for the instrumented (`debug`) build, and whether the worker
+    /// is parked at one. Shared with the worker thread through an `Arc` so
+    /// `set_breakpoints` needs no round-trip.
+    ///
+    /// Only consulted by `__hbot_trace`/`__hbot_pause` in a debug build
+    /// (`crate::instrument`, `docs/02-architecture.md` §6.5); a release build has
+    /// no probes, so this is inert there.
+    debug: Arc<Mutex<DebugState>>,
+    /// The debugger's atomics, sink slot and step session.
+    ///
+    /// Separate from [`Sandbox::debug`] because the probe fast path reads
+    /// atomics and must not take the `DebugState` mutex, and because the sink is
+    /// only meaningful for the duration of one [`Sandbox::dispatch_with_debug`].
+    control: Arc<DebugControl>,
+}
+
+/// Mutable debug state shared with the worker thread.
+#[derive(Debug, Default)]
+pub struct DebugState {
+    /// Breakpoints, per project-relative path.
+    pub breakpoints: Breakpoints,
+    /// Set while the worker is parked at a breakpoint.
+    pub paused: bool,
 }
 
 impl Sandbox {
@@ -79,18 +135,39 @@ impl Sandbox {
     pub fn spawn(project: CompiledProject, limits: Limits) -> Result<Self, CodeError> {
         let (commands, inbox) = std::sync::mpsc::sync_channel(COMMAND_BUFFER);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let worker_project = Arc::new(project);
+        // Built before the thread starts: the worker needs both, and the debug
+        // state has to be observable through `Sandbox` while the entry module is
+        // still evaluating.
+        let debug = Arc::new(Mutex::new(DebugState::default()));
+        let control = Arc::new(DebugControl::new());
+        let worker_debug = Arc::clone(&debug);
+        let worker_control = Arc::clone(&control);
         let worker = std::thread::Builder::new()
             .name("hbot-isolate".to_owned())
-            .spawn(move || worker(&inbox, worker_project, limits, &started_tx))
+            .spawn(move || {
+                worker(
+                    &inbox,
+                    worker_project,
+                    limits,
+                    worker_debug,
+                    worker_control,
+                    &started_tx,
+                    &finished_tx,
+                )
+            })
             .map_err(|error| CodeError::SandboxDead {
                 message: format!("cannot spawn isolate thread: {error}"),
             })?;
 
         let sandbox = Self {
             commands,
+            finished: Mutex::new(Some(finished_rx)),
             worker: Some(worker),
             limits,
+            debug,
+            control,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -111,30 +188,71 @@ impl Sandbox {
     /// [`Limits::handler_timeout`]; this method only holds a longer backstop in
     /// case the worker thread is wedged.
     ///
+    /// `Sandbox` is `Send + Sync`, so nothing stops several threads from calling
+    /// this concurrently; the worker still runs one command at a time and answers
+    /// them in arrival order. That is safe but not free: a burst deeper than the
+    /// inbox turns into [`CodeError::SandboxDead`] instead of queueing forever.
+    /// Per-conversation serialization upstream (`hbot-bot`) is what keeps that
+    /// from happening in practice — do not rely on this type for it.
+    ///
     /// # Errors
     ///
     /// [`CodeError::JsException`], [`CodeError::Timeout`],
     /// [`CodeError::MemoryLimit`], or [`CodeError::SandboxDead`] when the
     /// isolate is gone.
+    ///
+    /// This drops the logs a failed handler already wrote; call
+    /// [`Sandbox::dispatch_collecting`] when they matter (the host does — see
+    /// [`EventFailure`]).
     pub fn dispatch(&self, event: &serde_json::Value) -> Result<EventOutcome, CodeError> {
-        let payload = serde_json::to_string(event).map_err(|error| CodeError::JsException {
-            message: format!("event is not JSON-serialisable: {error}"),
-            stack: None,
-        })?;
+        // Thin wrapper over the collecting form: the isolate collects the logs
+        // either way, and this signature predates `EventFailure`. Callers that
+        // only care whether the event failed keep it unchanged.
+        self.dispatch_collecting(event)
+            .map_err(|failure| *failure.error)
+    }
+
+    /// [`Sandbox::dispatch`], keeping the `ctx.log()` lines a failed handler had
+    /// already written.
+    ///
+    /// A handler that logs three lines and then throws must not lose them: the
+    /// logs are usually the only clue to *why* it threw, and the isolate has
+    /// already collected them by the time the exception surfaces. This is the
+    /// same dispatch, with the collected output attached to the failure instead
+    /// of dropped by [`Self::finish`].
+    ///
+    /// The successful path is byte-for-byte [`Sandbox::dispatch`]. On failure,
+    /// `logs` is empty only when no handler ever ran: the payload did not
+    /// serialise, the isolate was already gone, or its inbox stayed full.
+    ///
+    /// # Errors
+    ///
+    /// [`EventFailure`] carrying the same [`CodeError`] [`Sandbox::dispatch`]
+    /// reports, plus everything `ctx.log()` captured before the failure.
+    pub fn dispatch_collecting(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<EventOutcome, EventFailure> {
+        let payload = payload_of(event)?;
         let (reply, result) = std::sync::mpsc::channel();
-        self.commands
-            .send(Command::Event { payload, reply })
-            .map_err(|_| self.dead())?;
+        self.send(Command::Event {
+            payload,
+            reply,
+            debug: false,
+        })
+        .map_err(EventFailure::without_output)?;
 
         match result.recv_timeout(self.backstop()) {
             Ok(outcome) => outcome,
-            Err(RecvTimeoutError::Timeout) => Err(CodeError::SandboxDead {
-                message: format!(
-                    "isolate did not answer within {:?}; the worker thread is wedged",
-                    self.backstop()
-                ),
-            }),
-            Err(RecvTimeoutError::Disconnected) => Err(self.dead()),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(EventFailure::without_output(CodeError::SandboxDead {
+                    message: format!(
+                        "isolate did not answer within {:?}; the worker thread is wedged",
+                        self.backstop()
+                    ),
+                }))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(EventFailure::without_output(self.dead())),
         }
     }
 
@@ -145,9 +263,7 @@ impl Sandbox {
     /// [`CodeError::SandboxDead`] when the isolate is gone.
     pub fn memory(&self) -> Result<MemoryReport, CodeError> {
         let (reply, result) = std::sync::mpsc::channel();
-        self.commands
-            .send(Command::Memory { reply })
-            .map_err(|_| self.dead())?;
+        self.send(Command::Memory { reply })?;
         match result.recv_timeout(self.backstop()) {
             Ok(outcome) => outcome,
             Err(RecvTimeoutError::Timeout) => Err(CodeError::SandboxDead {
@@ -163,11 +279,205 @@ impl Sandbox {
         self.limits
     }
 
+    /// Replace this isolate's breakpoints.
+    ///
+    /// Takes effect on the next instrumented line the worker reaches, so a
+    /// running handler is never interrupted mid-statement. Safe to call from any
+    /// thread and while a dispatch is in flight — including from inside
+    /// [`DebugSink::paused`], which is how a debugger UI changes breakpoints
+    /// while parked.
+    ///
+    /// A release build has no probes, so this stores a set nothing will consult.
+    pub fn set_breakpoints(&self, breakpoints: Breakpoints) {
+        // Publish the cheap "is there anything at all" flag first: a probe that
+        // sees an empty set must never take this mutex.
+        self.control.note_breakpoints(!breakpoints.is_empty());
+        let mut debug = self
+            .debug
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug.breakpoints = breakpoints;
+    }
+
+    /// Current breakpoints (a snapshot; never blocks on the worker).
+    #[must_use]
+    pub fn breakpoints(&self) -> Breakpoints {
+        self.debug
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .breakpoints
+            .clone()
+    }
+
+    /// Whether the worker is parked at a breakpoint right now.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.debug
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .paused
+    }
+
+    /// Run `onMessage` with a debug sink attached.
+    ///
+    /// With `sink: None` this is exactly [`Sandbox::dispatch`]: no probe stops,
+    /// and a debug build behaves like the release one.
+    ///
+    /// With a sink, every instrumented line the worker reaches asks the sink
+    /// whether to stop; when it stops, the sink runs **on the worker thread** and
+    /// blocks there until it returns a [`DebugAction`]
+    /// (`docs/02-architecture.md` §6.5.1). So:
+    ///
+    /// * call this from `spawn_blocking` or a dedicated thread, never from an
+    ///   async reactor;
+    /// * the sink must bound itself — `hbot_core::debug` asks for 5 minutes —
+    ///   because this call waits for it;
+    /// * a sink that never returns keeps this call waiting. It is not reported as
+    ///   [`CodeError::SandboxDead`] while the isolate says it is paused, because
+    ///   a user staring at a paused frame is not a wedged worker. The
+    ///   [`Limits::handler_timeout`] budget keeps running underneath, so the
+    ///   handler is still cut off with [`CodeError::Timeout`] as soon as it
+    ///   resumes — a paused debugger cannot disable the timeout.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Sandbox::dispatch`], plus the timeout behaviour above. Logs a
+    /// failed handler already wrote are dropped here, exactly as in
+    /// [`Sandbox::dispatch`]; use [`Sandbox::dispatch_with_debug_collecting`]
+    /// to keep them.
+    pub fn dispatch_with_debug(
+        &self,
+        event: &serde_json::Value,
+        sink: Option<&dyn DebugSink>,
+    ) -> Result<EventOutcome, CodeError> {
+        self.dispatch_with_debug_collecting(event, sink)
+            .map_err(|failure| *failure.error)
+    }
+
+    /// [`Sandbox::dispatch_with_debug`], keeping the logs of a failed handler.
+    ///
+    /// The debugger needs the same diagnostic output as the plain path: someone
+    /// stepping through a handler that then throws wants the lines it printed
+    /// before the throw. Blocking contract is identical to
+    /// [`Sandbox::dispatch_with_debug`] — call it from `spawn_blocking` or a
+    /// dedicated thread.
+    ///
+    /// # Errors
+    ///
+    /// [`EventFailure`] carrying the same [`CodeError`]
+    /// [`Sandbox::dispatch_with_debug`] reports, plus everything `ctx.log()`
+    /// captured before the failure.
+    pub fn dispatch_with_debug_collecting(
+        &self,
+        event: &serde_json::Value,
+        sink: Option<&dyn DebugSink>,
+    ) -> Result<EventOutcome, EventFailure> {
+        let payload = payload_of(event)?;
+        let armed = sink.is_some();
+        // The guard serializes debug dispatches and keeps the sink slot alive;
+        // `clear_sink` below runs for every exit path, including errors.
+        let guard = self.control.begin_dispatch(sink);
+        let outcome = self.dispatch_instrumented(payload, armed);
+        self.control.clear_sink();
+        drop(guard);
+        outcome
+    }
+
+    /// Queue an event whose probes may stop, and wait for the reply.
+    ///
+    /// Split out of [`Sandbox::dispatch_with_debug_collecting`] so the sink slot
+    /// is cleared on every path, including [`Sandbox::send`] failing.
+    fn dispatch_instrumented(
+        &self,
+        payload: String,
+        armed: bool,
+    ) -> Result<EventOutcome, EventFailure> {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.send(Command::Event {
+            payload,
+            reply,
+            debug: armed,
+        })
+        .map_err(EventFailure::without_output)?;
+
+        let backstop = self.backstop();
+        let mut wedged_for = Duration::ZERO;
+        loop {
+            match result.recv_timeout(DEBUG_POLL) {
+                Ok(outcome) => return outcome,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(EventFailure::without_output(self.dead()));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.is_paused() {
+                        // Parked in the sink on purpose: restart the wedge clock
+                        // instead of reporting a healthy isolate as dead.
+                        wedged_for = Duration::ZERO;
+                        continue;
+                    }
+                    wedged_for = wedged_for.saturating_add(DEBUG_POLL);
+                    if wedged_for >= backstop {
+                        return Err(EventFailure::without_output(CodeError::SandboxDead {
+                            message: format!(
+                                "isolate did not answer within {backstop:?}; the worker thread is wedged"
+                            ),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
     fn backstop(&self) -> Duration {
         self.limits
             .handler_timeout
             .saturating_mul(3)
             .saturating_add(Duration::from_secs(1))
+    }
+
+    /// How long [`Drop`] waits for the worker to stop.
+    ///
+    /// The interrupt handler kills a spinning handler shortly after
+    /// [`Limits::handler_timeout`], so that budget plus a grace second covers
+    /// every case where QuickJS is actually executing code. Anything that takes
+    /// longer is a worker wedged inside a host call or awaiting a promise that
+    /// never settles, and waiting for it would hang the host.
+    fn shutdown_budget(&self) -> Duration {
+        self.limits
+            .handler_timeout
+            .saturating_add(Duration::from_secs(1))
+    }
+
+    /// Queue `command` for the worker without blocking forever.
+    ///
+    /// A blocking `send` on a full inbox is a host hang: the worker only drains
+    /// it by executing commands, and a wedged worker never will. The backstop
+    /// turns that into [`CodeError::SandboxDead`] instead.
+    ///
+    /// This polls because `std`'s `SyncSender::send_timeout` is still unstable;
+    /// the retry interval is short enough that a healthy worker never notices,
+    /// and the loop only runs when the inbox is actually full.
+    fn send(&self, command: Command) -> Result<(), CodeError> {
+        let backstop = self.backstop();
+        let deadline = Instant::now() + backstop;
+        let mut command = command;
+        loop {
+            match self.commands.try_send(command) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => return Err(self.dead()),
+                Err(TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        return Err(CodeError::SandboxDead {
+                            message: format!(
+                                "isolate inbox is still full after {backstop:?}; the worker thread is wedged"
+                            ),
+                        });
+                    }
+                    command = returned;
+                    std::thread::sleep(SEND_RETRY);
+                }
+            }
+        }
     }
 
     fn dead(&self) -> CodeError {
@@ -179,18 +489,69 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        // Ask the worker to stop; dropping the sender afterwards also unblocks a
-        // worker that is waiting in `recv`.
-        let _ = self.commands.send(Command::Shutdown);
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            // A panicking worker is a bug, and it is also invisible to the
-            // caller because the panic happened on another thread. Record it
-            // instead of swallowing it silently.
-            tracing::error!("hbot-isolate thread panicked");
+        // Ask the worker to stop. `try_send` rather than `send`: a wedged worker
+        // never drains the inbox, and blocking here is exactly the host hang
+        // this method must not cause. A full inbox already means the worker is
+        // wedged (one in-flight command plus a `COMMAND_BUFFER` sized backlog is
+        // more than the per-conversation serialization upstream would produce);
+        // a closed channel means it already stopped.
+        let _ = self.commands.try_send(Command::Shutdown);
+
+        // Joining unconditionally was the S1 bug: a worker stuck inside QuickJS
+        // (or awaiting a promise that never settles) never returns, so dropping
+        // a `Sandbox` hung the whole host with no output and no CPU use. Wait for
+        // a bounded grace period, then detach the thread and leave a log line —
+        // a leaked thread is bad, a frozen user application is worse.
+        let budget = self.shutdown_budget();
+        // Take the receiver out of its slot so the bounded wait below holds no
+        // lock. Only this method ever takes it, so a second `Drop` cannot run and
+        // a missing receiver can only mean "already stopped".
+        let finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let stopped = match finished {
+            Some(finished) => finished.recv_timeout(budget),
+            None => Err(RecvTimeoutError::Disconnected),
+        };
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        match stopped {
+            // Normal stop — or the sender was dropped because the thread body
+            // ended (including a panic), in which case joining cannot block.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                if worker.join().is_err() {
+                    // A panicking worker is a bug, and it is also invisible to
+                    // the caller because the panic happened on another thread.
+                    // Record it instead of swallowing it silently.
+                    tracing::error!("hbot-isolate thread panicked");
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                tracing::error!(
+                    budget_ms = budget.as_millis(),
+                    "hbot-isolate thread did not stop within the shutdown budget; detaching it \
+                     (the isolate may be blocked in JavaScript or waiting on a promise that never settles)"
+                );
+                // Dropping the handle detaches the thread instead of joining it.
+            }
         }
     }
+}
+
+/// Serialise one event payload for the worker.
+///
+/// Shared by every dispatch entry point so the "not JSON-serialisable" failure
+/// is byte-identical whichever one the caller uses.
+fn payload_of(event: &serde_json::Value) -> Result<String, EventFailure> {
+    serde_json::to_string(event).map_err(|error| {
+        EventFailure::without_output(CodeError::JsException {
+            message: format!("event is not JSON-serialisable: {error}"),
+            stack: None,
+        })
+    })
 }
 
 /// A request from the owner thread to the isolate thread.
@@ -198,7 +559,13 @@ enum Command {
     /// Run the handler for `payload` and answer on `reply`.
     Event {
         payload: String,
-        reply: Sender<Result<EventOutcome, CodeError>>,
+        /// The outcome *or* the failure with the handler's collected logs, so
+        /// the error path does not throw away what the handler printed.
+        reply: Sender<Result<EventOutcome, EventFailure>>,
+        /// Whether the caller attached a [`DebugSink`], i.e. whether probes may
+        /// stop during this event. `false` for [`Sandbox::dispatch`], so a
+        /// debug build runs uninstrumented unless someone is watching.
+        debug: bool,
     },
     /// Report heap usage.
     Memory {
@@ -209,13 +576,17 @@ enum Command {
 }
 
 /// Thread body: build the realm once, then serve commands until shutdown.
+#[allow(clippy::too_many_arguments)]
 fn worker(
     inbox: &Receiver<Command>,
     project: Arc<CompiledProject>,
     limits: Limits,
+    debug: Arc<Mutex<DebugState>>,
+    control: Arc<DebugControl>,
     started: &Sender<Result<(), CodeError>>,
+    finished: &Sender<()>,
 ) {
-    if let Err(error) = serve(inbox, project, limits, started) {
+    if let Err(error) = serve(inbox, project, limits, debug, control, started) {
         tracing::error!(
             code = error.code(),
             error = %error,
@@ -229,17 +600,31 @@ fn worker(
         let failure = CodeError::SandboxDead {
             message: format!("{code}: {message}"),
         };
-        for command in inbox.iter() {
-            reject(command, &failure);
+        // Reject queued commands until the owner shuts us down. `Shutdown` must
+        // end this loop: the owner joins this thread while it still holds the
+        // command sender, so the channel never disconnects on its own — a worker
+        // that ignores the shutdown message deadlocks the host on drop.
+        while let Ok(command) = inbox.recv() {
+            match command {
+                Command::Shutdown => break,
+                other => reject(other, &failure),
+            }
         }
     }
+
+    // Tell `Sandbox::drop` the thread is about to end so it stops waiting.
+    let _ = finished.send(());
 }
 
 fn reject(command: Command, failure: &CodeError) {
     let message = failure.to_string();
     match command {
         Command::Event { reply, .. } => {
-            let _ = reply.send(Err(CodeError::SandboxDead { message }));
+            // The isolate is gone, so no handler ran for this event: there is
+            // nothing collected to report.
+            let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
+                message,
+            })));
         }
         Command::Memory { reply } => {
             let _ = reply.send(Err(CodeError::SandboxDead { message }));
@@ -254,10 +639,13 @@ fn trace(step: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     inbox: &Receiver<Command>,
     project: Arc<CompiledProject>,
     limits: Limits,
+    debug: Arc<Mutex<DebugState>>,
+    control: Arc<DebugControl>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -303,16 +691,25 @@ fn serve(
     trace("async context ready");
 
     let entry = format!("{ENTRY_SPECIFIER_PREFIX}{}", project.entry());
-    let handler = {
+    let boot = {
         let context = &context;
         let output = &output;
         let deadline = &deadline;
+        let project = &project;
+        let debug = &debug;
+        let control = &control;
         local.block_on(&runtime, async move {
             context
-                .async_with(async |ctx| bootstrap(&ctx, &entry, output, deadline, limits).await)
+                .async_with(async |ctx| {
+                    bootstrap(
+                        &ctx, &entry, output, deadline, project, debug, control, limits,
+                    )
+                    .await
+                })
                 .await
-        })?
+        })
     };
+    let handler = boot?;
 
     // Only now is the bot callable; unblock `Sandbox::spawn`.
     let _ = started.send(Ok(()));
@@ -324,18 +721,31 @@ fn serve(
                 let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
                 let _ = reply.send(Ok(memory_report(usage, limits)));
             }
-            Command::Event { payload, reply } => {
+            Command::Event {
+                payload,
+                reply,
+                debug: instrumented,
+            } => {
                 let raw = {
                     let context = &context;
                     let handler = &handler;
                     let output = &output;
                     let deadline = &deadline;
                     let project = &project;
+                    let control = &control;
                     local.block_on(&runtime, async move {
                         context
                             .async_with(async |ctx| {
                                 run_event(
-                                    &ctx, &payload, handler, output, deadline, project, limits,
+                                    &ctx,
+                                    &payload,
+                                    handler,
+                                    output,
+                                    deadline,
+                                    project,
+                                    control,
+                                    instrumented,
+                                    limits,
                                 )
                                 .await
                             })
@@ -364,11 +774,15 @@ fn memory_report(usage: rquickjs::qjs::JSMemoryUsage, limits: Limits) -> MemoryR
 }
 
 /// Evaluate `src/main.ts` and capture its `onMessage` function.
+#[allow(clippy::too_many_arguments)]
 async fn bootstrap<'js>(
     ctx: &Ctx<'js>,
     entry: &str,
     output: &Arc<Mutex<HostOutput>>,
     deadline: &Arc<Deadline>,
+    project: &Arc<CompiledProject>,
+    debug: &Arc<Mutex<DebugState>>,
+    control: &Arc<DebugControl>,
     limits: Limits,
 ) -> Result<Persistent<Function<'static>>, CodeError> {
     deadline.reset();
@@ -376,16 +790,31 @@ async fn bootstrap<'js>(
 
     let result = async {
         host_api::install(ctx, Arc::clone(output), Arc::clone(deadline))?;
+        // The probe functions exist in both builds so the loader never has to
+        // care, but `__hbot_dbg` starts `false`: a release build never emits a
+        // call, and a debug build never pays for one until a sink is attached.
+        DebugRuntime::new(
+            Arc::clone(control),
+            Arc::clone(debug),
+            Arc::clone(project),
+            Arc::clone(deadline),
+        )
+        .install(ctx)?;
         trace("host api installed");
 
         // The single `Module::import` that kicks off the loader chain; every
         // further module is pulled in by QuickJS itself through
         // `ProjectResolver`/`ProjectLoader`.
+        //
+        // A rejected import (syntax-level TypeError, `ReferenceError` from a
+        // missing global, a throw at module top level) settles this promise with
+        // an exception instead of staying pending, so `describe` — not `js_error`
+        // — is what turns it into a message and a remapped TypeScript stack.
         let namespace = Module::import(ctx, entry.to_owned())
-            .map_err(js_error)?
+            .map_err(|error| describe(ctx, error, project))?
             .into_future::<Object<'js>>()
             .await
-            .map_err(js_error)?;
+            .map_err(|error| describe(ctx, error, project))?;
         trace("entry module evaluated");
 
         let default = namespace
@@ -416,6 +845,7 @@ async fn bootstrap<'js>(
 }
 
 /// One handler invocation, with the deadline armed and host output captured.
+#[allow(clippy::too_many_arguments)]
 async fn run_event<'js>(
     ctx: &Ctx<'js>,
     payload: &str,
@@ -423,6 +853,8 @@ async fn run_event<'js>(
     output: &Arc<Mutex<HostOutput>>,
     deadline: &Arc<Deadline>,
     project: &CompiledProject,
+    control: &Arc<DebugControl>,
+    instrumented: bool,
     limits: Limits,
 ) -> RawEvent {
     deadline.reset();
@@ -432,10 +864,18 @@ async fn run_event<'js>(
         .unwrap_or_else(PoisonError::into_inner)
         .clear();
 
+    // `armed` is what the Rust fast path reads; `__hbot_dbg` is what makes the
+    // emitted probe skip the call entirely. Both are per event: a debug build
+    // dispatched without a sink must cost what the release build costs.
+    control.begin_event(instrumented);
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, instrumented);
+
     let started = Instant::now();
     let result = invoke(ctx, payload, handler, project).await;
     let duration = started.elapsed();
 
+    control.end_event();
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
     deadline.disarm();
     let interrupted = deadline.take_interrupted();
     let (logs, replies) = output.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -537,7 +977,16 @@ struct RawEvent {
     result: Result<(), CodeError>,
 }
 
-fn finish(raw: RawEvent, memory: MemoryReport, limits: Limits) -> Result<EventOutcome, CodeError> {
+/// Attach the heap sample to one invocation's result.
+///
+/// The error branch carries `raw.logs` too: the handler ran, so whatever it
+/// logged before failing is genuine diagnostic output. Dropping it here was the
+/// bug that made "my bot threw and my three `ctx.log` lines vanished" possible.
+fn finish(
+    raw: RawEvent,
+    memory: MemoryReport,
+    limits: Limits,
+) -> Result<EventOutcome, EventFailure> {
     match raw.result {
         Ok(()) => Ok(EventOutcome {
             logs: raw.logs,
@@ -545,7 +994,10 @@ fn finish(raw: RawEvent, memory: MemoryReport, limits: Limits) -> Result<EventOu
             duration: raw.duration,
             memory,
         }),
-        Err(error) => Err(classify(error, raw.interrupted, limits)),
+        Err(error) => Err(EventFailure {
+            logs: raw.logs,
+            error: Box::new(classify(error, raw.interrupted, limits)),
+        }),
     }
 }
 
@@ -643,6 +1095,25 @@ impl Loader for ProjectLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The acceptance point for `Sandbox`'s auto traits.
+    ///
+    /// `hbot-rpc` boxes a sandbox into an executor that must be `Send + Sync`,
+    /// and `Arc<Sandbox>: Send` additionally requires `Sandbox: Sync`. This
+    /// failed when `finished: Receiver<()>` was stored bare: `Receiver` is
+    /// `!Sync`, so the whole chain `Sandbox -> Arc<Sandbox> -> Worker` was
+    /// `!Send` and the RPC crate could not compile. It is a compile-time
+    /// assertion on purpose — a runtime test could pass while the bound rots.
+    #[test]
+    fn sandbox_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_send<T: Send>() {}
+
+        assert_send_sync::<Sandbox>();
+        // `Arc<T>: Send` needs `T: Send + Sync`, which is the bound the RPC
+        // crate's executor actually requires of whatever it stores.
+        assert_send::<Arc<Sandbox>>();
+    }
 
     #[test]
     fn out_of_memory_messages_are_recognised() {

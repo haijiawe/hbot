@@ -32,6 +32,16 @@ pub mod code {
     pub const MEMORY_LIMIT: &str = "HBOT_MEMORY_LIMIT";
     /// The isolate thread died or its command channel closed.
     pub const SANDBOX_DEAD: &str = "HBOT_SANDBOX_DEAD";
+    /// `hbot.json` is missing from the project root.
+    pub const MANIFEST_MISSING: &str = "HBOT_MANIFEST_MISSING";
+    /// `hbot.json` is present but invalid: bad JSON, unknown field, out-of-range
+    /// limit, entry outside the project, … Both [`super::CodeError::ManifestSyntax`]
+    /// and [`super::CodeError::ManifestInvalid`] answer this code — from the
+    /// caller's point of view they are the same class of failure (the manifest
+    /// must be fixed by the author), and the message carries the line/column.
+    pub const MANIFEST_INVALID: &str = "HBOT_MANIFEST_INVALID";
+    /// `scaffold` refused to overwrite existing files, or could not create them.
+    pub const SCAFFOLD: &str = "HBOT_SCAFFOLD";
 }
 
 /// A position in the *TypeScript* source (1-based line/column).
@@ -175,6 +185,53 @@ pub enum CodeError {
         source: std::io::Error,
     },
 
+    /// `hbot.json` does not exist in the project root.
+    #[error("HBOT_MANIFEST_MISSING: no manifest at {path}")]
+    ManifestMissing {
+        /// Expected path of `hbot.json`.
+        path: PathBuf,
+    },
+
+    /// `hbot.json` is not valid JSON.
+    ///
+    /// Kept separate from [`Self::ManifestInvalid`] only so the message can carry
+    /// the parser's `line:column`; both answer [`code::MANIFEST_INVALID`].
+    #[error("HBOT_MANIFEST_INVALID: {path}:{line}:{column}: {message}")]
+    ManifestSyntax {
+        /// Manifest path.
+        path: PathBuf,
+        /// 1-based line of the JSON syntax error.
+        line: u32,
+        /// 1-based column of the JSON syntax error.
+        column: u32,
+        /// Parser message.
+        message: String,
+    },
+
+    /// `hbot.json` parsed but violates the manifest contract.
+    ///
+    /// Covers unknown/missing fields, an entry outside the project or absent on
+    /// disk, and limits above the host hard caps. Out-of-range limits are a
+    /// **hard error**, never silently clamped: a project that asks for 512 MB
+    /// must be told it cannot have it, not quietly run with 32 MB
+    /// (`docs/02-architecture.md` §6.1).
+    #[error("HBOT_MANIFEST_INVALID: {path}: {message}")]
+    ManifestInvalid {
+        /// Manifest path.
+        path: PathBuf,
+        /// What is wrong, in the author's terms.
+        message: String,
+    },
+
+    /// `scaffold` refused to overwrite a file, or could not write the skeleton.
+    #[error("HBOT_SCAFFOLD: {path}: {message}")]
+    Scaffold {
+        /// File (or directory) the scaffold stopped at.
+        path: PathBuf,
+        /// Why it stopped.
+        message: String,
+    },
+
     /// The isolate died while running the handler.
     #[error("HBOT_SANDBOX_DEAD: {message}")]
     SandboxDead {
@@ -222,6 +279,9 @@ impl CodeError {
             Self::JsException { .. } => code::JS_EXCEPTION,
             Self::Timeout { .. } => code::TIMEOUT,
             Self::MemoryLimit { .. } => code::MEMORY_LIMIT,
+            Self::ManifestMissing { .. } => code::MANIFEST_MISSING,
+            Self::ManifestSyntax { .. } | Self::ManifestInvalid { .. } => code::MANIFEST_INVALID,
+            Self::Scaffold { .. } => code::SCAFFOLD,
         }
     }
 
@@ -240,6 +300,13 @@ impl CodeError {
                 column: *column,
             }),
             Self::BareImport { at, .. } => at.position().cloned(),
+            Self::ManifestSyntax {
+                path, line, column, ..
+            } => Some(SourcePos {
+                file: path.to_string_lossy().into_owned(),
+                line: *line,
+                column: *column,
+            }),
             Self::JsException { stack, .. } => {
                 stack.as_deref().and_then(parse_first_stack_position)
             }
@@ -298,6 +365,37 @@ mod tests {
         };
         assert!(err.to_string().contains("at src/main.ts:3:8"), "{err}");
         assert_eq!(err.position().map(|pos| pos.line), Some(3));
+    }
+
+    #[test]
+    fn manifest_errors_share_one_code_but_keep_the_json_position() {
+        let syntax = CodeError::ManifestSyntax {
+            path: PathBuf::from("hbot.json"),
+            line: 4,
+            column: 9,
+            message: "expected `,`".to_owned(),
+        };
+        let invalid = CodeError::ManifestInvalid {
+            path: PathBuf::from("hbot.json"),
+            message: "limits.handlerMs 超过宿主硬上限 2000".to_owned(),
+        };
+        assert_eq!(syntax.code(), "HBOT_MANIFEST_INVALID");
+        assert_eq!(invalid.code(), "HBOT_MANIFEST_INVALID");
+        assert_eq!(
+            syntax.position().map(|pos| (pos.line, pos.column)),
+            Some((4, 9)),
+            "JSON 语法错必须能回到清单的行列"
+        );
+        assert!(syntax.to_string().contains("hbot.json:4:9"), "{syntax}");
+    }
+
+    #[test]
+    fn missing_manifest_has_its_own_code() {
+        let error = CodeError::ManifestMissing {
+            path: PathBuf::from("/tmp/p/hbot.json"),
+        };
+        assert_eq!(error.code(), "HBOT_MANIFEST_MISSING");
+        assert!(error.position().is_none());
     }
 
     #[test]

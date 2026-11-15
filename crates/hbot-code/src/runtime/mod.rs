@@ -9,7 +9,8 @@
 //!
 //! Limits live in [`crate::limits`]; compile-time work in [`crate::compile`].
 
-mod host_api;
+pub(crate) mod debug_host;
+pub(crate) mod host_api;
 mod isolate;
 
 use std::time::Duration;
