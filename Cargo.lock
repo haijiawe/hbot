@@ -1699,6 +1699,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hbot-adapters",
  "hbot-core",
  "hbot-rpc",
  "serde",
@@ -1759,14 +1760,22 @@ name = "hbot-rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures-util",
+ "hbot-adapters",
+ "hbot-agent",
+ "hbot-bot",
+ "hbot-code",
  "hbot-core",
+ "hbot-store",
+ "hbot-workspace",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tracing",
  "ts-rs",
+ "uuid",
 ]
 
 [[package]]

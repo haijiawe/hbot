@@ -37,6 +37,7 @@ pub struct Dispatcher {
     clock: Option<Arc<dyn Clock>>,
     ids: Option<Arc<dyn IdGenerator>>,
     events: Option<Arc<dyn EventSink<Event>>>,
+    state: Option<Arc<crate::app::AppState>>,
 }
 
 impl Dispatcher {
@@ -63,6 +64,24 @@ impl Dispatcher {
         self
     }
 
+    /// 接上真实应用状态：此后命令走真实实现（store / workspace / bot / agent）。
+    ///
+    /// 没有调用这个构造的命令分发器是 M0 的空壳：除 `AppInfo` 外全部 `-32006`。
+    /// 两条路径共用同一个 `dispatch`，所以"桌面能做的事后台做不了"不会发生
+    /// （`docs/02-architecture.md` §2）。
+    pub fn with_state(mut self, state: Arc<crate::app::AppState>) -> Self {
+        self.clock = Some(Arc::clone(state.clock()));
+        self.ids = Some(Arc::clone(state.ids()));
+        self.events = Some(state.events().clone());
+        self.state = Some(state);
+        self
+    }
+
+    /// 已装配的应用状态；`None` 表示空壳。
+    pub fn state(&self) -> Option<&Arc<crate::app::AppState>> {
+        self.state.as_ref()
+    }
+
     /// 已注入的时钟。
     pub fn clock(&self) -> Option<&Arc<dyn Clock>> {
         self.clock.as_ref()
@@ -83,9 +102,46 @@ impl Dispatcher {
     /// 永不 panic、永不以 `Result` 报错：失败也走 [`Response::Error`]，保证 wire 上
     /// 只有一种返回形状（`AGENTS.md` §4.3 加字段要兼容旧 UI，形状不能漂）。
     pub async fn dispatch(&self, command: Command) -> Response {
-        match command {
-            Command::AppInfo => app_info(),
-            other => unimplemented(&other),
+        let Some(state) = &self.state else {
+            // 空壳模式：除 `AppInfo` 外一律"尚未实现"（M0 行为，测试钉住它）。
+            return match command {
+                Command::AppInfo => app_info(),
+                other => unimplemented(&other),
+            };
+        };
+
+        match &command {
+            Command::AppInfo => crate::app::commands::system::app_info(state),
+            Command::ProjectOpen { path } => {
+                crate::app::commands::system::project_open(state, path.clone()).await
+            }
+            Command::FileRead { .. }
+            | Command::FileWrite { .. }
+            | Command::FileList { .. }
+            | Command::FileCreate { .. }
+            | Command::FileRename { .. }
+            | Command::FileDelete { .. }
+            | Command::SearchStart { .. }
+            | Command::SearchCancel { .. }
+            | Command::Diagnostics { .. } => {
+                crate::app::commands::files::handle(state, command).await
+            }
+            Command::BotStart { .. }
+            | Command::BotStop { .. }
+            | Command::BotInject { .. }
+            | Command::LogsTail { .. } => crate::app::commands::bots::handle(state, command).await,
+            Command::AgentSend { .. }
+            | Command::AgentCancel { .. }
+            | Command::AgentApprove { .. }
+            | Command::EditApply { .. }
+            | Command::EditReject { .. } => {
+                crate::app::commands::agent::handle(state, command).await
+            }
+            Command::DebugSetBreakpoints { .. }
+            | Command::DebugResume { .. }
+            | Command::DebugStep { .. } => {
+                crate::app::commands::debug::handle(state, command).await
+            }
         }
     }
 }

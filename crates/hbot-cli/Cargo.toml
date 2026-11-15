@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 hbot-core = { path = "../hbot-core" }
 hbot-rpc = { path = "../hbot-rpc" }
+hbot-adapters = { path = "../hbot-adapters" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 serde.workspace = true

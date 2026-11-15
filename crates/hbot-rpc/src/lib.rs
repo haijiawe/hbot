@@ -12,11 +12,13 @@
 
 #![warn(missing_docs)]
 
+pub mod app;
 pub mod dispatch;
 pub mod dto;
 pub mod ts;
 pub mod ws;
 
+pub use app::{AppState, EventBus};
 pub use dispatch::Dispatcher;
 pub use dto::{
     ApiError, AppInfo, Command, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry,

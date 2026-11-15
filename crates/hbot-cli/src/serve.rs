@@ -129,7 +129,22 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let pid = std::process::id();
 
     let server = WsServer::new(plan.ws_config());
-    let dispatcher = Arc::new(Dispatcher::new().with_events(server.event_sink()));
+
+    // 真实应用状态：`hbot serve` 与桌面壳用**同一套** `Dispatcher::with_state`
+    // （`docs/02-architecture.md` §2 的"一个组合根"）——后台能做的事，桌面不需要
+    // 另写一遍，反之亦然。
+    let data_dir = match plan.data_dir.clone() {
+        Some(path) => path,
+        None => default_data_dir(),
+    };
+    let state = hbot_rpc::AppState::open(
+        &data_dir,
+        Arc::new(hbot_adapters::SystemClock),
+        Arc::new(hbot_rpc::app::ids::UuidIds),
+    )
+    .context("打开应用状态失败")?;
+
+    let dispatcher = Arc::new(Dispatcher::new().with_state(Arc::new(state)));
     let handle = server
         .bind(dispatcher)
         .await
@@ -153,6 +168,37 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     handle.shutdown().await;
     info!("hbot serve 已退出");
     Ok(())
+}
+
+/// 数据目录：与 `Dispatcher` 的 `default_data_dir` 口径一致（Windows 用
+/// `%APPDATA%\hbot`，Unix 用 `$XDG_DATA_HOME/hbot`）。
+///
+/// 这里复制了一份而不是从 `hbot-rpc` 借：那一份是 `dispatch` 的内部细节，
+/// 而 `serve` 需要的是"数据库放哪"，两者将来会一起改（M1 读配置）。
+fn default_data_dir() -> PathBuf {
+    if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("hbot");
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(profile)
+                .join("AppData")
+                .join("Roaming")
+                .join("hbot");
+        }
+    } else {
+        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(data_home).join("hbot");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("hbot");
+        }
+    }
+
+    PathBuf::from("hbot")
 }
 
 /// 等 Ctrl-C 或 SIGTERM（Unix）。两者走同一条收尾路径。

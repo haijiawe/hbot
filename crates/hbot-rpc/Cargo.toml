@@ -7,7 +7,15 @@ license.workspace = true
 
 [dependencies]
 hbot-core = { path = "../hbot-core" }
+hbot-store = { path = "../hbot-store" }
+hbot-workspace = { path = "../hbot-workspace" }
+hbot-code = { path = "../hbot-code" }
+hbot-bot = { path = "../hbot-bot" }
+hbot-adapters = { path = "../hbot-adapters" }
+hbot-agent = { path = "../hbot-agent" }
+async-trait.workspace = true
 anyhow.workspace = true
+uuid.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
