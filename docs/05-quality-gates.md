@@ -85,11 +85,12 @@ pnpm -C apps/web build           # 产物能构建
 
 | 指标 | 预算 | 测量 |
 |---|---|---|
-| 桌面空闲总 RSS | < 220 MB | 启动后静置 60s，采样 3 次取中位 |
-| 核心空闲 RSS | < 60 MB | 无 bot、无会话 |
-| 每多一个 bot | < 6 MB | 加 5 个 bot 的斜率 |
-| 每 isolate | < 8 MB（堆上限 32 MB） | 加载后 + 跑 1000 条消息 |
-| 冷启动到可交互 | < 800 ms | 进程启动 → 首帧可点击 |
+| 桌面整机（private commit 求和） | < 260 MB | `scripts/mem-probe.ps1 -IncludeChildren -SplitChildren`，静置 10s 采 30s 取中位。**不要用 WorkingSet**：WebView2 共享页会被 6–7 个子进程重复计入（实测 WS 382 MB vs private 206 MB，见 ADR-0002 §4） |
+| 核心空闲（private commit） | < 60 MB | `hbot serve` 无 bot、无会话 |
+| 每多一个 bot | < 6 MB | 加 5 个 bot 的斜率（实测 0.10 MB/bot） |
+| 每 isolate | < 8 MB（堆上限 32 MB） | 加载后 + 跑 1000 条消息（实测 0.30 MB） |
+| 冷启动到核心可用 | < 800 ms | `hbot serve` 打印 `{"type":"ready"}` 的时刻（实测 878 ms 中位 —— **当前不达标**，见 ADR-0002 §4.2） |
+| 冷启动到可交互 | < 800 ms | 进程启动 → 首帧可点击；「Monaco ready」无客观信号，只记 IPC 首次可用（924 ms 中位）作下界 |
 | UI 首屏 | < 1 s | 本地构建，中端机 |
 | 初始 JS（gzip） | < 1.5 MB | 构建报告 |
 | 入站 → 入队 p95 | < 10 ms | 注入 10k 条 |

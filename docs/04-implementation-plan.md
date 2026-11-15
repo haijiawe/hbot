@@ -10,7 +10,7 @@
 
 用户打开 IDE → 新建项目 → 和 Agent 描述想要的 bot → Agent 在多文件项目里写 `src/main.ts` 与 `src/lib/*`，每次写入以 Diff 呈现 → 用户逐块接受 → 点“运行” → 用模拟消息自测 → 看日志/问题 → 让 Agent 修 → 接真实 OneBot → 在托盘/后台跑。
 
-**MVP 完成 = 上述链路在 Windows 与 Linux 上可用，编辑器/搜索/问题/Diff/运行/日志可用，且桌面空闲总 RSS < 220 MB。**
+**MVP 完成 = 上述链路在 Windows 与 Linux 上可用，编辑器/搜索/问题/Diff/运行/日志可用，且桌面整机 private commit < 260 MB（口径与实测见 ADR-0002 §4）。**
 
 ### 1.1 非目标（M0–M6 都不做）
 
@@ -112,7 +112,9 @@
 1. 全局搜索/替换（流式、正则、glob）、符号大纲、重命名符号、多光标、分栏、面包屑。
 2. 行内编辑（`Cmd/Ctrl+K`）、问题面板 `Fix`、运行失败 `Ask Agent to fix`、整组撤销。
 3. 命令面板、快捷键、布局单一真源、面板懒加载、主题与 i18n。
-4. **调试构建**：SWC 插桩、行/条件断点、局部变量、步进、调用栈；debug/release 双构建；release 无插桩。
+4. **调试构建**：SWC 插桩、行断点、局部变量、步进、调用栈；运行时恒用 debug 构建但只在有断点时 arm；release 无插桩（`hbot check`/diagnostics 用 release）。
+   - 2026-11-16 已落地（勾掉的部分）：插桩器 `crates/hbot-code/src/instrument.rs`、宿主 `runtime/debug_host.rs`、`BuildMode`/`DebugInfo`/`source_position`、`Sandbox::dispatch_with_debug`、rpc 三命令两事件（`app/debug/`）、web 断点/工具条/暂停面板、ws critical 通道。实测开销 **4.64×**（上限 5×）。
+   - **仍未做**：条件断点（冻结契约没有条件字段，要加走 ADR）、回放、日志点、变量分页。
 5. 回放：历史入站事件用当前代码重跑并对比输出；mock fixture 保存/复用。
 6. 项目模板、`AGENTS.md` 项目规则、多项目切换；每项目独立 DB 与日志。
 
@@ -120,7 +122,7 @@
 
 - [ ] 改一行代码保存，2s 内新版本生效，不必重启 bot。
 - [ ] 编译失败时 bot 继续用旧版本跑，UI 指出行号。
-- [ ] 断点命中、查看局部变量、step over/into/out、resume 可用；debug 构建 ≤5× release。
+- [ ] 断点命中、查看局部变量、step over/into/out、resume 可用；debug 构建 ≤5× release。（Rust 链路与 web UI 已各自绿，**未做真机浏览器端到端验收**：`vitest` 是 `environment: 'node'`，组件层零测试，`ipc-mock` 故意不伪造 `debug.paused`）
 - [ ] 全局搜索 10,000 文件首屏 <1s；打开 1MB 文件 <150ms。
 - [ ] 新项目从模板创建到跑通 mock 消息 <3 分钟。
 - [ ] 20 标签 + 10,000 行日志下按键与滚动无明显卡顿。
@@ -232,24 +234,33 @@
 
 ## 4. parity 场景（从旧项目抽取，不逐条迁移测试）
 
-| # | 场景 | 旧证据 | 新验收 |
-|---|---|---|---|
-| 1 | 同一会话连发，回复不乱序 | `FlowRuntime.ts:401` 并发派发 | 顺序一致 |
-| 2 | 启动/重连窗口不丢消息 | `eventBus.ts:806-827`、`botManager.ts:250,256` | 先订阅后连接；缓冲有界 |
-| 3 | 重复投递不重复执行 | 旧官方链路无幂等 | 唯一键 + 只执行一次 |
-| 4 | 回复上下文正确 | 旧 `ctxFor` 绑定 | 被动回复带 `reply_to` |
-| 5 | 崩溃只影响单 bot | 旧插件主进程 vm | isolate + supervisor |
-| 6 | 热更新不打断在途消息 | 旧无此能力 | 队列在 Rust，切换不丢 |
-| 7 | 只读档拒绝写入 | 旧 `toolPipeline` 只读硬拒 | 直接拒绝，不弹审批 |
-| 8 | 命令不能逃出项目 | 旧 Windows ACL / 非 Windows 退化 | OS 级隔离；否则拒绝 |
-| 9 | 密钥不进日志 | 旧多处明文风险 | 脱敏测试 |
-| 10 | 批量写全有或全无 | 旧 `batchSaveValues` 半成功 | 单事务 |
-| 11 | 迁移不毁数据 | 旧先覆盖后校验 | 备份成功才覆盖 |
-| 12 | 审批 always 只作用当前动作 | 旧按大类放行 | 完整键匹配 |
-| 13 | 队列满背压不丢 | 旧无队列 | 暂停读取，不丢 |
-| 14 | 内存上限可中断 | 旧 `node:vm` 无内存限制 | 32MB 触发 |
-| 15 | 切项目/退出不丢未保存编辑 | 旧 `persistence.ts:106-110` 防抖 + 退出不 flush | 先 flush 再切/退，失败阻塞 |
-| 16 | Agent 写入不覆盖用户未保存修改 | 旧无 Diff 审查 | 基于缓冲区算 Diff + 冲突拒绝 |
+「现状」列是 2026-11-16 的实测盘点（不是计划）：**已有**指当前仓库里已有断言该行为的测试；**缺口**指没有任何测试会在它退化时变红。缺口必须在 M2 之前补进 `crates/hbot-parity`（跨 crate 集成套件，见 §4.1）。
+
+| # | 场景 | 旧证据 | 新验收 | 现状（实测） |
+|---|---|---|---|---|
+| 1 | 同一会话连发，回复不乱序 | `FlowRuntime.ts:401` 并发派发 | 顺序一致 | 已有：`crates/hbot-parity/tests/parity_01_same_conversation_is_fifo.rs`（经 supervisor + 真 handler 端到端） |
+| 2 | 启动/重连窗口不丢消息 | `eventBus.ts:806-827`、`botManager.ts:250,256` | 先订阅后连接；缓冲有界 | 已有：`parity_02_no_inbound_lost_before_adapter_ready.rs`（适配器未就绪期间投递的入站不丢） |
+| 3 | 重复投递不重复执行 | 旧官方链路无幂等 | 唯一键 + 只执行一次 | 已有：`replay_and_live_event_do_not_execute_the_same_message_twice`、`insert_inbound_if_new` 唯一键 |
+| 4 | 回复上下文正确 | 旧 `ctxFor` 绑定 | 被动回复带 `reply_to` | 已有：`parity_04_passive_reply_keeps_reply_to.rs`（`MessageCtx → outbox 行 → 恢复 → 发送 payload` 全链） |
+| 5 | 崩溃只影响单 bot | 旧插件主进程 vm | isolate + supervisor 隔离 | 已有：`parity_05_bot_crash_does_not_affect_others.rs`（A 崩后 B 继续处理） |
+| 6 | 热更新不打断在途消息 | 旧无此能力 | 队列在 Rust，切换不丢 | 已有（队列侧）：`sandbox_handler` 的 debounce + 上一版兜底 + 崩溃预算；在途消息走旧 isolate 直到本次 dispatch 结束。**未测**「切换时刻恰有消息在途」的专项用例 |
+| 7 | 只读档拒绝写入 | 旧 `toolPipeline` 只读硬拒 | 直接拒绝，不弹审批 | 已有：`hbot-agent` 网关轨迹单测（只读档 `approver.count()==0`） |
+| 8 | 命令不能逃出项目 | 旧 Windows ACL / 非 Windows 退化 | OS 级隔离；否则拒绝 | 部分：`hbot-workspace` 45 条路径守卫 + `crates/hbot-command` 进程树隔离 30 单测/6 集成 + 已接进 Agent（`RunCommandTool` 走 `CommandRunner` 端口）；**缺** 写隔离（Landlock/受限令牌），故 `workspace-write` 档仍 fail-closed 拒绝 |
+| 9 | 密钥不进日志 | 旧多处明文风险 | 脱敏测试 | 已有：`parity_09_secrets_never_reach_logs.rs`（密钥喂进 5 条真实路径，每条查原文/全大写/忽略大小写/头尾片段；`ASSERTED >= 4` 防空转）。曾因 `hbot-code` 中间态红在 `:228`（不是发现明文），2026-11-16 复验绿 |
+| 10 | 批量写全有或全无 | 旧 `batchSaveValues` 半成功 | 单事务 | 部分：store 是单 writer 串行事务，天然全有或全无；**缺**显式批量 API 与对应断言（当前无调用方，暂不提供） |
+| 11 | 迁移不毁数据 | 旧先覆盖后校验 | 备份成功才覆盖 | 部分：迁移可重放 + `schema_version` 断言；**缺**「迁移失败后原库仍可打开」 |
+| 12 | 审批 always 只作用当前动作 | 旧按大类放行 | 完整键匹配 | 已有：`ApprovalKey` + `canonical_json` 单测 |
+| 13 | 队列满背压不丢 | 旧无队列 | 暂停读取，不丢 | 已有：`parity_13_backpressure_recovers.rs`（`session_capacity=2` 时 `HbotError::Timeout` = -32004、被拒那条已落库；另有反证「B 会话永久卡死时 A 释放必须唤醒」） |
+| 14 | 内存上限可中断 | 旧 `node:vm` 无内存限制 | 32MB 触发 | 已有：`memory_limit_is_enforced`、`infinite_loop_is_interrupted` |
+| 15 | 切项目/退出不丢未保存编辑 | 旧 `persistence.ts:106-110` 防抖 + 退出不 flush | 先 flush 再切/退，失败阻塞 | **缺口**（web 侧；需 vitest + journal 接口） |
+| 16 | Agent 写入不覆盖用户未保存修改 | 旧无 Diff 审查 | 基于缓冲区算 Diff + 冲突拒绝 | **缺口**（编辑提案已有，未保存冲突没有） |
+
+### 4.1 为什么单开一个 `crates/hbot-parity`
+
+- 现有单测是按 crate 切的，最容易漏的恰恰是**跨 crate 的接缝**（supervisor ↔ queue ↔ sandbox ↔ store ↔ adapter）。这种接缝在哪个 crate 的 `tests/` 里写都会让该 crate 反依赖别人。
+- 所以建一个**只含测试**的 crate（`publish = false`、无 `src/lib.rs`，只有 `tests/`），允许它依赖全部实现 crate；它不属于依赖闸门的「实现层」，在 `xtask deps` 里单列一行。
+- 场景断言方式统一为「跑真实组件、只把**外部世界**替换成假货」：假平台适配器（可脚本化投递/断开）、假 LLM provider（回放 SSE）、真 SQLite（临时目录）、真 QuickJS。**禁止 mock 掉被验证的那一层**——否则就是在测试 mock。
+- 每条场景一个测试文件，命名 `parity_NN_<slug>.rs`，与上表编号对齐，报告里可直接说「#7 红」。
 
 ---
 

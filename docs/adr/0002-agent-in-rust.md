@@ -89,18 +89,44 @@ Linux 后台：
 
 ---
 
-## 4. 内存目标（Spike 实测，不是结论）
+## 4. 内存目标（S0/S2 已实测，见 §4.1）
 
-| 指标 | 目标 |
-|---|---|
-| 桌面空闲总 RSS | < 220 MB（核心 < 60 MB，WebView < 160 MB） |
-| 每多一个 bot | < 6 MB |
-| 每个 QuickJS isolate | < 8 MB（堆上限 32 MB） |
-| 冷启动到可交互 | < 800 ms |
-| 二进制 | < 60 MB（初始上限；SWC 链可能超，待 S1 实测） |
-| 安装包 | < 70 MB（同上） |
+**先定口径，再看数字。** 本 ADR 的「内存」一律指 **`PrivateMemorySize64`（私有提交，private commit）在进程树上求和**，不用 `WorkingSet64`：
+
+- 同一份 WebView2 DLL 会被 6–7 个子进程各自映射，WorkingSet 把共享页**重复计入**每个进程（实测子进程 340 MB 里有大量共享页），用它当预算等于「同一块代码按窗口数重复收费」，既不可优化也不可比。
+- Private 是真正为这个应用新增的提交量，能直接对应「这台机器少了多少可用内存」，也是唯一能拆成「核心 / WebView」两块归因的口径。
+- 代价：私有提交不含共享页的物理占用，比任务管理器「内存」列（private working set）略低。**所以文档一律写全 API 名，不写含糊的「RSS」。**
+
+| 指标（private commit） | 目标 | 实测 | 状态 |
+|---|---|---|---|
+| 核心（`hbot serve` 或桌面 Rust 主进程）空闲 | < 60 MB | **3.4 MB**（serve）/ 13.9 MB（桌面主进程） | 达标，余量 4–17× |
+| 桌面整机（Rust 主进程 + WebView2 子进程求和） | < 260 MB | **190–223 MB**，四次中位 206 MB | 达标（余量 ~20%） |
+| 每多一个 bot（连接态） | < 6 MB | **0.10 MB**（首个 bot +1.1 MB） | 达标，余量 60× |
+| 每个 QuickJS isolate | < 8 MB（堆上限 32 MB） | **0.30 MB**（32 个共 +9.5 MB） | 达标，余量 27× |
+| 冷启动到核心可用 | < 800 ms | **878 ms 中位 / 1264 ms p95**（`hbot serve` 打印 ready） | **未达标**，见 §4.2 |
+| 二进制 | < 60 MB | **`hbot.exe` 16.2 MB / `hbot-desktop.exe` 33.0 MB** | 达标（SWC 链没有把体积撑爆） |
+| 安装包 | < 70 MB | 未测（`bundle.active=false`，M5 才出安装器） | 待 M5 |
+
+原「桌面空闲总 RSS < 220 MB」这条**作废**：按 WorkingSet 实测 382–392 MB，而其中 88–89% 来自 WebView2 子进程，Rust 主进程只有 42 MB。任何 Chromium/WebView2 壳在 WS 口径下都过不了 220 MB，把它留在 ADR 里只会让后续每次评审都拿一个不可达的数字否决一个已达标的方案。
 
 达不到时按顺序重估：① WebView 换原生 UI；② QuickJS 换 `deno_core`（内存更高但 async 完整）；③ 回退 0001。
+
+### 4.1 实测结论（S0/S2，commit `ba49346`）
+
+- **Rust 核心这一侧的假设全部成立，且余量很大**：9 MB WS / 3.4 MB private 的空闲核心、每 bot 0.10 MB、每 isolate 0.30 MB。当初「用 Rust 砍掉 Node 运行时约几十 MB」的判断得到验证——**核心已经小到不再是内存议题**。
+- **整机内存完全由 WebView2 决定**：382.5 MB WS 里有 340.3 MB 在 7 个子进程（1 conhost + 6 `msedgewebview2.exe`），而且 **t=1 s 就到 364 MB，没有「先小后大」的空窗**——不是 Monaco 懒加载造成的，是 WebView2 自身基线。
+- 因此 §11 的那条判断（「桌面内存的大头是 WebView，不是 Node」）从推论升级为实测：**想再往下压，唯一动作是换原生 UI，Rust 侧再优化没有意义。**
+- 测量条件、脚本与原始日志：`docs/spikes/S0-memory.md`、`docs/spikes/S2-tauri.md`（含机器、Defender 状态、采样窗口、副本构建路径）。
+
+### 4.2 冷启动未达标怎么处理
+
+核心可用 878 ms 中位超过 800 ms 目标。这个数字里包含 `AppState::open` 的建库与迁移（实测日志有 `applied store migration version=1/2`），首次运行才是这条路径，第二次起迁移跳过。处置顺序：
+
+1. 先按「新装首次」与「已有数据」分开计量，别用一个数掩盖两种路径；
+2. 若「已有数据」仍 > 800 ms，再查 `spawn_blocking` 的建库串行与窗口创建顺序（当前是先建核心再建窗口，两者可否并行）；
+3. 都做完还超，就把目标改成 1000 ms 并在此处写明理由——**不许静默放宽**。
+
+「到可编辑」没有客观信号（Monaco ready 不可外部观测），924 ms 是「到 IPC 首次可用」的下界，不作为验收线。
 
 ---
 
@@ -127,15 +153,15 @@ Linux 后台：
 
 ## 7. Spike（7 天，先验证再转 Accepted）
 
-| # | 验证 | 通过标准 |
-|---|---|---|
-| S0 | 内存基线 | 旧 Electron 项目、Tauri 空壳、Rust 核心各测空闲 RSS；记录测量方法 |
-| S1 | SWC + QuickJS + host API（含多文件） | 多文件相对 import 能加载；TS 去类型后用 `await` 调 host 异步函数；超时能中断；内存上限能触发；错误栈能映射回 TS；插桩 `__hbot_trace` 可暂停 |
-| S2 | Tauri 链接核心 + IDE 骨架 | 同进程调用命令、推事件；Monaco 多文件打开/保存/诊断；UI 首屏 < 1 s；无 sidecar |
-| S3 | SQLite + keyring | 迁移可重放；并发写不 `SQLITE_BUSY`；三平台密钥读写或明确拒绝 |
-| S4 | OneBot 连接与队列 | 每会话有序；断线重连不丢；重复 `message_id` 只处理一次；队列满背压 |
-| S5 | 命令隔离 | Windows 受限令牌 / POSIX `bwrap` 至少一个平台真跑；无适配器时拒绝 |
-| S6 | Linux headless | 无 WebView/Node 依赖；systemd 启停；WS RPC 可连 |
+| # | 验证 | 通过标准 | 状态 |
+|---|---|---|---|
+| S0 | 内存基线 | 旧 Electron 项目、Tauri 空壳、Rust 核心各测 **private commit 求和**；记录测量方法与机器 | **核心 + 桌面已测**（`docs/spikes/S0-memory.md`）；旧 Electron 对比留 M6 影子运行 |
+| S1 | SWC + QuickJS + host API（含多文件） | 多文件相对 import 能加载；TS 去类型后用 `await` 调 host 异步函数；超时能中断；内存上限能触发；错误栈能映射回 TS；插桩 `__hbot_trace` 可暂停 | **已测**（`docs/spikes/S1-quickjs.md`）：编译 3.1 ms/40.9 ms（1/50 文件）、handler 34–72 µs、isolate 0.30 MB；插桩暂停在 S1 样板里验过 |
+| S2 | Tauri 链接核心 + IDE 骨架 | 同进程调用命令、推事件；Monaco 多文件打开/保存/诊断；UI 首屏 < 1 s；无 sidecar | **部分**（`docs/spikes/S2-tauri.md`）：同进程命令/事件、真迁移、整机内存与冷启动已测；Monaco 多文件与首屏未量化 |
+| S3 | SQLite + keyring | 迁移可重放；并发写不 `SQLITE_BUSY`；三平台密钥读写或明确拒绝 | 迁移与单 writer 已落地；keyring 未接 |
+| S4 | OneBot 连接与队列 | 每会话有序；断线重连不丢；重复 `message_id` 只处理一次；队列满背压 | 队列/重放/退避已落地并测；**真实网关未连** |
+| S5 | 命令隔离 | Windows 受限令牌 / POSIX `bwrap` 至少一个平台真跑；无适配器时拒绝 | 进行中（`crates/hbot-command` + ADR-0003） |
+| S6 | Linux headless | 无 WebView/Node 依赖；systemd 启停；WS RPC 可连 | 未开始 |
 
 **S1 或 S2 失败**：先修方案；S1 无法在两周内稳定 → `deno_core`；S2 失败 → 评估原生 UI 或 Electron 壳。
 **S5 失败**：不是技术栈失败，是能力范围决定——对应平台禁用命令工具，UI 明示。
@@ -146,7 +172,8 @@ Linux 后台：
 
 出现任一条就重新开 ADR：
 
-- 桌面空闲总 RSS > 300 MB，或核心 > 100 MB。
+- 桌面整机 private commit > 320 MB（实测基线 206 MB，留 55%），或核心 > 100 MB（实测 3.4 MB）。**用 WorkingSet 判会永远触发**，见 §4 口径说明。
+- WebView2 子进程数或基线内存随版本上涨（同一份实测重复做一次就涨 >20%）：说明整机预算不在我们控制下，需要重新评估壳。
 - QuickJS 的 async/await、错误栈、内存限制任一在两周内无法稳定。
 - Rust 交付速度低于计划 50%，且连续两个里程碑延期。
 - 生成代码必须多文件或第三方依赖才能写真实 bot（当前已支持多文件相对 import；若仍被迫引入 npm 生态，则重估）。
@@ -188,17 +215,18 @@ Linux 后台：
 ### 10.3 仍未验证（S0–S3 必须给数字）
 
 - QuickJS 的 `async/await` 与宿主异步调用在真实 bot 代码里的稳定性；错误栈能否映射回 TS 行号。
-- SWC 链的实际二进制体积与冷编译时间；是否被迫改“生成 JS + JSDoc”。
-- Tauri/WebView2 在 Windows 的真实空闲 RSS；220 MB 总目标是否可达。
-- `ts-rs` 对内部标签枚举（`#[serde(tag = "type")]`）的生成质量；复杂 Command 是否要手写。
-- OneBot 11 事件缺少稳定 `message_id` 时的去重键；重连是否重放同一事件。
+- ~~SWC 链的实际二进制体积与冷编译时间~~ **已测（S1/S0）**：`hbot.exe` 16.2 MB、`hbot-desktop.exe` 33.0 MB，全量首次 release 构建 7m46s；**没有超出 60 MB 上限，不需要退到 JS+JSDoc**。冷编译 7m46s 贴着 8 min 线，后续靠 sccache/lld 改善。
+- ~~Tauri/WebView2 在 Windows 的真实空闲 RSS；220 MB 总目标是否可达~~ **已测（S0/S2）**：见 §4.1。结论是 220 MB 在 WS 口径下不可达、在 private 口径下 206 MB 可达；口径已定。
+- `ts-rs` 对内部标签枚举（`#[serde(tag = "type")]`）的生成质量；复杂 Command 是否要手写。**（已落地 40 个生成文件，编译与 `gen --check` 均通过；UI 侧尚未全部改用生成类型）**
+- OneBot 11 事件缺少稳定 `message_id` 时的去重键；重连是否重放同一事件。**（已实现整条事件规范化 JSON 的 FNV 兜底键；真实网关是否重放仍未实测）**
 - macOS 命令隔离是否可用；不可用时产品能力如何表述。
 
 ### 10.4 判定
 
 - **能用**：技术栈没有“根本跑不通”的项；最坏情况是 SWC 退 JS、macOS 禁命令、内存目标上调，都不动产品核心。
 - **不完善**：上面 4 个缺口原稿没写透，已补进 02；`04` 的工期偏乐观，已按复核调整。
-- **不转 Accepted**：等 S0–S3 的数字。ADR 仍是 Proposed。
+- **S0/S1/S2 已给数字**（见 §4.1）：核心侧内存、每 bot、每 isolate、二进制体积全部达标且余量大；整机内存达标（private 口径）；**冷启动 878 ms 未达标**，处置写在 §4.2。
+- 仍不转 Accepted：`async/await` 在真实 bot 代码里的稳定性、真实 OneBot 网关的重放行为、macOS 命令隔离三项还没有实测。**转 Accepted 的条件收窄到这三项。**
 
 ---
 
@@ -219,7 +247,7 @@ Linux 后台：
 
 **关键判断：**
 
-1. **桌面内存的大头是 WebView，不是 Node。** 选 Rust 省的是核心侧（大约几十 MB），不是整机。如果目标是 <150 MB，Tauri 也达不到；如果目标是 220 MB，Rust 核心 + 一个窗口是合理的。
+1. **桌面内存的大头是 WebView，不是 Node。** 选 Rust 省的是核心侧（大约几十 MB），不是整机。**S0 实测证实了这条**：整机 206 MB private 里 Rust 主进程只占 13.9 MB，其余全在 WebView2 子进程，而且 t=1 s 就到 364 MB WS（不是 Monaco 懒加载造成的）。所以：目标是 260 MB 时，Rust 核心 + 一个窗口是合理的且余量 20%；**目标若压到 <150 MB，Tauri 也达不到，必须换原生 UI**。
 2. **bot 吞吐是 I/O 型。** 瓶颈在平台网络、每会话串行（正确性要求）、SQLite 单写；换 Rust 不会让 LLM 更快，也不会让平台 API 更快。
 3. **Agent 执行是 LLM 延迟主导。** Rust 只让文件/命令/编译这些本地工具快；模型本身的速度与语言无关。
 4. **选 Rust 的真正理由**：产品运行时无 Node、单二进制分发、Linux 后台同核、沙箱可控、崩溃面小。**不是“Rust 一定快”。**

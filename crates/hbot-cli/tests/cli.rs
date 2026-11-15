@@ -24,9 +24,14 @@ fn temp_project(tag: &str) -> PathBuf {
     ))
 }
 
+/// 写一个**能通过新语义体检**的最小项目。
+///
+/// 旧版本这里只写 `{}` —— 那时的 `check` 只回答"文件在不在"。现在 `check` 会把
+/// 项目一路编译到"可运行"（清单合规 → 入口存在 → SWC 编过 → d.ts 未漂移），
+/// 一个空对象清单和空 `src/` 必然失败。所以这里改用核心自己的脚手架，避免测试
+/// 手抄一份会过期的清单文本（同 `AGENTS.md` §7.18 的"不要断言源码文本"）。
 fn write_manifest(dir: &Path) {
-    std::fs::create_dir_all(dir).expect("建临时目录");
-    std::fs::write(dir.join("hbot.json"), "{}\n").expect("写 hbot.json");
+    hbot_code::manifest::scaffold(dir, "fixture").expect("脚手架应成功");
 }
 
 // ── version ────────────────────────────────────────────────────────────────
@@ -229,4 +234,60 @@ fn check_missing_directory_reports_error() {
         "errors：{:?}",
         report.errors
     );
+}
+
+#[test]
+fn check_reports_manifest_violations_as_one_error() {
+    let dir = temp_project("bad-manifest");
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    // 合规 JSON，但 handlerMs 超过宿主硬上限：不许静默 clamp。
+    std::fs::write(
+        dir.join("hbot.json"),
+        r#"{"name":"bad","platform":{"kind":"onebot11","ws":"ws://127.0.0.1:1"},
+            "limits":{"handlerMs":999999}}"#,
+    )
+    .expect("写 hbot.json");
+
+    let report = check_project(&dir);
+    assert!(!report.ok);
+    assert_eq!(report.errors.len(), 1, "首个失败即停：{:?}", report.errors);
+    assert!(
+        report.errors[0].starts_with("HBOT_MANIFEST_INVALID"),
+        "errors：{:?}",
+        report.errors
+    );
+    assert!(
+        report.errors[0].contains("handlerMs"),
+        "要指出字段：{:?}",
+        report.errors
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_reports_a_compile_error_with_its_typescript_line() {
+    let dir = temp_project("bad-source");
+    hbot_code::manifest::scaffold(&dir, "fixture").expect("脚手架");
+    // 语法错：`defineBot(` 少了右括号。
+    std::fs::write(
+        dir.join("src/main.ts"),
+        "import { defineBot } from 'hbot';\nexport default defineBot({ onMessage(ctx) { } };\n",
+    )
+    .expect("写坏源码");
+
+    let report = check_project(&dir);
+    assert!(!report.ok, "语法错应体检失败");
+    assert!(
+        report.errors[0].starts_with("HBOT_COMPILE"),
+        "errors：{:?}",
+        report.errors
+    );
+    assert!(
+        report.errors[0].contains("src/main.ts"),
+        "错误要带文件名：{:?}",
+        report.errors
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

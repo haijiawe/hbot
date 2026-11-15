@@ -14,7 +14,7 @@
 2. **产品形态是 IDE，不是聊天框**：多文件项目、编辑器、搜索、问题、Diff 审查、运行/调试、日志与回放都是一等能力（[06-ide.md](06-ide.md)）。
 3. **任何 bot**：平台无关的 bot 模型 + 适配器 SDK；MVP 至少 OneBot 11 与通用 Webhook，后续 Telegram/Discord/Slack/飞书/钉钉；不把某个平台的分支写进核心。
 4. **三平台桌面 + Linux 无 GUI 后台**，同一核心。
-5. **低常驻内存**：产品运行时不包含 Node；桌面空闲总 RSS 目标 < 220 MB。**注意：整机内存的大头是 WebView，不是核心**；Rust 核心只保证核心侧 <60 MB，220 MB 是否可达由 S0 的真实窗口测量决定。若目标压到 <150 MB，Tauri 也不够，要换原生 UI。
+5. **低常驻内存**：产品运行时不包含 Node；核心空闲 < 60 MB（private commit，实测 3.4 MB）。**整机内存的大头是 WebView，不是核心**：S0 实测桌面整机 206 MB（中位）、其中 Rust 主进程只占 13.9 MB，88% 以上在 WebView2 子进程。所以整机目标是 < 260 MB 而不是 220 MB —— 原 220 MB 是按 WorkingSet 估的，而 WS 会把共享 DLL 页按进程重复计入（见 ADR-0002 §4）。若压到 <150 MB 必须换原生 UI，Tauri 也做不到。
 6. **消息不丢、不乱序、可恢复**：入站先落库、每会话串行、断线重连、重复投递幂等。
 7. **默认安全**：生成代码在沙箱里跑；命令、网络、密钥都有明确边界。
 8. **Agent 可维护**：目录与契约单一真源，闸门可机器执行。
@@ -150,7 +150,10 @@ pub trait PlatformAdapter: Send + Sync {
 - 适配器负责：鉴权、心跳、重连（指数退避 + 抖动）、协议解析、发送限流。
 - 去重、排序、持久化由运行时统一做，适配器不重复实现。
 - **端口归属**：`trait PlatformAdapter` 定义在 `hbot-adapters`，由 `hbot-bot` 消费（见 `03-directory.md` 规则 5 的例外）；`hbot-core` 只保留与平台无关的 `Clock`/`IdGenerator`/`EventSink`。
-- **现状（M0 实测）**：OneBot 11 正向 WebSocket 已实现（心跳看门狗 45s 可注入、`Authorization: Bearer`、串行出站最多 3 次重试、1/2/4…30s ±20% 退避）；**TLS 未接**——`wss://` 与 `https://` 一律返回 `AdapterError::Unsupported`（显式失败，不静默降级成明文）。远程 NapCat 必须先补 TLS 后端（`tokio-tungstenite` 的 `rustls` feature 或 `native-tls`），本机 `ws://127.0.0.1` 不受影响。HTTP 客户端同样只支持 `http://`，且只 HTTP/1.1、不跟随 3xx、不支持 gzip、无连接池/代理。
+- **现状（M0 实测，2026-11-16 更新）**：OneBot 11 正向 WebSocket 已实现（心跳看门狗 45s 可注入、`Authorization: Bearer`、串行出站最多 3 次重试、1/2/4…30s ±20% 退避、连接超时 10s）。
+  - **TLS 已接**：`ws://` 与 `wss://` 都支持；`wss://` 与 `https://` 共用一份 `ClientConfig`（rustls + `webpki-roots`，**校验始终开启**）。证书不匹配/链到未知 CA → `AdapterError::Tls`（映射 `-32006`），**没有“跳过校验”开关**，也不退化成明文。单测与真 socket 测试见 `crates/hbot-adapters/tests/tls_sockets.rs`（进程内 rcgen 自签 CA、仅回环）。
+  - 仍不支持：mTLS（客户端证书）、证书指纹固定、HTTP/1.1 以外的协议、3xx 跟随、gzip、连接池、代理。
+  - **未接线的缺口**：`OneBotClient::probe_connection()` 只是库里的探测入口，rpc 层没调用；所以证书错在当前表现为反复重连的 `warn`，而不是一条明确的“证书不匹配”提示。接线位置应在 `OneBotAdapter::connect` 之前。
 
 ### 4.3 重连与恢复
 
@@ -235,17 +238,31 @@ turn = user message
     build/           source map 与编译缓存
 ```
 
-入口导出：
+入口导出（**这是 M1 唯一被运行时承认的形状**；`onStart`/`onSchedule` 尚未实现，见 §6.3 的 API 状态表）：
 
 ```ts
-import { defineBot } from 'hbot'
+import { defineBot, reply } from 'hbot'
 
 export default defineBot({
-  async onMessage(ctx) { /* ... */ },
-  async onStart(ctx) { /* ... */ },
-  async onSchedule(ctx) { /* ... */ },
+  async onMessage(ctx) {
+    reply(`收到：${ctx.text}`)
+  },
 })
 ```
+
+`hbot.json` 清单（`crates/hbot-code/src/manifest.rs` 解析，`serde(deny_unknown_fields)`）：
+
+| 字段 | 类型 | 默认 | 约束 |
+|---|---|---|---|
+| `name` | string | 必填 | 只用于展示与日志 |
+| `entry` | string | `src/main.ts` | 必须落在项目内（拒绝对路径/`..`/盘符/UNC），文件必须存在 |
+| `platform.kind` | `"onebot11"` | 必填 | 其它值在 M1 报不支持 |
+| `platform.ws` | string | 必填 | `ws://`；`wss://` 走 TLS 后端 |
+| `permissions.http` | string[] | `[]` | 空 = 全禁；`ctx.http` 尚未实现，字段先占位 |
+| `limits.handlerMs` | number | 2000 | 可调低；超过宿主硬上限直接报错，**不静默 clamp** |
+| `limits.heapMb` | number | 32 | 同上，硬上限 64 |
+
+清单只在**启动/保存**时解析，不在每条消息上解析。
 
 **模块规则（硬）**：
 
@@ -277,7 +294,30 @@ export default defineBot({
 - 宿主 API 通过 `rquickjs` 注入，参数/返回值走 JSON；不暴露宿主对象、不暴露 `Function` 构造器（QuickJS 里可冻结）。
 - 生成代码没有：`fs`、`net`、`process`、`require`、`eval`、动态 `import()`、`Deno`、定时器直接访问；静态 `import` 只由模块加载器解析相对路径。
 - **模块加载器**：在 isolate 线程内实现 `Resolver`/`Loader`；只读项目根内文件，规范化路径后拒绝越界；模块编译结果按内容哈希缓存；加载失败回 UI 并保留旧版本运行。
-- 允许的宿主 API：`ctx.reply`、`ctx.send`、`ctx.kv.get/set`、`ctx.http.fetch`（按 `hbot.json` 白名单）、`ctx.log`、`ctx.schedule`、`ctx.state`。
+- **宿主 API 的已实现面（M1，2026-11-16 按代码核实）**。真相在 `crates/hbot-code/src/runtime/host_api.rs` 的 `HOST_MODULE_SOURCE` 与 `isolate.rs` 的 `build_event`；`hbot.d.ts` 由 `crates/hbot-code/src/dts.rs` 生成，并有防漂移测试钉住这三处一致：
+
+  | API | 状态 | 说明 |
+  |---|---|---|
+  | `defineBot(config)` | 已实现 | 只校验 `config` 是对象且 `onMessage` 是函数；多余字段被忽略，**不校验** |
+  | `log(message)` | 已实现 | 进本次事件的捕获输出，转成 `RunLog` |
+  | `reply(text)` | 已实现 | 被动回复；`injected` 标记存在时按主动消息发送（`sandbox_handler.rs:621-634`） |
+  | `sleep(ms)` | 已实现 | 会被 handler 预算截断：`await sleep(60000)` 在 2s handler 里约 2s 后由中断处理器判超时 |
+  | `ctx.send` / `ctx.kv` / `ctx.http` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
+  | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage`（`isolate.rs:504-510`）；清单里的 `onSchedule` 字段同样未接 |
+
+- **`onMessage(ctx)` 的 `ctx` 真实形状**（`hbot-rpc/src/app/runtime/sandbox_handler.rs:776-787` 构造，`isolate.rs:600-604` 追加宿主函数）：入站字段**平铺**在 ctx 上，不是嵌套在 `ctx.message` 里。
+
+  | 字段 | 类型 | 来源 |
+  |---|---|---|
+  | `botId` / `conversationId` / `messageId` / `externalId` / `conversationExternalId` | `string` | 本地 ID 与平台外部 ID |
+  | `senderId` | `string` | 发送者平台 ID |
+  | `text` | `string` | 已归一化的纯文本（`@`、图片、表情都被替换成占位符） |
+  | `kind` | `"private"｜"group"｜"channel"` | 会话类型 |
+  | `receivedAt` | `number` | unix 毫秒 |
+  | `payload` | `unknown` | 原始平台事件（各平台不同，别当契约用） |
+  | `reply` / `log` / `sleep` | 函数 | 与模块导出的同名函数等价 |
+
+  新增宿主 API 的顺序（硬）：先 `HOST_MODULE_SOURCE` 注入 → 再 `build_event` 挂到 ctx → 再 `dts.rs` 声明 → 最后文档这张表，四处同一批改，缺一处就红。
 - 超时/内存超限：中断 isolate，记录错误 + 源码位置；该消息进死信，bot 标记 degraded。
 - 异步宿主调用的返回必须经 oneshot 回到同一 isolate 线程；禁止在宿主线程直接 resolve promise。
 
@@ -291,7 +331,7 @@ export default defineBot({
 ```
 
 - 切换不丢队列：队列在 Rust，不在 isolate。
-- `onStart` 在新 isolate 上重跑；旧 isolate 的 `onStop` 尽力执行。
+- 当前实现只认 `onMessage`（§6.3 的状态表），所以「新 isolate 预热后再切」的正确判据是**新版本能完成模块求值且 `onMessage` 存在**；`onStart`/`onStop` 是 M2+ 的事，接线时补一句「新 isolate 上重跑 onStart，旧 isolate 尽力执行 onStop」，在此之前不要写进 `hbot.d.ts`。
 - 连续崩溃 3 次：停止自动重启，UI 提示查看日志。
 
 ### 6.5 调试构建（源码级插桩）
@@ -304,14 +344,58 @@ release build: 源码 → SWC 去类型 → 执行（无插桩）
 ```
 
 - `__hbot_trace` 是宿主 API，默认 O(1) 返回；命中 UI 下发的断点时才阻塞 worker 并发 `debug.paused`。
-- 断点支持行断点与条件断点（条件只允许比较/布尔/字面量，宿主侧求值）。
-- 步进用插桩维护的逻辑栈：`stepOver` 同深度下一条、`stepInto` 下一条、`stepOut` 回到上一层深度。
+- **运行时恒用 debug 构建，但只在有断点时 arm**（2026-11-16 落地）：`sandbox_handler` 调 `compile_project_debug`，而"arm"由 `__hbot_dbg` 这个全局标志决定 —— 该 bot 没有断点时走普通 `dispatch`，探针快路径退化成每条语句一次全局读（实测 10 文件 24µs vs release 27µs，噪声内）；有断点时才传 sink 并 arm（probe-dense handler 最坏 **4.64×**，上限 5×）。两种构建的**编译产物大小**差别很大（10 文件 1,480 B → 20,596 B），这是"用不用都先付一点"的代价，换掉"断点在 release 构建上静默永不命中"这个更坏的失败模式。
+- 断点支持**行断点**（条件断点未做：冻结的 `Breakpoints` 没有条件字段，要加得走 ADR）。
+- 步进**不靠 enter/exit 插桩**，而是在暂停那一刻读一次 `new Error().stack` 得到逻辑深度：`stepOver` = 下一条 `depth <= d`、`stepInto` = 下一条任意深度、`stepOut` = 下一条 `depth < d`。代价是"从一个长循环体里 StepOut"最坏可逼近 `handler_timeout`；好处是不用每个函数出口都插桩。
+- 暂停**不抵消** handler 超时：`handler_timeout` 照旧生效，用户挂太久也会 `HBOT_TIMEOUT`。
+- `Continue` 后同一 `(file, line)` 的后续语句会被抑制直到换行 —— 满足"不重复停在同一行"，代价是"整行写成的循环"一个事件只停一次。
+- 模块**顶层**语句不插桩（在 bootstrap 阶段执行，那时没有 sink），所以顶层断点停不住。
 - 变量只发送可 JSON 序列化的局部变量；函数/循环引用/超大对象显示 `<unserializable>`。
 - 明确不支持：watch 任意表达式、原生 async 栈、DOM、性能剖析。
-- 插桩只影响 `debug build`；release 构建不含插桩，错误靠 source map 映射到文件:行。
-- 插桩开销目标：debug build ≤ 5× release；若超过，退化为“断点 + 日志点 + 调用栈”，不显示局部变量。
+- 插桩只影响 `debug build`；release 构建不含插桩，错误靠 source map 映射到文件:行（`hbot check` 与 diagnostics 走 release 编译，只要类型与错误，不要探针）。
+- 插桩开销目标：debug build ≤ 5× release；若超过，退化为“断点 + 日志点 + 调用栈”，不显示局部变量。**实测 4.64×（2000 次迭代 × 3 语句 = 6000 探针/事件，约 71 ns/探针），余量只剩 8%** —— 往探针快路径加任何锁/分支都会破线，`crates/hbot-code/tests/s1_debug_instrument.rs` 的 `//!` 注释里记了这条约束。
 
 详细 UI 与交互见 [06-ide.md](06-ide.md) 第 6 节。
+
+#### 6.5.1 调试端口契约（冻结，2026-11-16）
+
+跨 crate 的对接面只有一处：`crates/hbot-core/src/debug.rs`。`hbot-code` 实现它，`hbot-rpc` 适配它，两边都只依赖 `hbot-core`，因此可以直接并行开发。
+
+```rust
+// crates/hbot-core/src/debug.rs —— 冻结，改动必须走 ADR
+pub struct Breakpoints { /* files: BTreeMap<String, BTreeSet<u32>> */ }
+impl Breakpoints {
+    pub fn new() -> Self;
+    pub fn set(&mut self, file: &str, lines: BTreeSet<u32>); // 空集 = 移除该文件；行号 0 忽略
+    pub fn clear(&mut self);
+    pub fn is_empty(&self) -> bool;
+    pub fn lines_of(&self, file: &str) -> Option<&BTreeSet<u32>>;
+    pub fn files(&self) -> impl Iterator<Item = &str>;
+    pub fn hits(&self, file: &str, line: u32) -> bool;
+}
+
+pub struct DebugScope { pub name: String, pub variables: BTreeMap<String, serde_json::Value> }
+pub struct DebugFrame { pub name: String, pub file: String, pub line: u32, pub column: u32 }
+pub struct PausedAt {
+    pub file: String, pub line: u32, pub column: u32,
+    pub scopes: Vec<DebugScope>, pub call_stack: Vec<DebugFrame>,
+}
+pub enum DebugAction { Continue, StepOver, StepInto, StepOut }
+
+/// 同步阻塞：实现方负责超时并返回 `Continue`（建议 5 分钟 = 用户去泡杯咖啡）。
+pub trait DebugSink: Send + Sync { fn paused(&self, at: PausedAt) -> DebugAction; }
+```
+
+两边各自的入口：
+
+| 侧 | 入口 | 约束 |
+|---|---|---|
+| `hbot-code` | `Sandbox::set_breakpoints(&self, Breakpoints)`、`Sandbox::dispatch_with_debug(&self, &Value, Option<&dyn DebugSink>)` | `DebugSink` 只能在 worker 线程里调用，绝不能在 reactor 线程阻塞 |
+| `hbot-rpc` | `Command::DebugSetBreakpoints{botId,file,lines}` / `DebugResume{botId}` / `DebugStep{botId,kind}` → `Event::DebugPaused{botId,file,line,scopes,callStack}` / `DebugResumed{botId}` | 调试单位是 **bot** 而不是 agent 会话：断点属于某个 bot 的 isolate |
+
+为什么单位是 bot：同一份源码在两个 bot 的 isolate 里可以是不同版本（热重载时机不同），断点按会话走会串味。
+
+`Event::DebugPaused` 发出后，worker 停在 `DebugSink::paused` 里等三条命令之一：`DebugResume`（继续）、`DebugStep`（单步）、或 sink 自身超时（返回 `Continue`，并补一条 `DebugResumed`）。**暂停期间该 bot 的会话队列会积压**（容量 1024，满了按背压拒绝），这是有意的：不假装暂停时还能处理消息。
 
 ---
 
@@ -386,7 +470,7 @@ interface MessageContext {
 pub enum Command {
     AppInfo,
     ProjectOpen { path: String },
-    AgentSend { session_id: SessionId, text: String },
+    AgentSend { session_id: Option<SessionId>, text: String },
     AgentCancel { session_id: SessionId },
     AgentApprove { approval_id: ApprovalId, decision: ApprovalDecision, always: bool },
     FileRead { path: String },
@@ -403,6 +487,7 @@ pub enum Command {
     BotStart { bot_id: BotId },
     BotStop { bot_id: BotId },
     BotInject { bot_id: BotId, conversation_id: ConversationId, text: String },
+    BotList,
     DebugSetBreakpoints { file: String, lines: Vec<u32> },
     DebugResume { session_id: SessionId },
     DebugStep { session_id: SessionId, kind: StepKind },
@@ -413,12 +498,49 @@ pub enum Command {
 
 > Rust 源码里字段仍是 snake_case（`session_id`），**线上 JSON 是 camelCase**（`sessionId`），由 `rename_all_fields = "camelCase"` 保证。上面片段是按线上形状写的，便于 UI 侧读；实现以 `crates/hbot-rpc/src/dto/command.rs` 为准。
 
+**已落地命令的返回形状**（`data` 字段，UI 直接消费；完整表在 `crates/hbot-rpc/src/dto/mod.rs` 顶部）：
+
+| 命令 | `data` | 备注 |
+|---|---|---|
+| `app_info` | `AppInfo{name,version,platform,dataDir}` | `dataDir` 可为 null（桌面拿不到时） |
+| `bot_list` | `BotSummary[]`（空项目返回 `[]`，未开项目返回 -32002） | `BotSummary{botId,name,platform,status,updatedAt}`；`status ∈ stopped\|starting\|running\|stopping\|degraded`（**没有 error 档**）；`updatedAt` 是 Unix 毫秒，从未变更为 `0` |
+| `agent_send` | `sessionId` 为 `null` 时返回 `{sessionId}`；给定时返回无 `data` | 会话由核心创建，UI 不自己造 id |
+| `file_read` | `{content,hash}` | `hash` 是 blake3 十六进制，写回时当 `baseHash` |
+| `search_start` | `null` | 结果走 `file.search` 事件；取消后不发假结果 |
+
 - 桌面：Tauri `#[tauri::command] dispatch(cmd) -> Response`。
 - 后台/浏览器：JSON-RPC 2.0，唯一 method `dispatch`，`params = { command }`。
 - **唯一错误通道是 `Response` 的 `error` 变体**（`Response::into_result()` 供 Rust 侧使用）；不要在外面再包一层 `Result<Response, ApiError>`，否则 UI 要解析两种错误形状。
 - **字段风格**：`type` 值用 snake_case（`app_info`），**所有载荷字段用 camelCase**（`sessionId`、`baseHash`、`acceptHunks`）。Rust 侧靠 `#[serde(rename_all_fields = "camelCase")]` 保证，类型仍是 snake_case 字段名。
 - 类型由 Rust `ts-rs` 生成到 `apps/web/src/generated/`，UI 不手写 DTO。
 - 命令返回的 `data` 形状表在 `crates/hbot-rpc/src/dto/mod.rs` 顶部（`AppInfo`/`FileContent`/`DirEntry`/`RunLog` 等），加命令必须同时加一行。
+
+### 9.1.1 命令分发层（已落地）
+
+`crates/hbot-rpc/src/dispatch.rs` 的 `Dispatcher` 只做**路由**，实现按域放在
+`crates/hbot-rpc/src/app/commands/{system,files,bots,agent,debug}.rs`：
+
+```text
+WsServer (后台) ─┐
+                 ├─> Dispatcher::dispatch(Command) -> Response ─> app::commands::<域>::handle
+Tauri #[command] ┘        │
+                          └─ 读写 AppState { store, workspace, events, bots, clock, ids }
+```
+
+- **一个组合根**：`AppState::open(data_dir, clock, ids)` 是唯一装配点；`hbot serve`
+  （`crates/hbot-cli/src/serve.rs`）与 Tauri 壳（`crates/hbot-desktop`）都调
+  `Dispatcher::new().with_state(state)`，命令逻辑一份。桌面不另写业务规则，
+  后台也不会缺能力（这是旧项目 P0-8「桌面与无头两套装配」的修法）。
+- **空壳模式**：`Dispatcher::new()`（不接 `AppState`）除 `AppInfo` 外一律返回
+  `-32006 尚未实现：<kind>`。M0 的测试靠这条钉住"没接上的命令不返回假数据"。
+- **`AppState` 里有什么**：`store`（SQLite 单 writer）、`workspace`（当前项目，未打开时为
+  `None`，命令拿到 `-32002 没有打开的项目`）、`files`（读过文件的哈希，用于 `file_write`
+  的乐观并发）、`events`（进程内 `broadcast` 总线，**不监听端口**）、`bots`
+  （运行中的 bot 注册表，`stop` 有 5s 宽限期再 abort）、`clock`/`ids`（注入，测试可替换）。
+- **阻塞边界**：`hbot_store` 与 `hbot_workspace` 都是同步 API，handler 里一律经
+  `state.blocking(...)`（`spawn_blocking`）调用，禁止在 async 任务里直接查库。
+- **事件不落库**：总线是进程内广播（容量 4096），订阅者慢时丢的是自己的那份并记
+  `Lagged`；需要持久的历史在 `logs` 表里，事件本身不重放。
 
 ### 9.2 事件
 
@@ -462,6 +584,22 @@ debug.resumed      { sessionId }
 - 新错误类型先加一行再写代码；不要用 `internal` 兜一切，否则 UI 无法给出可操作提示。
 - **“功能尚未实现”也走 `-32006`**，但 `message` 必须以 `尚未实现：` 开头（实现在 `crates/hbot-rpc/src/dispatch.rs` 的 `UNIMPLEMENTED_CODE`）。UI 必须把这种回复显示成“该功能未上线”，**不能**当成参数错误提示——否则用户会去改参数而不是等版本。
 - 后台服务多一条：`-32003` 也用于“超过 `maxInflight` 的并发请求”，`data` 带 `{ "inFlight": N }`。
+
+### 9.5 M0 契约收敛（2026-11-16，实现后的裁决）
+
+落地时发现几处文档没写死、但两侧都在用的形状。以下是**最终裁决**，实现与测试都已按此钉住（改动需同步 `crates/hbot-rpc/src/dto/` 与 `apps/web/src/generated/`）：
+
+| 项 | 裁决 | 理由 |
+|---|---|---|
+| `Event::FileSearch` | `{ searchId, matches: [{ path, line, column, text }] }`，**没有** `query`/`hits`/`truncated` | 搜索结果是"命中的行"，截断信息对 UI 无用；`searchId` 已经能关联回请求 |
+| `search_start` 的 `data` | `null`（结果只经事件回） | 搜索可能很长，同步返回会逼 UI 等；事件里才有 `searchId` 可取消 |
+| `FileContent` | `{ content, hash }`，**没有** `path`/`size` | 路径是调用方的入参，重复回传只会分叉；大小由 UI 自己算 `content.length`（M0 不做换算） |
+| `file_delete { toTrash: false }` | `-32006 尚未实现` | `hbot-workspace` 目前只有 `delete_to_trash`；**不许**在命令层用 `std::fs::remove_file` 绕过路径守卫。等 workspace 长出 `delete_permanently` 再开 |
+
+> **已知不一致（待修，不算已完成）**：`apps/web/src/stores/workspace-store.ts` 仍在按旧 mock 的形状发
+> `workspace.tree` / `fs.read` / `fs.write`（期望 `{ content, version }`），与 Rust 侧 `file_list` /
+> `file_read` / `file_write` 的命令名与 DTO 都不一致。web 是 M0 的 mock 壳，接真后端时必须整层改到
+> `Command`/`Event` 上，**不要**为迁就它改 Rust 契约。
 
 ---
 
@@ -523,14 +661,29 @@ debug.resumed      { sessionId }
 | 档位 | 文件读 | 文件写 | 命令 | 网络（生成代码） |
 |---|---|---|---|---|
 | `read-only` | 项目内 | 拒绝 | 拒绝 | 拒绝 |
-| `workspace-write` | 项目内 | 项目内 | 受限令牌/OS 隔离 | 按 manifest |
-| `danger` | 项目内 | 项目内 | 显式确认 | 按 manifest |
+| `workspace-write` | 项目内 | 项目内 | 隔离可用则跑，否则拒绝（**当前全平台拒绝**） | 按 manifest |
+| `danger` | 项目内 | 项目内 | 白名单内可跑，每次需显式确认 | 按 manifest |
 
 - 默认 `workspace-write`。
-- 命令隔离：Windows 受限令牌 + Job Object；macOS `sandbox-exec`（系统已标弃用，可能在未来版本消失）；Linux `bwrap`/`nsjail`/容器。**建不出隔离就拒绝**，不回退名字白名单。
+- 命令隔离分两层（ADR-0003）：`Containment`（进程树可一起杀 + 进程数/内存上限）与 `WriteConfinement`（写不了工作区外）。`read-only` 档直接拒（`SandboxDenied`）；`workspace-write` 要求 `WriteConfinement`；`danger` 要求 `Containment`。端口 `hbot_core::ports::CommandRunner`，实现 `crates/hbot-command`。
+- **当前能力矩阵（2026-11-16，原型）**：
+
+  | 平台 | `Containment` | `WriteConfinement` | 结果 |
+  |---|---|---|---|
+  | Windows | 有（Job Object：`KILL_ON_JOB_CLOSE`、`ACTIVE_PROCESS=64`、2 GiB/进程、4 GiB/作业） | 无（受限令牌未接入） | `danger` 可跑；`workspace-write` 拒 |
+  | Linux | 有（`setsid` + `kill(-pgid)`） | 无（Landlock 未接入） | `danger` 可跑；`workspace-write` 拒 |
+  | macOS | 无 | 无 | 全拒（`sandbox-exec` 已弃用） |
+
+- **建不出隔离就拒绝**，不回退名字白名单：不可用时返回 `CommandDenied::IsolationUnavailable{platform, reason}`，`Display` 是一句可操作中文（形如「这台机器上无法建立命令隔离（平台：Linux；原因：内核未启用 landlock…），已拒绝执行。」）。探测在**解析程序之前**执行，避免"程序不存在"掩盖"隔离不可用"。
 - **能力矩阵必须显式**：命令工具在启动时探测隔离是否可用；不可用则工具从 Agent 工具表里移除，UI 说明“本机不支持命令执行”。不要留一个“能点但会失败”的按钮。
-- 三平台都要有“拒绝路径”的自动化测试（不是只有 Windows）；macOS 若 `sandbox-exec` 不可用，MVP 直接禁用命令工具，这是可接受的能力缺口。
-- 命令以 argv 传递，不用 `sh -c` 拼字符串；cwd 固定项目根；env 白名单；超时杀进程树。
+- 三平台都要有“拒绝路径”的自动化测试（不是只有 Windows）；macOS 若没有替代隔离手段，MVP 直接禁用命令工具，这是可接受的能力缺口。
+- 命令以 argv 传递，不用 `sh -c` 拼字符串；cwd 固定项目根（`canonicalize` 后逐组件比较）；env 默认清空、只认显式白名单；超时杀**整棵**进程树；输出有上限（超限判 `TooLong` 并杀树）。
+- **档位与白名单由配置决定，不在代码里写死**（2026-11-16 接线）：
+  - 来源顺序同 provider 配置：环境变量优先，否则 `<data_dir>/agent.json` 的同名字段。
+  - `HBOT_SANDBOX` / `agent.json` 的 `sandbox`：`read_only`｜`workspace_write`｜`danger`（也接受 `readonly`/`workspace-write`/`DANGER` 这类大小写与连字符变体）。**写错是 `-32002`，不静默退回默认档** —— 静默降档会让用户以为命令能跑却一直被拒。
+  - `HBOT_COMMAND_ALLOW` / `agent.json` 的 `allowedPrograms`：逗号分隔的程序名，去空去重保序；**默认空 = 一个程序都不许**。清单只放具体程序，不放 `cmd`/`sh`/`powershell` 这类解释器（ADR-0003 §5：放解释器等于绕过"不经 shell"）。
+  - 解析失败（档位拼错、`agent.json` 非法 JSON）= `agent_send` 直接失败，不起回合。
+- **尚未做到**（ADR-0003 §5 有完整清单）：Windows 受限令牌 / 低完整性标签、Linux Landlock、读与网络隔离；Windows 上 `spawn → AssignProcessToJobObject` 之间仍有孙进程逃逸窗口。
 
 ### 11.3 密钥
 
@@ -554,6 +707,8 @@ debug.resumed      { sessionId }
 | 进程崩溃 | 启动时重放未处理 inbound、未发送 outbound；可能重复，幂等键兜底 |
 | Agent 取消 | 取消 provider/工具/命令；已产生副作用记录在审计 |
 
+**重放的具体口径（D5，2026-11-16 补）**：`start_inner` 在进入 `Reading` 前后，按 `received_at` **升序、有界分批**读取 `unprocessed inbound`，走与实时消息**同一条** `MessageCtx → queues.enqueue → handler` 路径，成功后 `mark_processed`；同一次启动内不重复入队；越过批次上限时分批继续而不是丢弃。语义是 **at-least-once**：崩溃窗内的消息可能被执行/回复两次，业务侧用 `ctx.messageId` 幂等。恢复 outbound 时按 `ORDER BY created_at, rowid`（不是 UUID 主键）保证 FIFO。
+
 原则：**不静默吞错**；每个 catch 要么恢复、要么上报、要么显式降级并记录。
 
 ---
@@ -567,24 +722,28 @@ debug.resumed      { sessionId }
 
 ---
 
-## 14. 性能预算（Spike 实测后校准）
+## 14. 性能预算（S0/S1/S2 实测后校准）
 
-| 指标 | 目标 |
-|---|---|
-| 桌面空闲总 RSS | < 220 MB（核心 < 60，WebView < 160）；S0 用真实窗口测 |
-| 每多一个 bot | < 6 MB（含 1 个 isolate 常驻） |
-| 每 isolate | < 8 MB（堆上限 32 MB；`memory_usage` 采样） |
-| 冷启动到可交互 | < 800 ms |
-| 入站 → 入队 p95 | < 10 ms |
-| handler 执行 p95（本地、无网络） | < 20 ms |
+**内存口径一律是 `PrivateMemorySize64`（private commit）在进程树上求和**，不是 `WorkingSet64`：同一份 WebView2 DLL 被 6–7 个子进程各自映射，WS 会把共享页重复计入（实测子进程 340 MB 里大部分是共享页）。理由与完整数据见 `docs/adr/0002-agent-in-rust.md` §4、`docs/spikes/S0-memory.md`。**文档里不要写含糊的「RSS」。**
+
+| 指标 | 目标 | 实测（commit ba49346，S0/S1/S2） |
+|---|---|---|
+| 核心空闲（`hbot serve` / 桌面 Rust 主进程） | < 60 MB | **3.4 MB** / 13.9 MB |
+| 桌面整机（Rust + WebView2 子进程求和） | < 260 MB | **190–223 MB**，中位 206 MB |
+| 每多一个 bot（连接态） | < 6 MB（含 1 个 isolate 常驻） | **0.10 MB**（首个 bot +1.1 MB） |
+| 每 isolate | < 8 MB（堆上限 32 MB；`memory_usage` 采样） | **0.30 MB**（32 个共 +9.5 MB） |
+| 冷启动到核心可用 | < 800 ms | **878 ms 中位 / 1264 p95 —— 未达标**，处置见 ADR-0002 §4.2 |
+| 冷启动到可交互 | < 800 ms | 无客观信号（Monaco ready 不可外部观测）；「到 IPC 首次可用」924 ms 中位仅作下界 |
+| 二进制 | < 60 MB | `hbot.exe` **16.2 MB** / `hbot-desktop.exe` **33.0 MB** |
+| 编译 50 文件项目（冷/热） | — | **40.9 ms / 4.4 ms**（S1） |
+| handler 执行（本地、无网络） | < 20 ms | 1 文件 **0.034 ms** 均值 / 50 文件 0.072 ms 均值（S1） |
 | 本地回复 p95 | < 50 ms |
 | 500 条消息突发不丢 | 是（背压，不丢） |
-| 二进制 / 安装包 | **待 S1 实测**；初始上限 60 MB / 70 MB（SWC 可能超，超了按 6.2 的退路） |
 | `cargo check`（增量） | < 30 s |
-| 冷编译（clean → 可运行） | < 8 min（SWC 链可能拖长；用 sccache/lld 改善） |
+| 冷编译（clean → 可运行） | < 8 min（全量首建实测 7m46s，S0 报告） |
 | 全量测试 | < 5 min |
 
-测量方法：固定机器、固定 fixture、`hyperfine` + 进程 RSS 采样；回归 >10% 阻断。**禁止用“Rust 一定更快”替代测量。**
+测量方法：固定机器、固定 fixture、进程树 `PrivateMemorySize64` 采样（`scripts/mem-probe.ps1 -IncludeChildren`）；回归 >10% 阻断。**禁止用“Rust 一定更快”替代测量。**
 
 ---
 
@@ -615,5 +774,5 @@ debug.resumed      { sessionId }
 7. Agent 是否需要 LSP；MVP 先用 Monaco 的类型检查 + `cargo`/`swc` 错误。
 8. Linux 托盘依赖 `libayatana-appindicator`，并非所有发行版都有；托盘是否作为可选能力。
 9. OneBot 11 部分事件没有稳定 `message_id`：去重键如何合成（哈希 + 时间窗），需要实测。
-10. Tauri/WebView2 在 Windows 上的实际空闲内存：S0 必须测，不能拿“Rust 核心小”代替整机数字。
+10. ~~Tauri/WebView2 在 Windows 上的实际空闲内存~~ **已测（S0/S2）**：整机 206 MB private（中位）/ 382 MB WS，Rust 主进程 13.9 MB，其余在 WebView2 子进程。结论见 §1.1 与 ADR-0002 §4；遗留未测项是「Monaco 打开 3 个标签后的增量」与「按键 p95」，需 M3 接 tauri-driver 或 devtools 后再测。
 7. MCP 客户端排期：MVP 后是否需要接第三方工具服务器。

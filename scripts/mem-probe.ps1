@@ -1,11 +1,17 @@
-# 采样进程树内存（Windows）。用于 S0 基线，不参与产品运行时。
+# 采样进程树内存（Windows）。用于 S0/S2 基线，不参与产品运行时。
 #
 # 用法：
 #   pwsh -File scripts/mem-probe.ps1 -Name hbot
 #   pwsh -File scripts/mem-probe.ps1 -Id 1234 -Seconds 5 -IncludeChildren -Json
+#   pwsh -File scripts/mem-probe.ps1 -Id 1234 -Seconds 30 -IncludeChildren -SplitChildren -IntervalMs 500 -Json
 #
 # 口径：WorkingSet64 是任务管理器“内存（工作集）”；PrivateMemorySize64 是提交的私有内存。
 # 报告里必须写清用的是哪一个，别混。
+#
+# -SplitChildren：把「根进程」与「全部后代合计」分开报。多进程 UI（WebView2）必须用它，
+# 否则单看根进程会漏掉渲染/GPU/网络三个子进程，而任务管理器里用户看到的是加起来的总数。
+#   注意：子进程集合每个采样点重新枚举（子进程会随页面加载陆续出现），所以 Children
+#   的数字是“当时存活的子进程合计”，不是固定集合。
 
 [CmdletBinding(DefaultParameterSetName = 'ByName')]
 param(
@@ -18,6 +24,7 @@ param(
     [int]$Seconds = 3,
     [int]$IntervalMs = 200,
     [switch]$IncludeChildren,
+    [switch]$SplitChildren,
     [switch]$Json
 )
 
@@ -72,21 +79,40 @@ while ((Get-Date) -lt $deadline) {
     $working = 0L
     $private = 0L
     $alive = 0
+    $rootWorking = 0L
+    $rootPrivate = 0L
+    $childWorking = 0L
+    $childPrivate = 0L
+    $childCount = 0
     foreach ($procId in $ids) {
         $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
         if ($p) {
+            $isRoot = ($procId -eq $root.Id)
             $working += $p.WorkingSet64
             $private += $p.PrivateMemorySize64
             $alive++
+            if ($isRoot) {
+                $rootWorking = $p.WorkingSet64
+                $rootPrivate = $p.PrivateMemorySize64
+            } else {
+                $childWorking += $p.WorkingSet64
+                $childPrivate += $p.PrivateMemorySize64
+                $childCount++
+            }
         }
     }
     if ($alive -eq 0) { throw "进程已退出：$($root.Id)" }
 
     $samples.Add([pscustomobject]@{
-            At         = (Get-Date).ToString('o')
-            Processes  = $alive
-            WorkingSet = $working
-            Private    = $private
+            At            = (Get-Date).ToString('o')
+            Processes     = $alive
+            ChildCount    = $childCount
+            WorkingSet    = $working
+            Private       = $private
+            RootWorking   = $rootWorking
+            RootPrivate   = $rootPrivate
+            ChildWorking  = $childWorking
+            ChildPrivate  = $childPrivate
         })
     Start-Sleep -Milliseconds $IntervalMs
 }
@@ -105,11 +131,26 @@ $result = [pscustomobject]@{
     Name            = $root.ProcessName
     Pid             = $root.Id
     IncludeChildren = [bool]$IncludeChildren
+    SplitChildren   = [bool]$SplitChildren
+    IntervalMs      = $IntervalMs
     Seconds         = $Seconds
     Samples         = $samples.Count
     WorkingSetMB    = Stat ($samples | ForEach-Object { $_.WorkingSet })
     PrivateMB       = Stat ($samples | ForEach-Object { $_.Private })
     GeneratedAt     = (Get-Date).ToString('o')
+}
+
+if ($SplitChildren) {
+    $result | Add-Member -NotePropertyName Root -NotePropertyValue ([pscustomobject]@{
+            WorkingSetMB = Stat ($samples | ForEach-Object { $_.RootWorking })
+            PrivateMB    = Stat ($samples | ForEach-Object { $_.RootPrivate })
+        })
+    $result | Add-Member -NotePropertyName Children -NotePropertyValue ([pscustomobject]@{
+            CountMin     = ($samples | ForEach-Object { $_.ChildCount } | Measure-Object -Minimum).Minimum
+            CountMax     = ($samples | ForEach-Object { $_.ChildCount } | Measure-Object -Maximum).Maximum
+            WorkingSetMB = Stat ($samples | ForEach-Object { $_.ChildWorking })
+            PrivateMB    = Stat ($samples | ForEach-Object { $_.ChildPrivate })
+        })
 }
 
 if ($Json) {

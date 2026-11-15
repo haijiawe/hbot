@@ -132,7 +132,7 @@ pnpm -C apps/web tauri dev  # 桌面模式
 
 ## 内存与性能
 
-目标：桌面空闲总 RSS < 220 MB（核心 < 60，WebView < 160），每 bot < 6 MB，冷启动 < 800 ms。全部是**待 Spike 实测**的目标，不是已达成数字。预算与测量方法见 [`docs/05-quality-gates.md`](docs/05-quality-gates.md) §4。
+目标（内存口径 = 进程树 private commit，**不是** WorkingSet，理由见 [ADR-0002](docs/adr/0002-agent-in-rust.md) §4）：桌面整机 < 260 MB，核心 < 60 MB，每 bot < 6 MB，冷启动 < 800 ms。**已实测**：核心 3.4 MB、每 bot 0.10 MB、每 isolate 0.30 MB、整机 206 MB（中位）、`hbot.exe` 16.2 MB；冷启动 878 ms 中位**未达标**。数据见 [`docs/spikes/S0-memory.md`](docs/spikes/S0-memory.md)。
 
 ---
 

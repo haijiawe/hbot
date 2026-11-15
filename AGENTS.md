@@ -95,7 +95,10 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 ```
 
 - 队列有界；满时暂停读取，不丢。
-- 重复投递只执行一次；`ctx.messageId` 是幂等键。
+- **两层去重，别混成一句话**：
+  1. **入库层（exactly-once）**：`UNIQUE(bot_id, external_id)`，同一条平台消息只会插一行，重复投递被 `insert_inbound_if_new` 挡掉。
+  2. **执行层（at-least-once）**：崩溃/被杀发生在「handler 执行完」与「`mark_inbound_processed`」之间时，重启后的补偿重放会把**同一行**再执行一次。所以 `ctx.messageId` 是幂等键，**不是**「有副作用的操作一定只发生一次」的保证；要在外部产生副作用的代码自己按 `messageId` 判重。
+  说「重复投递只执行一次」时，指的必须是第 1 层；说第 2 层就必须写 at-least-once。
 - 被动回复必须绑定 `reply_to`；主动消息不得冒用旧事件。
 
 ### 4.2 Agent
@@ -165,6 +168,29 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 16. **闸门本地与 CI 语义不同**：旧 `format` 闸门本地只查 `git diff --cached`，不改暂存区等于没查。新 `scripts/check.sh` 必须对全树判定，本地与 CI 同一条命令。
 17. **测试配置一收窄就假绿**：旧项目曾把 vitest include 改窄，364 个测试文件静默不跑。新项目的 nextest/Playwright 配置要有“期望测试数对账”，数量突变即红。
 18. **测试断言源码文本**：旧仓库 88 个测试读源码字符串，重命名会以离奇断言失败出现。新项目用类型/契约/行为；结构约束交给依赖图与 `cargo`。
+
+### 7.1 新仓库自己已经踩过的坑（2026-11-16，都是实测）
+
+19. **`Drop` 里的无界 `join()` 会把宿主挂死**。`crates/hbot-code/src/runtime/isolate.rs:235`：sandbox 的 worker 线程在 bootstrap 失败后卡在 `recv`，发送端又在 `Drop` 内部，通道永不 disconnect，`join()` 永不返回 → 进程 0% CPU 假死、日志无错。规则：**任何 `Drop` 里的等待必须有超时**（`recv_timeout(handler_timeout + 1s)`），超时就 `error!` 并 detach，绝不 join 到底；`tests/s1_isolate_lifecycle.rs` 是这条的回归。
+20. **唤醒只在“全局归零”时通知会造成假死**。`crates/hbot-bot/src/queue.rs:492-494` 只在 `total == 0` 时 `notify_waiters()`，而 `enqueue` 等它：会话 A 满 → 读循环阻塞 → A 腾出容量但别的会话仍有在途 → A 的等待者永不醒，表现是「bot 突然不回消息、日志干净」。规则：**每处理完一条就按会话通知**，且 `enable()` 必须先于 `try_enqueue` 注册。
+21. **按 UUID 主键排序 ≠ FIFO**。`Store::list_pending_outbound` 曾是 `ORDER BY id`，恢复时出站顺序被打乱。规则：任何“待处理队列”的读取都要 `ORDER BY created_at, rowid`；UUID 只当主键，不当顺序。
+22. **注释声称“下次启动会重放”，但生产零调用**。`crates/hbot-bot/src/supervisor.rs:677` 说消息已落库会重放，实际 `list_unprocessed_inbound` 一个生产调用点都没有，崩溃窗内的消息永远停在未处理。规则：**「会重放/会恢复」这类声称必须有测试证明**，否则它就是一句谎；恢复路径要写清语义（我们不承诺 exactly-once，承诺 **at-least-once** + 幂等键）。
+23. **热路径上禁止 O(项目) 操作**。`sandbox_handler` 曾每条消息重算全项目指纹（全量读盘 + blake3）。规则：每消息路径只允许 O(1) 判断 + 内存缓存；文件变化靠 watcher 脏标志，内容指纹按需重算。
+24. **编译失败不能让 bot 停摆**。一个 typo 就 `Err` → inbound 不标记 → 每条消息都失败。规则：**保留 last-good 版本继续服务**，错误进 `RunLog` + UI；只有「从来没有成功过」才真报错。
+25. **`tauri-build` 需要 `crates/hbot-desktop/icons/icon.ico`**，否则报 `` required for generating a Windows Resource file during tauri-build ``。图标是 PNG payload 的 ICO（6 字节头 + 16 字节目录项 + PNG 体），`icons/` 已入库，别删。
+26. **`#[tauri::command]` 函数不能是 `pub`**：crate root 会 `E0255 __cmd__dispatch is defined multiple times`。命令写 `async fn`，只在 `run()` 里注册。
+27. **PowerShell 的 .NET API 用进程 CWD**，`Set-Location` 不改它（`[System.IO.File]::WriteAllBytes` 会写到启动目录）。脚本一律用工具的 `workdir`，或全程 `Join-Path $PSScriptRoot`。
+28. **长命令把输出写进管道会假死**：`cargo run` 输出没人读，进程卡在写、CPU 0%、看起来像死锁。规则：长任务一律 `*> 日志文件` 再读文件，不要靠终端缓冲区。
+29. **`CARGO_TARGET_DIR` 必须按 agent 分目录**（`D:\hbot-target\<line>`）：多个 agent 共用同一个 target 会互相等锁，看起来像“卡住”。
+30. **契约改了必须同批改三处**：`dto`（Rust）→ `cargo xtask gen`（TS 生成物入库）→ `apps/web` 消费点。`gen --check` 与 web 的 `tsc` 会各自抓到一半，别只修一半就提交。
+31. **调试断点属于 bot，不属于 agent 会话**（`crates/hbot-core/src/debug.rs`，2026-11-16 冻结）。同一份源码在两个 bot 的 isolate 里可以是不同版本（热重载时机不同），断点按会话走会串味。`DebugSink::paused` 是**同步阻塞**的，只能在 isolate worker 线程里调用；实现方必须自带超时（建议 5 分钟）并返回 `Continue`，否则挂死宿主。
+32. **命令执行 fail-closed**：`hbot-command` 的能力矩阵实测是「Windows/Linux 有进程树 Containment、**没有写隔离**、macOS 全无」。因此 `read_only` 直接拒、`workspace_write` 也拒（`IsolationUnavailable`）、只有 `danger` 能跑。**不许为了"能用"放松这条**——装不上隔离就是拒绝，放宽等于把旧项目"非 Windows 退化成名字白名单"的坑再踩一遍（旧 `sandbox.ts:66,166`）。
+33. **parity 测试要在别人的文件静止时跑**。并行改 `hbot-code` 期间跑 `crates/hbot-parity`，红可能是中间态（例如宿主 `log` 收集被改）：先看失败点是不是"断言没走到"而不是"结果不对"，再决定是打回还是复验。
+34. **内存一律按 `PrivateMemorySize64` 在进程树上求和**，不要用 `WorkingSet64`：WebView2 的 DLL 被 6–7 个子进程各自映射，WS 会把共享页重复计入（实测整机 WS 382.5 MB vs Private 205.5 MB）。口径写在 `docs/adr/0002-agent-in-rust.md` §4。
+35. **档位与命令白名单是配置，不是常量**：`HBOT_SANDBOX` / `HBOT_COMMAND_ALLOW` 或 `<data_dir>/agent.json` 的 `sandbox` / `allowedPrograms`。写错档位字符串是 `-32002`，**不许静默退回默认档**（那会把 `danger` 悄悄降成 `workspace_write`，用户以为命令能跑却一直被拒）。白名单默认空 = 一个程序都不许，且只放具体程序，别把 `cmd`/`sh`/`powershell` 放进去 —— 放解释器等于绕开"命令不经 shell"这条设计（`crates/hbot-rpc/src/app/agent/config.rs`）。
+36. **前端构建不产出 `.map`**：`tauri build` 会把整个 `apps/web/dist` 内嵌进安装包，实测 58.16 MiB 里有 44.20 MiB 是 sourcemap（关掉后 13.96 MiB）。dev server 的 sourcemap 在内存里，不受影响。
+37. **运行时的编译必须用 `compile_project_debug`**（`crates/hbot-rpc/src/app/runtime/sandbox_handler.rs`）：只有 debug 构建才插了 `__hbot_trace` 探针。退成 `compile_project`（release）不会报错，只会让 `debug_set_breakpoints` **静默永不命中** —— 这类"不报错的失效"比崩溃难查一个数量级。同时"没有断点就不 arm"是必须的：arm 后 probe-dense handler 实测 4.64×（上限 5×，余量 8%）。`hbot check` 与 diagnostics 反而**应该**用 release 编译（只要类型与错误，不要探针）。
+38. **`ctx.log` 在 handler 抛错时也要留下**：日志在 `hbot-code` 的 `RawEvent` 里已经收集了，别让它在 `finish()` 的错误分支被丢掉（旧实现就是这样）。用户看到"我的 bot 出错了，但出错前那三行 log 一条都没有"时，几乎无法定位。
 
 ---
 

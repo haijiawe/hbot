@@ -23,8 +23,35 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
-    "icon": []
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "publisher": "HBot",
+    "copyright": "Copyright © 2026 HBot contributors",
+    "license": "MIT OR Apache-2.0",
+    "category": "DeveloperTool",
+    "shortDescription": "QQ 机器人低代码框架桌面端",
+    "longDescription": "HBot 是 QQ 机器人的低代码开发框架：内置 Monaco 编辑器、Flow 可视化画布与 Agent 面板；业务能力统一经 hbot-rpc 的 dispatch 暴露给前端，数据落在 SQLite（hbot-store）。本安装包只含桌面壳与 Web 资源，不含 Node 运行时。",
+    "createUpdaterArtifacts": false,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "linux": {
+      "deb": {
+        "section": "devel"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "hardenedRuntime": true
+    }
   }
 }

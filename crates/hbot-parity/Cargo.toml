@@ -1,0 +1,24 @@
+[package]
+name = "hbot-parity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 只含跨 crate 的集成回归测试：没有 src/lib.rs，全部用例在 tests/ 下。
+# 为什么单开一个 crate 见 docs/04-implementation-plan.md §4.1：接缝测试塞进
+# 任何一个实现 crate 的 tests/ 都会逼那个 crate 反向依赖别人。
+publish = false
+
+[dev-dependencies]
+hbot-core = { path = "../hbot-core" }
+hbot-store = { path = "../hbot-store" }
+hbot-code = { path = "../hbot-code" }
+hbot-bot = { path = "../hbot-bot" }
+hbot-agent = { path = "../hbot-agent" }
+hbot-workspace = { path = "../hbot-workspace" }
+hbot-adapters = { path = "../hbot-adapters" }
+hbot-rpc = { path = "../hbot-rpc" }
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true

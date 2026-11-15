@@ -1,8 +1,12 @@
 //! `hbot` 二进制：`version` / `serve` / `check`。
 //!
 //! 边界（`docs/03-directory.md` §2）：这里只做参数解析、进程生命周期与输出，
-//! 协议与传输在 [`hbot_rpc`]；本 crate 不依赖 `hbot-store` / `hbot-bot` /
-//! `hbot-agent` / `hbot-code`。
+//! 协议与传输在 [`hbot_rpc`]。
+//!
+//! 依赖面刻意收窄：**不**依赖 `hbot-store` / `hbot-bot` / `hbot-agent`（那些实现
+//! 由 `hbot-rpc` 的 `AppState` 装配，CLI 只拿到已装好的 `Dispatcher`）。唯一例外是
+//! `hbot-code`——`check` 要真解析 `hbot.json` 并真跑一次 SWC 编译，借的是它的
+//! `manifest` / `compile` 两个模块，不是沙箱运行时。
 //!
 //! 输出约定：
 //!

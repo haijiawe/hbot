@@ -27,10 +27,20 @@ pub fn version_info() -> VersionInfo {
 
 /// 能力位。
 ///
-/// 后台服务的传输层是 `tokio-tungstenite`（无 TLS feature），所以这里显式写
-/// `tls=disabled`：UI 只能连本机 `ws://127.0.0.1:PORT`。启用 TLS 时改这一处。
+/// 两件事要分清，之前写成 `tls=disabled` 让读取这个输出的人（含 Agent）以为
+/// 「平台连接也不支持 TLS」：
+///
+/// * `rpc-tls=disabled`——**后台服务的 RPC 监听**没有 TLS，UI 只能连本机
+///   `ws://127.0.0.1:PORT`（有 token + Origin 白名单，见 §9.3）。启用 RPC TLS 时改这一处。
+/// * `platform-tls=rustls`——**平台适配器**的 `wss://`/`https://` 走 rustls + 公共根证书，
+///   校验始终开启（`crates/hbot-adapters/src/tls.rs`）。
 pub fn capabilities() -> &'static [&'static str] {
-    &["rpc-ws", "headless", "tls=disabled"]
+    &[
+        "rpc-ws",
+        "headless",
+        "rpc-tls=disabled",
+        "platform-tls=rustls",
+    ]
 }
 
 /// `hbot version` 的完整输出（多行，无尾换行）。
@@ -57,6 +67,8 @@ mod tests {
         assert_eq!(first, format!("hbot {}", env!("CARGO_PKG_VERSION")));
         assert!(text.contains("platform: "), "输出：{text}");
         assert!(text.contains("capabilities: rpc-ws"), "输出：{text}");
-        assert!(text.contains("tls=disabled"), "输出：{text}");
+        // RPC 监听没有 TLS；平台适配器有。两者别再混成一个 `tls=disabled`。
+        assert!(text.contains("rpc-tls=disabled"), "输出：{text}");
+        assert!(text.contains("platform-tls=rustls"), "输出：{text}");
     }
 }

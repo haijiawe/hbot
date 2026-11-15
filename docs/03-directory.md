@@ -37,6 +37,7 @@ crates/
   hbot-code/             生成代码：manifest、SWC 编译、QuickJS 运行时、宿主 API
   hbot-bot/              平台无关的 bot supervisor、会话队列、outbox、去重
   hbot-workspace/        项目文件、文件监听、全局搜索、符号/源码映射、编辑事务
+  hbot-command/          受控命令执行：进程树隔离、程序清单、cwd/env 守卫、输出上限（只依赖 hbot-core）
   hbot-adapters/         OneBot/Webhook/Telegram…、keyring、HTTP 客户端、文件系统
   hbot-rpc/              Command/Event DTO、dispatch、WS 服务
   hbot-cli/              `hbot` 二进制：serve / check / run
@@ -66,6 +67,8 @@ hbot-bot 只依赖 hbot-core + hbot-store（自己定义它需要的平台端口
 3. `hbot-bot` 不依赖 `hbot-agent`；`hbot-code` 不依赖 `hbot-agent`。
 4. `hbot-workspace` 只依赖 `hbot-core`；负责文件/搜索/监听/编辑事务，不含 UI、不含 Agent 决策。
 5. `hbot-adapters` 只依赖 `hbot-core`；不得 import 具体服务 crate。
+5.1 `hbot-command` 只依赖 `hbot-core`：它实现 `hbot_core::ports::CommandRunner`，**不许**认识
+   `hbot-agent`（agent 依赖它，不是反过来）；平台差异用 `cfg` + 自写 FFI，不引入第三方 crate。
 - **端口由消费方定义**：`hbot-bot` 里声明 `trait BotAdapter`（`crates/hbot-bot/src/adapter.rs`，`id/declared_conversations/subscribe/send`），`hbot-adapters` 只提供具体平台实现（`OneBotClient` 等）。两者之间的桥接（把 `OneBot` 的 `NormalizedInbound`/`OutboundSender` 适配成 `BotAdapter`）放在**组合根**（`hbot-rpc/src/bridge/` 或 `hbot-cli`），不放 bot、也不放 adapters —— 否则 bot 就得依赖 adapters，而 adapters 又可能想依赖 bot，形成双向。
 6. `hbot-rpc` 可以依赖五个实现 crate，但只做参数校验、编排、错误映射；业务规则不下沉。
 7. `hbot-desktop` 不含业务规则；只做“Tauri ↔ core”的适配与窗口/托盘/更新。
@@ -126,6 +129,16 @@ hbot-workspace/src/
   symbols.rs       符号大纲、定义位置（Monaco 结果落库/缓存）
   edit.rs          WorkspaceEdit / Diff / 冲突检测
   sourcemap.rs     运行时错误 → 文件:行
+
+hbot-command/src/
+  lib.rs           对外入口（PlatformRunner、CapabilityReport）
+  runner.rs        CommandRunner 实现：六道闸 + 超时/超限 + 杀树
+  probe.rs         能力探测（IsolationLevel / ProbeOutcome / IsolationProbe）
+  containment.rs   平台分派：containment_{win,linux,unsupported}.rs
+  program.rs       程序解析（PATH、.bat/.cmd 拒绝）+ 白名单比对
+  path.rs          cwd 必须在项目根内（canonicalize + 逐组件比较）
+  env.rs           环境变量白名单（默认清空、拒加载器注入变量）
+  output.rs        有界输出收集（超限即停读）
 
 hbot-adapters/src/
   platforms/onebot.rs webhook.rs
