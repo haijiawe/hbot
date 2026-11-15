@@ -6,12 +6,13 @@ fn main() -> Result<()> {
         "deps" => deps(),
         "gen" => {
             println!("gen: no generators yet");
+            Ok(())
         }
         _ => {
             println!("usage: cargo xtask <deps|gen>");
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// 校验 crate 依赖方向。规则见 docs/03-directory.md §4。
