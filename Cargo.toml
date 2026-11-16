@@ -24,6 +24,10 @@ hbot-rpc = { path = "crates/hbot-rpc", version = "0.1.0" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 只用于"人手编辑的配置文件"（`bots.json` / `agent.json`）：字段名打错要能**告警**，
+# 而不是静默失效、也不是硬失败。机器生成的 `hbot.json` 不走这条路（那边用
+# `deny_unknown_fields` 直接拒）。
+serde_ignored = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util"] }
 # `rustls-tls-webpki-roots`：让 OneBot 的 `wss://` 走 rustls + 公共根证书，
