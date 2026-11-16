@@ -148,7 +148,11 @@ conversationId: ConversationId,
 /**
  * 模拟的消息文本。
  */
-text: string, } | { "type": "bot_list" } | { "type": "debug_set_breakpoints", 
+text: string, } | { "type": "bot_list" } | { "type": "bot_conversations", 
+/**
+ * Bot ID。
+ */
+botId: BotId, } | { "type": "debug_set_breakpoints", 
 /**
  * Bot ID。
  */

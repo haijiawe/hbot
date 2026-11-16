@@ -57,6 +57,7 @@
 //! | `BotStop` | `null`（状态经 `bot.status`） |
 //! | `BotInject` | `null` |
 //! | `BotList` | `Vec<`[`BotSummary`]`>`（UI 启动时的运行态播种） |
+//! | `BotConversations` | `Vec<`[`ConversationSummary`]`>`（`bot_inject` 需要的 `conversationId` 由这里给；空数组表示还没有会话） |
 //! | `DebugSetBreakpoints` | `null` |
 //! | `DebugResume` | `null`（结果经 `debug.resumed` / `debug.paused`） |
 //! | `DebugStep` | `null`（同上） |
@@ -71,8 +72,8 @@ pub mod event;
 
 pub use command::Command;
 pub use common::{
-    ApiError, AppInfo, BotSummary, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry,
-    EditFile, FileChangeKind, FileContent, LogLevel, ProjectOpenResult, ProjectSummary, Response,
-    RiskLevel, RunLog, SearchMatch, StackFrame, StepKind,
+    ApiError, AppInfo, BotSummary, ConversationSummary, DebugScope, Diagnostic, DiagnosticSeverity,
+    DiffHunk, DirEntry, EditFile, FileChangeKind, FileContent, LogLevel, ProjectOpenResult,
+    ProjectSummary, Response, RiskLevel, RunLog, SearchMatch, StackFrame, StepKind,
 };
 pub use event::Event;

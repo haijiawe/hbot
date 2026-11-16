@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use hbot_core::{BotId, BotStatus, HbotError, Timestamp};
+use hbot_core::{BotId, BotStatus, ConversationId, HbotError, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -91,6 +91,21 @@ pub struct BotSummary {
     pub status: BotStatus,
     /// 状态最后一次变更的时间（毫秒时间戳）；从未变更为 0。
     pub updated_at: Timestamp,
+}
+
+/// 某个 bot 已登记的会话（`bot_conversations` 的 `data` 元素）。
+///
+/// `kind` 是**开放字符串**（`private` / `group` / `channel`），不是枚举：平台将来多一种
+/// 会话形态时不应该逼着这条命令先改 DTO 才能返回。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSummary {
+    /// 会话 ID（本地唯一，`bot_inject` 用它）。
+    pub conversation_id: ConversationId,
+    /// 平台侧的会话标识（如 `local:default`、群 `group_openid`、QQ 号）。
+    pub external_id: String,
+    /// 会话形态：`private` / `group` / `channel`。
+    pub kind: String,
 }
 
 /// 一条搜索匹配（`file.search.matches`）。

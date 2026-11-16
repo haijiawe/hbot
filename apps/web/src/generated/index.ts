@@ -10,6 +10,7 @@ export type { BotSummary } from "./BotSummary";
 export type { Command } from "./Command";
 export type { ConversationId } from "./ConversationId";
 export type { ConversationKind } from "./ConversationKind";
+export type { ConversationSummary } from "./ConversationSummary";
 export type { DebugScope } from "./DebugScope";
 export type { Diagnostic } from "./Diagnostic";
 export type { DiagnosticSeverity } from "./DiagnosticSeverity";

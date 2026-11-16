@@ -185,6 +185,19 @@ pub enum Command {
     /// 不补建、不编造。
     BotList,
 
+    /// 列出某个 bot 已登记的会话。
+    ///
+    /// `data` 是 [`ConversationSummary`](super::ConversationSummary) 的数组；没有会话时返回
+    /// 空数组，**不补建、不编造**。存在的理由是 `bot_inject` 需要 `conversationId`，而 UI
+    /// 此前唯一的获取途径是正则匹配日志里的一行——那是脏办法。
+    ///
+    /// `local` 平台启动后会有一条 `externalId = local:default` 的 `private` 会话，它就是
+    /// 本地试跑要交给 `bot_inject` 的那个 id。
+    BotConversations {
+        /// Bot ID。
+        bot_id: BotId,
+    },
+
     /// 设置断点（调试构建）。
     ///
     /// 断点是**按 bot 的沙箱**生效的：同一份源码在不同 bot 的 isolate 里可以是不同版本。
@@ -249,6 +262,7 @@ impl Command {
             Self::BotStop { .. } => "bot_stop",
             Self::BotInject { .. } => "bot_inject",
             Self::BotList => "bot_list",
+            Self::BotConversations { .. } => "bot_conversations",
             Self::DebugSetBreakpoints { .. } => "debug_set_breakpoints",
             Self::DebugResume { .. } => "debug_resume",
             Self::DebugStep { .. } => "debug_step",

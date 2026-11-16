@@ -134,6 +134,7 @@ impl Dispatcher {
             | Command::BotStop { .. }
             | Command::BotInject { .. }
             | Command::BotList
+            | Command::BotConversations { .. }
             | Command::LogsTail { .. } => crate::app::commands::bots::handle(state, command).await,
             Command::AgentSend { .. }
             | Command::AgentCancel { .. }
