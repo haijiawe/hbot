@@ -151,9 +151,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         "B 树首次：read_dir + DirEntry::metadata + fs::read（内容首次读）",
     );
     let walk_read = repeat(3, || walk(&pristine_root, true))?;
-    print_dist("variance_walk_read_hot", &walk_read, "B 树热：同上一段，第 2–4 次");
+    print_dist(
+        "variance_walk_read_hot",
+        &walk_read,
+        "B 树热：同上一段，第 2–4 次",
+    );
     let walk_meta = repeat(3, || walk_entry_metadata(&pristine_root))?;
-    print_dist("variance_walk_entry_hot", &walk_meta, "B 树热：只读目录项元数据");
+    print_dist(
+        "variance_walk_entry_hot",
+        &walk_meta,
+        "B 树热：只读目录项元数据",
+    );
     let bodies = read_all(&pristine_root)?;
     let inmem = repeat(3, || {
         let started = Instant::now();
@@ -164,14 +172,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         assert_eq!(hits, pristine_facts.hit_files, "内存内命中数与夹具不符");
         Ok(started.elapsed())
     })?;
-    print_dist("variance_inmem_match", &inmem, "已读入内存后子串扫描全树（21 MB）");
+    print_dist(
+        "variance_inmem_match",
+        &inmem,
+        "已读入内存后子串扫描全树（21 MB）",
+    );
     let inmem_all = repeat(3, || {
         let started = Instant::now();
-        let utf8 = bodies.iter().filter(|b| std::str::from_utf8(b).is_ok()).count();
+        let utf8 = bodies
+            .iter()
+            .filter(|b| std::str::from_utf8(b).is_ok())
+            .count();
         assert_eq!(utf8, pristine_facts.files, "内存内 UTF-8 校验数不对");
         Ok(started.elapsed())
     })?;
-    print_dist("variance_inmem_utf8", &inmem_all, "已读入内存后 from_utf8 全树");
+    print_dist(
+        "variance_inmem_utf8",
+        &inmem_all,
+        "已读入内存后 from_utf8 全树",
+    );
 
     // ---- §2 线程数扫描 ---------------------------------------------------
     harness::section("2. 线程数扫描（热缓存，交错取样，防漂移）");
@@ -188,7 +207,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     for (slot, &threads) in THREAD_CONFIGS.iter().enumerate() {
-        let label = if threads == 0 { "auto".to_string() } else { threads.to_string() };
+        let label = if threads == 0 {
+            "auto".to_string()
+        } else {
+            threads.to_string()
+        };
         print_dist(
             &format!("variance_threads_{label}"),
             &buckets[slot],
@@ -203,7 +226,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "hits",
         "任何线程数都必须找到同一批命中（确定性）",
     );
-    assert!(all_same, "不同线程数的命中数不一致 —— 这是正确性 bug，不是性能问题");
+    assert!(
+        all_same,
+        "不同线程数的命中数不一致 —— 这是正确性 bug，不是性能问题"
+    );
 
     // ---- §3 同进程连跑 ---------------------------------------------------
     harness::section("3. 同进程连跑（threads=auto，热缓存）");
@@ -213,7 +239,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     for index in 0..CONSECUTIVE_RUNS {
         let run = measure(&workspace, NEEDLE, &options, 0)?;
         assert_eq!(run.hits, facts.hit_files, "命中数必须等于夹具埋点数");
-        assert!(!run.limit_reached, "max_results=1000 且只有 100 命中，不该截断");
+        assert!(
+            !run.limit_reached,
+            "max_results=1000 且只有 100 命中，不该截断"
+        );
         if index == 0 {
             harness::info_line(
                 "variance_consecutive_first",
@@ -266,9 +295,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "runs",
         "同进程内超线次数与位次",
     );
-    let no_hit = repeat(5, || {
-        Ok(measure(&workspace, ABSENT, &options, 0)?.elapsed)
-    })?;
+    let no_hit = repeat(5, || Ok(measure(&workspace, ABSENT, &options, 0)?.elapsed))?;
     print_dist("variance_no_hit", &no_hit, "查不存在的词（必然扫完 10k）");
 
     // ---- §4 阶段拆分与排序开销 -------------------------------------------
@@ -284,7 +311,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "max_file_size=1 ⇒ 候选全被预筛掉，只剩阶段 1（遍历+排序空表）",
     );
     let serial_one = repeat(5, || Ok(measure(&workspace, NEEDLE, &options, 1)?.elapsed))?;
-    print_dist("variance_threads_one", &serial_one, "1 线程全流程（同口径对照）");
+    print_dist(
+        "variance_threads_one",
+        &serial_one,
+        "1 线程全流程（同口径对照）",
+    );
     // 排序开销：用真实的 10k 相对路径（与 search.rs 的候选 label 同源数据）量排序本身。
     let paths = all_relative_paths(&root)?;
     let sorting = repeat(5, || {
@@ -316,7 +347,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         copy.sort_unstable();
         Ok(started.elapsed())
     })?;
-    print_dist("variance_sort_100hits", &hits_sort, "100 条命中按 (path,line) 排序");
+    print_dist(
+        "variance_sort_100hits",
+        &hits_sort,
+        "100 条命中按 (path,line) 排序",
+    );
 
     // ---- §5 批间负载 -----------------------------------------------------
     harness::section("5. 批间负载（SEARCH_BATCH_FILES=512）");
@@ -330,7 +365,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     harness::section("6. 对照：故意制造 CPU 争用（同一份代码，只加忙等线程）");
     for level in [8usize, 20, 40] {
         let before = repeat(3, || Ok(measure(&workspace, NEEDLE, &options, 0)?.elapsed))?;
-        print_dist(&format!("variance_cpu{level}_before"), &before, "加负载前基线");
+        print_dist(
+            &format!("variance_cpu{level}_before"),
+            &before,
+            "加负载前基线",
+        );
         let hogs = Hogs::cpu(level);
         std::thread::sleep(Duration::from_millis(500));
         snapshot(&format!("during-cpu{level}"));
@@ -343,7 +382,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         hogs.stop();
         std::thread::sleep(Duration::from_millis(400));
         let after = repeat(2, || Ok(measure(&workspace, NEEDLE, &options, 0)?.elapsed))?;
-        print_dist(&format!("variance_cpu{level}_after"), &after, "撤掉争用后（恢复对照）");
+        print_dist(
+            &format!("variance_cpu{level}_after"),
+            &after,
+            "撤掉争用后（恢复对照）",
+        );
         print_ratio(&format!("variance_cpu{level}_ratio"), &before, &during);
     }
 
@@ -360,7 +403,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         snapshot("during-cpu20-sweep");
         for k in [1usize, 2, 4, 8, 14, 20, 32, 64, 0] {
             let samples = repeat(2, || Ok(measure(&workspace, NEEDLE, &options, k)?.elapsed))?;
-            let label = if k == 0 { "auto".to_string() } else { k.to_string() };
+            let label = if k == 0 {
+                "auto".to_string()
+            } else {
+                k.to_string()
+            };
             print_dist(
                 &format!("variance_overload_threads_{label}"),
                 &samples,
@@ -376,7 +423,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     harness::section("7. 对照：故意制造同盘 IO 争用（N 个线程循环读同一棵树）");
     for level in [3usize, 8] {
         let before = repeat(3, || Ok(measure(&workspace, NEEDLE, &options, 0)?.elapsed))?;
-        print_dist(&format!("variance_io{level}_before"), &before, "加负载前基线");
+        print_dist(
+            &format!("variance_io{level}_before"),
+            &before,
+            "加负载前基线",
+        );
         let hogs = Hogs::io(root.clone(), level);
         std::thread::sleep(Duration::from_millis(500));
         snapshot(&format!("during-io{level}"));
@@ -389,7 +440,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         hogs.stop();
         std::thread::sleep(Duration::from_millis(400));
         let after = repeat(2, || Ok(measure(&workspace, NEEDLE, &options, 0)?.elapsed))?;
-        print_dist(&format!("variance_io{level}_after"), &after, "撤掉争用后（恢复对照）");
+        print_dist(
+            &format!("variance_io{level}_after"),
+            &after,
+            "撤掉争用后（恢复对照）",
+        );
         print_ratio(&format!("variance_io{level}_ratio"), &before, &during);
     }
 
@@ -401,7 +456,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let walk_read_med = median_ms(&walk_read);
     harness::info_line(
         "variance_phase1_share",
-        &format!("{:.1} / {:.1} = {:.0}%", phase1_med, one_med, 100.0 * phase1_med / one_med),
+        &format!(
+            "{:.1} / {:.1} = {:.0}%",
+            phase1_med,
+            one_med,
+            100.0 * phase1_med / one_med
+        ),
         "ms",
         "阶段 1 占 1 线程全流程的比例",
     );
@@ -413,7 +473,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     harness::info_line(
         "variance_per_file_us",
-        &format!("{:.1}", 1000.0 * (one_med - phase1_med).max(0.0) / facts.files as f64),
+        &format!(
+            "{:.1}",
+            1000.0 * (one_med - phase1_med).max(0.0) / facts.files as f64
+        ),
         "us",
         "单文件串行读+匹配成本（阶段 2 / 文件数）",
     );
@@ -701,7 +764,10 @@ fn batch_balance(root: &Path, sorted_paths: &[String]) -> Result<(), Box<dyn Err
     let max = *bytes_per_batch.iter().max().unwrap_or(&0);
     harness::info_line(
         "variance_batch_bytes",
-        &format!("{batches} 批 / 每批字节 min {min} / max {max} / max÷min {:.3}", max as f64 / min.max(1) as f64),
+        &format!(
+            "{batches} 批 / 每批字节 min {min} / max {max} / max÷min {:.3}",
+            max as f64 / min.max(1) as f64
+        ),
         "B",
         "批间负载（512 文件一批，按候选排序切）",
     );
@@ -713,7 +779,10 @@ fn batch_balance(root: &Path, sorted_paths: &[String]) -> Result<(), Box<dyn Err
     );
     harness::info_line(
         "variance_batch_worker_ratio",
-        &format!("最坏 {:.3}×（第 {} 批，{} workers）", worst_worker_ratio, worst_batch.0, workers),
+        &format!(
+            "最坏 {:.3}×（第 {} 批，{} workers）",
+            worst_worker_ratio, worst_batch.0, workers
+        ),
         "x",
         "批内按自动线程数均分后的最大切片字节 / 平均切片字节",
     );
