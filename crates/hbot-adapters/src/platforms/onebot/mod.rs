@@ -44,6 +44,7 @@ pub use client::{ActionHandle, OneBotClient, OneBotConfig, probe_connection, val
 pub use event::{MessageType, OneBotEvent, PostType, Sender};
 pub use message::{MessagePayload, Segment, SegmentKind, build_outbound, outbound_json};
 pub use normalize::{
-    NormalizedInbound, fallback_external_id, fallback_fingerprint, fnv1a_64, normalize,
+    NormalizedInbound, fallback_external_id, fallback_fingerprint, fnv1a_64,
+    is_synthetic_external_id, normalize,
 };
 pub use send::{ActionSender, OutboundSender, RetryPolicy, SendAttempt, SendReceipt};

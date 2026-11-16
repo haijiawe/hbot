@@ -1,5 +1,9 @@
 //! OneBot 事件 → 平台无关的入站消息。
 //!
+//! [`NormalizedInbound`] 本身是**平台共用**的，定义在 [`crate::normalize`]（2026-11
+//! 新增 QQ 官方适配器时从本文件移出，见那里的模块说明）；本模块只负责 OneBot 方言
+//! 的字段映射与它特有的幂等键方案。
+//!
 //! 归一化只做「协议 → 领域」的形状转换，不碰数据库、不碰队列：
 //!
 //! ```text
@@ -41,13 +45,18 @@
 //! 兜底键的值总是含 `-`，数字 `message_id` 不含，所以两条路径的键空间不会互相
 //! 误撞（这是个小但重要的性质，测试里有断言）。
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use hbot_core::domain::{ConversationKind, InboundMessage, Timestamp};
-use hbot_core::ids::{BotId, ConversationId, MessageId};
+use hbot_core::domain::{ConversationKind, Timestamp};
 
 use super::event::{MessageType, OneBotEvent};
 use crate::error::AdapterError;
+
+// `NormalizedInbound` 与 `conversation_kind_str` 是**平台共用**的（2026-11 新增 QQ
+// 官方适配器时从本文件移到 `crate::normalize`，移动而非复制）。这里原样再导出，
+// 保持 `onebot::normalize::NormalizedInbound` / `onebot::NormalizedInbound` 等既有
+// 路径不变 —— 下游（`hbot-rpc`、`hbot-cli`、本 crate 的测试）不需要改。
+pub use crate::normalize::{NormalizedInbound, conversation_kind_str};
 
 /// FNV-1a 64 位偏移量（RFC 无编号，取自 FNV 规范）。
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -71,9 +80,46 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 ///
 /// 形如 `"123456-1700000000-1f2e3d4c5b6a7980"`；`fingerprint` 见
 /// [`fallback_fingerprint`]，碰撞与重投递的性质见模块级说明。
+///
+/// **格式与判据是一对**：[`is_synthetic_external_id`] 认的就是这里拼出来的形状。
+/// 改这段 `format!` 必须同步改那个判据（反之亦然），否则"平台没给 `message_id`"
+/// 的入站会被下游当成真平台消息 ID 拿去组被动回复的 `reply` 段。
 pub fn fallback_external_id(user_id: i64, time_seconds: i64, fingerprint: &str) -> String {
     let hash = fnv1a_64(fingerprint.as_bytes());
     format!("{user_id}-{time_seconds}-{hash:016x}")
+}
+
+/// 这个 `external_id` 是不是 [`fallback_external_id`] 造出来的**本地兜底键**。
+///
+/// 兜底键**只是去重键**，不是平台侧的消息 ID。下游（被动回复的 `reply_to`）必须
+/// 靠它区分"能引用"和"只能按主动消息发"：
+///
+/// - OneBot 真 `message_id` 是整数（`external_id = message_id.to_string()`，纯数字），
+///   这里返回 `false`；
+/// - 兜底键恰好三段（`{user_id}-{time}-{hash:016x}`），这里返回 `true`；
+/// - **其它平台的 id 一律返回 `false`**，包括 QQ 官方的 `ROBOT1.0_…`
+///   （`platforms::qq::normalize` 用 `d.id`）：它们的形状不匹配，不能被误判成兜底键，
+///   否则 QQ 的被动回复会被静默降级成主动消息。
+///
+/// 刻意按**严格形状**判（三段、前两段非空十进制、末段恰好 16 位十六进制），
+/// 而不是"含 `-` 就算"——`ROBOT1.0_…` 之类的平台 id 里完全可能有 `-`。
+///
+/// 判据只覆盖**非负** `user_id`/`time`：分隔符与负号都是 `-`，负数会拼出
+/// `"-1--2-<hex>"` 这种无法唯一切分的形状。生产上这不构成缺口（OneBot 的 `time`
+/// 是 unix 秒、`user_id` 是 QQ 号，都非负），但拿负数去构造兜底键的事件属于畸形入站。
+///
+/// 调用方另有两条合成就绪键不属于本函数：`bot_inject` 的 `inject-…` 与空串
+/// （见 `hbot-rpc` 的 `passive_reply_id`），它们由调用方自己拦。
+pub fn is_synthetic_external_id(external_id: &str) -> bool {
+    let mut parts = external_id.split('-');
+    let (Some(user_id), Some(time), Some(hash), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let decimal = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let hex16 = |part: &str| part.len() == 16 && part.bytes().all(|byte| byte.is_ascii_hexdigit());
+    decimal(user_id) && decimal(time) && hex16(hash)
 }
 
 /// 兜底幂等键的哈希输入：整条事件的规范化 JSON。
@@ -96,82 +142,6 @@ pub fn fallback_fingerprint(raw: &Value, raw_message: Option<&str>, text: &str) 
         value => {
             serde_json::to_string(value).unwrap_or_else(|_| raw_message.unwrap_or(text).to_string())
         }
-    }
-}
-
-/// 归一化后的入站消息：平台无关，交给 supervisor 落库 + 入队。
-#[derive(Clone, Debug, PartialEq)]
-pub struct NormalizedInbound {
-    /// 机器人自己的平台 ID（事件里的 `self_id`）；平台没给时为 `None`。
-    ///
-    /// 落库时用配置里的 bot_id（UUID），这里保留平台 ID 便于排查/发送定位。
-    pub bot_platform_id: Option<i64>,
-    /// 幂等键（半个去重键），见模块级说明。
-    pub external_id: String,
-    /// 平台侧会话标识：群聊是群号，私聊是对方 QQ 号。
-    pub conversation_external_id: String,
-    /// 会话类型。
-    pub kind: ConversationKind,
-    /// 发送者平台 ID（字符串形态，落 `inbound.sender_id`）。
-    pub sender_id: String,
-    /// 有损纯文本（见 `message.rs` 的有损表）。
-    pub text: String,
-    /// 被动回复应引用的平台消息 ID（`reply` 段），用于回填 `reply_to`。
-    pub reply_to: Option<String>,
-    /// 平台消息 ID（缺失时为 `None`；此时 `external_id` 是兜底键）。
-    pub platform_message_id: Option<i64>,
-    /// 原始事件 JSON（不透明，落 `inbound.payload_json` 便于排查）。
-    pub raw: Value,
-    /// 收到时间。
-    pub received_at: Timestamp,
-}
-
-impl NormalizedInbound {
-    /// 落 `inbound.payload_json` 的结构化载荷。
-    ///
-    /// 生成代码的 `ctx.text` / `ctx.senderId` / `ctx.replyTo` 从这里取；`raw` 原样
-    /// 嵌在 `raw` 字段下，避免把平台字段与运行时字段混在同一层。
-    pub fn payload_json(&self) -> Value {
-        json!({
-            "text": self.text,
-            "senderId": self.sender_id,
-            "conversationExternalId": self.conversation_external_id,
-            "kind": conversation_kind_str(self.kind),
-            "messageId": self.platform_message_id,
-            "replyTo": self.reply_to,
-            "botPlatformId": self.bot_platform_id,
-            "raw": self.raw,
-        })
-    }
-
-    /// 组装成 `hbot_core::domain::InboundMessage`（`id` / `conversation_id` / `bot_id`
-    /// 由调用方从库里取，适配器不生成 UUID）。
-    pub fn to_inbound(
-        &self,
-        id: MessageId,
-        bot_id: BotId,
-        conversation_id: ConversationId,
-    ) -> InboundMessage {
-        InboundMessage {
-            id,
-            bot_id,
-            conversation_id,
-            external_id: self.external_id.clone(),
-            sender_id: self.sender_id.clone(),
-            payload: self.payload_json(),
-            received_at: self.received_at,
-            processed_at: None,
-        }
-    }
-}
-
-/// `ConversationKind` → 稳定的 snake_case 字符串（与 `hbot-core` 的 serde 表示一致）。
-pub fn conversation_kind_str(kind: ConversationKind) -> &'static str {
-    match kind {
-        ConversationKind::Private => "private",
-        ConversationKind::Group => "group",
-        ConversationKind::Channel => "channel",
-        ConversationKind::Unknown => "unknown",
     }
 }
 
@@ -321,6 +291,60 @@ mod tests {
         // 兜底键含 '-'，数字 message_id 不含：两条键空间不会误撞。
         assert!(first.external_id.contains('-'));
         assert!(!first.external_id.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    /// 兜底键的**格式**与**判据**必须是一对：凡是 [`fallback_external_id`] 造出来的，
+    /// [`is_synthetic_external_id`] 必须认出来；凡是平台侧真 id（含 QQ 官方的
+    /// `ROBOT1.0_…`），一个都不许误判。
+    ///
+    /// 下游靠这个判据决定"回复带不带 `reply` 段"：漏判 → 拿兜底键当引用目标，
+    /// 真网关整条发不出去；误判 → QQ 的被动回复被静默降级成主动消息（丢引用语义、
+    /// 还可能撞上主动消息配额）。
+    #[test]
+    fn synthetic_id_judgement_round_trips_the_fallback_format() {
+        // ① 每一个兜底键都必须被认出来。
+        //
+        // 只覆盖**非负** `user_id`/`time`：`fallback_external_id` 用 `-` 做分隔符，
+        // 负数会拼出 `"-1--2-<hex>"` 这种**本身就有歧义**的形状（无法唯一切分），
+        // 所以判据不认它。这不影响生产：OneBot 的 `time` 是 unix 秒、`user_id` 是
+        // QQ 号，两者都非负；负数只会出现在畸形事件里。
+        for (user_id, time, fingerprint) in [
+            (42i64, 1_700_000_000i64, "same"),
+            (111, 1_794_790_031, "没有 message_id"),
+            (0, 0, ""),
+            (i64::MAX, i64::MAX, "huge"),
+        ] {
+            let key = fallback_external_id(user_id, time, fingerprint);
+            assert!(
+                is_synthetic_external_id(&key),
+                "兜底键 `{key}` 没被认成合成键：格式改了但判据没同步？"
+            );
+        }
+
+        // ② 平台侧真 id 不许误判。OneBot 的 message_id 是整数；
+        //    QQ 官方的是 `d.id`（`ROBOT1.0_…`），形状里可能带 `-`。
+        for platform_id in [
+            "9001",
+            "0",
+            "ROBOT1.0_abc",
+            "ROBOT1.0_abc!!",
+            "ROBOT1.0_a-b-c",
+            "msg-777",
+            "inject-abc",
+            "",
+            "123456-1700000000-1f2e3d4c5b6a798",
+            "123456-1700000000-1f2e3d4c5b6a79800",
+            "123456-abc-1f2e3d4c5b6a7980",
+            "123456--1f2e3d4c5b6a7980",
+            "-1700000000-1f2e3d4c5b6a7980",
+            "123456-1700000000-1f2e3d4c5b6a7980-extra",
+            "random subscription",
+        ] {
+            assert!(
+                !is_synthetic_external_id(platform_id),
+                "`{platform_id}` 被误判成兜底键：被动回复会被错误降级成主动消息"
+            );
+        }
     }
 
     #[test]
