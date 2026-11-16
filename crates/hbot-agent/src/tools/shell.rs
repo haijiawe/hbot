@@ -396,7 +396,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
-    use hbot_command::PlatformRunner;
+    use hbot_command::{CapabilityReport, IsolationLevel, IsolationProbe, PlatformRunner};
     use hbot_core::{CommandDenied, CommandRunner, CommandSpec, CommandStatus, OutputStream};
     use serde_json::json;
 
@@ -553,10 +553,20 @@ mod tests {
         assert!(error.to_string().contains("read-only"));
     }
 
+    /// workspace-write 的真实行为**由这台机器装不装得出写隔离决定**，不能钉死成"一律拒"。
+    ///
+    /// 2026-11-16 之前 `hbot-command` 只有进程树 Containment、没有写隔离，于是这一档
+    /// 恒报 `IsolationUnavailable`；`WriteConfinement` 落地后（Windows：受限令牌 +
+    /// 工作区 write SID + ACE）这条通路会**真的往下走**，于是同样的输入变成"拒在允许
+    /// 清单上"（本用例用的是空清单）。所以断言跟随能力矩阵分叉：
+    /// - 装得出写隔离 → 必须不报 `IsolationUnavailable`，且拒在允许清单（证明它没被
+    ///   隔离闸挡住，隔离那一层真的通了）；
+    /// - 装不出 → 仍然 `IsolationUnavailable` + 「命令未执行」（fail-closed 没松）。
     #[tokio::test]
-    async fn workspace_write_reports_missing_write_isolation() {
+    async fn workspace_write_follows_this_machines_write_isolation_capability() {
         let dir = TestDir::new("run-command-workspace-write");
-        // 用真实执行器：能力矩阵里没有任何平台有写隔离，必须报 IsolationUnavailable。
+        let confinement_available =
+            CapabilityReport::system().supports(SandboxMode::WorkspaceWrite);
         let runner: Arc<dyn CommandRunner> = Arc::new(PlatformRunner::system());
         let error = run_with(
             &dir,
@@ -565,11 +575,61 @@ mod tests {
             json!({ "command": "cargo", "args": ["--version"] }),
         )
         .await
-        .expect_err("workspace-write 必须拒");
+        .expect_err("空允许清单下没有任何命令能跑");
+        assert!(matches!(error, HbotError::Denied { .. }));
         assert_eq!(error.code(), -32005);
+        let message = error.to_string();
+        if confinement_available {
+            assert!(
+                !message.contains("建立不了"),
+                "这台机器装得出写隔离，不该报 IsolationUnavailable：{message}"
+            );
+            assert!(
+                message.contains("不在本次允许清单内"),
+                "写隔离可用时应当拒在允许清单上（隔离层已放行），实际：{message}"
+            );
+        } else {
+            assert!(message.contains("写隔离"), "{message}");
+            assert!(message.contains("命令未执行"), "{message}");
+        }
+    }
+
+    /// 探测失败必须 fail-closed，而且必须**先拒在隔离闸上**。
+    ///
+    /// 注入一个恒失败的 `IsolationProbe`，再用一个根本不存在的程序名：如果实现是"先解析
+    /// 程序、再看隔离"，这里会变成 -32002「找不到可执行文件」（`invalid`，模型会以为换个
+    /// 程序名就能重来）；只有隔离闸在前，才会是 -32005「命令未执行」。
+    #[tokio::test]
+    async fn failing_write_isolation_probe_denies_before_looking_at_the_program() {
+        struct DenyAllProbe;
+
+        impl IsolationProbe for DenyAllProbe {
+            fn probe(&self, _level: IsolationLevel) -> Result<(), String> {
+                Err("注入的探测失败".to_string())
+            }
+        }
+
+        let dir = TestDir::new("run-command-workspace-write-probe");
+        let runner: Arc<dyn CommandRunner> =
+            Arc::new(PlatformRunner::with_probe(Arc::new(DenyAllProbe)));
+        let error = run_with(
+            &dir,
+            SandboxMode::WorkspaceWrite,
+            Some(runner),
+            json!({ "command": "hbot-definitely-not-an-installed-program" }),
+        )
+        .await
+        .expect_err("探测失败必须拒");
+        assert!(matches!(error, HbotError::Denied { .. }));
+        assert_eq!(error.code(), -32005, "必须是 denied 而不是 invalid");
         let message = error.to_string();
         assert!(message.contains("写隔离"), "{message}");
         assert!(message.contains("命令未执行"), "{message}");
+        assert!(message.contains("注入的探测失败"), "{message}");
+        assert!(
+            !message.contains("找不到"),
+            "隔离闸必须在解析程序之前：{message}"
+        );
     }
 
     #[tokio::test]

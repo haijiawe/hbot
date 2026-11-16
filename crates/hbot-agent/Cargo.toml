@@ -24,3 +24,6 @@ tracing.workspace = true
 # 反过来就能在测试里换成假执行器断言"只读档根本没 spawn 进程"。
 # 依赖方向 `agent → command → core` 已在 `xtask/src/deps.rs` 的 ALLOWED 里登记。
 hbot-command = { path = "../hbot-command" }
+# 真 LLM 评测（`tests/real_llm_eval.rs`）要自己编译 + 调度模型写出来的项目，
+# 所以测试侧需要脚手架/编译器/沙箱。同样只在 dev-dependency 里，库代码不认识它。
+hbot-code = { path = "../hbot-code" }

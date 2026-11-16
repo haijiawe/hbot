@@ -7,18 +7,73 @@
 //! - [`CompletionRequest`] 自带 [`CancellationToken`]，provider 必须在等待过程中响应取消，
 //!   取消后不得再发新的网络请求。
 //!
-//! 具体实现见 [`openai`]（OpenAI 兼容 `/chat/completions` SSE）；SSE 解析被拆成纯函数
-//! 与纯状态机，测试不碰网络。真实传输在 [`reqwest`]（同样是"只接
-//! [`HttpTransport`]"，SSE 解析仍归 `openai`）。
+//! 具体实现：
+//!
+//! - [`openai`]：OpenAI 兼容 `/chat/completions`（SSE）；
+//! - [`anthropic`]：Anthropic Messages `/v1/messages`（SSE，**只有流式**）。
+//!
+//! 两条链路的线上契约完全不同，但都收敛到上面同一套类型，所以
+//! [`crate::r#loop`] / [`crate::gateway`] 不区分 provider。SSE 解析被拆成纯函数
+//! 与纯状态机，测试不碰网络。真实传输在 [`reqwest`]（只接 [`openai::HttpTransport`]，
+//! 两条链路共用）。
 
+pub mod anthropic;
 pub mod openai;
 pub mod reqwest;
 
+pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
 pub use reqwest::ReqwestTransport;
 
+/// 选择用哪条 provider 链路。
+///
+/// 配置层的字符串（`HBOT_LLM_PROVIDER` / `agent.json` 的 `provider`）通过
+/// [`LlmProvider::from_name`] 解析；**非法值必须报错**，不许悄悄退回默认值。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LlmProvider {
+    /// OpenAI 兼容 `/chat/completions`（缺省，保持向后兼容）。
+    #[default]
+    OpenAi,
+    /// Anthropic Messages `/v1/messages`。
+    Anthropic,
+}
+
+impl LlmProvider {
+    /// 配置里允许的取值（错误信息里要原样列出来）。
+    pub const NAMES: [&'static str; 2] = ["openai", "anthropic"];
+
+    /// 解析配置值（大小写与首尾空白不敏感）。
+    ///
+    /// 返回 `Err` 时带上收到的原文，调用方负责包成
+    /// [`hbot_core::HbotError::invalid`]（→ `-32002`）并列出 [`Self::NAMES`]。
+    pub fn from_name(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "openai" => Ok(Self::OpenAi),
+            "anthropic" => Ok(Self::Anthropic),
+            _ => Err(raw.trim().to_string()),
+        }
+    }
+
+    /// 配置里的规范名字（写日志 / 回显用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    /// 允许值的错误提示片段，例如 ```openai` / `anthropic``。
+    pub fn allowed_names() -> String {
+        Self::NAMES
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+}
+
 use async_trait::async_trait;
-use hbot_core::HbotError;
+use hbot_core::{HbotError, RedactedJson};
 use serde_json::Value;
 
 use crate::cancel::CancellationToken;
@@ -85,7 +140,7 @@ impl ChatMessage {
 }
 
 /// 模型请求的一次工具调用（参数已解析为 JSON）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ToolCallRequest {
     /// provider 给的调用 ID；回填工具结果时必须原样带回。
     pub id: String,
@@ -93,6 +148,24 @@ pub struct ToolCallRequest {
     pub name: String,
     /// 参数；约定是 JSON object，具体 schema 由工具声明。
     pub arguments: Value,
+}
+
+/// 手写 `Debug`（**不要**换回 `#[derive(Debug)]`）：RT-06。
+///
+/// `arguments` 是模型给的任意 JSON，工具参数里就可能有 `api_key` / `token` /
+/// `password` / `Authorization`。派生实现会把这串东西打进日志、错误链，以及
+/// "工具调用失败"时回给模型的那段描述里 —— 等于让密钥进 `logs` 表。
+///
+/// 走 [`RedactedJson`]（递归、按键名判定、命中才抹）：字段名与非敏感值全部保留，
+/// 例如 `{"max_tokens":4096}` 仍然可读。判据见 `hbot_core::redact`。
+impl std::fmt::Debug for ToolCallRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallRequest")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("arguments", &RedactedJson(&self.arguments))
+            .finish()
+    }
 }
 
 /// 暴露给模型的工具声明。
@@ -398,5 +471,35 @@ mod tests {
         assert!(message.contains('…'), "超长响应体必须被截断");
         // 按字节截断会把中文切成半个字符，出现替换符。
         assert!(!message.contains('\u{fffd}'), "截断必须按字符边界");
+    }
+
+    #[test]
+    fn provider_names_parse_and_default_is_openai() {
+        assert_eq!(LlmProvider::default(), LlmProvider::OpenAi);
+        assert_eq!(LlmProvider::from_name("openai"), Ok(LlmProvider::OpenAi));
+        assert_eq!(
+            LlmProvider::from_name("Anthropic"),
+            Ok(LlmProvider::Anthropic),
+            "大小写不敏感"
+        );
+        assert_eq!(
+            LlmProvider::from_name("  anthropic\n"),
+            Ok(LlmProvider::Anthropic),
+            "首尾空白不敏感"
+        );
+        // 非法值必须把原文带回来，让上层拼 -32002 的错误信息。
+        assert_eq!(LlmProvider::from_name("gemini"), Err("gemini".to_string()));
+        assert_eq!(LlmProvider::from_name(""), Err(String::new()));
+    }
+
+    #[test]
+    fn provider_names_round_trip_and_allow_list_is_listed() {
+        for provider in LlmProvider::NAMES {
+            let parsed = LlmProvider::from_name(provider).expect("允许值必须能解析");
+            assert_eq!(parsed.as_str(), provider, "as_str 必须与配置值一致");
+        }
+        let allowed = LlmProvider::allowed_names();
+        assert!(allowed.contains("`openai`"), "{allowed}");
+        assert!(allowed.contains("`anthropic`"), "{allowed}");
     }
 }

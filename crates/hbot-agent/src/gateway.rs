@@ -511,14 +511,10 @@ impl ToolGateway {
     fn canonicalize_path(&self, tool: &dyn Tool, raw: &str) -> Result<String, HbotError> {
         let rel = Path::new(raw);
         let resolved = if tool.may_create_path() {
-            self.workspace
-                .resolve_new(rel)
-                .map_err(|error| match error {
-                    HbotError::NotFound { .. } => {
-                        HbotError::invalid(format!("路径 `{raw}` 的父目录不存在或不可写"))
-                    }
-                    other => other,
-                })
+            // 写入/建目录类工具允许**父目录尚不存在**（`write_file` 会按需建，
+            // `create_dir` 自己建）：用宽松解析。守卫强度不变——`..`、绝对路径、
+            // `.git`/`.hbot`、符号链接逃逸都在这里被拒，早于任何目录创建。
+            self.workspace.resolve_write_target(rel)
         } else {
             self.workspace.resolve_existing(rel)
         }?;
@@ -538,7 +534,7 @@ mod tests {
     use crate::test_support::{
         RecordingApprover, RecordingAudit, RecordingTool, TestDir, session_id,
     };
-    use crate::tools::{ListDirTool, ReadFileTool, Risk, WriteFileTool};
+    use crate::tools::{CreateDirTool, ListDirTool, ReadFileTool, Risk, WriteFileTool};
 
     fn call(name: &str, arguments: Value) -> ToolCallRequest {
         ToolCallRequest {
@@ -1122,5 +1118,117 @@ mod tests {
         assert_eq!(approver.count(), 0, "沙箱档拒绝不得弹审批");
         assert_eq!(runner.calls(), 0, "只读档一个进程都不许起");
         assert_eq!(audit.len(), 1);
+    }
+
+    /// 父目录缺失不再卡在 PathRealpath：`src/lib/x.ts` 直通并落盘。
+    #[tokio::test]
+    async fn write_file_with_missing_parents_passes_path_realpath() {
+        let fixture = Fixture::new(SandboxMode::WorkspaceWrite, &[Arc::new(WriteFileTool)]);
+        let approver = RecordingApprover::approving_once();
+        let cancel = CancellationToken::new();
+        let outcome = fixture
+            .gateway
+            .call(
+                session_id(),
+                call(
+                    "write_file",
+                    json!({ "path": "src/lib/x.ts", "content": "v" }),
+                ),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect("父目录缺失不应在 realpath 步被拒");
+
+        assert!(outcome.steps.contains(&GatewayStep::Execute));
+        assert_eq!(outcome.steps.last(), Some(&GatewayStep::Audit));
+        assert_eq!(fixture.dir.read("src/lib/x.ts"), "v");
+        assert_eq!(approver.count(), 1, "write_file 是 mutation，必须审批");
+        let key = outcome.key.expect("mutation 必须有审批键");
+        assert!(
+            key.canonical_args().contains("src/lib/x.ts"),
+            "审批键用归一化后的相对路径：{}",
+            key.canonical_args()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_dir_creates_nested_path_through_the_gateway() {
+        let fixture = Fixture::new(SandboxMode::WorkspaceWrite, &[Arc::new(CreateDirTool)]);
+        let approver = RecordingApprover::approving_once();
+        let cancel = CancellationToken::new();
+        fixture
+            .gateway
+            .call(
+                session_id(),
+                call("create_dir", json!({ "path": "src/lib" })),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect("嵌套建目录必须过网关（父目录尚不存在）");
+
+        assert!(fixture.dir.path().join("src").join("lib").is_dir());
+        assert_eq!(approver.count(), 1, "create_dir 是 mutation，必须审批");
+    }
+
+    /// 审批键含**工具名**：放行 `create_dir <path>` 不会顺带放行 `write_file <同一 path>`。
+    #[tokio::test]
+    async fn remembered_create_dir_approval_does_not_unlock_write_file() {
+        let fixture = Fixture::new(
+            SandboxMode::WorkspaceWrite,
+            &[Arc::new(CreateDirTool), Arc::new(WriteFileTool)],
+        );
+        let approver = RecordingApprover::approving_always();
+        let cancel = CancellationToken::new();
+
+        // 第一次问一次，记下 (create_dir, {path:lib}, workspace-write)。
+        fixture
+            .gateway
+            .call(
+                session_id(),
+                call("create_dir", json!({ "path": "lib" })),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect("create_dir");
+        assert_eq!(approver.count(), 1);
+
+        // 同一工具同一参数：不再问（对照组，证明 remember 本身是生效的）。
+        fixture
+            .gateway
+            .call(
+                session_id(),
+                call("create_dir", json!({ "path": "lib" })),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect("create_dir again");
+        assert_eq!(approver.count(), 1, "同键不得重复问");
+
+        // 换工具、**同一个 path 字符串**：必须重新问。
+        let error = fixture
+            .gateway
+            .call(
+                session_id(),
+                call("write_file", json!({ "path": "lib", "content": "" })),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect_err("`lib` 已是目录，写入必须失败");
+        assert_eq!(
+            approver.count(),
+            2,
+            "create_dir 的放行不得命中 write_file（审批键含工具名）"
+        );
+        assert!(
+            matches!(error.error, HbotError::Invalid { .. }),
+            "got {:?}",
+            error.error
+        );
+        assert_eq!(error.failed_at(), Some(GatewayStep::Execute));
     }
 }

@@ -62,14 +62,133 @@ fn truncate_chars(text: &str, max: usize) -> String {
     out
 }
 
+/// 参数摘要的字符上限（键很多时别把描述撑成一大段）。
+const MAX_DESCRIBE_ARGS_CHARS: usize = 300;
+
+/// 参数摘要：键名 + 值的**类型/长度**，永不出现值本身。
+///
+/// 拒绝文案与日志都会用到它，而参数里可能是消息正文甚至密钥：所以这里只回答
+/// 「哪个参数、值有多长」，不回答「值是什么」。反序列化失败（`from_canonical`
+/// 的调用方给了非 JSON）时整体隐藏——连键名都不可信，不能拿它拼进日志。
+fn summarize_args(canonical_args: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(canonical_args) else {
+        return "<参数不可解析，已隐藏>".to_string();
+    };
+    let Value::Object(map) = value else {
+        return summarize_value(&value);
+    };
+    if map.is_empty() {
+        return "无参数".to_string();
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(map.len());
+    for (key, value) in &map {
+        let summary = if is_secret_key(key) {
+            "<redacted>".to_string()
+        } else {
+            summarize_value(value)
+        };
+        parts.push(format!("{key}: {summary}"));
+    }
+    truncate_chars(&parts.join(", "), MAX_DESCRIBE_ARGS_CHARS)
+}
+
+/// 一个值只描述类型与规模（长度 / 项数 / 键数），不含内容。
+fn summarize_value(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(_) => "boolean".to_string(),
+        Value::Number(number) => format!("number({} 位)", number.to_string().chars().count()),
+        Value::String(text) => format!("string({} 字符)", text.chars().count()),
+        Value::Array(items) => format!("array({} 项)", items.len()),
+        Value::Object(map) => format!("object({} 键)", map.len()),
+    }
+}
+
+/// 键名是否属于密钥类（值一律打码）。
+///
+/// 按词边界判断而不是子串包含：`api_key` / `accessToken` / `X-Api-Key` 都命中，
+/// `monkey` / `keyboard` 不命中（否则会把无关参数也打码，摘要就没用了）。
+/// 不分隔的连写（`apikey`）词边界切不出来，另列一小张表。
+fn is_secret_key(name: &str) -> bool {
+    const SECRET_WORDS: [&str; 7] = [
+        "token",
+        "secret",
+        "key",
+        "password",
+        "passwd",
+        "authorization",
+        "credential",
+    ];
+    const SECRET_COMPOUNDS: [&str; 10] = [
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "publickey",
+        "secretkey",
+        "signingkey",
+        "clientsecret",
+        "accesstoken",
+        "refreshtoken",
+        "bearertoken",
+    ];
+
+    fn words_of(name: &str) -> Vec<String> {
+        let mut words: Vec<String> = Vec::new();
+        for part in name.split(|character: char| !character.is_alphanumeric()) {
+            if part.is_empty() {
+                continue;
+            }
+            let mut word = String::new();
+            let mut previous_is_lower_or_digit = false;
+            for character in part.chars() {
+                if character.is_uppercase() && previous_is_lower_or_digit {
+                    words.push(word.to_lowercase());
+                    word = String::new();
+                }
+                previous_is_lower_or_digit = character.is_lowercase() || character.is_ascii_digit();
+                word.push(character);
+            }
+            words.push(word.to_lowercase());
+        }
+        words
+    }
+
+    if words_of(name)
+        .iter()
+        .any(|word| SECRET_WORDS.contains(&word.as_str()))
+    {
+        return true;
+    }
+    let compact: String = name
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect();
+    SECRET_COMPOUNDS.contains(&compact.to_lowercase().as_str())
+}
+
 /// 审批规则键：工具名 + 规范化参数 + 沙箱档。
 ///
 /// 三个部分全部参与比较；任意一项不同就是不同的键。
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// `Debug` **手写**而不是 derive：派生实现会把 `canonical_args` 原样打出来，
+/// 而键的 Debug 会经 `tracing` 的 `?error`、`error_chain` 的 `{item:?}` 进入
+/// 日志/UI（红队 F 面 RT-03）。这里只打脱敏摘要。
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ApprovalKey {
     tool: String,
     canonical_args: String,
     sandbox: &'static str,
+}
+
+impl std::fmt::Debug for ApprovalKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApprovalKey")
+            .field("tool", &self.tool)
+            .field("args", &summarize_args(&self.canonical_args))
+            .field("sandbox", &self.sandbox)
+            .finish()
+    }
 }
 
 impl ApprovalKey {
@@ -109,11 +228,15 @@ impl ApprovalKey {
     }
 
     /// 给用户看的单行摘要（不用于比较）。
+    ///
+    /// **绝不回显参数值原文**：这段文案会进拒绝消息、审计与 UI，参数里可能是
+    /// 消息正文甚至密钥。只保留「哪个工具、哪些参数、值有多长」，密钥类键名
+    /// （`token` / `secret` / `key` / `password`）的值一律 `<redacted>`。
     pub fn describe(&self) -> String {
         format!(
             "{} {} [{}]",
             self.tool,
-            truncate_chars(&self.canonical_args, 300),
+            summarize_args(&self.canonical_args),
             self.sandbox
         )
     }
@@ -401,5 +524,110 @@ mod tests {
         assert!(text.contains("write_file"));
         assert!(text.contains("workspace_write"));
         assert!(text.chars().count() < 400);
+    }
+
+    #[test]
+    fn describe_never_echoes_argument_values() {
+        let secret = "sk-test-DEADBEEF";
+        let key = ApprovalKey::new(
+            "write_file",
+            &json!({ "path": "notes.txt", "content": format!("API_KEY={secret}") }),
+            SandboxMode::WorkspaceWrite,
+        );
+        let text = key.describe();
+        assert!(text.contains("write_file"));
+        assert!(text.contains("workspace_write"));
+        assert!(!text.contains(secret), "描述里出现了参数值：{text}");
+        assert!(!text.contains("notes.txt"), "路径值也是参数原文：{text}");
+        assert!(text.contains("path"), "要能看出是哪个参数：{text}");
+        assert!(text.contains("content"), "要能看出是哪个参数：{text}");
+        assert!(text.contains("string("), "要能看出值的类型与长度：{text}");
+    }
+
+    #[test]
+    fn describe_redacts_secret_key_names() {
+        let key = ApprovalKey::new(
+            "http_fetch",
+            &json!({
+                "api_key": "sk-live-123",
+                "accessToken": "tok-456",
+                "password": "hunter2",
+                "authorization": "Bearer abc",
+                "query": "safe",
+            }),
+            SandboxMode::Danger,
+        );
+        let text = key.describe();
+        for secret in ["sk-live-123", "tok-456", "hunter2", "Bearer abc"] {
+            assert!(!text.contains(secret), "密钥值泄漏：{text}");
+        }
+        assert_eq!(text.matches("<redacted>").count(), 4, "{text}");
+        assert!(text.contains("api_key"), "键名要保留便于排查：{text}");
+    }
+
+    #[test]
+    fn describe_does_not_redact_innocent_names() {
+        let key = ApprovalKey::new(
+            "probe",
+            &json!({ "monkey": "x", "keyboard": "y" }),
+            SandboxMode::ReadOnly,
+        );
+        let text = key.describe();
+        assert!(!text.contains("<redacted>"), "{text}");
+        assert!(text.contains("monkey"), "{text}");
+    }
+
+    #[test]
+    fn debug_never_echoes_argument_values() {
+        let secret = "sk-test-DEADBEEF";
+        let key = ApprovalKey::new(
+            "write_file",
+            &json!({ "path": "notes.txt", "content": format!("API_KEY={secret}") }),
+            SandboxMode::WorkspaceWrite,
+        );
+        let text = format!("{key:?}");
+        assert!(!text.contains(secret), "Debug 里出现了参数值：{text}");
+        assert!(!text.contains("notes.txt"), "Debug 里出现了路径值：{text}");
+        assert!(text.contains("write_file"), "{text}");
+        assert!(text.contains("ApprovalKey"), "{text}");
+    }
+
+    #[test]
+    fn describe_hides_unparseable_canonical_args() {
+        let key = ApprovalKey::from_canonical(
+            "probe",
+            "not-json-but-maybe-a-secret",
+            SandboxMode::ReadOnly,
+        );
+        let text = key.describe();
+        assert!(!text.contains("not-json-but-maybe-a-secret"), "{text}");
+        assert!(text.contains("probe"), "{text}");
+        assert!(text.contains("已隐藏"), "{text}");
+    }
+
+    #[test]
+    fn secret_key_names_cover_underscore_and_camel_case() {
+        for name in [
+            "api_key",
+            "apiKey",
+            "API_KEY",
+            "access_token",
+            "client_secret",
+            "password",
+            "X-Api-Key",
+            "apikey",
+        ] {
+            assert!(is_secret_key(name), "`{name}` 应判为密钥类");
+        }
+        for name in [
+            "monkey",
+            "keyboard",
+            "path",
+            "content",
+            "query",
+            "tokenizer",
+        ] {
+            assert!(!is_secret_key(name), "`{name}` 不该判为密钥类");
+        }
     }
 }

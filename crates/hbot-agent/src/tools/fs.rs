@@ -1,7 +1,11 @@
-//! 文件类工具：`read_file`、`write_file`、`edit_file`、`list_dir`。
+//! 文件类工具：`read_file`、`write_file`、`edit_file`、`list_dir`、`create_dir`。
 //!
 //! 全部走 [`hbot_workspace::Workspace`]：路径越界、`.hbot`/`.git` 过滤、
 //! 原子写、乐观并发校验都在那里，工具层不重复实现（也就不会两处不一致）。
+//!
+//! 建目录有两条路，遵循同一条守卫：`create_dir` 工具供模型**显式**声明目录结构
+//! （空目录、多级一次建）；`write_file` / `edit_file` 则**隐式**按需创建缺失的父目录
+//! （[`Workspace::write_file`] 里实现），这样模型写 `src/lib/x.ts` 不需要先建 `src/lib`。
 //!
 //! 写类工具（`write_file` / `edit_file`）有两条路径，由 [`ToolCtx::edits`] 决定：
 //!
@@ -142,7 +146,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "写入工作区内的 UTF-8 文本文件（整文件覆盖）。给了 expected_hash 时，若文件当前哈希不匹配则拒绝，避免覆盖他人改动。"
+        "写入工作区内的 UTF-8 文本文件（整文件覆盖）。缺失的父目录会自动创建（无需先 create_dir）。给了 expected_hash 时，若文件当前哈希不匹配则拒绝，避免覆盖他人改动。"
     }
 
     fn schema(&self) -> Value {
@@ -151,7 +155,7 @@ impl Tool for WriteFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "工作区相对路径；父目录必须已存在"
+                    "description": "工作区相对路径；缺失的父目录会自动创建"
                 },
                 "content": {
                     "type": "string",
@@ -415,6 +419,67 @@ impl Tool for ListDirTool {
     }
 }
 
+/// 建目录（`create_dir_all` 语义）：一次可建多级，已存在且是目录则成功。
+///
+/// 工具集原本没有建目录能力，于是模型想搭多目录结构时，只能指望父目录恰好已存在。
+/// 现在有两条路：本工具用于**显式**声明目录（含空目录），`write_file` / `edit_file`
+/// 用于**隐式**按需建父目录。落点都在 [`Workspace::create_dir`] / [`Workspace::write_file`]，
+/// 守卫（`..`、绝对路径、`.git`、`.hbot`、符号链接逃逸）只有一套。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateDirTool;
+
+#[async_trait]
+impl Tool for CreateDirTool {
+    fn name(&self) -> &str {
+        "create_dir"
+    }
+
+    fn description(&self) -> &str {
+        "在工作区内创建目录（多级一次建出；已存在且是目录则成功）。路径必须是工作区相对路径。"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "工作区相对目录路径，例如 src/lib"
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Write
+    }
+
+    fn path_arg(&self) -> Option<&'static str> {
+        Some("path")
+    }
+
+    fn may_create_path(&self) -> bool {
+        true
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, HbotError> {
+        let path = required_str(self.name(), &args, "path")?.to_string();
+        let workspace = Arc::clone(&ctx.workspace);
+        let rel = PathBuf::from(&path);
+        let created = blocking(move || workspace.create_dir(&rel)).await?;
+        Ok(ToolOutput::text(format!(
+            "已确保目录存在 {path}\n绝对路径: {}",
+            created.display()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -662,5 +727,122 @@ mod tests {
             .expect("edit");
         assert!(output.content.contains("已替换"));
         assert_eq!(dir.read("a.txt"), "hello rust\n");
+    }
+
+    /// 真机缺口回归：写 `src/lib/format.ts` 时 `src/lib` 不存在，也必须成功并建出目录。
+    #[tokio::test]
+    async fn write_file_creates_nested_parent_directories() {
+        let dir = TestDir::new("write-nested");
+        let workspace = dir.workspace();
+        let cancel = CancellationToken::new();
+        let output = WriteFileTool
+            .run(
+                json!({ "path": "src/lib/format.ts", "content": "export const x = 1;\n" }),
+                &ctx(&workspace, &cancel),
+            )
+            .await
+            .expect("write with missing parents");
+        assert!(output.content.contains("已写入 src/lib/format.ts"));
+        assert!(dir.path().join("src").join("lib").is_dir());
+        assert_eq!(dir.read("src/lib/format.ts"), "export const x = 1;\n");
+    }
+
+    /// 建父目录不得成为越界后门：拒绝时磁盘上不留任何新目录。
+    #[tokio::test]
+    async fn write_file_rejects_escape_before_creating_parents() {
+        let dir = TestDir::new("write-escape");
+        let workspace = dir.workspace();
+        let cancel = CancellationToken::new();
+        for path in [
+            "../escape/x.ts",
+            r"C:\x.ts",
+            "/abs/x.ts",
+            "src/../../../x.ts",
+        ] {
+            let error = WriteFileTool
+                .run(
+                    json!({ "path": path, "content": "x" }),
+                    &ctx(&workspace, &cancel),
+                )
+                .await
+                .expect_err(path);
+            assert!(
+                matches!(error, hbot_core::HbotError::Invalid { .. }),
+                "{path}: got {error:?}"
+            );
+            assert!(
+                !dir.path().join("src").exists() && !dir.path().join("escape").exists(),
+                "{path}: rejected before any directory is created"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_dir_creates_and_is_idempotent() {
+        let dir = TestDir::new("mkdir-tool");
+        let workspace = dir.workspace();
+        let cancel = CancellationToken::new();
+        let first = CreateDirTool
+            .run(json!({ "path": "src/lib" }), &ctx(&workspace, &cancel))
+            .await
+            .expect("create nested");
+        assert!(first.content.contains("已确保目录存在 src/lib"));
+        assert!(dir.path().join("src").join("lib").is_dir());
+
+        // 已存在且是目录 → 成功（幂等，不报 Conflict）。
+        CreateDirTool
+            .run(json!({ "path": "src/lib" }), &ctx(&workspace, &cancel))
+            .await
+            .expect("idempotent");
+    }
+
+    #[tokio::test]
+    async fn create_dir_rejects_existing_file() {
+        let dir = TestDir::new("mkdir-file");
+        dir.write("a.txt", "x");
+        let workspace = dir.workspace();
+        let cancel = CancellationToken::new();
+        let error = CreateDirTool
+            .run(json!({ "path": "a.txt" }), &ctx(&workspace, &cancel))
+            .await
+            .expect_err("file cannot become a directory");
+        assert!(
+            matches!(error, hbot_core::HbotError::Invalid { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(dir.read("a.txt"), "x");
+    }
+
+    #[tokio::test]
+    async fn create_dir_rejects_escape_and_reserved_paths() {
+        let dir = TestDir::new("mkdir-guard");
+        let workspace = dir.workspace();
+        let cancel = CancellationToken::new();
+        for path in ["../escape", r"C:\escape", "/escape", ".git", ".hbot"] {
+            let error = CreateDirTool
+                .run(json!({ "path": path }), &ctx(&workspace, &cancel))
+                .await
+                .expect_err(path);
+            assert!(
+                matches!(error, hbot_core::HbotError::Invalid { .. }),
+                "{path}: got {error:?}"
+            );
+        }
+        assert!(!dir.path().join(".git").exists());
+        assert!(!dir.path().join(".hbot").exists());
+    }
+
+    /// 声明层契约：`create_dir` 是 mutation（与 `write_file` 同类，要审批），只认 path。
+    #[test]
+    fn create_dir_declares_mutation_schema() {
+        assert_eq!(CreateDirTool.name(), "create_dir");
+        assert_eq!(CreateDirTool.risk(), Risk::Write);
+        assert!(
+            CreateDirTool.requires_approval(SandboxMode::WorkspaceWrite, &json!({ "path": "a/b" }))
+        );
+        assert_eq!(CreateDirTool.path_arg(), Some("path"));
+        assert!(CreateDirTool.may_create_path());
+        let schema = CreateDirTool.schema();
+        assert_eq!(schema["required"], json!(["path"]));
     }
 }

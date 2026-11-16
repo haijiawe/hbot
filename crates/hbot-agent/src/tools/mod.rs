@@ -28,7 +28,7 @@ pub mod http;
 pub mod search;
 pub mod shell;
 
-pub use fs::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
+pub use fs::{CreateDirTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use http::HttpFetchTool;
 pub use search::SearchTool;
 pub use shell::RunCommandTool;
@@ -270,6 +270,7 @@ impl ToolRegistry {
         registry.register(Arc::new(WriteFileTool));
         registry.register(Arc::new(EditFileTool));
         registry.register(Arc::new(ListDirTool));
+        registry.register(Arc::new(CreateDirTool));
         registry.register(Arc::new(SearchTool));
         registry.register(Arc::new(RunCommandTool::new()));
         registry.register(Arc::new(HttpFetchTool));
@@ -295,8 +296,12 @@ impl ToolRegistry {
 
 /// 参数校验（网关第一步）。
 ///
-/// 只做**必填 + 类型**两件事：这是本地能确定性判定、且模型最容易搞错的部分。
-/// 语义约束（路径是否越界、内容是否合法）留给工具自己，报错也更好懂。
+/// 做三类**本地能确定性判定、且模型最容易搞错**的事：必填、类型、值域
+/// （`enum` / `minimum` / `maximum`）。语义约束（路径是否越界、内容是否合法）
+/// 留给工具自己，报错也更好懂。
+///
+/// 值域必须在这里查，不能在工具实现里各查一遍：网关只许有**一处**参数闸，
+/// 多开一条路径就一定会有一条分支漏掉（红队 D 面 RT-02 就是"只查了必填与类型"）。
 pub fn validate_args(tool_name: &str, schema: &Value, args: &Value) -> Result<(), HbotError> {
     let Some(object) = args.as_object() else {
         return Err(HbotError::invalid(format!(
@@ -327,6 +332,8 @@ pub fn validate_args(tool_name: &str, schema: &Value, args: &Value) -> Result<()
                         "工具 `{tool_name}` 的参数 `{key}` 类型应为 {expected}"
                     )));
                 }
+                // 值域校验与类型校验在同一个循环里：同一个字段、同一处闸门。
+                check_value_constraints(tool_name, key, property, value)?;
             }
             None => {
                 if deny_unknown {
@@ -338,6 +345,90 @@ pub fn validate_args(tool_name: &str, schema: &Value, args: &Value) -> Result<()
         }
     }
     Ok(())
+}
+
+/// 校验 `enum` / `minimum` / `maximum` 这三条值域约束。
+///
+/// - `enum`：字符串与数值都生效（按 JSON 值判等，不做隐式类型转换，
+///   `"1"` 不等于 `1`）；
+/// - `minimum` / `maximum`：只对数值生效（JSON Schema 语义）；声明了上下限
+///   但收到非数值时交给 `type` 判定，这里不重复报错；
+/// - `NaN` / `Infinity` 不算合法数值：即使将来数值表示放宽（如打开
+///   `serde_json/arbitrary_precision`），带上下限的字段也不会让它们过去。
+/// - 错误一律用 [`HbotError::invalid`]（-32002），文案带字段名与被拒的值
+///   （有长度上限，别把整段正文抄进日志）。
+fn check_value_constraints(
+    tool_name: &str,
+    key: &str,
+    property: &Value,
+    value: &Value,
+) -> Result<(), HbotError> {
+    if let Some(choices) = property.get("enum").and_then(Value::as_array)
+        && !choices.iter().any(|choice| choice == value)
+    {
+        let allowed: Vec<String> = choices.iter().map(echo_rejected).collect();
+        return Err(HbotError::invalid(format!(
+            "工具 `{tool_name}` 的参数 `{key}` 必须是 {} 之一，收到 {}",
+            truncate_chars(&allowed.join(" | "), MAX_ECHO_CHARS),
+            echo_rejected(value)
+        )));
+    }
+
+    let minimum = property.get("minimum").and_then(Value::as_f64);
+    let maximum = property.get("maximum").and_then(Value::as_f64);
+    if minimum.is_none() && maximum.is_none() {
+        return Ok(());
+    }
+    if !value.is_number() {
+        // 上下限只约束数值；类型不对已经由 `matches_type` 报过了。
+        return Ok(());
+    }
+    let Some(number) = value.as_f64().filter(|number| number.is_finite()) else {
+        return Err(HbotError::invalid(format!(
+            "工具 `{tool_name}` 的参数 `{key}` 不是有限数值（NaN / Infinity 不算合法数值）"
+        )));
+    };
+    if let Some(minimum) = minimum
+        && number < minimum
+    {
+        return Err(HbotError::invalid(format!(
+            "工具 `{tool_name}` 的参数 `{key}` 不得小于 {minimum}，收到 {}",
+            echo_rejected(value)
+        )));
+    }
+    if let Some(maximum) = maximum
+        && number > maximum
+    {
+        return Err(HbotError::invalid(format!(
+            "工具 `{tool_name}` 的参数 `{key}` 不得大于 {maximum}，收到 {}",
+            echo_rejected(value)
+        )));
+    }
+    Ok(())
+}
+
+/// 错误文案里回显一个值/枚举项的上限（字符数）。
+///
+/// 够看清"被拒的是什么"，又不至于把消息正文复制进日志与 UI。
+const MAX_ECHO_CHARS: usize = 120;
+
+/// 把被拒的值渲染成一行短文本（字符串带引号，其它类型用 JSON 表示）。
+fn echo_rejected(value: &Value) -> String {
+    let text = match value {
+        Value::String(text) => format!("\"{text}\""),
+        other => other.to_string(),
+    };
+    truncate_chars(&text, MAX_ECHO_CHARS)
+}
+
+/// 按字符截断并加省略号（错误文案用，不用于数据本身）。
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 fn matches_type(value: &Value, expected: &str) -> bool {
@@ -456,6 +547,72 @@ mod tests {
         let schema = json!({ "type": "object" });
         let error = validate_args("read_file", &schema, &json!("x")).expect_err("not object");
         assert!(matches!(error, HbotError::Invalid { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_value_outside_enum() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "mode": { "type": "string", "enum": ["read", "write"] } },
+            "required": ["mode"],
+        });
+        let error =
+            validate_args("probe", &schema, &json!({ "mode": "delete" })).expect_err("enum");
+        assert!(matches!(error, HbotError::Invalid { .. }));
+        assert_eq!(error.code(), -32002);
+        let text = error.to_string();
+        assert!(text.contains("mode"), "{text}");
+        assert!(text.contains("delete"), "错误文案要带被拒的值：{text}");
+    }
+
+    #[test]
+    fn validate_accepts_enum_choice_for_string_and_number() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["read", "write"] },
+                "level": { "type": "integer", "enum": [1, 2] },
+            },
+        });
+        validate_args("probe", &schema, &json!({ "mode": "read", "level": 2 })).expect("enum 命中");
+    }
+
+    #[test]
+    fn validate_rejects_number_outside_bounds() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "count": { "type": "integer", "minimum": 1, "maximum": 3 } },
+        });
+        for value in [0, 99] {
+            let error =
+                validate_args("probe", &schema, &json!({ "count": value })).expect_err("越界数值");
+            assert!(matches!(error, HbotError::Invalid { .. }));
+            assert_eq!(error.code(), -32002);
+            let text = error.to_string();
+            assert!(text.contains("count"), "{text}");
+            assert!(
+                text.contains(&value.to_string()),
+                "错误文案要带被拒的值：{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_number_on_bounds() {
+        let schema = json!({
+            "properties": { "count": { "type": "integer", "minimum": 1, "maximum": 3 } },
+        });
+        validate_args("probe", &schema, &json!({ "count": 1 })).expect("下界含等于");
+        validate_args("probe", &schema, &json!({ "count": 3 })).expect("上界含等于");
+    }
+
+    #[test]
+    fn validate_bounds_only_apply_to_numbers() {
+        // 上下限只约束数值：字符串该由 `type` 报，这里不该重复报越界。
+        let schema = json!({
+            "properties": { "count": { "minimum": 1 } },
+        });
+        validate_args("probe", &schema, &json!({ "count": "1" })).expect("非数值不受上下限约束");
     }
 
     #[test]
