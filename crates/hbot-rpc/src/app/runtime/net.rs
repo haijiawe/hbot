@@ -8,17 +8,17 @@
 //! 而 `hbot-rpc` 是唯一同时依赖两者的组合根（见 `xtask/src/deps.rs` 的允许边）。
 //! 所以**依赖边一条都没加**：传输实现落在这里，`hbot-code` 仍然看不见 `hbot-adapters`。
 //!
-//! ## 两次拒绝，各管一段
+//! ## 两次判定，但只有一份判据
 //!
 //! | 层 | 判据 | 拒绝时给模型看到的东西 |
 //! |---|---|---|
 //! | `hbot-code` | 清单的 `permissions.http`（空表 = 全禁），只读档直接拒 | `HBOT_HTTP_DENIED: …` |
-//! | `hbot-adapters` | 真的能不能连：只 http/https、拒绝回环/内网/云元数据等（[`hbot_adapters::http::is_blocked_ip`]） | 这里映射回 [`TransportError::Blocked`]，仍然是 `HBOT_HTTP_DENIED` |
+//! | `hbot-adapters` | 协议安全：只 http/https、拒 userinfo、拒 CR/LF、拒 3xx 跟随、长度/超时上限 | 这里映射回 [`TransportError`]，`Blocked` 仍是 `HBOT_HTTP_DENIED` |
 //!
-//! 第二条**没有放宽**：`is_blocked_ip` 那套原样保留，[`AdaptersHttpTransport`] 用生产默认
-//! 的 [`FetchOptions`]（空 `allowed_hosts`）。因此**清单允许 ≠ 一定连得上**：清单是"用户允许
-//! 模型代码访问谁"，适配层还会拒掉私网地址（SSRF 纵深防御）。这也意味着 bot 代码连不到本机
-//! 服务；要放开得先有产品决策（比如清单里显式声明 `allowPrivate`），不是这个单元自己发明。
+//! **地址位置（回环/内网/云元数据）不再由适配层判**——这是 2026-11-16 的产品决策
+//! （策略 **C**，见 `docs/02-architecture.md` §6.6）：网络范围完全由清单决定。
+//! 所以 [`AdaptersHttpTransport::new`] 把 [`FetchOptions::allow_private`] 置真，清单写了
+//! `127.0.0.1:11434` 就真能连上，写 `*` 就什么都能连（**含云元数据地址**，代价见该字段文档）。
 //!
 //! ## 阻塞契约与线程
 //!
@@ -51,32 +51,41 @@ const BOT_SANDBOX_MODE: SandboxMode = SandboxMode::WorkspaceWrite;
 
 /// 真传输：转调 `hbot-adapters` 的 `http_fetch_full_with`。
 ///
-/// 生产构造用 [`AdaptersHttpTransport::new`]（空 `allowed_hosts`，SSRF 守卫全开）。
-#[derive(Debug, Clone, Default)]
+/// 生产构造用 [`AdaptersHttpTransport::new`]。
+#[derive(Debug, Clone)]
 pub struct AdaptersHttpTransport {
     /// 交给 [`FetchOptions::allowed_hosts`] 的**写明的**主机名。
     ///
     /// 生产永远为空 —— 见 [`AdaptersHttpTransport::with_allowed_hosts`]。
     allowed_hosts: Vec<String>,
+    /// 是否放开地址位置判定。生产恒 `true`（策略 C：网络范围由清单决定）。
+    allow_private: bool,
 }
 
 impl AdaptersHttpTransport {
-    /// 生产用的构造：回环/内网地址一律拒绝。
+    /// 生产用的构造。
+    ///
+    /// `allow_private: true` 不是随手写的开关：授权判据只有一份，在
+    /// `hbot_code::permissions::authorize`（清单的 `permissions.http`）。适配层若再按地址位置
+    /// 拒一次，就会出现"清单写了 `127.0.0.1:11434` 却连不上"——两道判据各说一套，最终解释权
+    /// 却在第一道。代价（清单写 `*` 时可访问云元数据地址）见 [`FetchOptions::allow_private`]。
     pub const fn new() -> Self {
         Self {
             allowed_hosts: Vec::new(),
+            allow_private: true,
         }
     }
 
     /// **只给测试用**：把写明的回环主机名交给适配层的那条既有逃生口
     /// （[`FetchOptions::allowed_hosts`]，`hbot-adapters` 的 loopback/TLS 测试同样用它）。
     ///
-    /// 端到端测试必须打本机的 loopback server，而生产默认拒回环；放宽判据是不允许的，
-    /// 所以由测试显式点名"这一个主机"。生产路径没有任何调用者。
+    /// 端到端测试必须打本机的 loopback server；这里仍然显式点名"这一个主机"，
+    /// 不依赖生产构造的 `allow_private`，免得测试掩盖"点名名单"那条路走不通。
     #[doc(hidden)]
     pub fn with_allowed_hosts(hosts: Vec<String>) -> Self {
         Self {
             allowed_hosts: hosts,
+            allow_private: true,
         }
     }
 
@@ -87,6 +96,7 @@ impl AdaptersHttpTransport {
         let options = FetchOptions {
             headers: request.headers.clone(),
             allowed_hosts: self.allowed_hosts.clone(),
+            allow_private: self.allow_private,
             ..FetchOptions::default()
         };
 
@@ -125,6 +135,16 @@ impl AdaptersHttpTransport {
 impl HttpTransport for AdaptersHttpTransport {
     fn get(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
         self.fetch(request)
+    }
+}
+
+/// 与 [`AdaptersHttpTransport::new`] 完全一致。
+///
+/// 刻意**不**用 `#[derive(Default)]`：派生出来的 `allow_private` 会是 `false`（严格口径），
+/// 与生产构造不一致就会变成"默认构造悄悄更严、热路径行为不同"的陷阱。默认必须是生产语义。
+impl Default for AdaptersHttpTransport {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -236,7 +256,11 @@ mod tests {
     }
 
     #[test]
-    fn production_transport_has_no_allow_list() {
-        assert!(AdaptersHttpTransport::new().allowed_hosts.is_empty());
+    fn production_transport_has_no_allow_list_but_trusts_the_manifest() {
+        let transport = AdaptersHttpTransport::new();
+        // 名单空：没有"点名放行某个主机"这种绕过授权判据的后门。
+        assert!(transport.allowed_hosts.is_empty());
+        // 但位置判定放开：授权判据在 hbot-code，适配层不再二次拒绝（策略 C）。
+        assert!(transport.allow_private);
     }
 }

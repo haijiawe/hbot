@@ -277,7 +277,7 @@ export default defineBot({
 | `entry` | string | `src/main.ts` | 必须落在项目内（拒绝对路径/`..`/盘符/UNC），文件必须存在 |
 | `platform.kind` | string | 必填 | 平台标识，取值与 `bots.json` 的 `platform` 字段一致（`"onebot11"` / `"qq_official"` / `"local"`）。核心**不校验取值**（开放字符串，加平台不改 `hbot-code`）；`hbot check` 对未识别的值只给 warning |
 | `platform.ws` | string | 仅 `onebot11` 必填 | `onebot11`：必填且须 `ws://`/`wss://`（`wss://` 走 TLS 后端）；其它平台不需要（QQ 官方的地址由 `/gateway` 发现，`local` 不联网），写了不报错，`hbot check` 提示会被忽略 |
-| `permissions.http` | string[] | `[]` | 空 = 全禁（fail-closed）；已实现，`http.get` 按此表判权（`crates/hbot-code/src/permissions.rs`）。每项为精确 host、`*.子域`（匹配一层或多层子域，**不匹配裸域**）、`host:port`（不带端口 = 任意端口，端口对比较 host 同时判）；`*` = 全部放行（首次命中打一条 warn）。大小写不敏感、尾点忽略、只允许 `http(s)`；`evil-api.example.com` 不会被 `api.example.com` 放过 |
+| `permissions.http` | string[] | `[]` | 空 = 全禁（fail-closed）；已实现，`http.get` 按此表判权（`crates/hbot-code/src/permissions.rs`）。每项为精确 host、`*.子域`（匹配一层或多层子域，**不匹配裸域**）、`host:port`（不带端口 = 任意端口，端口对比较 host 同时判）；`*` = 全部放行（首次命中打一条 warn）。大小写不敏感、尾点忽略、只允许 `http(s)`；`evil-api.example.com` 不会被 `api.example.com` 放过。**这是唯一的网络授权判据**：适配层不再按地址位置（回环/私网/云元数据）二次拒绝，见 §6.6 |
 | `limits.handlerMs` | number | 2000 | 可调低；超过宿主硬上限直接报错，**不静默 clamp** |
 | `limits.heapMb` | number | 32 | 同上，硬上限 64 |
 
@@ -347,7 +347,7 @@ export default defineBot({
   | `log(message)` | 已实现 | 进本次事件的捕获输出，转成 `RunLog` |
   | `reply(text)` | 已实现 | 被动回复；`injected` 标记存在时按主动消息发送（`sandbox_handler.rs:621-634`） |
   | `sleep(ms)` | 已实现 | 会被 handler 预算截断：`await sleep(60000)` 在 2s handler 里约 2s 后由中断处理器判超时 |
-  | `http.get(url, options?)` | 已实现 | 受 `permissions.http` 约束：默认拒绝（空表 = 全禁）、只 GET、不跟随 3xx 重定向、不支持 gzip；单次超时默认 10s（上限 60s，且被 handler 剩余预算截断）、响应体上限 256 KiB；`read-only` 档**在授权判断之前**就拒绝（不建 socket）。失败以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 前缀 reject，异常消息里的 query 抹成 `?<redacted>`。返回 `{ status, body, headers }`（headers 名小写）。**传输层由 `hbot-rpc` 注入**（`crates/hbot-rpc/src/app/runtime/net.rs` 的 `AdaptersHttpTransport`，在 `sandbox_handler.rs` 建 isolate 时按 `hbot.json` 装进沙箱），它转调 `hbot-adapters` 的 HTTP/1.1 客户端；**SSRF 判据仍只在 `hbot-adapters` 一份**（回环/内网/云元数据地址即使清单允许也拒），因此「清单允许」不等于一定连得上。清单缺失/非法时退回 `HttpConfig::deny_all()`，沙箱照常启动 |
+  | `http.get(url, options?)` | 已实现 | 受 `permissions.http` 约束：默认拒绝（空表 = 全禁）、只 GET、不跟随 3xx 重定向、不支持 gzip；单次超时默认 10s（上限 60s，且被 handler 剩余预算截断）、响应体上限 256 KiB；`read-only` 档**在授权判断之前**就拒绝（不建 socket）。失败以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 前缀 reject，异常消息里的 query 抹成 `?<redacted>`。返回 `{ status, body, headers }`（headers 名小写）。**传输层由 `hbot-rpc` 注入**（`crates/hbot-rpc/src/app/runtime/net.rs` 的 `AdaptersHttpTransport`，在 `sandbox_handler.rs` 建 isolate 时按 `hbot.json` 装进沙箱），它转调 `hbot-adapters` 的 HTTP/1.1 客户端；**授权只有一份判据**（`hbot-code` 的 `permissions.rs`），适配层不按地址位置二次拒绝，所以清单写 `127.0.0.1:11434` 就真能连本机（策略 C，见 §6.6）。清单缺失/非法时退回 `HttpConfig::deny_all()`，沙箱照常启动 |
   | `ctx.send` / `ctx.kv` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
   | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage`（`isolate.rs:504-510`）；清单里的 `onSchedule` 字段同样未接 |
 
@@ -444,6 +444,30 @@ pub trait DebugSink: Send + Sync { fn paused(&self, at: PausedAt) -> DebugAction
 
 `Event::DebugPaused` 发出后，worker 停在 `DebugSink::paused` 里等三条命令之一：`DebugResume`（继续）、`DebugStep`（单步）、或 sink 自身超时（返回 `Continue`，并补一条 `DebugResumed`）。**暂停期间该 bot 的会话队列会积压**（容量 1024，满了按背压拒绝），这是有意的：不假装暂停时还能处理消息。
 
+### 6.6 生成代码的网络范围（策略 C，2026-11-16 定）
+
+**一句话：清单写了什么就允许什么，适配层不再按地址位置二次拒绝。**
+
+`hbot.json` 的 `permissions.http` 是**唯一**的网络授权判据（`crates/hbot-code/src/permissions.rs` 的 `authorize`）。适配层（`hbot-adapters`）只负责协议安全，不再判"这个地址是不是内网"。
+
+| 目标 | 之前 | 现在（C） |
+|---|---|---|
+| 公网 | 允许（明文或清单命中） | 允许 |
+| `127.0.0.1:11434`（本机 Ollama） | **清单写了也拒** | 清单写了就连 |
+| `192.168.x.x` / `10/8`（局域网 NAS） | 拒 | 清单写了就连 |
+| `*` 通配 | 只覆盖公网 | **覆盖一切**，含回环与私网 |
+| `169.254.169.254`、`100.100.100.200`、`metadata.google.internal` | 拒 | **清单写了（或 `*`）就连** |
+
+判据藏在哪、怎么落地：
+
+- `crates/hbot-adapters/src/http.rs` 的 `FetchOptions::allow_private`（默认 `false`）。为 `true` 时跳过 `check_host_name`、字面 IP 的 `is_blocked_ip`、以及 `resolve()` 的逐地址复核。
+- `crates/hbot-rpc/src/app/runtime/net.rs` 的 `AdaptersHttpTransport::new()` 恒置 `allow_private: true` —— 因为授权已经在上一道做过了，这里再拒一次就会出现"清单写了 `127.0.0.1:11434` 却连不上"这种两道判据各说一套的行为。
+- `hbot-code` 到不了 `hbot-adapters`（`xtask/src/deps.rs` 不允许这条边），所以传输实现放在 `hbot-rpc`（唯一同时依赖两者的组合根）。
+
+**仍然生效的保护（与地址位置无关）**：只 `http(s)`、拒 URL 里的 userinfo、拒请求头里的 CR/LF、不跟随 3xx、URL/头/正文长度上限、超时、`read-only` 档在授权之前就拒，以及歧义纯数字主机（`http://2130706433/`、`http://0x7f.1/`）——最后一条是**解析歧义**防护，不是位置判据。
+
+**明确接受的代价**：清单写 `*` 后，模型生成的代码可以访问本机所有端口，以及在云主机上读到元数据服务的机器身份凭据（提示注入 → 凭据外泄的标准路径）。这是产品决策，不是缺陷；要收紧就把 `*` 换成具体主机，或在 `permissions.http` 里只写业务真正需要的域名。改动前请读 `crates/hbot-adapters/src/http.rs` 里 `allow_private` 的文档注释。
+
 ---
 
 ## 7. 存储
@@ -499,7 +523,7 @@ interface MessageContext {
 ```
 
 - `ReplyOptions`：`{ replyTo?, atSender?, mention? }`；被动回复必须带 `replyTo` 或由运行时绑定。
-- `http.get` 只允许 `hbot.json` 的 `permissions.http` 域名；默认空 = 禁止。传输由 `hbot-rpc` 注入，回环/私网地址在 `hbot-adapters` 仍被拒（SSRF 纵深防御）。
+- `http.get` 只允许 `hbot.json` 的 `permissions.http` 域名；默认空 = 禁止。传输由 `hbot-rpc` 注入；**授权判据只有这一份**，回环/私网地址只要清单写了就允许（策略 C，§6.6）。
 - `kv` 落在项目 DB，按 bot 隔离；单值上限 1 MB。
 - 所有 promise 失败都以异常抛回 JS；未捕获异常由运行时记录，不静默吞。
 
@@ -688,7 +712,7 @@ debug.resumed      { botId }
 
 | 威胁 | 边界 |
 |---|---|
-| 生成代码恶意/有 bug | QuickJS 隔离 + 宿主 API 白名单（`log`/`reply`/`sleep`/`http.get`；无 `fs`/`process`/原生 socket）+ 内存/时间限制；`http.get` 受清单 `permissions.http`（空表 = 全禁）与 `hbot-adapters` 的 SSRF 判据双重约束，只 GET、不跟随 3xx |
+| 生成代码恶意/有 bug | QuickJS 隔离 + 宿主 API 白名单（`log`/`reply`/`sleep`/`http.get`；无 `fs`/`process`/原生 socket）+ 内存/时间限制；`http.get` 受清单 `permissions.http`（空表 = 全禁）单点约束，只 GET、不跟随 3xx。**网络范围完全由清单决定**（策略 C，§6.6）：`*` 可连本机与云元数据地址，这是显式接受的取舍 |
 | 平台消息里的提示注入 | 消息/日志是不可信输入；Agent 读到也不得据此提权；写/命令/网络工具一律按当前档位审批；测试用例覆盖“群消息让 Agent 删库/发密钥” |
 | Agent 执行危险命令 | 命令默认审批 + OS 级隔离；无隔离则拒绝 |
 | 本机其他进程冒充 UI | 桌面无端口；后台 WS 绑 127.0.0.1 + token + Origin |

@@ -11,18 +11,18 @@
 //! **不联网**：服务端是 `127.0.0.1` 上 `TcpListener::bind(...,0)` 起的进程内 loopback，
 //! 端口由内核分配。
 //!
-//! ## 一个必须说清楚的缝
+//! ## 关于回环地址（策略 C 之后）
 //!
-//! `hbot-adapters` 的 SSRF 守卫在生产路径上**拒绝回环与私网地址**（`is_blocked_ip`，
-//! 一行没放宽）。所以"清单允许 127.0.0.1 就能连上"在生产传输下**并不成立**——
-//! 这也是产品现状：清单是"允许模型代码访问谁"，适配层还会挡私网。
+//! 2026-11-16 之前，适配层还会按地址位置拒一次私网/回环，于是"清单允许 `127.0.0.1` 就能连上"
+//! 在生产路径上并不成立，成功类用例只能靠 `with_allowed_hosts` 点名逃生。
 //!
-//! 为了让"允许 → 成功"这条断言仍然能被真 socket 验证，成功类用例用
-//! [`AdaptersHttpTransport::with_allowed_hosts`]（`#[doc(hidden)]`，只给测试）点名这一个
-//! 回环主机 —— 与 `hbot-adapters` 自己的 loopback/TLS 测试用的是同一个既有逃生口
-//! （`FetchOptions::allowed_hosts`）。**生产构造 `AdaptersHttpTransport::new()` 的名单为空**，
-//! 由 `net::http_config` 使用；`the_production_transport_is_installed_and_still_blocks_loopback`
-//! 这条用例专门钉住"生产传输确实装了、并且仍然拒回环"。
+//! 决策改成 **C**（网络范围完全由清单决定，见 `docs/02-architecture.md` §6.6）之后，生产传输
+//! `AdaptersHttpTransport::new()` 把 `allow_private` 置真，**清单授权即可连回环**。
+//! 所以现在 A 组用例走的就是生产构造，不需要测试专用后门：
+//! `the_production_transport_reaches_loopback_when_the_manifest_allows_it` 直接钉住这一点。
+//!
+//! 授权判据仍然只有一份（`hbot-code` 的 `permissions::authorize`）：空清单、端口不符、
+//! 主机不符、只读档，全部在那里就拒，一个字节都到不了适配层。
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener};
@@ -320,15 +320,18 @@ async fn a_wrong_port_is_denied_and_never_reaches_the_server() {
     assert_eq!(server.count(), 0, "被拒的请求不该连到 server");
 }
 
-/// **生产传输确实装上了**：清单写 `*`（授权通过）→ 请求真的进了传输层 →
-/// 被 `hbot-adapters` 的 SSRF 守卫拒掉。
+/// **生产传输确实装上了，且按清单授权真的能连上回环**（策略 C）。
 ///
-/// 这条是 `sandbox_handler.rs` 接线的关键证据：如果 transport 没装上，
-/// 错误会变成 `no HTTP transport is installed in this sandbox`（也是 FAILED 文案），
-/// 而这里必须是 DENIED 且理由来自适配层。
+/// 清单写 `*` → `hbot-code` 的 `permissions::authorize` 放行 → **生产**传输
+/// `AdaptersHttpTransport::new()`（`allow_private: true`）→ 真连本机 loopback 拿到正文。
+///
+/// 这条同时钉住两件事：
+/// 1. transport 真的装进了沙箱（没装上会是 `no HTTP transport is installed in this sandbox`）；
+/// 2. 适配层**不再**按地址位置二次拒绝——2026-11-16 的策略 C 就是这样定义的
+///    （见 `docs/02-architecture.md` §6.6）：写 `127.0.0.1:11434` 就该连得上。
 #[tokio::test]
-async fn the_production_transport_is_installed_and_still_blocks_loopback() {
-    let server = Loopback::start(b"should never be fetched".to_vec());
+async fn the_production_transport_reaches_loopback_when_the_manifest_allows_it() {
+    let server = Loopback::start(b"hello from production transport".to_vec());
     let harness = Harness::new(
         "installed",
         &handler_source(&server.url("/x")),
@@ -338,15 +341,12 @@ async fn the_production_transport_is_installed_and_still_blocks_loopback() {
 
     let replies = harness.say("hi").await;
 
-    assert!(
-        replies[0].contains("HBOT_HTTP_DENIED"),
-        "适配层的 SSRF 拒绝要原样冒出来（不是泛泛的失败）：{replies:?}"
+    assert_eq!(
+        replies,
+        vec!["OK 200 hello from production transport".to_owned()],
+        "生产传输必须按清单授权真的连上回环：{replies:?}"
     );
-    assert!(
-        !replies[0].contains("no HTTP transport"),
-        "transport 没装上就会是这句话；这里不该出现：{replies:?}"
-    );
-    assert_eq!(server.count(), 0, "回环地址在适配层就被拒，不该建连接");
+    assert_eq!(server.count(), 1, "应当恰好发出一条真请求");
 }
 
 // ---------------------------------------------------------------------------

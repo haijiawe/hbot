@@ -88,6 +88,34 @@ pub struct FetchOptions {
     /// - 这是"显式点名一个目标"，不是"关掉 SSRF 校验"的布尔开关：没有通配、
     ///   没有环境变量、生产代码路径里也没有任何地方会填它。
     pub allowed_hosts: Vec<String>,
+    /// 是否放开**地址位置**判定（回环 / 内网 / 云元数据）。
+    ///
+    /// 默认 `false` = 生产严格口径：`localhost`、`127.0.0.1`、`10/8`、`169.254.169.254`
+    /// 一律拒绝。置 `true` 时跳过 [`check_host_name`]、字面 IP 的 [`is_blocked_ip`]、
+    /// 以及 [`resolve`] 里的逐地址复核。
+    ///
+    /// ## 为什么会有这个字段
+    ///
+    /// 2026-11-16 的产品决策（策略 **C**，见 `docs/02-architecture.md` §6.6）：**网络访问
+    /// 范围完全由清单的 `permissions.http` 决定**，适配层不再另立一套地址黑白名单。理由：
+    /// 用户要接本机 Ollama / 本机 API / 局域网 NAS，而"清单写了 `127.0.0.1:11434` 却连不上"
+    /// 是不可解释的行为——两道判据各说一套，最终解释权在第一道。
+    ///
+    /// 因此**授权判据只有一份**，在 `hbot-code` 的 `permissions::authorize`；这个字段只
+    /// 告诉适配层"上游已经判过了，不要再按地址位置二次拒绝"。
+    ///
+    /// ## 代价（写清，不掩饰）
+    ///
+    /// 清单写 `*` 时，模型生成的代码可以访问本机所有端口，以及云上的元数据地址
+    /// （`169.254.169.254`、`100.100.100.200`、`metadata.google.internal`）——那是提示注入
+    /// 拿机器身份凭据的标准路径。这是用户明确选择的取舍，不是遗漏。
+    ///
+    /// ## 仍然生效的保护（与地址位置无关）
+    ///
+    /// 只 `http(s)`、拒 userinfo、拒 CR/LF 注入、拒 3xx 跟随、URL/头/正文长度上限、
+    /// 超时、以及歧义纯数字主机（`http://2130706433/`）的拒绝。最后一条是**解析歧义**防护
+    /// 而非位置判据，故 `allow_private` 不影响它。
+    pub allow_private: bool,
     /// 额外请求头，按给定顺序追加在固定头之后。
     ///
     /// 默认空，所以 [`http_fetch`] / [`http_fetch_with`] 的报文与没有这个字段时
@@ -146,13 +174,18 @@ struct Body {
 
 /// 解析并校验 URL 的静态部分（不做 DNS）。
 ///
-/// 生产路径永远走这个：等同于 `allowed_hosts` 为空、所有检查全跑。
+/// 生产路径永远走这个：等同于 `allowed_hosts` 为空、位置判定全跑。
 pub fn parse_target(url: &str) -> Result<HttpTarget, AdapterError> {
-    parse_target_with(url, &[])
+    parse_target_with(url, &[], false)
 }
 
-/// 同 [`parse_target`]，但接受一份显式放行名单（见 [`FetchOptions::allowed_hosts`]）。
-fn parse_target_with(url: &str, allowed_hosts: &[String]) -> Result<HttpTarget, AdapterError> {
+/// 同 [`parse_target`]，但接受一份显式放行名单（见 [`FetchOptions::allowed_hosts`]）
+/// 与位置判定开关（见 [`FetchOptions::allow_private`]）。
+fn parse_target_with(
+    url: &str,
+    allowed_hosts: &[String],
+    allow_private: bool,
+) -> Result<HttpTarget, AdapterError> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err(AdapterError::blocked("url must not be empty"));
@@ -216,7 +249,10 @@ fn parse_target_with(url: &str, allowed_hosts: &[String]) -> Result<HttpTarget, 
         )));
     }
     let host_allowed = is_host_allowed(&host, allowed_hosts);
-    if !host_allowed {
+    // 位置判定（回环/内网/云元数据）在两种情况下不做：显式点名了这一个主机，
+    // 或上游已按清单授权（`allow_private`）。
+    let location_checked = !host_allowed && !allow_private;
+    if location_checked {
         check_host_name(&host)?;
 
         // 字面 IP 先查一遍，省掉 DNS；域名等解析后再查全部地址。
@@ -226,13 +262,14 @@ fn parse_target_with(url: &str, allowed_hosts: &[String]) -> Result<HttpTarget, 
                     "refusing to fetch a private/loopback address: {ip}"
                 )));
             }
-        } else if is_numeric_host(&host) {
-            // `http://2130706433/`、`http://0x7f.1/` 这类"看起来像主机其实像 IP"的写法，
-            // 各平台解析规则不一致，直接拒绝。
-            return Err(AdapterError::blocked(format!(
-                "ambiguous numeric host `{host}` is not allowed; use a dotted-decimal ip or a name"
-            )));
         }
+    }
+    // 歧义纯数字主机（`http://2130706433/`、`http://0x7f.1/`）与"是不是私网"无关：
+    // 各平台解析规则不一致，**始终**拒绝。显式点名的主机维持旧行为（跳过）。
+    if !host_allowed && host.parse::<IpAddr>().is_err() && is_numeric_host(&host) {
+        return Err(AdapterError::blocked(format!(
+            "ambiguous numeric host `{host}` is not allowed; use a dotted-decimal ip or a name"
+        )));
     }
 
     let path = build_path(
@@ -446,7 +483,7 @@ async fn fetch_with_mode(
             "max_bytes must be greater than 0",
         ));
     }
-    let target = parse_target_with(url, &options.allowed_hosts)?;
+    let target = parse_target_with(url, &options.allowed_hosts, options.allow_private)?;
     if timeout.is_zero() {
         return Err(AdapterError::timeout("http fetch", timeout));
     }
@@ -464,7 +501,13 @@ async fn fetch_inner(
 ) -> Result<FullResponse, AdapterError> {
     // 先组装请求（含额外的头校验）：参数错就不该去解析 DNS、更不该建连接。
     let request = build_request(target, &options.headers)?;
-    let addresses = resolve(&target.host, target.port, &options.allowed_hosts).await?;
+    let addresses = resolve(
+        &target.host,
+        target.port,
+        &options.allowed_hosts,
+        options.allow_private,
+    )
+    .await?;
     let stream = connect_any(&addresses).await?;
     // 明文与 TLS 只在"拿到哪个流"这一步不同，之后的写请求/读响应完全共用：
     // 两种 scheme 的协议行为必须一致，否则 https 会悄悄多出/少掉一些限制。
@@ -596,6 +639,7 @@ async fn resolve(
     host: &str,
     port: u16,
     allowed_hosts: &[String],
+    allow_private: bool,
 ) -> Result<Vec<SocketAddr>, AdapterError> {
     let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
@@ -606,9 +650,8 @@ async fn resolve(
             "dns lookup returned no address for `{host}`"
         )));
     }
-    // 名单命中的主机名跳过逐地址复核（回环监听器的测试需要它）；默认空名单 ⇒
-    // 这里的行为与"没有这个参数"逐字相同。
-    if !is_host_allowed(host, allowed_hosts) {
+    // 名单命中的主机名、以及上游已按清单授权（`allow_private`）时跳过逐地址复核。
+    if !is_host_allowed(host, allowed_hosts) && !allow_private {
         if let Some(blocked) = addresses.iter().find(|addr| is_blocked_ip(addr.ip())) {
             return Err(AdapterError::blocked(format!(
                 "host `{host}` resolves to a private/loopback address ({})",
@@ -1043,6 +1086,107 @@ mod tests {
 
         let target = parse_target("http://1.1.1.1:8080/x").expect("explicit port");
         assert_eq!(target.port, 8080);
+    }
+
+    #[test]
+    fn location_guards_stay_on_by_default() {
+        // 生产默认口径没变：没有 `allow_private` 时私网/回环/云元数据照样拒。
+        for url in [
+            "http://127.0.0.1:11434/api",
+            "http://10.1.2.3/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost:8080/",
+            "http://metadata.google.internal/",
+        ] {
+            let error = parse_target_with(url, &[], false)
+                .err()
+                .unwrap_or_else(|| panic!("{url} must stay blocked by default"));
+            assert!(
+                matches!(error, AdapterError::Blocked { .. }),
+                "{url} → {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_private_lets_authorized_private_targets_through() {
+        // 策略 C：地址位置不再拦，清单判据在上游（hbot-code）。
+        for (url, host, port) in [
+            ("http://127.0.0.1:11434/api/chat", "127.0.0.1", 11434u16),
+            ("http://10.1.2.3/x", "10.1.2.3", 80),
+            (
+                "http://169.254.169.254/latest/meta-data/",
+                "169.254.169.254",
+                80,
+            ),
+            ("http://localhost:8080/", "localhost", 8080),
+            (
+                "http://metadata.google.internal/",
+                "metadata.google.internal",
+                80,
+            ),
+            ("http://[::1]:9000/x", "::1", 9000),
+        ] {
+            let target = parse_target_with(url, &[], true)
+                .unwrap_or_else(|error| panic!("{url} must be allowed: {error:?}"));
+            assert_eq!(target.host, host, "{url}");
+            assert_eq!(target.port, port, "{url}");
+        }
+    }
+
+    #[test]
+    fn allow_private_does_not_weaken_protocol_guards() {
+        // 放开的是"地址在哪"，不是"请求合法不合法"。
+        for url in [
+            "file:///etc/passwd",
+            "http://user:pass@127.0.0.1/",
+            "http://2130706433/",
+            "http://0x7f.1/",
+        ] {
+            let error = parse_target_with(url, &[], true)
+                .err()
+                .unwrap_or_else(|| panic!("{url} must stay rejected under policy C"));
+            assert!(
+                matches!(error, AdapterError::Blocked { .. }),
+                "{url} → {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_private_really_connects_to_a_loopback_listener() {
+        // 端到端：这条路径同时走过 `parse_target_with` 与 `resolve` 的逐地址复核。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("local addr");
+        let serving = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nprivate")
+                .await
+                .expect("write response");
+            socket.flush().await.expect("flush");
+        });
+
+        let options = FetchOptions {
+            allow_private: true,
+            ..FetchOptions::default()
+        };
+        let response = http_fetch_full_with(
+            &format!("http://{address}/x"),
+            Duration::from_secs(5),
+            1024,
+            &options,
+        )
+        .await
+        .expect("loopback fetch under policy C");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"private");
+        serving.await.expect("server task");
     }
 
     #[tokio::test]

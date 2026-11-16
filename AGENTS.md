@@ -201,6 +201,8 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 46. **"按 crate 划写域"仍然会让两个人互相堵住**（2026-11-16 踩到）。`cargo` 的编译单元是**整个 crate**，不是文件：`search-io` 把 `crates/hbot-workspace/src/search.rs` 写成中间态时，另一个单元对 `project.rs`/`files.rs` 的改动**一行都验不了**（`cargo test -p hbot-workspace` 直接编译失败），而两边改的文件根本不重叠。规则：① 同一 crate 里并行，**共享文件必须明确归属一个人**，其余人只能读；② 改到一半就把 crate 弄成编译不过的人，**有义务第一时间广播"已可编译"**，别人据此放行；③ 被挡住的一方**不要空等也不要越界代改**——先做能做的（写文档、设计变异脚本、静态自查），并靠"错误是否全部落在他人的文件里"来判读自己的部分是否已经编译通过。
 47. **对外错误文案不许带项目根的绝对路径**（RT-01，2026-11-16 修）。`NotFound` 之类的错误会把 `E:\HBot-Next\projects\demo\src\main.ts` 整条路径拼进 message，而这条 message 会作为**工具输出喂给模型**、也会进日志——用户的目录结构因此泄漏进模型上下文与日志文件。规则：面向模型的错误只给**项目内相对路径**（`hbot-workspace` 统一走 `display_rel` / `Workspace::display_path`，`io_error` 收 root 参数）；操作系统的原始错误（`std::io::Error`）可以保留，但要与相对路径拼接后再外传。新增错误构造点时先问一句"这条 message 会不会被模型看到"。
 
+48. **网络授权判据只有一份：`hbot.json` 的 `permissions.http`**（策略 C，2026-11-16 定，见 `docs/02-architecture.md` §6.6）。判据在 `crates/hbot-code/src/permissions.rs`；适配层（`hbot-adapters`）**不再按地址位置**（回环/私网/云元数据）二次拒绝——`FetchOptions::allow_private` 默认 `false` 保留严格口径，而 `hbot-rpc` 的 `AdaptersHttpTransport::new()` 恒置 `true`，因为上游已经判过。别在适配层"顺手加一条 SSRF 检查"：那会立刻造成"清单写了 `127.0.0.1:11434` 却连不上"的两道判据打架，而且**最终解释权在第一道**，第二道只是让人困惑。要收紧就收紧清单。已验证的边界：`read-only` 档仍在授权之前拒（不建 socket）、`http://2130706433/` 这类歧义数字主机仍拒（解析歧义，非位置）。
+
 ---
 
 ## 8. 新增 X 的步骤

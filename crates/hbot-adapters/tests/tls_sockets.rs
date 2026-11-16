@@ -400,6 +400,7 @@ async fn https_fetch_returns_body_over_tls() {
     let options = FetchOptions {
         extra_roots: vec![pki.ca_der.clone()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
+        allow_private: false,
         headers: Vec::new(),
     };
     let body = http_fetch_with(
@@ -440,6 +441,7 @@ async fn https_fetch_rejects_untrusted_certificate() {
     let options = FetchOptions {
         extra_roots: Vec::new(),
         allowed_hosts: vec!["127.0.0.1".to_string()],
+        allow_private: false,
         headers: Vec::new(),
     };
     let error = http_fetch_with(
