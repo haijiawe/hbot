@@ -199,6 +199,11 @@ cargo run -q --release -p hbot-bench --example search_variance *> variance.log
 - `walk_read`（1.06–1.96 s）> 预算 1 s ⇒ **即使把搜索逻辑全删掉、只保留「遍历 + 读全部文件」，也已经超预算**。所以这不是「搜索实现写得差」，是**这台机器上 10k 个小文件的逐文件开销**决定的。
 - 量级核对：151.3 µs/文件对 SSD + Defender 实时保护来说是合理的（每次 open 都要过过滤驱动）；但**无法把 Defender 的贡献单独分离出来**（关实时保护需管理员），所以这一条只给结构证据，不给百分比（见「未测」）。
 
+> **两个「元数据」不是一回事（2026-11-16 实测补注，数字来自批次 H §1）**：上表「元数据 453.90 ms」对应的是**改前** `search()` 里那一次 `fs::metadata(path)`（按路径 stat）；而 `crates/hbot-bench/src/search_bench.rs` 的 `measure_walk`/`search_10k_walk_metadata` 用的也是 `fs::metadata(&path)`，两者同口径，所以相减成立。**但 `search.rs` 批次 G 之后用的是 `entry.metadata()`**（walker 读目录时已缓存的元数据），同一棵树上实测：`entry.metadata()` 首次 **18.4 ms** vs `fs::metadata(path)` 首次 **410.6 ms**，差 **23×**。所以：
+> – 上表 453.90 ms 只能当「改前真付过的账」，**不能**当作当前 `search()` 的 IO 成本；当前阶段 1 已降到 **42.8 ms（7%）**（批次 H §4）。
+> – 任何拿 `search_10k_walk_metadata` 去和现在的 `search()` 相减得出的「元数据占比」都是**口径混用**，无效。
+> – 这也解释了批次 G 第 1 条为什么能省 ≈450 ms：省掉的正是 10k 次按路径 stat（对应这 23× 的差值），而不是「把同一次调用挪了个位置」。
+
 ### 与另一轮（并发 agent）数字的差异，以及为什么不能取平均
 
 同一台机器、同一个 crate、同一份夹具，两轮测量差 1.4–1.7 倍：
