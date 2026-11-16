@@ -15,7 +15,7 @@
 //!       "token": "可选：OneBot 的 access_token",
 //!       "selfId": 10001,
 //!       "name": "可选：展示名，缺省用项目目录名",
-//!       "platform": "可选：onebot11（缺省）或 qq_official",
+//!       "platform": "可选：onebot11（缺省）或 qq_official 或 local",
 //!       "limits": { "memoryMb": 32, "handlerTimeoutMs": 2000 }
 //!     },
 //!     {
@@ -24,6 +24,11 @@
 //!       "appId": "102000000",
 //!       "clientSecret": "QQ 开放平台机器人后台的 AppSecret",
 //!       "name": "QQ 官方机器人示例"
+//!     },
+//!     {
+//!       "id": "44444444-4444-4444-8444-444444444444",
+//!       "platform": "local",
+//!       "name": "本地试跑（不联网，回复只进日志）"
 //!     }
 //!   ]
 //! }
@@ -32,23 +37,38 @@
 //! 字段说明：
 //!
 //! * `id`（必填）— 必须是 `bots.id` 那个 UUID 的字符串形式；一个文件可以放多个 bot。
-//! * `platform`（可选）— 平台标识，**精确匹配**：`onebot11`（缺省）或 `qq_official`。
-//!   写错 / 写了个没实现的值一律 -32002 并列出允许值，**不静默降档成 OneBot**
+//! * `platform`（可选）— 平台标识，**精确匹配**：`onebot11`（缺省）、`qq_official` 或
+//!   `local`。写错 / 写了个没实现的值一律 -32002 并列出允许值，**不静默降档成 OneBot**
 //!   （与 `docs/02-architecture.md` "写错档位不许静默降档"同一条纪律）。
 //! * `url`（`onebot11` 必填）— OneBot 11 正向 WebSocket 地址，`ws://` 与 `wss://` 都可以。
 //!   `wss://` 走 rustls + `webpki-roots`，**证书校验始终开启**：证书不匹配报
 //!   `AdapterError::Tls`（wire 上 -32006），不会降级成明文，也**没有**跳过校验的开关
 //!   （私有 CA / 自签部署用 `OneBotConfig::with_extra_root_certificates` 追加根证书）。
-//!   `platform = qq_official` 时**不用**这个字段（QQ 官方走固定端点），填了也不参与连接。
+//!   `platform = qq_official` / `local` 时**不用**这个字段，填了也不参与连接。
 //! * `token`（可选，仅 `onebot11`）— 作为 `Authorization: Bearer <token>` 发出；日志里打码。
 //! * `appId`（`qq_official` 必填）— QQ 开放平台机器人后台的 AppID。不是密钥，可以进日志，
-//!   但仍不刷屏。
+//!   但仍不刷屏。`platform = local` 时不需要。
 //! * `clientSecret`（`qq_official` 必填）— QQ 开放平台机器人后台的 AppSecret。**按密钥对待**：
 //!   手写的 `Debug` 把它打成 `<redacted>`，错误消息与日志里都不出现原文。
+//!   `platform = local` 时不需要。
 //! * `selfId`（可选，仅 `onebot11`）— bot 自己的 QQ 号；只用于乐观校验收到的事件是不是发给自己的。
 //! * `name`（可选）— 展示名；缺省取项目根目录名（`bots.name`）。
 //! * `limits`（可选）— 交给沙箱的每 isolate 限额，缺省即
-//!   [`hbot_code::Limits::default`]（32 MiB / 2 s）。
+//!   [`hbot_code::Limits::default`]（32 MiB / 2 s）。**三个平台都生效**（`local` 也一样：
+//!   试跑要能复现"真机上超时/内存不够"的样子）。
+//!
+//! ## `platform = "local"`：本地试跑
+//!
+//! 唯一的用途是**没有真实平台时也能跑一遍刚生成的代码**：
+//!
+//! * **不联网**：`url` / `token` / `appId` / `clientSecret` 一个都不需要，填了也不参与；
+//! * 入站靠 `bot_inject`（`bot_start` 会幂等建好 `local:default` 那一行会话，`bot_inject`
+//!   的 `conversationId` 用它）；
+//! * 出站**不会真的发出去**：每条回复按 `[reply] <文本>` 写进 run log（日志表 +
+//!   `Event::RunLog`），IDE 的日志面板因此能看见"bot 会回什么"。
+//!
+//! 它**不是**生产平台：没有传输、没有平台侧校验，消息不会出现在 QQ 上。真机联调仍然
+//! 必须用 `onebot11`（NapCat / LLOneBot / Lagrange）或 `qq_official`。
 //!
 //! 所有读盘都是阻塞的：调用方负责把它放进 `spawn_blocking` / `AppState::blocking`。
 
@@ -61,7 +81,7 @@ use hbot_code::Limits;
 use hbot_core::{BotId, HbotError};
 use serde::Deserialize;
 
-use super::{onebot, platform_list, qq};
+use super::{local, onebot, platform_list, qq};
 
 /// 配置文件名（位于项目根）。
 pub const BOTS_FILE: &str = "bots.json";
@@ -240,6 +260,11 @@ pub fn read_bot_config(root: &Path, bot_id: &BotId) -> Result<BotConfig, HbotErr
         qq::PLATFORM => {
             // QQ 官方不用 ws:// 地址（网关靠 access token 换），填了也不参与连接。
             // 这里**不**把空串塞进 ws_url：空串的语义是"连一个空地址"，会被误解。
+            None
+        }
+        local::PLATFORM => {
+            // 本地试跑不连任何端点，所以 url 既不校验也不保留：
+            // 填了一个 url 也不会被使用（这一点写进了模块文档，避免有人以为它真去连）。
             None
         }
         other => {
@@ -803,5 +828,95 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("onebot11"), "{message}");
         assert!(message.contains("qq_official"), "{message}");
+        // `local` 也是允许值：错误消息必须把它列出来，否则用户看不出"本地试跑"这条路存在。
+        assert!(message.contains("local"), "{message}");
+    }
+
+    /// `local` 是**唯一**不需要任何连接参数的平台：四个字段全缺也能解析（这就是它存在的理由）。
+    #[test]
+    fn local_entry_parses_without_any_credentials() {
+        let dir = TempDir::new("local");
+        dir.write(
+            r#"{"bots":[{"id":"22222222-2222-4222-8222-222222222222",
+                          "platform":"local","name":"本地试跑"}]}"#,
+        );
+
+        let config = read_bot_config(dir.path(), &bot_id()).expect("local entry must parse");
+        assert_eq!(config.effective_platform(), local::PLATFORM);
+        assert_eq!(config.name.as_deref(), Some("本地试跑"));
+        // 不联网：没有地址可用，也不该凭空造一个。
+        assert_eq!(config.ws_url, None);
+        assert_eq!(config.access_token, None);
+        assert_eq!(config.app_id, None);
+        assert_eq!(config.client_secret, None);
+        // 限额照旧生效（缺省即 `Limits::default`）。
+        assert_eq!(config.limits, Limits::default());
+    }
+
+    /// `local` 时即使把 `url` / `token` / 凭据都填了，它们也**不参与**：
+    /// `ws_url` 保持 `None`（没有"连一个闲置地址"这种事），token 记下来也不发。
+    ///
+    /// 这条钉的是"填了也不参与"这个承诺：如果哪天有人给 local 分支塞回
+    /// `Some(require_onebot_url(...))`，这里会立刻红。
+    #[test]
+    fn local_entry_ignores_url_and_credentials() {
+        let dir = TempDir::new("local-ignores");
+        dir.write(
+            r#"{"bots":[{"id":"22222222-2222-4222-8222-222222222222",
+                          "platform":"local","url":"ws://127.0.0.1:3001",
+                          "token":"sk-live-TOKEN-do-not-print","appId":"10001",
+                          "clientSecret":"QQ-SECRET-do-not-print"}]}"#,
+        );
+
+        let config = read_bot_config(dir.path(), &bot_id()).expect("local entry must parse");
+        assert_eq!(config.effective_platform(), local::PLATFORM);
+        assert_eq!(
+            config.ws_url, None,
+            "local 不该保留 url：它不连任何端点，留着会让人以为真去连"
+        );
+        // 解析仍然照收（同一个 schema，不按平台分叉字段表），只是不用于连接。
+        assert_eq!(
+            config.access_token.as_deref(),
+            Some("sk-live-TOKEN-do-not-print")
+        );
+        // 密钥照样打码：local 也不例外（注意别拿 `secret` 当断言词 —— 字段名
+        // `client_secret` 本身就含它，断言会永远成立）。
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("TOKEN-do-not-print"), "{printed}");
+        assert!(!printed.contains("QQ-SECRET-do-not-print"), "{printed}");
+    }
+
+    /// `local` 的 `limits` 照旧生效（含夹取），否则"本地试跑"复现不了真机的超时/内存问题。
+    #[test]
+    fn local_entry_applies_limits() {
+        let dir = TempDir::new("local-limits");
+        dir.write(
+            r#"{"bots":[{"id":"22222222-2222-4222-8222-222222222222",
+                          "platform":"local",
+                          "limits":{"memoryMb":0,"handlerTimeoutMs":0}}]}"#,
+        );
+
+        let config = read_bot_config(dir.path(), &bot_id()).expect("local entry must parse");
+        assert_eq!(
+            config.limits.memory_bytes,
+            1024 * 1024,
+            "memoryMb=0 夹到 1 MiB（0 不是「无限制」）"
+        );
+        assert_eq!(config.limits.handler_timeout, Duration::from_millis(1));
+    }
+
+    /// 显式写 `platform: "onebot11"` 但缺 `url`：仍然 -32002（加了 local 之后不许把
+    /// onebot11 的必填项放松成"反正有别的平台"）。
+    #[test]
+    fn onebot_entry_without_url_is_still_invalid_after_adding_local() {
+        let dir = TempDir::new("onebot-no-url");
+        dir.write(
+            r#"{"bots":[{"id":"22222222-2222-4222-8222-222222222222",
+                          "platform":"onebot11"}]}"#,
+        );
+
+        let error = read_bot_config(dir.path(), &bot_id()).expect_err("must fail");
+        assert_eq!(error.code(), -32002);
+        assert!(error.to_string().contains("url"), "{error}");
     }
 }

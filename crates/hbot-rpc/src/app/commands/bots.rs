@@ -31,9 +31,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hbot_bot::{
-    BotSpec, ConversationRef, InjectOutcome, PlatformEvent, Supervisor, SupervisorDeps,
+    BotSpec, ConversationRef, Inbox, InjectOutcome, PlatformEvent, Supervisor, SupervisorDeps,
 };
-use hbot_core::{BotId, BotStatus, ConversationId, EventSink, HbotError, Timestamp};
+use hbot_core::{
+    BotId, BotStatus, ConversationId, ConversationKind, EventSink, HbotError, Timestamp,
+};
 use hbot_store::{
     BOT_STATUS_DEGRADED, BOT_STATUS_ERROR, BOT_STATUS_RUNNING, BOT_STATUS_STOPPED, Bot, Project,
 };
@@ -44,10 +46,11 @@ use crate::app::AppState;
 use crate::app::bots::running_bot;
 use crate::app::commands::{done, failed, unimplemented};
 use crate::app::runtime::config::{BotConfig, read_bot_config};
+use crate::app::runtime::local;
 use crate::app::runtime::onebot::PLATFORM;
 use crate::app::runtime::outbox_source::StorePendingOutbox;
 use crate::app::runtime::sandbox_handler::{REPLY_CAPACITY, SandboxHandler, SandboxHandlerConfig};
-use crate::app::runtime::{conversation_kind_from_str, conversation_kind_str};
+use crate::app::runtime::{AdapterPorts, conversation_kind_from_str, conversation_kind_str};
 use crate::app::store_failed;
 use crate::dto::{BotSummary, Command, Event, LogLevel, Response, RunLog};
 
@@ -126,7 +129,14 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
     };
 
     // 平台适配器：OneBot 走 `connect`（内含 `wss://` 的显式拒绝）。
-    let adapter = state.adapter_factory().create(&bot, &config)?;
+    // 走 `create_with` 而不是 `create`：`local` 平台要把回复写进 run log，需要
+    // store / events / clock 三个端口；不关心端口的平台用 trait 的默认实现原样转发。
+    let ports = AdapterPorts {
+        store: Arc::clone(state.store()),
+        events: Arc::clone(state.events()),
+        clock: Arc::clone(state.clock()),
+    };
+    let adapter = state.adapter_factory().create_with(&bot, &config, &ports)?;
 
     // 沙箱执行器：回复先落在有界 channel 上，再由下面的搬运任务转进 outbox。
     let (replies_tx, mut replies_rx) = mpsc::channel(REPLY_CAPACITY);
@@ -161,6 +171,16 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
 
     let supervisor = Arc::new(Supervisor::new(spec, deps));
     supervisor.start().await?;
+
+    // `local` 平台的会话行：它不订阅任何真实事件，所以没有人会替它建 conversation 行，
+    // 而 `bot_inject` 要求这一行存在（`inject_inner` 会 `get_conversation`，拿不到 -32001）。
+    // 失败要收尾：supervisor 已经在跑，直接返回 Err 会留下一个没人登记的 runtime。
+    if let Err(error) = ensure_local_conversation(state, &bot).await {
+        if let Err(stop_error) = supervisor.stop().await {
+            tracing::warn!(bot = %bot_id, error = %stop_error, "启动收尾时停止 supervisor 失败");
+        }
+        return Err(error);
+    }
 
     // 回复搬运：handler 产出 → supervisor.send() → outbox 行 → 适配器发送。
     // supervisor 自己不会调 handler，这条单行道保证"回复必须经过 outbox"。
@@ -201,6 +221,65 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
         platform = %bot.platform,
         project = %bot.project_id,
         "bot 已启动"
+    );
+    Ok(())
+}
+
+/// `local` 平台在启动时幂等建好试跑用的会话行（其它平台什么都不做）。
+///
+/// ## 为什么必须在这里建
+///
+/// `local` 适配器不产生任何入站事件（那是它的定义），而真实平台的 conversation 行是由
+/// supervisor 的 [`Inbox`] 在处理第一条事件时补建的 —— `local` 没有"第一条事件"，
+/// 于是也就没人建。`bot_inject` 要求这一行存在（`inject_inner` 先 `get_conversation`），
+/// 所以不给它一行，本地试跑根本用不了（注入直接 -32001）。
+///
+/// ## 为什么用 `local:default` 这个固定值
+///
+/// 会话 ID 由 `(bot_id, external_id)` 确定性派生（[`hbot_bot::conversation_id_for`]），
+/// 外部 ID 固定 → 本地 ID 也固定：重复 `bot_start`、进程重启之后仍然是同一个会话，
+/// 不会每启动一次就在 `conversations` 表里多一行孤儿。
+///
+/// 这里复用 [`Inbox::ensure_conversation`] 而不是自己"先查再插"：它已经把
+/// "唯一约束撞了 = 已经存在"这条判据写好了（见 `crates/hbot-bot/src/dedupe.rs`），
+/// 两条路径各写一份就会有一份漏掉冲突处理。
+///
+/// 返回的会话 ID 会落一行 run log —— 不是装饰：wire DTO 目前**没有**把会话 id 交给 UI
+/// 的通道（`BotStart` 返回 `null`、`BotSummary` 没有这个字段），日志是眼下唯一能让
+/// 人/脚本拿到它的地方（`logs_tail` 可读）。
+async fn ensure_local_conversation(state: &AppState, bot: &Bot) -> Result<(), HbotError> {
+    if bot.platform != local::PLATFORM {
+        return Ok(());
+    }
+    let conversation = ConversationRef::new(
+        local::DEFAULT_CONVERSATION_EXTERNAL_ID.to_owned(),
+        ConversationKind::Private,
+    );
+    let inbox = Inbox::new(
+        Arc::clone(state.store()),
+        Arc::clone(state.ids()),
+        Arc::clone(state.clock()),
+    );
+    let conversation_id = inbox.ensure_conversation(&bot.id, &conversation).await?;
+    // 落一行可读日志：UI 侧要靠它拿到试跑要用的 conversationId（见上面的说明）。
+    local::record_lines(
+        state.store(),
+        state.events(),
+        state.clock(),
+        bot.id,
+        LogLevel::Info,
+        vec![format!(
+            "local 试跑会话已就绪：conversationId = {conversation_id}，externalId = \
+             {}（bot_inject 用这个 conversationId）",
+            local::DEFAULT_CONVERSATION_EXTERNAL_ID
+        )],
+    )
+    .await;
+    tracing::info!(
+        bot = %bot.id,
+        conversation = %conversation_id,
+        external_id = local::DEFAULT_CONVERSATION_EXTERNAL_ID,
+        "local 试跑会话已就绪"
     );
     Ok(())
 }

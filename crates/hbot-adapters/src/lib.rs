@@ -2,7 +2,8 @@
 //!
 //! 职责（`docs/03-directory.md`）：
 //!
-//! - **平台协议**：[`platforms`]（当前实现 OneBot 11 与 QQ 官方机器人，两者并列）；
+//! - **平台协议**：[`platforms`]（当前实现 OneBot 11、QQ 官方机器人与本地试跑 `local`，
+//!   三者并列；`local` 不联网，只提供"能 `bot_start` 成功"的那一档）；
 //! - **归一化消息**：[`normalize`]（平台共用的 [`NormalizedInbound`]）；
 //! - **受限 HTTP**：[`http`]（超时、大小上限、拒绝内网，给工具层抓网页用）；
 //! - **注入用的实现**：[`clock`]（只再导出 `hbot_core::SystemClock`；实现上移到
@@ -79,4 +80,4 @@ pub use http::{
     FetchOptions, HttpTarget, Scheme, http_fetch, http_fetch_with, is_blocked_ip, parse_target,
 };
 pub use normalize::{NormalizedInbound, conversation_kind_str};
-pub use platforms::{onebot, qq};
+pub use platforms::{local, onebot, qq};

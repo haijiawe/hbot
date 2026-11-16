@@ -15,6 +15,8 @@
 //! |---|---|---|---|
 //! | OneBot 11（NapCat / LLOneBot / Lagrange） | [`onebot`] | 正向 WebSocket | 社区实现，群号/QQ 号即会话 ID |
 //! | QQ 官方机器人（QQ 开放平台） | [`qq`] | 官方 WS 网关 + HTTPS OpenAPI | 会话 ID 是 `group_openid` / `user_openid`，**不是 QQ 号** |
+//! | 本地试跑 | [`local`] | **无**（不联网） | 入站靠 `bot_inject`，出站回复只写 run log；给 IDE 试跑用，不用于生产 |
 
+pub mod local;
 pub mod onebot;
 pub mod qq;

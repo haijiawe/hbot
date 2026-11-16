@@ -21,6 +21,7 @@
 //! * [`config`]：项目根的 `bots.json`（M0 的 bot 配置来源，schema 见该文件）；
 //! * [`onebot`]：`BotAdapter` 的 OneBot 11 实现（单一读任务 + 有界 mpsc）；
 //! * [`qq`]：`BotAdapter` 的 QQ 官方机器人实现（同一套读任务骨架，被动回复必须带 `d.id`）；
+//! * [`local`]：`BotAdapter` 的**本地试跑**实现（不联网：不产生事件，回复只写 run log）；
 //! * [`fingerprint_cache`]：项目内容指纹的两层缓存（元数据 TTL + 内容地板），
 //!   保证热路径不读文件内容；
 //! * [`sandbox_handler`]：`HandlerExecutor` 的 QuickJS 实现（每 bot ≤2 个 isolate）；
@@ -29,6 +30,7 @@
 
 pub mod config;
 pub mod fingerprint_cache;
+pub mod local;
 pub mod onebot;
 pub mod outbox_source;
 pub mod qq;
@@ -37,9 +39,10 @@ pub mod sandbox_handler;
 use std::sync::Arc;
 
 use hbot_bot::BotAdapter;
-use hbot_core::{ConversationKind, HbotError};
-use hbot_store::Bot;
+use hbot_core::{Clock, ConversationKind, HbotError};
+use hbot_store::{Bot, Store};
 
+use crate::app::EventBus;
 use crate::app::runtime::config::BotConfig;
 
 /// 装配期错误：把各 crate 的错误归一成一句能看懂的说明。
@@ -54,15 +57,36 @@ pub fn setup_failed(what: &str, detail: impl std::fmt::Display) -> HbotError {
 ///
 /// 新增平台时在这里加一项、在 [`PlatformRouter`] 的 `match` 里加一条分支；两处少一处都会
 /// 在 `bots.json` 校验与路由上露馅（前者报"不认识"，后者 `match` 编译不过）。
-pub const PLATFORMS: [&str; 2] = [onebot::PLATFORM, qq::PLATFORM];
+///
+/// [`local`] 也在列表里：它不是"半成品平台"，而是产品闭环的一档 —— 没有真实平台时
+/// 也能 `bot_start` 成功、`bot_inject` 一条消息、把回复写进 run log（试跑，不联网）。
+pub const PLATFORMS: [&str; 3] = [onebot::PLATFORM, qq::PLATFORM, local::PLATFORM];
 
-/// 允许的平台值 → 给人看的一句话（错误消息用，例如 "`onebot11`、`qq_official`"）。
+/// 允许的平台值 → 给人看的一句话（错误消息用，例如 "`onebot11`、`qq_official`、`local`"）。
 pub fn platform_list() -> String {
     PLATFORMS
         .iter()
         .map(|platform| format!("`{platform}`"))
         .collect::<Vec<_>>()
         .join("、")
+}
+
+/// 造适配器时可能要用的运行时端口。
+///
+/// 为什么需要这一层：`AdapterFactory::create` 的签名只有 `&Bot` 与 `&BotConfig`，而
+/// `local` 平台要把回复写进 run log —— 那需要 store（`logs_tail` 读的表）、事件总线
+/// （日志面板实时读的 `Event::RunLog`）与时钟。这些都在 `AppState` 手上，而
+/// `AppState` 不归本模块管。
+///
+/// 做法是给 [`AdapterFactory`] 加一个**带默认实现**的 [`AdapterFactory::create_with`]：
+/// 不关心端口的平台（onebot / qq / 测试里的假工厂）一行都不用改，只有 `local` 走新口。
+pub struct AdapterPorts {
+    /// 日志表：`local` 的 `[reply]` 行落在这里。
+    pub store: Arc<Store>,
+    /// 事件总线：`Event::RunLog` 推给它，IDE 面板实时显示。
+    pub events: Arc<EventBus>,
+    /// 日志行的时间戳来源。
+    pub clock: Arc<dyn Clock>,
 }
 
 /// 按平台造一个 `BotAdapter`。
@@ -78,9 +102,23 @@ pub trait AdapterFactory: Send + Sync + 'static {
     /// 失败必须是**真原因**（如 `wss://` 的证书校验失败报 `AdapterError::Tls`），不得退回到
     /// 一个"什么也不做"的实现。
     fn create(&self, bot: &Bot, config: &BotConfig) -> Result<Arc<dyn BotAdapter>, HbotError>;
+
+    /// 带运行时端口地造适配器（默认实现忽略端口，直接转 [`Self::create`]）。
+    ///
+    /// 只有需要"落地到进程内设施"的平台才覆写它（当前只有 `local`：回复要写 run log）。
+    /// 默认实现保证既有工厂（onebot / qq / 测试里的假工厂）**一行都不用改**。
+    fn create_with(
+        &self,
+        bot: &Bot,
+        config: &BotConfig,
+        ports: &AdapterPorts,
+    ) -> Result<Arc<dyn BotAdapter>, HbotError> {
+        let _ = ports;
+        self.create(bot, config)
+    }
 }
 
-/// 生产用的适配器工厂：按 `bots.platform` 精确匹配，选 OneBot 或 QQ 官方。
+/// 生产用的适配器工厂：按 `bots.platform` 精确匹配，选 OneBot、QQ 官方或本地试跑。
 ///
 /// 为什么要有这一层：在这之前 `AppState::open` 硬绑 [`onebot::OneBotAdapterFactory`]，
 /// 于是 QQ 官方适配器（`crates/hbot-adapters/src/platforms/qq`）写好了却**没有任何调用方**
@@ -88,13 +126,16 @@ pub trait AdapterFactory: Send + Sync + 'static {
 /// 不存在的 `ws://` 地址。路由把"平台 → 工厂"这一跳补上，并且：
 ///
 /// * **字符串精确匹配**（不做前缀/大小写/别名匹配）：`bots.json` 与 `bots.platform` 列
-///   里存的都必须是 [`onebot::PLATFORM`] 或 [`qq::PLATFORM`]，其它值 -32002 并列出允许值；
+///   里存的都必须是 [`onebot::PLATFORM`]、[`qq::PLATFORM`] 或 [`local::PLATFORM`]，
+///   其它值 -32002 并列出允许值；
 /// * `bots.json` 里显式写了 `platform` 但与库里的 `bots.platform` 不一致时**报错**，
 ///   不按任何一边静默降档：两处不一致说明用户在改配置但没改库，猜一边就是猜错一半
 ///   （`docs/02-architecture.md` §4.2「写错档位不许静默降档」）；
 /// * 具体的 [`onebot::OneBotAdapterFactory`] / [`qq::QqAdapterFactory`] 都保留为可注入的
 ///   具体类型：测试注入假工厂的既有能力（[`crate::app::AppState::with_adapter_factory`]）
-///   不受影响，也仍然可以单独测某一个平台的工厂。
+///   不受影响，也仍然可以单独测某一个平台的工厂；
+/// * [`local`] 走 [`AdapterFactory::create_with`]（它需要运行时端口写 run log）；
+///   `create` 对 `local` 直接报错，避免造出一个"不写日志"的半成品适配器。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlatformRouter;
 
@@ -103,7 +144,41 @@ impl AdapterFactory for PlatformRouter {
         match resolve_platform(bot, config)? {
             onebot::PLATFORM => onebot::OneBotAdapterFactory.create(bot, config),
             qq::PLATFORM => qq::QqAdapterFactory.create(bot, config),
+            // `local` 的回复要写进 run log，需要 store / events / clock 三个端口。
+            // 这几个端口只有 `AppState` 有，所以**只能**经 `create_with` 装配：
+            // 在这里静默造一个"不写日志"的适配器，会让 IDE 面板永远看不到回复，
+            // 而那正是这个平台存在的理由。宁可报错，也不给半个功能。
+            local::PLATFORM => Err(setup_failed(
+                &format!("platform = `{}` 的适配器", local::PLATFORM),
+                "它要把回复写进 run log，必须由 bot_start 经 AdapterFactory::create_with \
+                 带上 store / events / clock 三个端口装配",
+            )),
             other => Err(unknown_platform(bot, other)),
+        }
+    }
+
+    fn create_with(
+        &self,
+        bot: &Bot,
+        config: &BotConfig,
+        ports: &AdapterPorts,
+    ) -> Result<Arc<dyn BotAdapter>, HbotError> {
+        match resolve_platform(bot, config)? {
+            local::PLATFORM => {
+                tracing::info!(
+                    bot = %bot.id,
+                    platform = local::PLATFORM,
+                    "local 适配器已装配（不联网：不产生事件，回复只写 run log）"
+                );
+                Ok(Arc::new(local::LocalAdapter::new(
+                    bot.id,
+                    Arc::clone(&ports.store),
+                    Arc::clone(&ports.events),
+                    Arc::clone(&ports.clock),
+                )))
+            }
+            // 其它平台不需要端口，走与 `create` 完全相同的路径（不复制一份 match）。
+            _ => self.create(bot, config),
         }
     }
 }
