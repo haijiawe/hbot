@@ -451,7 +451,7 @@ interface DeviceApi {
 | IDE 面板 + 授权弹窗 | **已完成**（web 30 文件 / 230 用例） | `apps/web/src/features/device/`、`src/stores/device-store.ts` |
 | 注入沙箱（装配） | **已完成**（2026-11-17） | `SandboxHandler::with_device(gate, backend)`，在 `crates/hbot-rpc/src/app/commands/bots.rs` 的 `start_bot` 里调；每次新建 isolate 时 `set_device` + `set_device_apps(device_apps(project_root))` |
 | 切项目时刷新清单 | **已完成** | `AppState::open_project` 末尾 `self.device.note_project_root(Some(root))` |
-| 限速（20 次/秒、2 帧/秒） | **窄版未做** | 应在闸层；今天 `HBOT_DEVICE_HOST_LIMIT` 只在超时时出现（见 §13 问 8） |
+| 限速（20 次/秒、2 帧/秒） | **已完成（2026-11-17）** | 判据只有一份：`hbot_core::DeviceRateWindow`（一秒滑动窗口，先判后记，被拒的那次不占配额）。两处各持一个实例：bot 代码在 `hbot-code` 的 `DeviceSlot`（一个 `Sandbox` = 一个 bot），Agent 在 `hbot-rpc` 的 `DeviceRegistry`。参数错误在闸之前返回，所以传错参数不占配额、也不会被限速文案盖住。超时已拆成 `HBOT_DEVICE_TIMEOUT`（见 §13 问 8） |
 | OCR | **已完成（窄版）**（`hbot-device` 24 lib + 7 api + 8 desktop，clippy 0） | §9.1 的 B 路线：`Windows.Media.Ocr` → 文本。宿主函数 `__hbot.device.ocr`、Agent 工具 `read_screen` |
 | `ToolGateway` 的 Capability 闸 | **已完成**（B2，2026-11-17） | `GatewayStep::Capability` 作第一步；实现者 `app/device/capabilities.rs` 的 `ManifestCapabilityGate`（每次重读清单，不快照） |
 | Agent 侧的会话判据 | **已完成**（B2，2026-11-17） | `app/device/agent_backend.rs` 的 `SessionScopedBackend`：撤销/到期对 Agent 立刻生效（见下） |
@@ -525,8 +525,8 @@ OCR 的三条硬限制（同 `crates/hbot-device/src/lib.rs:40`）：按窗口 O
 4. **`device_request` 与现有 `ApprovalRequest` 是否合并**：两者都是"Agent 请用户点一下"，但语义不同（一个是单次动作、一个是限时会话）。倾向不合并 —— 合并会让审批 UI 长出两种完全不同的卡片。但用同一个 critical 通道。
 5. **多显示器时的坐标系**：`screen()` 返回"当前主屏"还是"虚拟桌面全图"？注入坐标是绝对还是相对某屏？倾向：默认主屏 + 显式 `monitor` 参数，绝对坐标。
 6. **无头模式下谁批准设备会话**：`hbot serve` 没有 UI。是拒绝（最安全）、还是从 `device.json` 里预置一个"永久允许"（危险）？倾向**拒绝**：无头模式没有人在场，设备能力应该返回 `HOST_LIMIT` 并说明"需要桌面端批准"。
-7. **`ctx.device` 的调用是否要限速在 gate 层还是 backend 层**（07 §9.3 给了 20 次/秒、2 帧/秒的数字）：倾向 gate 层，因为 back 层可能被绕过（未来加第二个 backend 时）。**窄版没做限速**（见 §11.1）。
-8. **`HBOT_DEVICE_HOST_LIMIT` 目前一词两义（第 11 节的实现事实，2026-11-17）**：它既表示"宿主做不到 / 不支持"，也覆盖"后端调用超时"（`crates/hbot-code/src/device/gate.rs` 的 `DEFAULT_TIMEOUT = 10s`，实际被 handler 的 2s 预算压到 2s）。窄版按现状保留（限速还没做，今天这个码基本只会在超时时出现）；等 §11.1 的限速落地时，超时应拆成独立的 `HBOT_DEVICE_TIMEOUT`，否则用户看到 `HOST_LIMIT` 会以为"这台机器不支持设备能力"。
+7. **`ctx.device` 的调用是否要限速在 gate 层还是 backend 层**（07 §9.3 给了 20 次/秒、2 帧/秒的数字）——**已定并落地（2026-11-17）：放闸层**，因为后端可能被换、被绕过；实现只有一份 `hbot_core::DeviceRateWindow`，两个装配点（`hbot-code` 的 `DeviceSlot`、`hbot-rpc` 的 `DeviceRegistry`）各持一个实例。两个细节写进了代码注释，别改：① 被拒的那次**不占配额**（`admit` 先判后记），否则一个 handler 循环重试会把窗口彻底堵死；② 限速排在授权**之后**，否则"没授权"会被报成 `RATE_LIMITED`，用户会以为等一秒就好。
+8. **`HBOT_DEVICE_HOST_LIMIT` 不再一词两义（2026-11-17 收口）**：它只表示"宿主做不到 / 不支持"（无显示器、无语言包、按窗口 OCR 未实现、非 Windows）。后端调用超时**已经拆成独立的 `HBOT_DEVICE_TIMEOUT`**（`hbot_core::DeviceError::Timeout { ms }`），否则用户看到 `HOST_LIMIT` 会以为"这台机器不支持设备能力"。限速另有独立的 `HBOT_DEVICE_RATE_LIMITED`（带 `retry_after_ms`，文案是"调得太频繁，N 毫秒后再试"）。三种码对应三种补救动作：换机器 / 加预算 / 等一等——不要合并。
 9. **`clipboardWrite` 的"不回显"只管住了闸这一侧（第 11 节）**：`crates/hbot-code/src/runtime/device_api.rs` 从不把写入内容放进异常与日志（有测试钉住），但它对后端返回的 `DeviceError::Failed { message }` 是**原样透传**的。所以 `DeviceBackend` 的实现方也不许把剪贴板内容/截图字节塞进 `message` —— 这条约束同时属于 V16 的两侧（闸 + 后端），不只管闸。
 
 ---
