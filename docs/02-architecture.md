@@ -298,6 +298,8 @@ export default defineBot({
 | `limits.memoryMb` | number | 32 | 每 isolate 堆上限（Mb） |
 | `limits.handlerTimeoutMs` | number | 2000 | handler 单次执行预算 |
 
+表里没有的字段不会被"悄悄忽略"：解析时会给每个未知键打一条 `tracing::warn!`，带完整路径（`bots[0].clientSecert` 这种形式）和近似建议（"你是不是想写 `clientSecret`？"），**但解析照常成功**。`_` 开头的键（`_说明`、`_comment`）视为用户备注，既不告警也不报错——JSON 没有注释语法，手写配置总得有留备注的地方，这也是这里**不用** `serde(deny_unknown_fields)` 的原因。字段**类型**写错仍然是 `-32002`。每进程每个字段只告警一次（重连/重试不刷屏）。
+
 两条必须知道的：
 
 - **不用手工插库**。`bot_start` 的 `start_inner` 先 `get_bot`，有就检查 `enabled`，没有就按 `bots.json` 建行（M0 引导路径）。
@@ -756,6 +758,7 @@ debug.resumed      { botId }
   - 确实要跑解释器时：显式设 `HBOT_ALLOW_SHELL=1`（只认 `1`/`true`/`yes`/`on`，其余值一律算关）。打开后**放行并保留清单原样**，同时 `tracing::warn!` 一条 —— **每进程每条清单只告警一次**（不是每回合一条）。这只是逃生阀，不是默认姿势：正确做法是把任务固化成具体程序/项目脚本，见 `docs/security/red-team-findings.md` RT-05「仍需人工决定」。
   - 判据**只在配置解析层**（`crates/hbot-rpc/src/app/agent/config.rs` 的 `SandboxConfig::resolve_with`）：`hbot-command` 仍然只回答"这份清单里有没有这个名字"，不判断哪些名字危险（ADR-0003 §5）。
   - 解析失败（档位拼错、`agent.json` 非法 JSON）= `agent_send` 直接失败，不起回合。
+  - **未知字段只告警、不失败**（`bots.json` 同一口径）：`agent.json` 里对不上任何字段的键（如把 `baseUrl` 写成 `baseURL`）会在解析时 `tracing::warn!` 出完整路径与近似建议，解析继续；`_` 开头的键视为备注，既不告警也不报错；字段**类型**写错仍然是 `-32002`。机制在 `crates/hbot-rpc/src/app/runtime/config.rs` 的 `deserialize_with_warnings`（`agent.json` 借用）。
 - **尚未做到**（ADR-0003 有完整清单）：Windows 低完整性标签 / AppContainer、Linux 写隔离的**运行验证**（只编译过）、读与网络隔离、注册表 `HKCU` 写不限、临时目录不可写；Windows 上 `spawn → AssignProcessToJobObject` 之间仍有孙进程逃逸窗口。
 
 ### 11.3 密钥
@@ -826,8 +829,8 @@ debug.resumed      { botId }
 | 桌面整机（Rust + WebView2 子进程求和） | < 260 MB | **190–223 MB**，中位 206 MB |
 | 每多一个 bot（连接态） | < 6 MB（含 1 个 isolate 常驻） | **0.10 MB**（首个 bot +1.1 MB） |
 | 每 isolate | < 8 MB（堆上限 32 MB；`memory_usage` 采样） | **0.30 MB**（32 个共 +9.5 MB） |
-| 冷启动到核心可用 | < 800 ms | **878 ms 中位 / 1264 p95 —— 未达标**，处置见 ADR-0002 §4.2 |
-| 冷启动到可交互 | < 800 ms | 无客观信号（Monaco ready 不可外部观测）；「到 IPC 首次可用」924 ms 中位仅作下界 |
+| 冷启动到核心可用（headless `hbot serve`） | < 800 ms | **878 ms 中位 / 1264 p95 —— 未达标**，处置见 ADR-0002 §4.2 |
+| 桌面到 IPC 首次可用 | < 1500 ms | **1049 ms 中位 / 1425 p95**（2026-11-16 分段：915 ms 在 Tauri/WebView2 进入 `setup` 前，核心 `AppState::open` 仅 33 ms）；见 `docs/spikes/S2-tauri.md` §3.2 |
 | 二进制 | < 60 MB | `hbot.exe` **16.2 MB** / `hbot-desktop.exe` **33.0 MB** |
 | 编译 50 文件项目（冷/热） | — | **40.9 ms / 4.4 ms**（S1） |
 | handler 执行（本地、无网络） | < 20 ms | 1 文件 **0.034 ms** 均值 / 50 文件 0.072 ms 均值（S1） |

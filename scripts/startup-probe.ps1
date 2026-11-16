@@ -36,7 +36,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Exe = 'E:\hbot-target\coldstart\release\hbot-desktop.exe',
+    [string]$Exe = '',
     [int]$Runs = 7,
     [string]$DataDir = '',
     [int]$Warmup = 1,
@@ -46,6 +46,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+if (-not $Exe) {
+    $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repo 'target' }
+    $Exe = Join-Path $targetRoot 'release\hbot-desktop.exe'
+}
 if (-not $OutDir) { $OutDir = Join-Path $repo '_recovery\startup-probe' }
 if (-not $DataDir) { $DataDir = Join-Path $repo '_recovery\startup-probe-data' }
 if (-not (Test-Path $Exe)) { throw "找不到 hbot-desktop.exe: $Exe" }

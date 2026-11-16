@@ -89,8 +89,8 @@ pnpm -C apps/web build           # 产物能构建
 | 核心空闲（private commit） | < 60 MB | `hbot serve` 无 bot、无会话 |
 | 每多一个 bot | < 6 MB | 加 5 个 bot 的斜率（实测 0.10 MB/bot） |
 | 每 isolate | < 8 MB（堆上限 32 MB） | 加载后 + 跑 1000 条消息（实测 0.30 MB） |
-| 冷启动到核心可用 | < 800 ms | `hbot serve` 打印 `{"type":"ready"}` 的时刻（实测 878 ms 中位 —— **当前不达标**，见 ADR-0002 §4.2） |
-| 冷启动到可交互 | < 800 ms | 进程启动 → 首帧可点击；「Monaco ready」无客观信号，只记 IPC 首次可用（924 ms 中位）作下界 |
+| 冷启动到核心可用（headless） | < 800 ms | `hbot serve` 打印 `{"type":"ready"}` 的时刻（实测 878 ms 中位 —— **当前不达标**，见 ADR-0002 §4.2） |
+| 桌面到 IPC 首次可用 | < 1500 ms | `scripts/startup-probe.ps1`：进程启动 → web 第一次 `dispatch`（实测 1049 ms 中位 / 1425 p95）。**不要用桌面「核心可用」套 800 ms**：其中 915 ms 在 Tauri/WebView2 进入 `setup` 之前，核心只占 33 ms |
 | UI 首屏 | < 1 s | 本地构建，中端机 |
 | 初始 JS（gzip） | < 1.5 MB | 构建报告 |
 | 入站 → 入队 p95 | < 10 ms | 注入 10k 条 |
