@@ -20,6 +20,7 @@ import type {
   BotSummary as BotSummaryDto,
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
+  RunLog as RunLogDto,
   StepKind as StepKindDto,
 } from '../generated'
 import { dispatchViaTauri, isTauriRuntime, subscribeCoreEvents } from './ipc-tauri'
@@ -134,6 +135,13 @@ export interface CommandInputs {
   'bot.start': { botId: string }
   'bot.stop': { botId: string }
   /**
+   * 读运行日志。
+   *
+   * `botId: null` = 全项目日志（含没有 bot 归属的 Agent 行，`source: 'agent'`）；
+   * 传具体 bot ID 时只看该 bot 的行。
+   */
+  'logs.tail': { botId: string | null; limit: number }
+  /**
    * 发一条消息给 Agent。
    *
    * `sessionId: null` = 新建会话（核心分配 ID 并回传）；之后必须一直带同一个 ID，
@@ -178,6 +186,8 @@ export interface CommandOutputs {
   /** 启停只回"命令已接受"（`data: null`）；状态看 `bot.status` 事件。 */
   'bot.start': null
   'bot.stop': null
+  /** 日志行（核心按从旧到新返回，最新一行在末尾；面板按原顺序渲染）。 */
+  'logs.tail': RunLogDto[]
   'agent.send': AgentSendResult
   'agent.cancel': null
   'agent.approve': null

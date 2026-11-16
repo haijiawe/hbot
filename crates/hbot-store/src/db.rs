@@ -40,9 +40,11 @@ use crate::ids::{BotId, ConversationId, InboundId, OutboundId};
 use crate::migrations;
 use crate::models::{
     BOT_STATUSES, Bot, BotStatusRow, Conversation, InboundReplayRow, InboundRow, LogRow,
-    NewInbound, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project, is_valid_bot_status,
+    NewAgentLog, NewInbound, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project,
+    is_valid_bot_status,
 };
 use crate::repositories;
+use crate::startup_trace;
 
 /// 写/读连接统一的忙等窗口（毫秒）：遇到锁时最多重试 5s，再报 `SQLITE_BUSY`。
 pub const BUSY_TIMEOUT_MS: u32 = 5_000;
@@ -114,6 +116,10 @@ enum StoreOp {
     },
     AppendLog {
         entry: NewLog,
+        reply: Reply<()>,
+    },
+    AppendAgentLog {
+        entry: NewAgentLog,
         reply: Reply<()>,
     },
     UpdateBotStatus {
@@ -189,18 +195,30 @@ impl Store {
     /// [`StoreError::JournalMode`]，**不**静默退回 delete 模式。
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut writer = open_connection(path)?;
+        let open_total = startup_trace::Phase::start("store_open_total");
+
+        let mut writer = open_connection(path, "role=writer")?;
+
+        let phase = startup_trace::Phase::start("store_migrations");
         let schema_version = migrations::apply(&mut writer, now_unix_ms())?;
+        phase.done();
 
         let mut read_connections = Vec::with_capacity(READ_CONNECTIONS);
-        for _ in 0..READ_CONNECTIONS {
-            read_connections.push(Mutex::new(open_connection(path)?));
+        for index in 0..READ_CONNECTIONS {
+            let role = if index == 0 {
+                "role=read0"
+            } else {
+                "role=read1"
+            };
+            read_connections.push(Mutex::new(open_connection(path, role)?));
         }
 
+        let phase = startup_trace::Phase::start("store_writer_thread");
         let (sender, receiver) = mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let ops_thread = std::thread::Builder::new()
             .name("hbot-store-writer".to_owned())
             .spawn(move || store_loop(writer, receiver))?;
+        phase.done();
 
         tracing::info!(
             path = %path.display(),
@@ -209,6 +227,8 @@ impl Store {
             read_connections = READ_CONNECTIONS,
             "hbot-store opened"
         );
+
+        open_total.done();
 
         Ok(Self {
             ops: Mutex::new(Some(sender)),
@@ -336,6 +356,11 @@ impl Store {
     /// 追加一条运行日志（`logs`）。
     pub fn append_log(&self, entry: NewLog) -> Result<()> {
         self.submit(|reply| StoreOp::AppendLog { entry, reply })
+    }
+
+    /// 追加一条 Agent 日志（`bot_id = NULL`、`source = 'agent'`）。
+    pub fn append_agent_log(&self, entry: NewAgentLog) -> Result<()> {
+        self.submit(|reply| StoreOp::AppendAgentLog { entry, reply })
     }
 
     /// 读一个 bot；不存在返回 `Ok(None)`。走只读连接池。
@@ -781,6 +806,9 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
             StoreOp::AppendLog { entry, reply } => {
                 reply_send(reply, repositories::log::append(&connection, &entry));
             }
+            StoreOp::AppendAgentLog { entry, reply } => {
+                reply_send(reply, repositories::log::append_agent(&connection, &entry));
+            }
             StoreOp::UpdateBotStatus {
                 id,
                 status,
@@ -870,10 +898,15 @@ fn reply_send<T>(reply: Reply<T>, result: Result<T>) {
 }
 
 /// 打开一个连接并施加本层的 PRAGMA 契约。
-fn open_connection(path: &Path) -> Result<Connection> {
+///
+/// `role` 只用于启动计时（`role=writer` / `role=read0` / `role=read1`），不参与逻辑。
+fn open_connection(path: &Path, role: &'static str) -> Result<Connection> {
+    let phase = startup_trace::Phase::start("store_conn_open");
     let connection = Connection::open(path)?;
+    phase.done_with(role);
 
     // 先给忙等窗口，再切 WAL：切 journal_mode 需要短暂排他，否则并发启动会直接 SQLITE_BUSY。
+    let phase = startup_trace::Phase::start("store_conn_wal");
     connection.execute_batch(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};"))?;
 
     let journal_mode: String =
@@ -883,9 +916,12 @@ fn open_connection(path: &Path) -> Result<Connection> {
             actual: journal_mode,
         });
     }
+    phase.done_with(role);
 
     // synchronous 与 foreign_keys 都是“每连接”设置，必须对每个连接显式施加。
+    let phase = startup_trace::Phase::start("store_conn_pragmas");
     connection.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+    phase.done_with(role);
 
     Ok(connection)
 }

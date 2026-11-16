@@ -11,7 +11,7 @@ use rusqlite::params;
 use crate::error::StoreError;
 use crate::migrations;
 use crate::models::{
-    BOT_STATUS_RUNNING, BOT_STATUS_STOPPED, Bot, NewLog, OUTBOUND_STATE_FAILED,
+    BOT_STATUS_RUNNING, BOT_STATUS_STOPPED, Bot, NewAgentLog, NewLog, OUTBOUND_STATE_FAILED,
     OUTBOUND_STATE_SENT, is_valid_bot_status,
 };
 use crate::test_support::{
@@ -883,7 +883,7 @@ fn count_pending_outbound_matches_list_pending() {
     assert_eq!(ids, vec![outbound_id(43), outbound_id(44)]);
 }
 
-/// 0001 老库升级到 0002：旧行保留、新列取默认值、水位推到最新。
+/// 0001 老库升级到最新：旧行保留、新列取默认值、水位推到最新。
 ///
 /// 这是 `docs/05-quality-gates.md` G6 的“空库/老库都能升到最新”回归测试：手写一个只有
 /// 0001 的库（不经过 `Store::open`），再用当前二进制打开它。
@@ -946,7 +946,7 @@ fn upgrading_from_0001_keeps_rows_and_adds_new_columns() {
     }
 
     let store = Store::open(dir.db_path()).expect("open and upgrade legacy store");
-    assert_eq!(store.schema_version().expect("schema version"), 2);
+    assert_eq!(store.schema_version().expect("schema version"), 3);
 
     let pending = store.list_pending_outbound(10).expect("list pending");
     assert_eq!(pending.len(), 1, "升级不得丢旧行");
@@ -966,6 +966,157 @@ fn upgrading_from_0001_keeps_rows_and_adds_new_columns() {
         .expect("legacy bot");
     assert_eq!(status.status, BOT_STATUS_STOPPED);
     assert_eq!(status.updated_at, 0);
+}
+
+/// 0002 老库升级到 0003：`logs` 表重建后旧行一条不少、`bot_id` 仍指向原 bot、`source='bot'`。
+#[test]
+fn upgrading_from_0002_keeps_existing_logs_with_bot_id_and_bot_source() {
+    let dir = TempDir::new("upgrade-0002-logs");
+    {
+        let conn = raw(&dir);
+        conn.execute_batch(migrations::MIGRATIONS[0].sql)
+            .expect("apply 0001 by hand");
+        conn.execute_batch(migrations::MIGRATIONS[1].sql)
+            .expect("apply 0002 by hand");
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version    INTEGER PRIMARY KEY NOT NULL,
+                 name       TEXT    NOT NULL,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations (version, name, applied_at) VALUES
+                 (1, '0001_init', 0),
+                 (2, '0002_outbound_routing_and_status', 0);
+             PRAGMA user_version = 2;",
+        )
+        .expect("record 0001+0002 as applied");
+        conn.execute(
+            "INSERT INTO projects (id, name, path, created_at) VALUES (?1, 'legacy', '/tmp/legacy', 1)",
+            params![project_id().to_string()],
+        )
+        .expect("insert legacy project");
+        conn.execute(
+            "INSERT INTO bots (id, project_id, name, platform, config_json, enabled, created_at)
+             VALUES (?1, ?2, 'legacy-bot', 'onebot', '{}', 1, 2)",
+            params![bot_id().to_string(), project_id().to_string()],
+        )
+        .expect("insert legacy bot");
+        // 0002 的 logs 还是 NOT NULL bot_id 的老形状。
+        for (line, at) in [("old-first", 10_i64), ("old-second", 20)] {
+            conn.execute(
+                "INSERT INTO logs (bot_id, level, line, at) VALUES (?1, 'info', ?2, ?3)",
+                params![bot_id().to_string(), line, at],
+            )
+            .expect("insert legacy log");
+        }
+    }
+
+    let store = Store::open(dir.db_path()).expect("open and upgrade v2 store");
+    assert_eq!(store.schema_version().expect("schema version"), 3);
+
+    let rows = store
+        .list_logs(Some(&bot_id()), 10)
+        .expect("list legacy logs");
+    assert_eq!(rows.len(), 2, "升级不得丢旧日志行");
+    assert_eq!(rows[0].line, "old-second");
+    assert_eq!(rows[1].line, "old-first");
+    assert!(
+        rows.iter().all(|row| row.bot_id == Some(bot_id())),
+        "旧日志的 bot_id 必须保留"
+    );
+    assert!(
+        rows.iter().all(|row| row.source == "bot"),
+        "旧日志的 source 必须是 'bot'"
+    );
+
+    drop(store);
+    let raw = raw(&dir);
+    let user_version: i64 = raw
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user_version");
+    assert_eq!(user_version, 3, "user_version 必须推进到 3");
+
+    let table_sql: String = raw
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'logs'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("logs table sql");
+    assert!(
+        !table_sql.contains("bot_id  TEXT NOT NULL"),
+        "logs.bot_id 必须可空：{table_sql}"
+    );
+    assert!(
+        table_sql.contains("source  TEXT NOT NULL DEFAULT 'bot'"),
+        "logs.source 必须是 NOT NULL DEFAULT 'bot'：{table_sql}"
+    );
+
+    let mut indexes: Vec<String> = raw
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'logs'")
+        .expect("prepare index query")
+        .query_map([], |row| row.get(0))
+        .expect("query indexes")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect indexes");
+    indexes.sort();
+    assert_eq!(
+        indexes,
+        vec!["idx_logs_at".to_owned(), "idx_logs_bot_at".to_owned()],
+        "两个索引都必须存在"
+    );
+}
+
+/// Agent 行写 `bot_id = NULL` + `source = 'agent'`；按 bot 过滤时看不到，全项目时看得到。
+#[test]
+fn agent_logs_are_nullable_and_filtered_out_of_bot_views() {
+    let dir = TempDir::new("agent-logs");
+    let store = open_store(&dir);
+
+    store
+        .append_log(new_log("info", "bot-line", 100))
+        .expect("append bot log");
+    store
+        .append_agent_log(NewAgentLog {
+            level: "info".to_owned(),
+            line: "[session 3f2a…] agent 工具 fs_read 成功（1 ms）".to_owned(),
+            at: 101,
+        })
+        .expect("append agent log");
+
+    let all = store.list_logs(None, 10).expect("list all logs");
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].source, "agent");
+    assert!(all[0].bot_id.is_none(), "Agent 行不允许有 bot_id");
+    assert_eq!(all[1].source, "bot");
+    assert_eq!(all[1].bot_id, Some(bot_id()));
+
+    let bot_view = store.list_logs(Some(&bot_id()), 10).expect("list bot logs");
+    assert_eq!(bot_view.len(), 1, "Agent 行不能出现在 bot 视图里");
+    assert_eq!(bot_view[0].line, "bot-line");
+}
+
+/// `source` 的列默认值仍是 `'bot'`：直接 INSERT 不带 source 的老写法不会变成 NULL/agent。
+#[test]
+fn logs_source_defaults_to_bot_for_direct_inserts() {
+    let dir = TempDir::new("logs-source-default");
+    let store = open_store(&dir);
+    drop(store);
+
+    let conn = raw(&dir);
+    conn.execute(
+        "INSERT INTO logs (bot_id, level, line, at) VALUES (?1, 'info', 'no-source', 1)",
+        params![bot_id().to_string()],
+    )
+    .expect("insert log without source");
+    let source: String = conn
+        .query_row(
+            "SELECT source FROM logs WHERE line = 'no-source'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read source");
+    assert_eq!(source, "bot");
 }
 
 /// 死信状态常量与 `state` 列一致：`failed` 不等于 `sent`，两者都不是 `pending`。

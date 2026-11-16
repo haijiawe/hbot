@@ -180,16 +180,31 @@ pub struct InboundReplayRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRow {
     pub id: i64,
+    /// `None` = Agent 日志（不属于任何 bot）。
+    pub bot_id: Option<BotId>,
+    pub level: String,
+    pub line: String,
+    pub at: i64,
+    /// 日志来源：`bot` / `agent`（0003 起）。
+    pub source: String,
+}
+
+/// `logs` 的插入参数（Bot 日志，`source` 固定写 `'bot'`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewLog {
     pub bot_id: BotId,
     pub level: String,
     pub line: String,
     pub at: i64,
 }
 
-/// `logs` 的插入参数。
+/// `logs` 的 Agent 日志插入参数：没有 bot 归属，落库时 `bot_id = NULL`、`source = 'agent'`。
+///
+/// 单独一个类型而不是给 [`NewLog`] 加 `source`/`Option<BotId>`：`hbot-bot` 与
+/// `hbot-rpc` 的 sandbox handler 都直接 struct literal 构造 `NewLog`，改字段形状会
+/// 破坏那些不在本改动边界内的 crate。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewLog {
-    pub bot_id: BotId,
+pub struct NewAgentLog {
     pub level: String,
     pub line: String,
     pub at: i64,

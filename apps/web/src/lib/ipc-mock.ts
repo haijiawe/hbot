@@ -338,6 +338,10 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
       setMockStatus('stopped')
       return null
 
+    // mock 没有 SQLite：日志面板查询返回空集（Agent 行只存在于真机数据库）。
+    case 'logs.tail':
+      return []
+
     case 'agent.send':
       return { sessionId: command.sessionId ?? MOCK_SESSION_ID }
 

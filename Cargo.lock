@@ -1915,6 +1915,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hbot-adapters",
+ "hbot-bot",
  "hbot-code",
  "hbot-core",
  "hbot-rpc",

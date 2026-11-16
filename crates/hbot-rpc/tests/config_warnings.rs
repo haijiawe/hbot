@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hbot_core::BotId;
-use hbot_rpc::app::agent::config::ProviderConfig;
+use hbot_rpc::app::agent::config::{ENV_ALLOW_SHELL, ProviderConfig, SandboxConfig};
 use hbot_rpc::app::runtime::config::read_bot_config;
 
 /// 固定的 bot id（与 `tests/support/mod.rs` 的 `BOT_UUID` 同一个值）。
@@ -255,5 +255,72 @@ fn warnings_are_not_repeated_within_one_process() {
         logs.matches("clientSecert").count(),
         1,
         "同一文件同一字段只该告警一次，实际日志：{logs}"
+    );
+}
+
+// ---- RT-05：解释器/外壳类白名单的拒绝与逃生阀 ---------------------------------
+
+#[test]
+fn interpreter_in_allowlist_is_rejected_with_32002_and_a_warn_free_path() {
+    let dir = TempDir::new("rt05-reject");
+    dir.write(
+        "agent.json",
+        r#"{"sandbox":"danger","allowedPrograms":["cmd.exe","cargo"]}"#,
+    );
+
+    let (result, logs) = with_captured_logs(|| SandboxConfig::resolve_with(dir.path(), &no_env()));
+
+    let error = result.expect_err("白名单里的 cmd.exe 必须被拒");
+    assert_eq!(error.code(), -32002, "拒绝走 -32002：{error}");
+    let message = error.to_string();
+    assert!(message.contains("`cmd.exe`"), "要回显被拒的名字：{message}");
+    assert!(
+        message.contains(ENV_ALLOW_SHELL),
+        "要告诉用户逃生阀是什么：{message}"
+    );
+    // 拒绝是"解析失败"，不是"放行 + 告警"：这条路径不该留下 WARN 噪声。
+    assert!(!logs.contains("WARN"), "拒绝路径不该打 warn：{logs}");
+}
+
+#[test]
+fn shell_hatch_warns_once_per_process_when_it_lets_interpreters_through() {
+    let dir = TempDir::new("rt05-hatch");
+    dir.write(
+        "agent.json",
+        r#"{"sandbox":"danger","allowedPrograms":["powershell.exe","python311"]}"#,
+    );
+    // 逃生阀只对 `HBOT_ALLOW_SHELL` 生效，且只认显式真值。
+    let env = |name: &str| match name {
+        ENV_ALLOW_SHELL => Some("1".to_string()),
+        _ => None,
+    };
+
+    // `agent_send` 每个回合都会重读配置；同一份清单只该留下一条 warn。
+    let ((first, second), logs) = with_captured_logs(|| {
+        let first = SandboxConfig::resolve_with(dir.path(), &env).expect("逃生阀打开后第一次解析");
+        let second = SandboxConfig::resolve_with(dir.path(), &env).expect("第二次解析");
+        (first, second)
+    });
+
+    // 放行不是"顺手把名字删掉"：清单原样交给命令层（否则会变成空清单全拒）。
+    assert_eq!(first.allowed_programs(), ["powershell.exe", "python311"]);
+    assert_eq!(second, first);
+
+    assert_eq!(
+        logs.matches("WARN").count(),
+        1,
+        "每进程每条清单只该告警一次，实际日志：{logs}"
+    );
+    assert!(
+        logs.contains("powershell.exe") && logs.contains("python311"),
+        "告警要列出全部被放行的解释器，实际日志：{logs}"
+    );
+    assert!(
+        logs.contains(ENV_ALLOW_SHELL),
+        "告警要说明是哪只逃生阀开的，实际日志：{logs}"
+    );
+    assert!(
+        logs.contains("RT-05"),
+        "告警要指向安全发现编号，实际日志：{logs}"
     );
 }

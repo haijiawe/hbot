@@ -8,7 +8,7 @@
 //! | [`event`] | 线上事件 DTO，容错反序列化（缺字段、数字/字符串双方言） |
 //! | [`message`] | 消息段 ↔ 纯文本；出站消息构造（含 `reply` 段） |
 //! | [`normalize`] | 事件 → [`hbot_core::domain::InboundMessage`] 所需的字段与幂等键 |
-//! | [`client`] | 正向 WS 连接、心跳看门狗、重连、动作收发 |
+//! | [`client`] | 正向 WS 连接、心跳看门狗、重连、动作收发、探测交接（probe → handoff） |
 //! | [`send`] | 出站串行队列 + 有界重试 |
 //! | [`backoff`] | 指数退避 1/2/4…30s ±20% 抖动（可注入种子） |
 //!
@@ -40,7 +40,10 @@ pub mod normalize;
 pub mod send;
 
 pub use backoff::{Backoff, Jitter, NoJitter, SeededJitter};
-pub use client::{ActionHandle, OneBotClient, OneBotConfig, probe_connection, validate_ws_url};
+pub use client::{
+    ActionHandle, ConnectedSession, LIFECYCLE_CONFIRM_WINDOW, OneBotClient, OneBotConfig,
+    probe_connection, probe_session, validate_ws_url,
+};
 pub use event::{MessageType, OneBotEvent, PostType, Sender};
 pub use message::{MessagePayload, Segment, SegmentKind, build_outbound, outbound_json};
 pub use normalize::{

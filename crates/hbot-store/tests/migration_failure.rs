@@ -287,14 +287,14 @@ fn the_same_fixture_upgrades_cleanly_without_the_injected_conflict() {
     seed_v1(&db, false);
 
     let store = Store::open(&db).expect("没有冲突时必须能开到最新版");
-    assert_eq!(store.schema_version().expect("schema_version"), 2);
+    assert_eq!(store.schema_version().expect("schema_version"), 3);
     drop(store);
 
     let conn = Connection::open(&db).expect("open");
-    assert_eq!(user_version(&conn), 2);
+    assert_eq!(user_version(&conn), 3);
     assert_eq!(
         scalar_i64(&conn, "SELECT COUNT(*) FROM schema_migrations"),
-        2
+        3
     );
     // 数据在这次成功迁移里也没丢。
     assert_eq!(
@@ -314,4 +314,7 @@ fn the_same_fixture_upgrades_cleanly_without_the_injected_conflict() {
     assert!(columns(&conn, "outbound").contains(&"target_json".to_string()));
     assert!(columns(&conn, "outbound").contains(&"reply_to".to_string()));
     assert!(indexes(&conn).contains(&"idx_outbound_pending".to_string()));
+    // 0003 也全部到位。
+    assert!(columns(&conn, "logs").contains(&"source".to_string()));
+    assert!(indexes(&conn).contains(&"idx_logs_at".to_string()));
 }

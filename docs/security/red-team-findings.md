@@ -9,12 +9,12 @@
   **默认不响，但只跑 `--ignored` 就能立刻复现**。
 * **已修条目要转正**：修好之后去掉 `#[ignore]`、让用例进默认套件（否则修复本身没有回归网），
   条目里保留"修复前的现场"作为取证，并补一段"修法与证据"。
-* **状态**：**已修**：RT-01、RT-02、RT-03、RT-07、RT-08（2026-11-16；RT-02 / RT-03 见各条
-  「修法与证据」）；**未修**：RT-05（产品决策）、RT-06。每条末尾给出对应的 run 命令 / 用例名。
+* **状态**：**已修**：RT-01、RT-02、RT-03、RT-05、RT-07、RT-08（2026-11-16；RT-02 / RT-03 / RT-05
+  见各条「修法与证据」）；**未修**：RT-06。每条末尾给出对应的 run 命令 / 用例名。
 
 ```powershell
 $env:CARGO_TARGET_DIR='E:\hbot-target\redteam'   # 别用 D 盘：本机 D 盘满过一次
-cargo test -p hbot-redteam                       # 默认套件：全绿（71 passed / 1 ignored）
+cargo test -p hbot-redteam                       # 默认套件：全绿（72 passed / 1 ignored）
 cargo test -p hbot-redteam -- --ignored          # 只剩非安全的 b_helper（当前 0 条未修的安全用例）
 ```
 
@@ -261,25 +261,73 @@ cargo test -p hbot-redteam -- --ignored          # 只剩非安全的 b_helper�
 
 ## RT-05 允许清单里放 `cmd` / `powershell` 等于把 shell 装回来
 
-**严重度：中**（配置面风险，非代码缺陷）　**状态：未修（属产品决策）**
+**严重度：中**（配置面风险，非代码缺陷）　**状态：已修（2026-11-16）**
 
-* **位置**：`crates/hbot-agent/src/tools/shell.rs:77-160`（`RunCommandTool::with_allowed_programs`）、
-  `crates/hbot-command/src/program.rs`（白名单解析，允许绝对路径条目）
-* **复现**：`RunCommandTool::with_allowed_programs(["cmd"])` + `danger` 档，命令
-  `echo PWNED>marker.txt` → `marker.txt` **真的被写出来了**。
+* **位置（修复前）**：`crates/hbot-agent/src/tools/shell.rs:77-160`（`RunCommandTool::with_allowed_programs`）、
+  `crates/hbot-command/src/program.rs`（白名单解析，允许绝对路径条目）；配置入口在
+  `crates/hbot-rpc/src/app/agent/config.rs`（`HBOT_COMMAND_ALLOW` / `agent.json` 的
+  `allowedPrograms`，经 `SandboxConfig::resolve_with` 解析）。
+* **复现（修复前的现场）**：`RunCommandTool::with_allowed_programs(["cmd"])` + `danger` 档，命令
+  `echo PWNED>marker.txt` → `marker.txt` **真的被写出来了**。这条现场保留为可执行证据：
+  `b03_允许cmd等于把shell装回来自证`（**故意断言"能跑通"**、不是 `#[ignore]`）。它钉的是**命令层**
+  的事实 —— `hbot-command` 只回答"这份清单里有没有这个名字"，不判断名字危险不危险。
 * **期望**：白名单只放行"某一类程序"，不放行"解释器"。
-* **实际**：实现是 **argv 直传**（不经 shell），所以 `echo hi; rm -rf /` 里的 `;` 是普通字符 ——
+* **实际（修复前）**：实现是 **argv 直传**（不经 shell），所以 `echo hi; rm -rf /` 里的 `;` 是普通字符 ——
   这一点是对的（`b02` 证明）。但 `cmd /c "<任意字符串>"` 的 `/c` 之后**就是 shell**，
   于是"允许 cmd"等价于"允许任意命令"。同理 `powershell`/`pwsh`/`bash`/`sh`/`wscript`/`cscript`/
-  `mshta`/`rundll32`/`node -e`。
-* **影响**：一条配置项（`HBOT_COMMAND_ALLOW=cmd` 或 `bots.json` 的允许清单）直接换成 RCE。
-  当前**没有**在配置解析处做拦截，也没有在文档里警告；这是"看起来像收紧、实际等于放开"的典型陷阱。
-* **最小修法建议**：在 `resolve_allowed_entry` 里维护一份解释器黑名单（大小写、去扩展名后比较），
-  命中则 `Err(CommandDenied::ProgramNotAllowed)`；若确有需要（例如产品要跑 `pnpm` 脚本），
-  加一个显式的 `allow_interpreters: bool`（默认 false）并要求写进日志。
-* **红队用例**：`crates/hbot-redteam/tests/b_command_injection.rs::b03_允许cmd等于把shell装回来自证`
-  —— 这条**故意断言"能跑通"**（不是 `#[ignore]`）：它记录的是既定事实，防止有人改完白名单后
-  以为这条"安全"了却不知道语义已经变了。同文件 `b02` 是它的反向对照（argv 直传、元字符无效）。
+  `mshta`/`rundll32`/`node -e`。当时**没有**在配置解析处做拦截，也没有在文档里警告；这是
+  "看起来像收紧、实际等于放开"的典型陷阱。
+
+### 修法与证据（2026-11-16）
+
+* **决策：默认拒绝，不采用"只告警"**。理由：只告警等于把一个 RCE 面留在默认配置里，而日志在生产
+  里最容易被忽略；拒绝是 fail-closed，且错误在 `agent_send` 第一回合就以 `-32002` 回到 UI
+  （`HbotError::invalid`），用户当场知道要改哪一行。逃生阀保留为环境变量 `HBOT_ALLOW_SHELL`：
+  只认 `1` / `true` / `yes` / `on`（大小写不敏感），其余值（含 `0`、空串、拼错）**一律算关**；
+  打开时**放行并保留名字**（不删条目，命令层要拿完整清单），同时 `tracing::warn!` ——
+  **每进程每条清单只告警一次**（`agent.json` 每回合都会被重读，不去重就是一回合一条）。
+* **判据在配置解析层**：`crates/hbot-rpc/src/app/agent/config.rs` 的 `SandboxConfig::resolve_with`
+  （环境变量 `HBOT_COMMAND_ALLOW` 与 `agent.json` 的 `allowedPrograms` 都经过它）。
+  `normalize_program_name` 四步：取 **basename**（按 `/` 与 `\`）→ 去首尾空白 → 去尾部点 →
+  `to_ascii_lowercase` → 去**最后一个扩展名**；然后与 `INTERPRETER_PROGRAMS` **精确**比较，
+  **不做子串匹配**。所以全路径 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`、
+  `CMD.EXE`、`cmd.` 都会命中；而 `ssh`（SSH 客户端）、`shellcheck`（对 shell 脚本做静态检查、
+  不执行参数）、`bashful-tool`、`node_modules` 都不命中 —— **`ssh` 明确不拦、`shellcheck`
+  也明确不拦**，它们只做自己被指定的那件事。
+* **名单**：`cmd`、`conhost`、`powershell`、`pwsh`、`sh`、`bash`、`zsh`、`fish`、`dash`、`ksh`、
+  `csh`、`tcsh`、`wsl`、`cscript`、`wscript`、`mshta`、`rundll32`、`regsvr32`、`python`、`python3`、
+  `py`、`node`、`nodejs`、`deno`、`bun`、`ruby`、`perl`、`php`、`java`、`osascript`；
+  另加 `python` + 纯数字/点（覆盖 `python311` / `python3.11` 这类带版本号的可执行名）。
+* **为什么不改 `hbot-command`**：那一层只认"这份清单里有没有这个名字"，不该知道"哪些名字危险"
+  （`docs/adr/0003-command-isolation.md` §5）。所以命令层行为不变，`b03` 仍然成立。
+* **证据（可直接跑）**：
+  * `crates/hbot-rpc/tests/config_warnings.rs::interpreter_in_allowlist_is_rejected_with_32002_and_a_warn_free_path`
+    —— 拒绝 + `-32002` + 逐个回显被拒名字 + 拒绝路径不打 warn；
+  * `crates/hbot-rpc/tests/config_warnings.rs::shell_hatch_warns_once_per_process_when_it_lets_interpreters_through`
+    —— 逃生阀放行 + 名字保留 + **同进程两次解析只留一条 WARN**；
+  * `crates/hbot-rpc/src/app/agent/config.rs` 单测：`interpreter_names_normalise_to_a_bare_basename`、
+    `windows_full_path_interpreter_is_recognised_from_the_env_list`、
+    `windows_full_path_with_spaces_is_recognised_from_agent_json`、
+    `interpreter_matching_is_case_insensitive_and_extension_agnostic`、
+    `concrete_programs_are_not_flagged`（`ssh`/`shellcheck`/`bashful-tool`/`node_modules` 反向）、
+    `escape_hatch_keeps_the_names_and_only_accepts_explicit_truthy_values`；
+  * 红队：`crates/hbot-redteam/tests/b_command_injection.rs::b10_配置层必须拒绝解释器类允许清单`。
+* **没修的部分（如实写）**：这是一张**判据表**，不是完备集合。`env` / `busybox` / `xargs` /
+  `npm exec` 这类"给个参数就能起别的程序"的启动器不在表里 —— 它们也是正常开发工具，逐个拉黑
+  会把白名单变成黑名单的补集；这一层靠"清单只放具体程序"的纪律（ADR-0003 §5）与 `b03` 的可执行
+  证据兜。仍然是一个**产品决策**：是否允许清单整体出现"运行时/包管理器"（`npm`、`pnpm`、`uv`）
+  需要产品明确，见 `docs/02-architecture.md` §11.2 与下方"仍需人工决定"。
+* **当时的建议 vs 实际**：原建议是在 `hbot-command::resolve_allowed_entry` 里维护黑名单；实际修法
+  改到了更上层（配置解析），因为"哪些名字危险"是策略与配置解释，不属于"清单里有没有这个名字"
+  的实现层（ADR-0003 §5）。
+
+### 仍需人工决定
+
+* 用户**确实要跑 `python` / `node`** 时的正确姿势：默认答案不是把它们塞进 `allowedPrograms`，而是
+  ① 把要跑的东西固化成具体程序或项目脚本（例如编译产物、`cargo` 子命令、已安装的 CLI）；
+  ② 确实需要解释器时，显式设 `HBOT_ALLOW_SHELL=1` 启动进程 —— 逃生阀会 `warn` 一次，让这件事在
+  日志里可见；③ 不接受解释器又必须跑脚本的场景，应由产品层提供"固定参数的内置工具"，而不是
+  放开整个解释器。是否要为此加一个 per-program 的显式开关（而不是一个全局布尔），留给后续产品决策。
 
 ---
 
@@ -472,17 +520,17 @@ cargo test -p hbot-redteam -- --ignored          # 只剩非安全的 b_helper�
 | 面 | 文件 | 用例数 | 默认通过 | `#[ignore]` | 对应发现 |
 |---|---|---|---|---|---|
 | A 路径逃逸 | `tests/a_path_escape.rs` | 20 | 20 | 0（`a20` 已随 RT-01 转正） | RT-01（已修） |
-| B 命令注入 | `tests/b_command_injection.rs` | 10（9 安全 + 1 helper） | 9 | 1（`b_helper`，非安全用例） | RT-05 |
+| B 命令注入 | `tests/b_command_injection.rs` | 11（10 安全 + 1 helper） | 10 | 1（`b_helper`，非安全用例） | RT-05（已修） |
 | C 提示注入 | `tests/c_prompt_injection.rs` | 8 | 8 | 0 | — |
 | D 审批绕过 | `tests/d_approval_bypass.rs` | 11 | 11 | 0（`d09`、`d10` 已随 RT-02 转正） | RT-02（已修） |
 | E 资源耗尽 | `tests/e_resource_exhaustion.rs` | 8 | 8 | 0 | RT-07（已修） |
 | F 密钥泄漏 | `tests/f_secret_leak.rs` | 10 | 10 | 0（`f03`、`f04`、`f06`、`f08`、`f09` 均已转正） | RT-01/03/06/08 |
 | 夹具自测 | `src/lib.rs`（`#[cfg(test)]`） | 5 | 5 | 0 | — |
-| **合计** | | **72** | **71** | **1** | |
+| **合计** | | **73** | **72** | **1** | |
 
-六面共 **66 条安全用例**（不含 `b_helper` 与 5 条夹具自测），其中 **66 条默认通过**、**0 条
+六面共 **67 条安全用例**（不含 `b_helper` 与 5 条夹具自测），其中 **67 条默认通过**、**0 条
 指向已登记发现**。全部数字以 `cargo test -p hbot-redteam` 的 `test result:` 行为准；
-本行是 2026-11-16 10:24 实测值（`71 passed / 1 ignored`，唯一被忽略的是非安全用例 `b_helper`）。
+本行是 2026-11-16 17:07 实测值（`72 passed / 1 ignored`，唯一被忽略的是非安全用例 `b_helper`）。
 
 > A、D、F 三行的「默认通过 / `#[ignore]`」列已由各自修复批次回填：
 > `a20`（RT-01）、`d09`/`d10`（RT-02）、`f03`/`f04`（RT-06）、`f06`/`f08`/`f09`（RT-03 / RT-08）

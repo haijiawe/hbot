@@ -259,6 +259,39 @@ mod drift {
             .collect()
     }
 
+    /// Property declarations (`botId: string;`) inside `MessageCtx`.
+    ///
+    /// Interface properties are the 4-space-indented `name: type;` lines; methods
+    /// carry a `(` before the colon and are covered by [`message_ctx_functions`].
+    fn message_ctx_properties() -> BTreeSet<String> {
+        let start = HOST_DTS
+            .find("export interface MessageCtx {")
+            .expect("hbot.d.ts 应有 MessageCtx");
+        let block = &HOST_DTS[start..];
+        let end = block.find("\n  }").expect("MessageCtx 应有收尾 `}`");
+        block[..end]
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("    ")?;
+                let trimmed = rest.trim_start();
+                // Skip the doc-comment lines above each property.
+                if trimmed.starts_with('*') || trimmed.starts_with('/') {
+                    return None;
+                }
+                let (name, after) = rest.split_once(':')?;
+                if !after.trim_end().ends_with(';') || rest.contains('(') {
+                    return None;
+                }
+                let name = name.trim();
+                let is_property = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+                is_property.then(|| name.to_owned())
+            })
+            .collect()
+    }
+
     #[test]
     fn hbot_dts_exports_match_the_runtime_module() {
         let runtime = function_exports(HOST_MODULE_SOURCE);
@@ -302,12 +335,11 @@ mod drift {
 
     #[test]
     fn ctx_carries_exactly_the_documented_inbound_fields() {
-        // Pinned by `docs/02-architecture.md` §6.3 and produced by
-        // `hbot-rpc/src/app/runtime/sandbox_handler.rs`; the d.ts must say
-        // `string` where the JSON carries a string, etc. Field *names* are only
-        // checkable here against the documented set, because the producer lives
-        // in another crate (a shared const there is the M1 follow-up).
-        for field in [
+        // §6.3 的字段清单是声明侧的唯一真源；生产/回放真正输出的键由
+        // `crates/hbot-rpc/tests/event_shape_dts.rs` 拿这份 d.ts 与
+        // `hbot_bot::event_json` 的输出直接比对（hbot-code 只允许依赖 hbot-core，
+        // 不能在这里调用事件拼装函数）。
+        let documented: BTreeSet<String> = [
             "botId",
             "conversationId",
             "messageId",
@@ -318,17 +350,17 @@ mod drift {
             "conversationExternalId",
             "receivedAt",
             "payload",
-        ] {
-            assert!(
-                HOST_DTS.contains(field),
-                "MessageCtx 缺少文档规定的字段 `{field}`"
-            );
-            assert_eq!(
-                HOST_DTS.matches(&format!("    {field}:")).count(),
-                1,
-                "MessageCtx 里 `{field}` 应恰好声明一次"
-            );
-        }
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(
+            message_ctx_properties(),
+            documented,
+            "MessageCtx 的字段与 §6.3 的文档清单不一致：新增/删除字段必须同时更新 \
+             event_json 与文档"
+        );
     }
 
     #[test]

@@ -67,13 +67,14 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | 项 | 状态 |
 |---|---|
 | 旧项目代码体检 | 完成（`docs/00-assessment.md`） |
-| 技术栈 ADR | Proposed（`0002`，7 天 Spike 后转 Accepted） |
-| 架构 / 目录 / 计划 / 闸门 | Draft（`02`–`05`） |
-| IDE 设计 | Draft（`06`） |
-| 代码 | **尚未开始**（M0 第一周任务见 `04` §9） |
-| 可运行的 `package.json` / `Cargo.toml` | 还没有；下面命令是目标形态 |
+| 技术栈 ADR | Proposed（`0002`；转 Accepted 还差 QuickJS 长跑、真 OneBot 网关、macOS 隔离） |
+| 架构 / 目录 / 计划 / 闸门 / IDE | Draft，已按实现回填实测口径（`02`–`06`） |
+| 代码 | **已落地 M0–M2 主体 + M3/M4/M5 部分**（Rust 14 crate + `xtask`，`apps/web` 可构建） |
+| 测试 | 最近一次 `cargo test --workspace`：**1047 passed / 0 failed**；`apps/web`：13 文件 101 用例 |
+| 真机验证 | QQ 官方群/私聊被动回复已端到端跑通（`docs/spikes/S9-e2e-qq-official.md`）；Windows NSIS 安装包 9.14 MiB、安装冒烟 11/11 |
+| 未完成 | M6 迁移/影子、真 NapCat、Linux/macOS 运行、CI 从未执行（无 remote）、M3 回放 UI、M4 Linux 写隔离 |
 
-> 现在是设计阶段。不要照着本文去 `pnpm install` —— 仓库里还没有实现。
+> 本仓库**没有任何 Go 代码**（0 个 `.go` 文件、0 个 `go.mod`）。Go 只出现在 ADR 的候选对比表里，且未被采用；当前实现是 Rust（核心）+ TypeScript（仅 IDE 前端）。
 
 ---
 
@@ -96,14 +97,16 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 
 ---
 
-## 目录（目标形态）
+## 目录
 
 ```text
-crates/            Rust workspace（core/store/agent/code/bot/workspace/adapters/rpc/cli/desktop/xtask）
+crates/            Rust workspace：core / store / agent / code / bot / workspace / adapters /
+                   rpc / cli / desktop / command / parity / redteam / bench（+ xtask）
 apps/web/          React IDE（generated/ 由 Rust 生成）
-tests/             integration / e2e / perf / parity / security
-docs/              设计与决策
-scripts/           闸门与一次性脚本
+docs/              设计与决策（00 体检、01 需求、ADR、02 架构、03 目录、04 计划、05 闸门、
+                   06 IDE、spikes 实测、security 红队）
+scripts/           闸门、打包、真机验证脚本
+packaging/         systemd / logrotate 部署物
 AGENTS.md          Agent 入口
 ```
 
@@ -111,16 +114,31 @@ AGENTS.md          Agent 入口
 
 ---
 
-## 命令（M0 落地后）
+## 命令
 
 ```bash
-./scripts/check.sh          # 静态检查 + 单测（本地与 CI 同一套）
-./scripts/check.sh --full   # 集成 + E2E + 打包 smoke
-cargo xtask gen             # 生成 TS 契约与 hbot.d.ts
-cargo run -p hbot-cli -- serve --project ./examples/hello
-pnpm -C apps/web dev        # 浏览器模式，连本地 serve
-pnpm -C apps/web tauri dev  # 桌面模式
+# 静态闸门（与 CI 同一套，Windows 本地全部实跑过）
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -q -p xtask -- gen --check   # 契约生成物是否漂移（40 个文件）
+cargo run -q -p xtask -- deps          # 依赖方向（15 个 crate，46 条内部边）
+pnpm --dir apps/web run check          # tsc + IPC 无 any + vitest + vite build
+
+# 运行
+cargo run -p hbot-cli -- serve --bind 127.0.0.1:0 --token <tok> --data-dir <dir>
+cargo run -p hbot-cli -- check <项目目录>          # 解析 hbot.json + 真跑 SWC 编译
+cargo run -p hbot-cli -- replay <项目目录> --bot <id>   # 回放历史入站，退出码 0/1/2
+cargo run -p hbot-desktop                          # 桌面端（需要 apps/web/dist）
+pnpm --dir apps/web dev                            # 纯浏览器模式（mock 后端）
+
+# 打包（Windows）
+node scripts/build-desktop.mjs
+cargo tauri build --bundles nsis
+node scripts/smoke-nsis-install.ps1                # 安装/卸载冒烟
 ```
+
+> `cargo xtask …` 不是 cargo 别名，正确写法是 `cargo run -p xtask -- …`。
 
 ---
 

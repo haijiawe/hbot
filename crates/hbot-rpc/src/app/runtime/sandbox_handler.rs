@@ -42,16 +42,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use hbot_bot::{HandlerExecutor, MessageCtx, OutboundRequest};
+use hbot_bot::{EventSource, HandlerExecutor, MessageCtx, OutboundRequest, event_json};
 use hbot_code::{CodeError, CompiledProject, Limits, Sandbox};
 use hbot_core::{BotId, Clock, EventSink, HbotError};
 use hbot_store::{NewLog, Store};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::app::debug::sink::BotDebugSink;
 use crate::app::debug::{BreakpointTarget, DebugRegistry};
-use crate::app::runtime::conversation_kind_str;
 use crate::app::runtime::fingerprint_cache::FingerprintCache;
 use crate::app::{EventBus, store_failed};
 use crate::dto::{Event, LogLevel};
@@ -758,7 +757,19 @@ impl HandlerExecutor for SandboxHandler {
 impl SandboxHandler {
     /// 一条消息的完整处理：编译 → 取 worker → dispatch → 日志 → 回复。
     async fn run(&self, ctx: &MessageCtx) -> Result<(), HbotError> {
-        let event = event_json(ctx);
+        // 事件对象的唯一拼装在 `hbot-bot::event_json`（生产与回放共用）。
+        let event = event_json(&EventSource {
+            bot_id: ctx.bot_id,
+            conversation_id: ctx.conversation_id(),
+            message_id: ctx.message_id(),
+            external_id: ctx.external_id(),
+            sender_id: &ctx.message.sender_id,
+            text: ctx.text(),
+            kind: ctx.conversation_kind(),
+            conversation_external_id: &ctx.conversation.external_id,
+            received_at: ctx.received_at(),
+            payload: ctx.payload(),
+        });
         let conversation_id = ctx.conversation_id();
         let worker_index = stable_index(&conversation_id.to_string(), self.workers.len());
 
@@ -888,43 +899,6 @@ fn stable_index(key: &str, modulo: usize) -> usize {
     }
 }
 
-/// `ctx` → 交给 `onMessage(event)` 的 JSON。
-///
-/// 沙箱会把 `reply` / `log` / `sleep` 三个宿主函数挂到这个对象上，所以这里给的就是
-/// **事件对象本身**的字段（`text`、`kind`、`senderId`……），代码里写 `ctx.text`。
-///
-/// # 这里有一份**复制实现**
-///
-/// `crates/hbot-cli/src/replay.rs` 的 `event_json` 逐字段复刻了本函数（`hbot replay` 要
-/// 用同一形状重建历史事件）。两处必须一起改：字段名集合被
-/// `crates/hbot-code/src/dts.rs` 的漂移测试钉着（`botId/conversationId/messageId/
-/// externalId/senderId/text/kind/conversationExternalId/receivedAt/payload`），少一个
-/// 字段用户代码里读到的就是 `undefined`。
-///
-/// 为什么不直接复用：本函数吃 `&MessageCtx`，而 replay 侧手上只有
-/// `InboundReplayRow`（库行 + 会话列），构造一个 `MessageCtx` 再丢掉一半字段并不比
-/// 直写 JSON 更安全；且本函数在本 crate 内是私有的（`hbot-cli` 只能看到 `pub` 项）。
-/// 要彻底消掉这份复制，正确做法是把「事件对象」提升成 `hbot-bot`/`hbot-code` 里的
-/// 共用 DTO（生产与回放都从它序列化），那是一次跨 crate 改造，不在本次范围内。
-fn event_json(ctx: &MessageCtx) -> Value {
-    json!({
-        "botId": ctx.bot_id.to_string(),
-        "conversationId": ctx.conversation_id().to_string(),
-        "messageId": ctx.message_id().to_string(),
-        "externalId": ctx.external_id(),
-        "senderId": ctx.message.sender_id,
-        // 恒为字符串：`MessageCtx::text()` 是 `Option<&str>`，纯图片/表情入站的 payload
-        // 里没有 `text` 字段，直接落成 JSON 就是 `null`；而 `hbot.d.ts` 声明的是
-        // `text: string`，生成代码写 `ctx.text.length` 会当场抛 TypeError。
-        // 类型声明是对用户的承诺，缺失文本用空串表达（见 docs/02-architecture.md §6.3）。
-        "text": ctx.text().unwrap_or_default(),
-        "kind": conversation_kind_str(ctx.conversation_kind()),
-        "conversationExternalId": ctx.conversation.external_id,
-        "receivedAt": ctx.received_at().unix_millis(),
-        "payload": ctx.payload(),
-    })
-}
-
 /// isolate 起不来：没有隔离就不执行代码（§6.3），错误码按原因区分。
 fn sandbox_start_error(error: CodeError) -> HbotError {
     match error {
@@ -1003,6 +977,7 @@ mod tests {
     use hbot_bot::ConversationRef;
     use hbot_core::{ConversationId, MessageId, Timestamp};
     use hbot_store::{Bot as StoreBot, Project, ProjectId};
+    use serde_json::json;
     use tokio::sync::mpsc;
     use uuid::Uuid;
 

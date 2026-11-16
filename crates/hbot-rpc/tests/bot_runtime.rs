@@ -671,7 +671,7 @@ async fn compile_error_is_reported_and_inbound_stays_unprocessed() {
     let tail = harness
         .dispatcher
         .dispatch(Command::LogsTail {
-            bot_id: harness.bot,
+            bot_id: Some(harness.bot),
             limit: 10,
         })
         .await;
@@ -874,7 +874,7 @@ async fn logs_tail_is_newest_limit_in_chronological_order() {
     let response = harness
         .dispatcher
         .dispatch(Command::LogsTail {
-            bot_id: bot,
+            bot_id: Some(bot),
             limit: 2,
         })
         .await;

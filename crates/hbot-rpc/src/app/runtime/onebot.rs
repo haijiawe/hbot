@@ -11,8 +11,9 @@
 //! 读取循环还得反复借那个锁），而是**一个读者任务**：
 //!
 //! ```text
-//! connect(): OneBotClient::start ──► tokio::spawn(reader) ──► mpsc::Sender<PlatformEvent>
-//! subscribe(): 交出那个 mpsc::Receiver（一次性）
+//! connect(): 只校验配置 + 建事件队列（不碰网络）
+//! subscribe(): probe_session() ──► OneBotClient::start_with_session ──► tokio::spawn(reader)
+//!              └─ 探测建立的这条连接直接交给常驻客户端：一次 bot_start = **一条** WS 连接
 //! send():      ActionHandle（Clone，内部是 action channel）
 //! ```
 //!
@@ -27,10 +28,13 @@
 //!   开启**，失败报 `AdapterError::Tls`（wire 上是 -32006 internal），不会降级成明文
 //!   `ws://`，也**没有**"跳过校验"的开关（私有 CA / 自签部署用
 //!   `OneBotConfig::with_extra_root_certificates` 追加根证书）。
-//! * **启动前探测**：`subscribe()` 先跑一次 [`probe_connection`]（连得上就关掉，连不上就
-//!   当场报错），失败原因经 [`describe_probe_failure`] 翻成一句人话再进 `bot_start` 的
-//!   错误返回。没有这一步时，证书错 / token 错 / 地址错只表现为"启动成功 + 后台反复重连
-//!   的 `warn`"，用户永远不知道自己配错了（见 `docs/02-architecture.md` §10）。
+//! * **启动前探测（probe → handoff）**：`subscribe()` 先跑一次 [`probe_session`] —— 连上、
+//!   等 OneBot 生命周期握手（`meta_event/lifecycle` / 心跳）、失败原因经
+//!   [`describe_probe_failure`] 翻成一句人话再进 `bot_start` 的错误返回。**探测建立的
+//!   连接不关闭**，而是交给 [`OneBotClient::start_with_session`] 当常驻客户端的第一条
+//!   连接：一次 `bot_start` 对平台只开**一次** WS 连接（旧实现是"探测一条 + 真客户端一条"）。
+//!   没有这一步时，证书错 / token 错 / 地址错只表现为"启动成功 + 后台反复重连的
+//!   `warn`"，用户永远不知道自己配错了（见 `docs/02-architecture.md` §10）。
 //!
 //!   为什么探测放在 `subscribe` 而不是 `create`：`create` 是 `AdapterFactory` 的同步端口，
 //!   它的既有语义是"**只校验配置**、不碰网络"（`tests/bot_runtime.rs::wss_is_supported…`
@@ -49,7 +53,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use hbot_adapters::AdapterError;
 use hbot_adapters::platforms::onebot::{
-    OneBotClient, OneBotConfig, probe_connection, validate_ws_url,
+    ConnectedSession, LIFECYCLE_CONFIRM_WINDOW, OneBotClient, OneBotConfig, probe_session,
 };
 use hbot_bot::supervisor::ADAPTER_EVENT_CAPACITY;
 use hbot_bot::{AdapterSubscription, BotAdapter, ConversationRef, OutboundEnvelope, PlatformEvent};
@@ -72,15 +76,25 @@ pub const PLATFORM: &str = "onebot11";
 /// 显式配置更短也仍然按 10 秒算（`connect_timeout` 是给持续连接用的，探测跟它的取舍不同）。
 pub const PROBE_MIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 一 个 bot 的 OneBot 适配器：一个读者任务 + 一个 action 句柄。
+/// 一个 bot 的 OneBot 适配器：一个读者任务 + 一个 action 句柄。
 pub struct OneBotAdapter {
     /// 出站：`Clone` 的 action 句柄，内部是有界 channel。
-    actions: hbot_adapters::platforms::onebot::ActionHandle,
+    ///
+    /// `subscribe` 之前是 `None` —— `connect` / `create` 只校验配置、不碰网络，
+    /// 所以这里不能提前造句柄（旧实现会在 `connect` 里直接连一次）。
+    actions: Mutex<Option<hbot_adapters::platforms::onebot::ActionHandle>>,
     /// 地址，只用于诊断日志（token 不在这里，绝不打日志）。
     ws_url: String,
+    /// 常驻连接配置（重连、容量、退避、心跳）：`subscribe` 时连同探测连接一起交给
+    /// [`OneBotClient::start_with_session`]。
+    config: OneBotConfig,
     /// 启动前探测用的配置快照（`subscribe` 时用；`connect_timeout` 已被抬到
     /// [`PROBE_MIN_TIMEOUT`] 以上）。
     probe: OneBotConfig,
+    /// `self_id`：读者任务用它过滤"挂错号"的事件。
+    self_id: Option<i64>,
+    /// 入站事件的写端；`subscribe` 取走后为 `None`（第二次订阅由此立刻失败）。
+    events_tx: Mutex<Option<mpsc::Sender<PlatformEvent>>>,
     /// 入站事件的一次性交付口：`subscribe` 取走后为 `None`。
     subscriber: Mutex<Option<mpsc::Receiver<PlatformEvent>>>,
     /// 读者任务的句柄；`Drop` 时 abort（client 在任务里，随之关闭连接）。
@@ -88,38 +102,36 @@ pub struct OneBotAdapter {
 }
 
 impl OneBotAdapter {
-    /// 连上一个 OneBot 11 正向 WS 服务端，并启动唯一的事件读者任务。
+    /// 校验配置、建好事件队列；**不碰网络**（连接在 [`BotAdapter::subscribe`] 里建立）。
     ///
     /// `self_id` 给了就做一次乐观校验：事件里带了 `self_id` 且不相等时丢弃并 warn
     /// （一个 ws 端点上挂错号是最常见的配置错误）。
     ///
     /// # Errors
     ///
-    /// 地址非法（包括 `wss://`）、容量为 0——直接来自 [`OneBotClient::start`]，
-    /// 经 `From<AdapterError> for HbotError` 映射：`Unsupported` → -32005。
+    /// 地址非法（`ws://`/`wss://` 以外）、容量为 0——直接来自
+    /// [`OneBotClient::validate`]，经 `From<AdapterError> for HbotError` 映射：
+    /// `Unsupported` → -32005。
     pub fn connect(config: OneBotConfig, self_id: Option<i64>) -> Result<Self, HbotError> {
         // 先校验，再起任何任务：地址不合法时不要留下半个连接。
-        validate_ws_url(&config.ws_url).map_err(HbotError::from)?;
+        OneBotClient::validate(&config).map_err(HbotError::from)?;
         let ws_url = config.ws_url.clone();
-        // 探测配置要在 `config` 被移交给 client 之前留一份（`OneBotConfig: Clone`）。
+        // 探测配置要在 `config` 被移交给常驻客户端之前留一份（`OneBotConfig: Clone`）。
         let probe = probe_config(&config);
 
-        let mut client = OneBotClient::start(config).map_err(HbotError::from)?;
-        let actions = client.action_handle();
-
+        // 事件队列先建好（`AGENTS.md` §7.1「先建队列再连接」）：探测交接之前就有一个
+        // 空的、有界的事件队列，读者任务一启动就能往里送，重连窗口内的事件不会丢。
         let (tx, rx) = mpsc::channel::<PlatformEvent>(ADAPTER_EVENT_CAPACITY);
-        let reader = tokio::spawn(async move {
-            read_events(&mut client, &tx, self_id).await;
-            // 事件流结束（连接被关闭 / 订阅者消失）：显式关闭客户端，让重连任务收尾。
-            client.shutdown().await;
-        });
 
         Ok(Self {
-            actions,
+            actions: Mutex::new(None),
             ws_url,
+            config,
             probe,
+            self_id,
+            events_tx: Mutex::new(Some(tx)),
             subscriber: Mutex::new(Some(rx)),
-            reader: Mutex::new(Some(reader)),
+            reader: Mutex::new(None),
         })
     }
 
@@ -144,6 +156,7 @@ impl std::fmt::Debug for OneBotAdapter {
             .debug_struct("OneBotAdapter")
             .field("ws_url", &self.ws_url)
             .field("subscribed", &lock(&self.subscriber).is_none())
+            .field("connected", &lock(&self.actions).is_some())
             .finish_non_exhaustive()
     }
 }
@@ -164,13 +177,31 @@ impl BotAdapter for OneBotAdapter {
     }
 
     async fn subscribe(&self) -> Result<AdapterSubscription, HbotError> {
-        // 启动前的连通性探测：`bot_start` 走到这里时配置与数据库行都已就位，但**还没**
-        // 开始消费事件。此刻探一次，成功就把探测连接关掉继续启动；失败就当场报错，
-        // 让 `bot_start` 带着一句人话失败（而不是"启动成功 + 后台无限重连的 warn"）。
-        probe_startup(&self.probe).await?;
-
         // 事件的唯一消费者：supervisor 的 read_loop。第二次订阅不能静默返回一个永远
         // 收不到事件的 channel（那会让 supervisor 看起来 "Running" 却一条消息都收不到）。
+        // 先取写端：它同时充当"是否已订阅"的判据，失败时不要先建一条连接再报错。
+        let events_tx = lock(&self.events_tx).take().ok_or_else(|| {
+            HbotError::conflict("onebot 适配器只能订阅一次：事件读者任务已经把流交给了上一个订阅者")
+        })?;
+
+        // 启动前探测：`bot_start` 走到这里时配置与数据库行都已就位，但**还没**开始消费
+        // 事件。连上的这条连接**不关闭**——直接交给常驻客户端做第一次会话（probe →
+        // handoff），所以一次 `bot_start` 对平台只开一条 WS 连接。失败就当场报错，让
+        // `bot_start` 带着一句人话失败（而不是"启动成功 + 后台无限重连的 warn"）。
+        let session = probe_startup(&self.probe).await?;
+
+        let mut client = OneBotClient::start_with_session(self.config.clone(), session)
+            .map_err(HbotError::from)?;
+        *lock(&self.actions) = Some(client.action_handle());
+
+        let self_id = self.self_id;
+        let reader = tokio::spawn(async move {
+            read_events(&mut client, &events_tx, self_id).await;
+            // 事件流结束（连接被关闭 / 订阅者消失）：显式关闭客户端，让重连任务收尾。
+            client.shutdown().await;
+        });
+        *lock(&self.reader) = Some(reader);
+
         let receiver = lock(&self.subscriber).take().ok_or_else(|| {
             HbotError::conflict("onebot 适配器只能订阅一次：事件读者任务已经把流交给了上一个订阅者")
         })?;
@@ -178,17 +209,22 @@ impl BotAdapter for OneBotAdapter {
     }
 
     async fn send(&self, envelope: OutboundEnvelope) -> Result<(), HbotError> {
+        // 句柄是 `Clone` 的：guard 在第一个 `.await` 之前就丢掉，避免把 MutexGuard 带过
+        // await 点（那会让 `OneBotAdapter` 不再是 `Send`，也会把并发发送串成一条）。
+        let actions = lock(&self.actions).clone().ok_or_else(|| {
+            HbotError::conflict("onebot 适配器尚未订阅：发送前必须先 subscribe（bot_start 会做）")
+        })?;
         let address = address_of(&envelope)?;
         // 被动回复要绑定到触发它的那条平台消息（§4.1）；`None` 是主动消息。
         let reply_to = envelope.reply_to.as_deref();
         let sent = match address {
             Address::Group(group_id) => {
-                self.actions
+                actions
                     .send_group_msg(group_id, &envelope.text, reply_to)
                     .await
             }
             Address::Private(user_id) => {
-                self.actions
+                actions
                     .send_private_msg(user_id, &envelope.text, reply_to)
                     .await
             }
@@ -221,7 +257,7 @@ impl AdapterFactory for OneBotAdapterFactory {
         tracing::info!(
             bot = %bot.id,
             ws_url = adapter.ws_url(),
-            "onebot 适配器已连接（单一读任务 + 有界事件通道）"
+            "onebot 适配器已装配（不碰网络；连接在 subscribe 时建立：probe → handoff，单一读任务 + 有界事件通道）"
         );
         Ok(Arc::new(adapter))
     }
@@ -255,13 +291,33 @@ fn probe_config(config: &OneBotConfig) -> OneBotConfig {
 
 /// 启动前探一次连通性；失败时把原因翻成一句人话并记日志。
 ///
-/// 探测本身**不复用**持续连接的客户端：它只建立一次连接、立刻关掉
-/// （`probe_connection` 的文档写明了它就是给"测试连接"用的那条路径，不进入永续重连语义）。
-async fn probe_startup(config: &OneBotConfig) -> Result<(), HbotError> {
-    match probe_connection(config).await {
-        Ok(()) => {
-            tracing::debug!(ws_url = %config.ws_url, "onebot 启动前探测通过");
-            Ok(())
+/// 与旧实现的关键区别：探测**不再把连接关掉**。`probe_session` 返回的
+/// [`ConnectedSession`] 连同探到的配置一起交给 [`OneBotClient::start_with_session`]，
+/// 成为常驻客户端的第一条会话——一次 `bot_start` 因此只对平台开一条 WS 连接，
+/// 而探测的失败语义（连不上 / 握手失败 / 401 / 超时 → `bot_start` 当场报错）保持不变。
+///
+/// “OneBot 生命周期握手”的确认是**宽限式**的：`probe_session` 最多等
+/// [`LIFECYCLE_CONFIRM_WINDOW`] 看对端有没有推 `meta_event/lifecycle` 或心跳。
+/// 收到了就是强确认；窗口内一帧都没收到仍然算连接可用（有些协议端只在有事件时才说话，
+/// 而心跳超时由常驻客户端的心跳看门狗负责），但会打一条 `warn` 留下证据。
+async fn probe_startup(config: &OneBotConfig) -> Result<ConnectedSession, HbotError> {
+    match probe_session(config).await {
+        Ok(session) => {
+            if session.lifecycle_seen() {
+                tracing::debug!(
+                    ws_url = %config.ws_url,
+                    "onebot 启动前探测通过：已确认 OneBot 生命周期握手，连接将交给常驻客户端"
+                );
+            } else {
+                tracing::warn!(
+                    ws_url = %config.ws_url,
+                    window_ms = u64::try_from(LIFECYCLE_CONFIRM_WINDOW.as_millis())
+                        .unwrap_or(u64::MAX),
+                    "onebot 启动前探测通过（宽限）：对端在确认窗口内没有推 meta_event/lifecycle，\
+                     连接仍然交给常驻客户端；心跳超时后会按既有逻辑重连"
+                );
+            }
+            Ok(session)
         }
         Err(error) => {
             let reason = describe_probe_failure(&error, config);

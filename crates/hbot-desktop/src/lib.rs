@@ -29,15 +29,126 @@ pub mod shell;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hbot_core::SystemClock;
 use hbot_rpc::app::ids::UuidIds;
 use hbot_rpc::app::{AppState, EventBus};
 use hbot_rpc::{ApiError, Command, Dispatcher, Response};
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Listener, Manager, Runtime};
 use tokio::sync::OnceCell;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
+
+/// 启动分段计时（`HBOT_STARTUP_TRACE=1` 时开启，默认零开销）。
+///
+/// `hbot-store` 里有同一份（rpc 侧用它记库内阶段）。桌面壳不能依赖 `hbot-store`
+/// （`xtask/src/deps.rs` 的依赖白名单只有 `hbot-core` / `hbot-rpc`），所以这里内联
+/// 一份最小实现：所有事件都从 [`run`] 入口的同一个 `Instant` 起算，输出
+/// `hbot-startup ev=<event> t_ms=<f64> unix_ms=<u64> [k=v ...]` 到 stderr。
+mod startup_trace {
+    use std::sync::OnceLock;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+    /// 是否开启启动计时：只有 `HBOT_STARTUP_TRACE=1` 才开启。
+    pub fn enabled() -> bool {
+        *ENABLED.get_or_init(|| std::env::var("HBOT_STARTUP_TRACE").as_deref() == Ok("1"))
+    }
+
+    fn origin() -> &'static Instant {
+        ORIGIN.get_or_init(Instant::now)
+    }
+
+    /// 打一个时间点事件（相对 [`run`] 入口的毫秒数）。
+    pub fn point(event: &str, detail: &str) {
+        if !enabled() {
+            return;
+        }
+        let t_ms = origin().elapsed().as_secs_f64() * 1000.0;
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        if detail.is_empty() {
+            eprintln!("hbot-startup ev={event} t_ms={t_ms:.3} unix_ms={unix_ms}");
+        } else {
+            eprintln!("hbot-startup ev={event} t_ms={t_ms:.3} unix_ms={unix_ms} {detail}");
+        }
+    }
+
+    /// 计时开启时返回当前 `Instant`，供需要算时长的调用点使用。
+    pub fn now() -> Option<Instant> {
+        enabled().then(Instant::now)
+    }
+}
+
+/// 只在 `HBOT_STARTUP_TRACE=1` 时注入页面的首帧标记脚本（不进入前端产物）。
+///
+/// 页面加载完成后读取 Navigation Timing 与 paint timing，再等两个 `requestAnimationFrame`
+/// 把标记经 `plugin:event|emit` 送回 Rust 侧（事件名 [`STARTUP_MARK_EVENT`]）。
+/// 测量专用：失败（例如 ACL 拒绝）只影响本脚本，不影响页面。
+const STARTUP_MARK_SCRIPT: &str = r#"
+(function () {
+  var report = function (phase) {
+    try {
+      var nav = performance.getEntriesByType('navigation')[0];
+      var paints = performance.getEntriesByType('paint') || [];
+      var paintOf = function (name) {
+        for (var i = 0; i < paints.length; i += 1) {
+          if (paints[i].name === name) { return paints[i].startTime; }
+        }
+        return null;
+      };
+      var firstPaint = paintOf('first-paint');
+      var payload = {
+        phase: phase,
+        time_origin: performance.timeOrigin,
+        nav_start: nav ? nav.startTime : null,
+        dom_interactive: nav ? nav.domInteractive : null,
+        load_end: nav ? nav.loadEventEnd : null,
+        first_paint: firstPaint,
+        fcp: paintOf('first-contentful-paint'),
+        now: performance.now()
+      };
+      // 外部探针的兜底信号（不依赖 IPC 权限）：窗口标题里带 first-paint 的绝对时间
+      // （epoch 毫秒，= timeOrigin + 相对毫秒），探针可直接换算到进程启动基准。
+      // 只在 `HBOT_STARTUP_TRACE=1` 时注入，正常启动不会执行这段脚本。
+      document.title = 'hbot-frame@' + Math.round(performance.timeOrigin + (firstPaint === null ? performance.now() : firstPaint));
+      var internals = window.__TAURI_INTERNALS__;
+      if (internals && internals.invoke) {
+        // 走应用命令（不是 plugin:），不受 ACL 影响。
+        internals.invoke('startup_mark', { payload: payload }).then(function () {}, function () {});
+      }
+    } catch (error) {
+      // 测量脚本，任何失败都不该影响页面。
+    }
+  };
+  report('eval');
+  var sent = false;
+  var send = function () {
+    if (sent) { return; }
+    sent = true;
+    report('frame');
+  };
+  if (window.requestAnimationFrame) {
+    requestAnimationFrame(function () {
+      requestAnimationFrame(send);
+    });
+  }
+  // 窗口不可见时 rAF 可能不跑，300ms 后兜底再报一次（只报一次）。
+  setTimeout(send, 300);
+})();
+"#;
+
+/// 前端首帧标记使用的事件名（只给 [`STARTUP_MARK_SCRIPT`] 与监听端共用）。
+const STARTUP_MARK_EVENT: &str = "hbot://startup-mark";
+
+/// 前几条命令的序号从 1 开始，用于把"首个 RPC"和它的响应配成一对。
+static DISPATCH_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 /// web 侧订阅的事件通道名（`apps/web/src/lib/ipc-tauri.ts` 里的 `EVENT_CHANNEL`）。
 ///
@@ -56,6 +167,41 @@ struct Core {
     state: Arc<AppState>,
     /// 与 CLI / 后台完全同一个分发器（`Dispatcher::with_state`）。
     dispatcher: Arc<Dispatcher>,
+}
+
+/// 核心预取插件：**在单实例检查之后、创建窗口之前**把 `AppState::open` 放到后台线程。
+///
+/// 插件按注册顺序初始化，而单实例插件注册在本插件之前：第二个实例会在单实例插件
+/// 的 `initialize` 里直接 `exit(0)`，根本走不到这里，所以不会出现两个进程同时打开
+/// 同一个 SQLite 库的写入者。第一个实例则可以在 WebView2 初始化（约 300 ms）的
+/// 同时打开数据库，把这段 IO 完全藏进窗口创建时间里。
+struct CorePrefetchPlugin {
+    host: Option<Arc<DesktopHost>>,
+}
+
+impl<R: tauri::Runtime> tauri::plugin::Plugin<R> for CorePrefetchPlugin {
+    fn name(&self) -> &'static str {
+        "hbot-core-prefetch"
+    }
+
+    fn initialize(
+        &mut self,
+        _app: &tauri::AppHandle<R>,
+        _config: serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(host) = self.host.take() else {
+            return Ok(());
+        };
+        startup_trace::point("core_prefetch_start", "");
+        tauri::async_runtime::spawn(async move {
+            match host.core().await {
+                // 真正的「核心可用」时刻：预取任务完成，比 setup 里观察到的更早。
+                Ok(_) => startup_trace::point("core_ready", ""),
+                Err(_) => startup_trace::point("core_failed", ""),
+            }
+        });
+        Ok(())
+    }
 }
 
 /// Tauri 管理的桌面宿主状态。
@@ -108,9 +254,13 @@ impl DesktopHost {
 /// SQLite 打开 + 迁移是阻塞 IO，必须离开 tokio reactor（`AGENTS.md` 的"阻塞工作
 /// 不上 reactor"），所以整个 `AppState::open` 走 `spawn_blocking`。
 async fn open_core(data_dir: PathBuf) -> Result<Core, String> {
+    startup_trace::point("open_core_begin", "");
     let blocking_dir = data_dir.clone();
     let opened = tokio::task::spawn_blocking(move || {
-        AppState::open(&blocking_dir, Arc::new(SystemClock), Arc::new(UuidIds))
+        startup_trace::point("open_blocking_enter", "");
+        let opened = AppState::open(&blocking_dir, Arc::new(SystemClock), Arc::new(UuidIds));
+        startup_trace::point("appstate_open_returned", "");
+        opened
     })
     .await;
 
@@ -127,6 +277,7 @@ async fn open_core(data_dir: PathBuf) -> Result<Core, String> {
 
     // 与 CLI 用的是同一个构造：`with_state` 顺带注入 clock / ids / events。
     let dispatcher = Arc::new(Dispatcher::new().with_state(Arc::clone(&state)));
+    startup_trace::point("dispatcher_ready", "");
     Ok(Core { state, dispatcher })
 }
 
@@ -156,7 +307,14 @@ pub async fn dispatch_on(host: &DesktopHost, command: Command) -> Response {
 /// times」。非 `pub` 不导出宏，`generate_handler![dispatch]` 在 crate 内照样解析得到。
 #[tauri::command]
 async fn dispatch(app: AppHandle, command: Command) -> Response {
-    match app.try_state::<Arc<DesktopHost>>() {
+    let sequence = DISPATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    let started = startup_trace::now();
+    let kind = command.kind();
+    if sequence <= 8 && startup_trace::enabled() {
+        startup_trace::point("dispatch_in", &format!("n={sequence} cmd={kind}"));
+    }
+
+    let response = match app.try_state::<Arc<DesktopHost>>() {
         Some(host) => {
             // 先把 `Arc` 取出来，避免把 `State` 的借用带进 await。
             let host = Arc::clone(host.inner());
@@ -168,6 +326,32 @@ async fn dispatch(app: AppHandle, command: Command) -> Response {
             message: "桌面核心未装配：setup 没有注册 DesktopHost".to_owned(),
             data: None,
         }),
+    };
+
+    if let Some(started) = started {
+        if sequence <= 8 {
+            startup_trace::point(
+                "dispatch_out",
+                &format!(
+                    "n={sequence} cmd={kind} dur_ms={:.3} ok={}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    matches!(response, Response::Ok { .. })
+                ),
+            );
+        }
+    }
+
+    response
+}
+
+/// 测量专用：接收页面脚本送来的首帧标记（`HBOT_STARTUP_TRACE=1` 时才会被调用）。
+///
+/// 走应用命令而不是 `plugin:event|emit`：应用命令不经过 capabilities ACL，页面脚本
+/// 无需任何额外权限；关闭 trace 时函数体只剩一次 `enabled()`（OnceLock 读取）。
+#[tauri::command]
+fn startup_mark(payload: serde_json::Value) {
+    if startup_trace::enabled() {
+        eprintln!("hbot-startup ev=frontend_mark payload={payload}");
     }
 }
 
@@ -288,6 +472,30 @@ fn init_tracing() {
         .try_init();
 }
 
+/// 仅测试用：启动期主动 panic，验证 `<data_dir>/logs/crash-*.log` 真的落盘。
+///
+/// 两道闸，保证普通用户（包括 release 用户）误触发不了：
+///
+/// 1. **编译期**：整个函数体只在 `debug_assertions` 构建里存在。release 下即使
+///    环境变量写成 `1` 也不会 panic（这段代码根本不编译进去）。
+/// 2. **运行期**：debug 构建里也必须显式设置 `HBOT_TEST_PANIC_ON_START=1`。
+///
+/// panic 消息里故意带 `api_key=sk-live-test-s6-crash-e2e-7f3a9b2c`，让
+/// `scripts/verify-crash-report.ps1` 能断言报告经过了
+/// `hbot_rpc::app::agent::log::redact_text`（见 `crash.rs` 的 `render`）。
+/// `marker=S6-CRASH-E2E` 是脚本定位这一次 panic 的稳定标记。
+fn maybe_trigger_test_panic() {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var("HBOT_TEST_PANIC_ON_START").as_deref() == Ok("1") {
+            panic!(
+                "HBOT_TEST_PANIC_ON_START=1：启动期自检 panic（marker=S6-CRASH-E2E；\
+                 api_key=sk-live-test-s6-crash-e2e-7f3a9b2c）"
+            );
+        }
+    }
+}
+
 /// 启动桌面壳，返回进程退出码。
 ///
 /// 只在最外层返回 `i32`；内部的失败都变成可读错误 + 退出码 1，不做 unwrap/panic。
@@ -302,82 +510,145 @@ fn init_tracing() {
 ///    `WebviewWindowBuilder::from_config`）。第二个实例在插件里就把参数交给第一个实例
 ///    并以 `0` 退出，**不会**再开一个 WebView、也不会再开一个数据库写入者。
 pub fn run() -> i32 {
+    startup_trace::point("run_enter", "");
+
     // 1. 命令行入口（`hbot --set-autostart on` 之类）。
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = cli::run_headless(&args) {
         return code;
     }
+    startup_trace::point("cli_headless_done", "");
 
     init_tracing();
+    startup_trace::point("tracing_ready", "");
 
     // 2. 崩溃上报：只写本机 `<data_dir>/logs/crash-*.log`，下次启动变成一条 error 日志。
     //    数据目录算法只有一份（`hbot_core::data_dir`），这里和 `setup` 用的是同一个。
-    let crash_dir = hbot_core::data_dir();
-    crash::install(Some(crash_dir));
+    //    同时把核心预取要用的绝对路径算出来：没有绝对路径时（极端环境缺 APPDATA）
+    //    退到 setup 里再用 Tauri 的 `app_data_dir`，这时不预取。
+    let resolved = hbot_core::data_dir();
+    let data_dir = resolved.is_absolute().then_some(resolved);
+    let early_host = data_dir.clone().map(|dir| Arc::new(DesktopHost::new(dir)));
+    crash::install(Some(data_dir.clone().unwrap_or_else(hbot_core::data_dir)));
+    // 仅测试用的启动期 panic（debug 构建 + 显式环境变量，见函数文档）。
+    maybe_trigger_test_panic();
+    startup_trace::point("crash_hook_ready", "");
+    startup_trace::point("builder_begin", "");
 
     let outcome = tauri::Builder::default()
         // 3. 单实例：第二个进程把 argv/cwd 交给第一个，然后自己 exit(0)。
         //    回调里"把已有窗口带到前台"就是用户能感知到的全部效果。
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        //    隐藏入口 `--tray-action <id>` 也走这条通道：第二个进程把 argv 交过来，
+        //    这里把它翻译成与真实菜单点击完全相同的 `MenuAction` 再派发。
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(raw) = cli::tray_action_from_args(&argv) {
+                let id = shell::menu_id_for_cli(&raw);
+                shell::dispatch_menu_action(app, shell::handle_menu(&id), "cli", id.0.as_str());
+                return;
+            }
             tracing::info!("检测到第二次启动，把已有窗口带到前台");
             shell::show_main_window(app);
         }))
-        .invoke_handler(tauri::generate_handler![dispatch])
+        // 预取核心：必须在单实例插件之后注册，第二个实例走不到这里（见结构体文档）。
+        .plugin(CorePrefetchPlugin {
+            host: early_host.clone(),
+        })
+        .invoke_handler(tauri::generate_handler![dispatch, startup_mark])
         .on_menu_event(shell::on_menu_event)
         .on_tray_icon_event(|app, event| shell::on_tray_icon_event(app, &event))
-        .setup(|app| {
+        .on_page_load(|webview, payload| {
+            if !startup_trace::enabled() {
+                return;
+            }
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                startup_trace::point("page_load_finished", "");
+                if let Err(error) = webview.eval(STARTUP_MARK_SCRIPT) {
+                    eprintln!("hbot-startup ev=page_mark_eval_failed message={error}");
+                }
+            }
+        })
+        .setup(move |app| {
+            startup_trace::point("setup_enter", "");
             let handle = app.handle().clone();
 
             // 数据目录必须与 `hbot serve` / `hbot replay` 一致，否则同一个产品
             // 的桌面端和后台端会各开一个库（`%APPDATA%\hbot` vs
             // `%APPDATA%\com.hbot.app`）。算法只有一份，在 `hbot_core::paths`。
-            let resolved = hbot_core::data_dir();
-            let data_dir = if resolved.is_absolute() {
-                resolved
-            } else {
-                // 连 HOME/APPDATA 都读不到的极端环境才走 Tauri 的兜底，
-                // 并明确记日志——这不是正常路径。
-                tracing::warn!(
-                    fallback = %resolved.display(),
-                    "环境变量里没有用户目录，改用 Tauri 的应用数据目录"
-                );
-                match handle.path().app_data_dir() {
-                    Ok(dir) => {
-                        tracing::warn!(data_dir = %dir.display(), "已切换到 Tauri 应用数据目录");
-                        dir
-                    }
-                    Err(error) => {
-                        let message = format!("无法确定应用数据目录：{error}");
-                        report_fatal(&message);
-                        return Err(message.into());
+            let data_dir = match data_dir.clone() {
+                Some(dir) => dir,
+                None => {
+                    // 连 HOME/APPDATA 都读不到的极端环境才走 Tauri 的兜底，
+                    // 并明确记日志——这不是正常路径（也不会预取核心）。
+                    let resolved = hbot_core::data_dir();
+                    tracing::warn!(
+                        fallback = %resolved.display(),
+                        "环境变量里没有用户目录，改用 Tauri 的应用数据目录"
+                    );
+                    match handle.path().app_data_dir() {
+                        Ok(dir) => {
+                            tracing::warn!(data_dir = %dir.display(), "已切换到 Tauri 应用数据目录");
+                            dir
+                        }
+                        Err(error) => {
+                            let message = format!("无法确定应用数据目录：{error}");
+                            report_fatal(&message);
+                            return Err(message.into());
+                        }
                     }
                 }
             };
             tracing::info!(data_dir = %data_dir.display(), "桌面壳数据目录");
+            if startup_trace::enabled() {
+                startup_trace::point(
+                    "data_dir_resolved",
+                    &format!("data_dir={}", data_dir.display()),
+                );
+            }
 
-            let host = Arc::new(DesktopHost::new(data_dir.clone()));
+            // 测量专用：收前端首帧标记（`STARTUP_MARK_SCRIPT` 通过 plugin:event|emit 发出）。
+            // 这条路径只在 `HBOT_STARTUP_TRACE=1` 时执行。
+            if startup_trace::enabled() {
+                // `AppHandle::listen` 返回 `EventId`（u32）而不是 `Result`；Tauri 2.12
+                // 里没有可失败的分支。AppHandle 级监听器随应用存活，不需要 unlisten。
+                let _event_id = app.handle().listen(STARTUP_MARK_EVENT, |event| {
+                    eprintln!("hbot-startup ev=frontend_mark payload={}", event.payload());
+                });
+            }
+
+            let host = match early_host {
+                Some(host) => host,
+                None => Arc::new(DesktopHost::new(data_dir.clone())),
+            };
             app.manage(Arc::clone(&host));
+            startup_trace::point("host_managed", "");
 
             // 托盘菜单、关窗到托盘、退出按钮。托盘图标本身由 `tauri.conf.json` 的
             // `app.trayIcon` 在 `Builder::build()` 里建好，这里只挂菜单。
             let prefs = settings::DesktopSettings::load(&data_dir);
+            startup_trace::point("settings_loaded", "");
             reconcile_autostart(&prefs, &data_dir);
+            startup_trace::point("autostart_reconciled", "");
             if let Err(error) = shell::install(&handle, prefs, data_dir.clone()) {
                 // 托盘装不上不该让应用起不来，但这意味着关窗行为可能不对 —— 必须留痕。
                 tracing::error!(%error, "托盘/关窗行为安装失败");
             }
+            startup_trace::point("shell_installed", "");
 
             // 核心装配放后台任务：SQLite 打开 + 迁移不能挡住窗口首帧（§2.1）。
             let crash_dir = data_dir;
             tauri::async_runtime::spawn(async move {
+                startup_trace::point("open_task_start", "");
                 match host.core().await {
                     Ok(core) => {
+                        startup_trace::point("core_ready_observed", "");
                         attach_event_pumps(&handle, &core.state);
+                        startup_trace::point("event_pumps_ready", "");
                         // 事件泵起来之后再看上次有没有崩过：`EventBus` 是广播，
                         // 没有订阅者的事件会被丢掉，所以必须等订阅挂上再说。
                         crash::report_pending(crash_dir, Arc::clone(&core.state)).await;
                     }
                     Err(message) => {
+                        startup_trace::point("core_failed", "");
                         let message = format!("hbot 启动失败：{message}");
                         // 对话框会阻塞调用线程，放到 blocking 池，别堵住 async worker。
                         let report = message.clone();
@@ -388,6 +659,7 @@ pub fn run() -> i32 {
                 }
             });
 
+            startup_trace::point("setup_exit", "");
             Ok(())
         })
         .run(tauri::generate_context!());

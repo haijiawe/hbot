@@ -301,7 +301,7 @@ mod tests {
                 kind: crate::dto::StepKind::Over,
             },
             Command::LogsTail {
-                bot_id: parse(BOT),
+                bot_id: Some(parse(BOT)),
                 limit: 50,
             },
         ]

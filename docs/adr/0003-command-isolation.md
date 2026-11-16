@@ -170,8 +170,13 @@ Linux 侧同理只声明 `setsid`/`setpgid`/`kill` 三个符号，不引入 `lib
   （`KILL_ON_JOB_CLOSE` 杀不到它）。
 - **Linux 上的孤儿**：本进程被 `SIGKILL` 时，已 `setsid` 的子孙不会被连带杀掉
   （Windows 侧因为 `KILL_ON_JOB_CLOSE` 反而更稳）。
-- **程序清单是调用方的责任**：实现只保证"清单里的绝对路径才放行"。若上层把 `cmd.exe` 放进清单，
-  argv 保证就失效了 —— 策略层（`hbot-agent` 的工具实现）不许把解释器放进清单。
+- **程序清单是调用方的责任**：`hbot-command` 实现只保证"清单里的绝对路径才放行"，**不判断哪些名字
+  危险**（分层取舍，不是遗漏）。解释器准入判据放在**配置解析层**
+  （`crates/hbot-rpc/src/app/agent/config.rs` 的 `SandboxConfig::resolve_with`）：默认拒绝
+  `INTERPRETER_PROGRAMS`（`cmd`/`powershell`/`python`/`node` 等）里的名字并返回 `-32002`；
+  显式 `HBOT_ALLOW_SHELL=1`（只认 `1`/`true`/`yes`/`on`）才放行并 `warn`（每进程每条清单一次）。
+  绕开配置层直接构造 `CommandSpec`（如红队 `b03`）仍然能跑 `cmd` —— 这正是"命令层不兜底、
+  判据必须在配置层"的可执行证据（RT-05，2026-11-16）。
 - **半写文件**：超时是 `SIGKILL`/`TerminateProcess` 语义，不给程序清理机会。
 - **CPU/IO 抢占**：只限内存与进程数，没限 CPU 时间与 IO 带宽。
 
@@ -230,3 +235,8 @@ Linux 侧同理只声明 `setsid`/`setpgid`/`kill` 三个符号，不引入 `lib
 - `docs/03-directory.md` 的 crate 清单需要加 `hbot-command`（依赖只有 `hbot-core`）。
 - `xtask/src/deps.rs` 的 `ALLOWED` 已加 `("hbot-command", &["hbot-core"])`。
 - `run_command` **仍然返回 denied**：本 ADR 只交端口 + 实现 + 证据，接线是下一批的事。
+- **2026-11-16 补记（RT-05）**：§5 的"程序清单是调用方的责任"现在由**配置解析层**执行 ——
+  `crates/hbot-rpc/src/app/agent/config.rs` 的 `SandboxConfig::resolve_with` 默认拒绝解释器/外壳类
+  白名单（`-32002`），`HBOT_ALLOW_SHELL=1` 是显式逃生阀（放行 + 每进程一次 `warn`）。
+  **§2.4 的六道闸顺序与 `hbot-command` 的职责不变**：那一层仍然只认"清单里有没有这个名字"，
+  危险名字的解释权在配置层。详见 `docs/security/red-team-findings.md` RT-05。

@@ -261,10 +261,19 @@ fn bot_debug_and_log_commands_use_camel_case_fields() {
 
     assert_command(
         Command::LogsTail {
-            bot_id: bot(),
+            bot_id: Some(bot()),
             limit: 200,
         },
         json!({ "type": "logs_tail", "botId": BOT_UUID, "limit": 200 }),
+    );
+
+    // `None` 是全项目视图（含 Agent 行）：wire 上必须是 null，不能省略字段。
+    assert_command(
+        Command::LogsTail {
+            bot_id: None,
+            limit: 10,
+        },
+        json!({ "type": "logs_tail", "botId": null, "limit": 10 }),
     );
 }
 
@@ -351,7 +360,7 @@ fn command_fields_never_serialize_as_snake_case() {
             kind: StepKind::Over,
         },
         Command::LogsTail {
-            bot_id: bot(),
+            bot_id: Some(bot()),
             limit: 1,
         },
     ];
@@ -466,10 +475,11 @@ fn command_result_types_use_camel_case() {
         at: at(),
         level: LogLevel::Info,
         line: "started".to_string(),
+        source: "bot".to_string(),
     };
     assert_eq!(
         serde_json::to_value(&log).expect("ser"),
-        json!({ "at": AT, "level": "info", "line": "started" })
+        json!({ "at": AT, "level": "info", "line": "started", "source": "bot" })
     );
 
     // 往返，并确认没漏改的 snake_case 键。

@@ -1,10 +1,12 @@
 /**
  * runStore：bot 运行状态与运行日志。
  *
- * 两条输入，职责分明：
+ * 三条输入，职责分明：
  * - `bot.status` 事件是**唯一**的运行态真源（启停命令的返回值不再参与）；
  * - `bot.list` 只在打开项目 / 启停之后播种一次状态（`refresh()`），
- *   用来对齐"界面刚打开、核心其实早就在跑"，事件一到就以事件为准（`live`）。
+ *   用来对齐"界面刚打开、核心其实早就在跑"，事件一到就以事件为准（`live`）；
+ * - `logs.tail` 在首屏补读一次历史日志（`loadLogs()`），没有选中 bot 时读全项目
+ *   （包含没有 bot 归属、`source = 'agent'` 的 Agent 行）。
  *
  * 不引用 workspaceStore / agentStore（AGENTS.md §0.10）。
  */
@@ -17,6 +19,9 @@ import { dispatch } from '../lib/ipc'
 
 /** 日志环形缓冲上限：10k 行 —— 够复现一次故障，又不至于把内存吃光。 */
 export const MAX_LOG_LINES = 10_000
+
+/** 首屏从数据库补读的日志条数：够看清最近一次运行，又不至于一次拉太多。 */
+export const LOG_TAIL_LIMIT = 500
 
 export interface RunState {
   botId: string
@@ -32,6 +37,8 @@ export interface RunState {
 
   /** 用 `bot.list` 对齐一次状态；事件优先，`live` 时不动 status。 */
   refresh: () => Promise<void>
+  /** 从 `logs_tail` 补读一次历史日志；`botId` 为空时读全项目（含 Agent 行）。 */
+  loadLogs: () => Promise<void>
   hydrate: () => Promise<void>
   start: () => Promise<void>
   stop: () => Promise<void>
@@ -69,12 +76,36 @@ export const useRunStore = create<RunState>()((set, get) => ({
       // 事件已经到过就别用快照覆盖它（快照可能比事件旧）。
       if (!first || get().live) {
         set({ hydrated: true })
+        await get().loadLogs()
         return
       }
       set({ botId: first.botId, status: first.status, hydrated: true })
+      await get().loadLogs()
     } catch (error) {
       // 查不到列表不是致命错误（可能还没打开项目），但必须让用户看见。
       set({ hydrated: true, error: `读取 bot 列表失败：${errorMessage(error)}` })
+    }
+  },
+
+  async loadLogs() {
+    const botId = get().botId
+    try {
+      const rows = await dispatch({
+        type: 'logs.tail',
+        // 没有选中 bot 时读全项目：Agent 行没有 bot 归属，只有 null 视图看得到。
+        botId: botId.length > 0 ? botId : null,
+        limit: LOG_TAIL_LIMIT,
+      })
+      const lines: LogLine[] = rows.map((row) => ({
+        level: panelLevel(row.level),
+        // Agent 行用 `[agent]` 前缀和普通 bot 日志区分开。
+        source: row.source === 'agent' ? '[agent]' : botId || 'bot',
+        message: row.line,
+        at: row.at,
+      }))
+      set({ logs: lines })
+    } catch (error) {
+      set({ error: `读取日志失败：${errorMessage(error)}` })
     }
   },
 

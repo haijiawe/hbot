@@ -174,9 +174,9 @@ botId: BotId,
  */
 kind: StepKind, } | { "type": "logs_tail", 
 /**
- * Bot ID。
+ * Bot ID；`None` 表示全项目（含 Agent 行）。
  */
-botId: BotId, 
+botId: BotId | null, 
 /**
  * 条数上限。
  */

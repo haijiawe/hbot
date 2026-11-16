@@ -153,7 +153,7 @@ pub trait PlatformAdapter: Send + Sync {
 - **现状（M0 实测，2026-11-16 更新）**：OneBot 11 正向 WebSocket 已实现（心跳看门狗 45s 可注入、`Authorization: Bearer`、串行出站最多 3 次重试、1/2/4…30s ±20% 退避、连接超时 10s）。
   - **TLS 已接**：`ws://` 与 `wss://` 都支持；`wss://` 与 `https://` 共用一份 `ClientConfig`（rustls + `webpki-roots`，**校验始终开启**）。证书不匹配/链到未知 CA → `AdapterError::Tls`（映射 `-32006`），**没有“跳过校验”开关**，也不退化成明文。单测与真 socket 测试见 `crates/hbot-adapters/tests/tls_sockets.rs`（进程内 rcgen 自签 CA、仅回环）。
   - 仍不支持：mTLS（客户端证书）、证书指纹固定、HTTP/1.1 以外的协议、3xx 跟随、gzip、连接池、代理。
-  - **启动前探测（已接线）**：`BotAdapter::subscribe()` 会先跑一次 `OneBotClient::probe_connection()`，失败则 `bot_start` 直接返回 `-32002`（不再表现为后台反复重连）。**已知代价**：一次 `bot_start` 会产生**两条 WS 连接**（一条一次性探测 + 一条真客户端）。除了多一次握手，它会让平台侧看到的「同一 appId 并发连接数」翻倍——OneBot 协议端通常不限制，但这不是可以忽略的常数，若要省掉应改成"探测成功即复用该连接"，那需要把 `probe_connection` 从 `probe → drop` 改成 `probe → handoff`，属于独立改动。
+  - **启动前探测（probe → handoff）**：`BotAdapter::subscribe()` 先用 `OneBotClient::probe_session()` 建立连接并等 OneBot 生命周期握手（`meta_event/lifecycle` 或心跳，最多 `LIFECYCLE_CONFIRM_WINDOW` = 500 ms），成功则把这条连接**原样交给** `OneBotClient::start_with_session()` 当常驻客户端的第一条会话——一次 `bot_start` 只产生**一条** WS 连接（旧实现是"一次性探测 + 真客户端"两条，现已合并）。失败（DNS/拒绝/TLS/401/协议错/超时）仍当场返回 `-32002`（策略类 `-32005`），错误文案保留地址、原始错误与超时上限。`probe_connection()` 保留为一次性探测入口（测试/诊断用），与 handoff 走同一条 `probe_session` 路径。**已知代价**：① 确认窗口内一帧都不发的协议端按"宽限"继续启动（真 NapCat 连上立刻发 lifecycle，不受影响），此时若对端其实不兼容，由 45s 心跳看门狗兜底重连，而不是启动时立刻报错；② 探测失败时这唯一一条连接已经用掉，`bot_start` 返回错误后没有后台重连。
   - **证书/鉴权错误的表现**：探测阶段就把 401 与证书错误转成 `bot_start` 的显式失败，错误信息里不含 token。
 
 #### 平台不是二选一：OneBot 与 QQ 官方**并列**为一等平台
@@ -346,7 +346,7 @@ export default defineBot({
   | `ctx.send` / `ctx.kv` / `ctx.http` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
   | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage`（`isolate.rs:504-510`）；清单里的 `onSchedule` 字段同样未接 |
 
-- **`onMessage(ctx)` 的 `ctx` 真实形状**（`hbot-rpc/src/app/runtime/sandbox_handler.rs:860-877` 构造，`isolate.rs:924-942` 追加宿主函数）：入站字段**平铺**在 ctx 上，不是嵌套在 `ctx.message` 里。
+- **`onMessage(ctx)` 的 `ctx` 真实形状**（由 `hbot-bot/src/event_json.rs` 的 `EventSource` / `event_json` **唯一拼装**，生产 `sandbox_handler` 与 `hbot replay` 共用这一份实现；`isolate.rs:924-942` 只追加宿主函数）：入站字段**平铺**在 ctx 上，不是嵌套在 `ctx.message` 里。
 
   | 字段 | 类型 | 来源 |
   |---|---|---|
@@ -358,6 +358,7 @@ export default defineBot({
   | `payload` | `unknown` | 原始平台事件（各平台不同，别当契约用） |
   | `reply` / `log` / `sleep` | 函数 | 与模块导出的同名函数等价 |
 
+  新增**入站字段**的顺序（硬）：先 `hbot-bot/src/event_json.rs` 的 `EventSource` / `event_json` → 再 `dts.rs` 的 `HOST_DTS` 声明 → 最后本表与 `dts.rs` 测试里的字段清单；`crates/hbot-rpc/tests/event_shape_dts.rs` 会把 d.ts 声明的字段名集合与 `event_json` 的真实输出逐键比对，漏一处就红。
   新增宿主 API 的顺序（硬）：先 `HOST_MODULE_SOURCE` 注入 → 再 `build_event` 挂到 ctx → 再 `dts.rs` 声明 → 最后文档这张表，四处同一批改，缺一处就红。
 - 超时/内存超限：中断 isolate，记录错误 + 源码位置；该消息进死信，bot 标记 degraded。
 - 异步宿主调用的返回必须经 oneshot 回到同一 isolate 线程；禁止在宿主线程直接 resolve promise。
@@ -532,7 +533,7 @@ pub enum Command {
     DebugSetBreakpoints { file: String, lines: Vec<u32> },
     DebugResume { session_id: SessionId },
     DebugStep { session_id: SessionId, kind: StepKind },
-    LogsTail { bot_id: BotId, limit: usize },
+    LogsTail { bot_id: Option<BotId>, limit: usize }, // None = 全项目（含 Agent 行）
     // ...
 }
 ```
@@ -751,6 +752,9 @@ debug.resumed      { botId }
   - 来源顺序同 provider 配置：环境变量优先，否则 `<data_dir>/agent.json` 的同名字段。
   - `HBOT_SANDBOX` / `agent.json` 的 `sandbox`：`read_only`｜`workspace_write`｜`danger`（也接受 `readonly`/`workspace-write`/`DANGER` 这类大小写与连字符变体）。**写错是 `-32002`，不静默退回默认档** —— 静默降档会让用户以为命令能跑却一直被拒。
   - `HBOT_COMMAND_ALLOW` / `agent.json` 的 `allowedPrograms`：逗号分隔的程序名，去空去重保序；**默认空 = 一个程序都不许**。清单只放具体程序，不放 `cmd`/`sh`/`powershell` 这类解释器（ADR-0003 §5：放解释器等于绕过"不经 shell"）。
+  - **RT-05（2026-11-16 已修）：解释器/外壳类名字在配置解析层被拒**（`-32002`，错误里逐个列出被拒名字与原因）。判据 = 取 **basename**（按 `/` 与 `\`）→ 去首尾空白、去尾部点 → `to_ascii_lowercase` → 去**最后一个扩展名**，再与 `INTERPRETER_PROGRAMS` **精确**比较（**不做子串匹配** —— 所以 `ssh`、`shellcheck`、`bashful-tool`、`node_modules` 不会被误杀）。名单含 `cmd`/`powershell`/`pwsh`/`sh`/`bash`/`zsh`/`fish`/`dash`/`ksh`/`csh`/`tcsh`/`wsl`/`conhost`/`cscript`/`wscript`/`mshta`/`rundll32`/`regsvr32`/`python`（含 `python311` 这类版本后缀）/`py`/`node`/`nodejs`/`deno`/`bun`/`ruby`/`perl`/`php`/`java`/`osascript`。
+  - 确实要跑解释器时：显式设 `HBOT_ALLOW_SHELL=1`（只认 `1`/`true`/`yes`/`on`，其余值一律算关）。打开后**放行并保留清单原样**，同时 `tracing::warn!` 一条 —— **每进程每条清单只告警一次**（不是每回合一条）。这只是逃生阀，不是默认姿势：正确做法是把任务固化成具体程序/项目脚本，见 `docs/security/red-team-findings.md` RT-05「仍需人工决定」。
+  - 判据**只在配置解析层**（`crates/hbot-rpc/src/app/agent/config.rs` 的 `SandboxConfig::resolve_with`）：`hbot-command` 仍然只回答"这份清单里有没有这个名字"，不判断哪些名字危险（ADR-0003 §5）。
   - 解析失败（档位拼错、`agent.json` 非法 JSON）= `agent_send` 直接失败，不起回合。
 - **尚未做到**（ADR-0003 有完整清单）：Windows 低完整性标签 / AppContainer、Linux 写隔离的**运行验证**（只编译过）、读与网络隔离、注册表 `HKCU` 写不限、临时目录不可写；Windows 上 `spawn → AssignProcessToJobObject` 之间仍有孙进程逃逸窗口。
 
@@ -889,7 +893,7 @@ debug.resumed      { botId }
 | 托盘「显示主窗口」/ 第二次启动 | `show` + `unminimize` + `set_focus`（前台是否真的切过去由 Windows 前台锁决定，见 S6 §9） |
 | 任务管理器强杀 | 无处理（OS 行为）；WebView2 用户数据目录可能被占住，立刻重启会在 `setup` panic 并留下崩溃报告 |
 
-**写屏障为什么是 `append_log`**：`Store` 只有一条写线程，`submit()` 阻塞等回执，所以一次成功的写等价于「此前排队的写都已落盘」。`Store` 没有公开 `flush()`/`close()`（`StoreOp::Shutdown` 只由 `Drop` 发）。空库时 `logs.bot_id` 外键无处可插，此时只记日志、不假装排空过。
+**写屏障为什么是 `append_log`**：`Store` 只有一条写线程，`submit()` 阻塞等回执，所以一次成功的写等价于「此前排队的写都已落盘」。`Store` 没有公开 `flush()`/`close()`（`StoreOp::Shutdown` 只由 `Drop` 发）。空库时没有 bot 行可指，此时只记日志、不假装排空过（`logs.bot_id` 自迁移 0003 起允许 NULL，但关闭屏障仍按 bot 存在与否决定是否写行）。
 
 ### 17.3 数据与日志位置
 
@@ -899,6 +903,7 @@ debug.resumed      { botId }
 | 数据库 | `<data_dir>/hbot.db`（SQLite，WAL） |
 | 桌面偏好 | `<data_dir>/desktop.json`（`{"autostart":false,"closeToTray":true}`，无 BOM） |
 | 崩溃报告 | `<data_dir>/logs/crash-<UTC 时间戳>.log`，提示过后改名 `*.reported.log` |
+| 崩溃提示（结构化） | `<data_dir>/hbot.db` 的 `logs` 表：`level='error'`、`bot_id=NULL`、`source='agent'` |
 | 运行日志 | 桌面壳：stderr（由启动方重定向）；`serve`：stdout 一行 ready + stderr；systemd 部署时进 journald |
 
 ### 17.4 运维入口
@@ -907,6 +912,7 @@ debug.resumed      { botId }
 |---|---|
 | 开/关开机自启（不用开 GUI） | `hbot-desktop --set-autostart on\|off\|toggle` |
 | 看偏好与系统实际自启状态 | `hbot-desktop --print-settings`（JSON：`settings` / `systemAutostart` / `dataDir` / `execPath`） |
+| 读日志表（含崩溃提示） | `hbot-desktop --logs-tail [n]`（`bot_id=None` 全项目视图，输出 JSON 数组） |
 | 后台服务（Linux） | `systemctl enable --now hbot` → `journalctl -u hbot -f`；卸载与 hardening 取舍见 `packaging/README.md` |
 | 崩溃取证 | 让用户把 `<data_dir>/logs/crash-*.log` 发过来；文件里不含环境变量 dump，且过了 `redact_text`（token/密钥/长 hex 会被抹成 `<redacted>`） |
 
@@ -914,6 +920,6 @@ debug.resumed      { botId }
 
 ### 17.5 可验证性
 
-`scripts/verify-single-instance.ps1` / `verify-tray-close.ps1` / `verify-autostart.ps1` 是真机脚本（起真进程、看真退出码与真日志、读真注册表；自启脚本会备份并还原真实注册表与 `desktop.json`）。**要求 `pwsh` 7**：Windows PowerShell 5.1 的 `Start-Process -RedirectStandardError` 会丢子进程 `.ExitCode`。
+`scripts/verify-single-instance.ps1` / `verify-tray-close.ps1` / `verify-autostart.ps1` / `verify-tray-actions.ps1` / `verify-crash-report.ps1` 是真机脚本（起真进程、看真退出码与真日志、读真注册表；自启脚本会备份并还原真实注册表与 `desktop.json`）。**要求 `pwsh` 7**：Windows PowerShell 5.1 的 `Start-Process -RedirectStandardError` 会丢子进程 `.ExitCode`。
 
-已经验过的：单实例退出码 0 且未进 `setup`、关窗隐藏进程不退、第二次启动恢复窗口、`closeToTray=false` 优雅退出 0、注册表写入/幂等/删除、`desktop.json` 字段、崩溃文件落盘与下次启动检测。**没验过的**（Linux systemd/logrotate、macOS 全部、托盘菜单项被点击、崩溃提示出现在界面上、有真实 bot 时的退出）逐条列在 S6 §9 —— 不要把它们当成已验证。
+已经验过的：单实例退出码 0 且未进 `setup`、关窗隐藏进程不退、第二次启动恢复窗口、`closeToTray=false` 优雅退出 0、注册表写入/幂等/删除、`desktop.json` 字段、托盘三个菜单 id → 动作派发（show / autostart / quit）、崩溃文件落盘与脱敏、下次启动 stderr 提示、`logs_tail` 读到 `source=agent`/`error` 的崩溃行。**没验过的**（Linux systemd/logrotate、macOS 全部、鼠标真的点中托盘菜单项、崩溃提示在 UI 中的渲染、有真实 bot 时的退出、重启后自启）逐条列在 S6 §9 —— 不要把它们当成已验证。

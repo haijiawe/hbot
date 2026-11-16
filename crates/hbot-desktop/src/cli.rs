@@ -5,16 +5,25 @@
 //! + [`crate::settings`]）也挂到命令行上，脚本就能"开 → 查 → 关 → 查"走一遍。
 //!
 //! 约定：`run_headless` 返回 `None` 表示"不是命令行请求，照常起 GUI"。返回 `Some(code)`
-//! 表示已经处理完，进程应该用这个退出码退出（**不会**创建任何窗口，也不会打开数据库 ——
-//! 这条路径刻意不碰 `hbot_rpc`，所以它可以在第一个实例正跑着的时候安全执行）。
+//! 表示已经处理完，进程应该用这个退出码退出（**不会**创建任何窗口 —— 这条路径刻意不碰
+//! `hbot_rpc`，所以它可以在第一个实例正跑着的时候安全执行）。唯一例外是 `--logs-tail`：
+//! 它会只读打开数据库，用来给崩溃上报脚本提供"日志表里能查到"的证据。
 //!
 //! 用法：
 //!
 //! ```text
 //! hbot --set-autostart on|off|toggle   开/关开机自启（同时更新 desktop.json）
 //! hbot --print-settings                打印偏好 + 系统里的实际自启状态（JSON）
+//! hbot --tray-action show|autostart|quit
+//!                                      （隐藏入口）把一次托盘菜单派发送给已运行的实例
+//! hbot --logs-tail [n]                 打印最近 n 条 logs（默认 20，测试/诊断用）
 //! hbot --help                          这段文字
 //! ```
+//!
+//! `--tray-action` 刻意**不**在 `run_headless` 里处理：它必须先让单实例插件把 argv
+//! 交给已经运行的实例，再由那个实例执行动作。真正的执行入口在 `lib.rs` 的单实例回调，
+//! 与 `on_menu_event` 共用 [`crate::shell::handle_menu`] + [`crate::shell::dispatch_menu_action`]。
+//! 它验证的是「菜单 id → 动作」的派发，**不是**「鼠标点中托盘图标」这一步。
 
 use std::path::PathBuf;
 
@@ -30,6 +39,10 @@ pub enum Invocation {
     PrintSettings,
     /// `--help` / `-h`。
     Help,
+    /// `--tray-action <菜单 id>`：交给已运行实例的隐藏入口（见模块文档）。
+    TrayAction(String),
+    /// `--logs-tail [n]`：只读打印最近 n 条 logs（默认 20），给崩溃上报脚本取证。
+    LogsTail(usize),
     /// 没有任何参数：起 GUI。
     Launch,
     /// 不认识的长参数：报错退出，不要静默起 GUI（打错一个字母就不知道该发生了）。
@@ -63,6 +76,37 @@ pub fn parse(args: &[String]) -> Invocation {
                     _ => return Invocation::Unknown("--set-autostart 需要 on|off|toggle".into()),
                 };
             }
+            "--tray-action" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Invocation::Unknown(
+                        "--tray-action 需要 show|autostart|quit 或完整菜单 id".into(),
+                    );
+                };
+                if value.starts_with('-') {
+                    return Invocation::Unknown(
+                        "--tray-action 需要 show|autostart|quit 或完整菜单 id".into(),
+                    );
+                }
+                index += 1;
+                invocation = Invocation::TrayAction(value.clone());
+            }
+            "--logs-tail" => {
+                let value = args.get(index + 1);
+                match value {
+                    Some(text) if !text.starts_with('-') => match text.parse::<usize>() {
+                        Ok(limit) if limit > 0 => {
+                            index += 1;
+                            invocation = Invocation::LogsTail(limit);
+                        }
+                        _ => {
+                            return Invocation::Unknown(
+                                "--logs-tail 需要一个正整数（默认 20）".into(),
+                            );
+                        }
+                    },
+                    _ => invocation = Invocation::LogsTail(20),
+                }
+            }
             other if other.starts_with('-') => return Invocation::Unknown(other.to_string()),
             // 非参数（比如安装器塞进来的路径）：GUI 自己会忽略，别抢它的活。
             _ => {}
@@ -87,7 +131,25 @@ pub fn run_headless(args: &[String]) -> Option<i32> {
         }
         Invocation::PrintSettings => Some(print_settings()),
         Invocation::SetAutostart(desired) => Some(set_autostart(desired)),
+        Invocation::LogsTail(limit) => Some(print_logs_tail(limit)),
+        // 留给单实例插件：先转发给已运行的实例，再在那边执行（见模块文档）。
+        Invocation::TrayAction(_) => None,
     }
+}
+
+/// 从（第二个进程转交过来的）参数里找 `--tray-action` 的值。
+///
+/// 插件转交的是 `std::env::args_os()`，第一项是 exe 路径；这里**不假设位置**，
+/// 从任意一项开始找，找到 flag 就取下一项。没有就返回 `None`（普通第二实例）。
+pub fn tray_action_from_args(args: &[String]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--tray-action" {
+            return args.get(index + 1).cloned();
+        }
+        index += 1;
+    }
+    None
 }
 
 const USAGE: &str = "\
@@ -97,6 +159,8 @@ hbot —— HBot 桌面壳
   hbot                                  启动图形界面（已在运行则把它带到前台）
   hbot --set-autostart on|off|toggle     开/关开机自启（同时更新 desktop.json）
   hbot --print-settings                  打印偏好与系统实际自启状态（JSON）
+  hbot --tray-action show|autostart|quit 把一次托盘菜单动作交给已运行的实例（测试用）
+  hbot --logs-tail [n]                   打印最近 n 条 logs（默认 20，测试/诊断用）
   hbot --help                            显示这段帮助
 
 说明:
@@ -153,6 +217,46 @@ fn print_settings() -> i32 {
         })
     );
     0
+}
+
+/// 只读打印最近若干条 logs。`bot_id = None` 是全项目视图（包含 Agent 行）。
+///
+/// 需要这个入口的理由：崩溃上报写的是 `logs` 表（`bot_id = NULL`、`source = 'agent'`），
+/// 验证脚本要能直接断言"下一次启动后 `logs_tail` 真能查到"，而不是只看 stderr。
+fn print_logs_tail(limit: usize) -> i32 {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_time()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("启动日志查询运行时失败：{error}");
+            return 1;
+        }
+    };
+
+    runtime.block_on(async {
+        let host = crate::DesktopHost::new(hbot_core::data_dir());
+        let response = crate::dispatch_on(
+            &host,
+            hbot_rpc::Command::LogsTail {
+                bot_id: None,
+                limit,
+            },
+        )
+        .await;
+        match response {
+            hbot_rpc::Response::Ok { data } => {
+                println!("{}", data.unwrap_or_else(|| serde_json::json!([])));
+                0
+            }
+            hbot_rpc::Response::Error { error } => {
+                eprintln!("logs_tail 失败：{error:?}");
+                1
+            }
+        }
+    })
 }
 
 fn state_name(state: AutostartState) -> &'static str {
@@ -231,6 +335,54 @@ mod tests {
         );
         assert_eq!(parse(&args(&["--help"])), Invocation::Help);
         assert_eq!(parse(&args(&["-h"])), Invocation::Help);
+    }
+
+    #[test]
+    fn tray_action_is_parsed_and_kept_out_of_headless() {
+        assert_eq!(
+            parse(&args(&["--tray-action", "show"])),
+            Invocation::TrayAction("show".into())
+        );
+        assert_eq!(
+            parse(&args(&["--tray-action", "desktop/tray/quit"])),
+            Invocation::TrayAction("desktop/tray/quit".into())
+        );
+        assert_eq!(
+            parse(&args(&["--tray-action"])),
+            Invocation::Unknown("--tray-action 需要 show|autostart|quit 或完整菜单 id".into())
+        );
+    }
+
+    #[test]
+    fn tray_action_from_forwarded_args_does_not_assume_position() {
+        // 单实例插件转发的是 args_os()，第一项是 exe 路径，flag 永远不在第一个。
+        let forwarded = args(&[
+            "C:\\Program Files\\hbot\\hbot-desktop.exe",
+            "--tray-action",
+            "autostart",
+        ]);
+        assert_eq!(
+            tray_action_from_args(&forwarded),
+            Some("autostart".to_string())
+        );
+        assert_eq!(tray_action_from_args(&args(&["hbot.exe"])), None);
+    }
+
+    #[test]
+    fn logs_tail_is_parsed_with_an_optional_positive_limit() {
+        assert_eq!(parse(&args(&["--logs-tail"])), Invocation::LogsTail(20));
+        assert_eq!(
+            parse(&args(&["--logs-tail", "50"])),
+            Invocation::LogsTail(50)
+        );
+        assert_eq!(
+            parse(&args(&["--logs-tail", "abc"])),
+            Invocation::Unknown("--logs-tail 需要一个正整数（默认 20）".into())
+        );
+        assert_eq!(
+            parse(&args(&["--logs-tail", "0"])),
+            Invocation::Unknown("--logs-tail 需要一个正整数（默认 20）".into())
+        );
     }
 
     #[test]

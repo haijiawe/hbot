@@ -9,7 +9,9 @@
 //!
 //! 1. 空白名单时必须 fail-closed（否则等于任意命令执行）；
 //! 2. 允许清单里混进 `cmd.exe` / `powershell.exe` / `.bat` / `.cmd` 时，隔离当场失效
-//!    —— 那条路径等于把 shell 装回来（见 RT-05）；
+//!    —— 那条路径等于把 shell 装回来（见 RT-05）。**配置层**已在 RT-05 修复后拒绝这类
+//!    清单（`b10` 钉住）；**命令层**仍然只回答"清单里有没有这个名字"（`b03` 钉住）。
+//!    两层分工见 `docs/adr/0003-command-isolation.md` §5。
 //! 3. 超时必须杀掉**整棵进程树**（只 kill 直接子进程，孙进程会活着继续吃资源）；
 //! 4. 输出必须有硬上限（否则一条 `yes` 就能把宿主内存吃满）；
 //! 5. 环境变量默认不继承（否则 `APPDATA` / `PATH` / 各种 token 变量直接泄给子进程）；
@@ -30,6 +32,7 @@ use hbot_agent::{CancellationToken, Tool, ToolCtx};
 use hbot_command::PlatformRunner;
 use hbot_core::{CommandDenied, CommandRunner, CommandSpec, CommandStatus, SandboxMode, SessionId};
 use hbot_redteam::{TempTree, parse_pid, wait_for_file, wait_gone};
+use hbot_rpc::app::agent::config::SandboxConfig;
 use hbot_workspace::Workspace;
 
 // ── helper（被 ignore，只有测试自己会按名字把它拉起来）────────────────────────
@@ -241,8 +244,10 @@ fn b02_参数里的元字符必须原样传递而不是被shell解释() {
 
 /// 防的是：允许清单把 `cmd.exe` / `powershell.exe` 这类**解释器**放进来。
 ///
-/// 这条用例**故意断言"能跑"**，因为当前实现允许（见 RT-05）；它的作用是把风险钉成
-/// 可执行的证据：只要允许清单里有 `cmd`，`/c` 后面就是任意命令，白名单等于没有。
+/// 这条用例**故意断言"能跑"**，钉的是**命令层的事实**：`hbot-command` 只回答"这份清单里有没有
+/// 这个名字"，不会替你判断哪些名字危险（ADR-0003 §5）。所以判据必须在**配置层** ——
+/// RT-05 的修法与对应用例是 `b10`（`hbot-rpc` 的 `SandboxConfig::resolve_with`），
+/// 本用例不随配置层收紧而改变：它证明的是"命令层不会兜底"。
 #[test]
 fn b03_允许cmd等于把shell装回来自证() {
     let tree = TempTree::new("b03");
@@ -472,6 +477,67 @@ fn b09_bat与cmd脚本不能作为可执行程序() {
     assert!(
         !tree.exists("marker.txt"),
         "`.cmd` 被执行了（marker.txt 出现）"
+    );
+}
+
+// ── 9. RT-05：配置解析层的解释器准入判据 ───────────────────────────────────
+
+/// 防的是：`allowedPrograms` 里出现 `cmd` / `powershell` / `python` 这类解释器时，
+/// 配置层原样放行 —— `run_command` 的 argv 保证对它们无效（`cmd /c …` 之后就是任意命令）。
+///
+/// 这条钉的是**配置解析层**（`hbot-rpc` 的 `SandboxConfig::resolve_with`）：判据必须在那里，
+/// 因为 `hbot-command` 永远只回答"清单里有没有这个名字"（ADR-0003 §5）。`b03` 钉的是另一半：
+/// 命令层不会替你兜底。
+#[test]
+fn b10_配置层必须拒绝解释器类允许清单() {
+    let tree = TempTree::new("b10");
+    let config_path = tree.path().join("agent.json");
+    let none = |_name: &str| None::<String>;
+
+    // ① 全路径 + 大小写 + 扩展名混写：都必须在解析层被识别（判据 = basename/小写/去扩展名）。
+    std::fs::write(
+        &config_path,
+        r#"{"sandbox":"danger","allowedPrograms":["C:/Windows/System32/WindowsPowerShell/v1.0/POWERSHELL.EXE","cmd"]}"#,
+    )
+    .expect("写 agent.json");
+    let error = SandboxConfig::resolve_with(tree.path(), &none).expect_err("解释器清单必须被拒");
+    assert_eq!(error.code(), -32002, "拒绝走 -32002：{error}");
+    let message = error.to_string();
+    assert!(
+        message.contains("POWERSHELL.EXE"),
+        "要回显用户写的那一行，否则不知道删哪个：{message}"
+    );
+    assert!(message.contains("`cmd`"), "要列出被拒的名字：{message}");
+    assert!(
+        message.contains("HBOT_ALLOW_SHELL"),
+        "要说清逃生阀（默认拒绝，显式才放行）：{message}"
+    );
+
+    // ② 具体程序不误杀：`ssh` / `shellcheck` 只含 "sh" 子串，不是解释器。
+    std::fs::write(
+        &config_path,
+        r#"{"sandbox":"danger","allowedPrograms":["git","ssh","shellcheck"]}"#,
+    )
+    .expect("写 agent.json");
+    let config = SandboxConfig::resolve_with(tree.path(), &none).expect("具体程序必须可用");
+    assert_eq!(config.allowed_programs(), ["git", "ssh", "shellcheck"]);
+
+    // ③ 逃生阀：显式打开时放行，而且名字原样保留（放行不是"顺手删掉"，否则命令层拿到空清单）。
+    //    告警的"每进程每条清单一次"由 `hbot-rpc` 的 `tests/config_warnings.rs` 契约测试钉住。
+    std::fs::write(
+        &config_path,
+        r#"{"sandbox":"danger","allowedPrograms":["cmd"]}"#,
+    )
+    .expect("写 agent.json");
+    let hatch = |name: &str| match name {
+        "HBOT_ALLOW_SHELL" => Some("1".to_string()),
+        _ => None,
+    };
+    let config = SandboxConfig::resolve_with(tree.path(), &hatch).expect("逃生阀打开后应放行");
+    assert_eq!(
+        config.allowed_programs(),
+        ["cmd"],
+        "放行时清单必须原样交给命令层"
     );
 }
 

@@ -6,14 +6,20 @@
 //!
 //! ## 怎么跑
 //!
-//! 需要三个环境变量（缺任一就打印说明并跳过，不算失败）：
+//! 需要三个必需环境变量（缺任一就打印说明并跳过，不算失败），另有一个可选的
+//! `HBOT_LLM_PROVIDER`（`openai` 缺省 / `anthropic`）：
 //!
 //! ```powershell
-//! $env:HBOT_LLM_BASE_URL='https://…/v1'   # 必须带 /v1，客户端拼 {base_url}/chat/completions
+//! $env:HBOT_LLM_PROVIDER='openai'         # 可选；openai（缺省）或 anthropic
+//! $env:HBOT_LLM_BASE_URL='https://…/v1'   # OpenAI：必须带 /v1，客户端拼 {base_url}/chat/completions
 //! $env:HBOT_LLM_API_KEY='sk-…'            # 只放在环境变量里，绝不进仓库
 //! $env:HBOT_LLM_MODEL='…'
 //! cargo test -p hbot-agent --test real_llm_eval -- --ignored --nocapture
 //! ```
+//!
+//! Anthropic 链路的 base 规则不同：`{base_url}/v1/messages`；`base_url` 带 `/v1`
+//! 时会自动改成 `{base_url}/messages`（见 `provider::anthropic::messages_endpoint`），
+//! 不会拼出 `/v1/v1/messages`。所以同一份 base 值在两条链路下都能跑。
 //!
 //! 调试时只跑指定条目：`$env:HBOT_LLM_EVAL_ONLY='1,8,15'`。
 //!
@@ -35,9 +41,10 @@ use std::time::{Duration, Instant};
 
 use hbot_agent::tools::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 use hbot_agent::{
-    ApprovalReply, ApprovalRequest, Approver, CancellationToken, ChatMessage, NullAudit,
-    OpenAiProvider, Provider, ReqwestTransport, SandboxMode, ToolCallRequest, ToolGateway,
-    ToolOutput, ToolRegistry, TurnConfig, TurnInput, TurnSink, run_turn,
+    AnthropicProvider, ApprovalReply, ApprovalRequest, Approver, CancellationToken, ChatMessage,
+    LlmProvider, NullAudit, OpenAiProvider, Provider, ReqwestTransport, SandboxMode,
+    ToolCallRequest, ToolGateway, ToolOutput, ToolRegistry, TurnConfig, TurnInput, TurnSink,
+    run_turn,
 };
 use hbot_code::manifest::{load, scaffold};
 use hbot_code::{CodeError, EventOutcome, Limits, Sandbox, compile_project};
@@ -49,15 +56,18 @@ use serde_json::{Value, json};
 // 配置：只从环境变量读，key 绝不落盘
 // ---------------------------------------------------------------------------
 
-/// 真 provider 的三元组。`Debug` 刻意手写，防止 key 被顺手 `{:?}` 进日志。
+/// 真 provider 的配置。`Debug` 刻意手写，防止 key 被顺手 `{:?}` 进日志。
 struct LlmConfig {
+    /// 走哪条线上契约：OpenAI `/chat/completions` 或 Anthropic `/v1/messages`。
+    provider: LlmProvider,
     base_url: String,
     api_key: String,
     model: String,
 }
 
 impl LlmConfig {
-    /// 三个变量缺任一就返回 `None`（调用方打印说明并跳过）。
+    /// 三个必需变量缺任一就返回 `None`（调用方打印说明并跳过）。
+    /// `HBOT_LLM_PROVIDER` 可选，缺省 `openai`；非法值直接 panic（不许悄悄退回默认）。
     fn from_env() -> Option<Self> {
         let read = |name: &str| {
             std::env::var(name)
@@ -77,7 +87,15 @@ impl LlmConfig {
             );
             return None;
         }
+        let provider_raw = read("HBOT_LLM_PROVIDER").unwrap_or_else(|| "openai".to_owned());
+        let provider = LlmProvider::from_name(&provider_raw).unwrap_or_else(|raw| {
+            panic!(
+                "HBOT_LLM_PROVIDER 非法：{raw:?}（允许值：{}）",
+                LlmProvider::allowed_names()
+            )
+        });
         Some(Self {
+            provider,
             base_url: read("HBOT_LLM_BASE_URL").unwrap_or_default(),
             api_key: read("HBOT_LLM_API_KEY").unwrap_or_default(),
             model: read("HBOT_LLM_MODEL").unwrap_or_default(),
@@ -808,11 +826,27 @@ async fn real_llm_writes_working_bots() {
         Ok(transport) => transport,
         Err(error) => panic!("无法装配 reqwest 传输层：{error}"),
     };
-    let provider = OpenAiProvider::new(config.base_url.clone(), config.api_key.clone(), transport)
-        .with_timeout(Duration::from_secs(120));
+    // 两条链路的构造函数不同，但都收敛到 `Provider`；测试主体（`run_case`）只认 trait。
+    let (provider, endpoint): (Box<dyn Provider>, String) = match config.provider {
+        LlmProvider::OpenAi => {
+            let provider =
+                OpenAiProvider::new(config.base_url.clone(), config.api_key.clone(), transport)
+                    .with_timeout(Duration::from_secs(120));
+            let endpoint = provider.endpoint();
+            (Box::new(provider), endpoint)
+        }
+        LlmProvider::Anthropic => {
+            let provider =
+                AnthropicProvider::new(config.base_url.clone(), config.api_key.clone(), transport)
+                    .with_timeout(Duration::from_secs(120));
+            let endpoint = provider.endpoint();
+            (Box::new(provider), endpoint)
+        }
+    };
 
     println!("== 真 LLM 评测 ==");
-    println!("endpoint = {}", provider.endpoint());
+    println!("provider = {}", config.provider.as_str());
+    println!("endpoint = {endpoint}");
     println!("model    = {}", config.model);
     println!("sandbox  = workspace_write，工具 = read_file/list_dir/write_file/edit_file");
     println!();
@@ -837,7 +871,7 @@ async fn real_llm_writes_working_bots() {
             case.id,
             case.title
         );
-        let row = run_case(&provider, &config, case, &mut usage).await;
+        let row = run_case(provider.as_ref(), &config, case, &mut usage).await;
         println!(
             "      -> {} ({} 步, {:.1}s) {}",
             row.verdict.tag(),

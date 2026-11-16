@@ -14,26 +14,22 @@
 //!
 //! ## 为什么是"可注入的 sink"而不是直接写库
 //!
-//! `logs.bot_id` 是 `NOT NULL REFERENCES bots(id)`，而 [`super::AgentManager`] 是
-//! **全局单例**（一个 `AppState` 一个），手里既没有 `Store` 也没有 bot id：Agent 的
-//! 会话是人机对话（`SessionId`），不是平台会话（`ConversationId`），两者之间没有
-//! 可反查的外键。所以这一层只定义落点，由装配方注入：
+//! `logs.bot_id` 从 0003 起可空：Agent 会话是人机对话（`SessionId`），不是平台会话
+//! （`ConversationId`），两者之间没有可反查的外键。所以这一层只定义落点，由装配方注入：
 //!
-//! * 能确定"这份日志属于哪个 bot"的场景 → [`StoreRunLogSink`]；
-//! * 确定不了（或测试里不关心） → [`NullRunLogSink`]（默认值，**不写库而不是写错归属**）。
+//! * Agent 行 → [`StoreRunLogSink`]（`bot_id = NULL`、`source = 'agent'`）；
+//! * 测试或不关心落库 → [`NullRunLogSink`]（默认值，**不写库而不是写错归属**）。
 //!
-//! 这也是为什么终报要写明剩下的一步接线：`AppState::open` 里构造 `AgentManager` 时
-//! 注入 `StoreRunLogSink`，前提是先定下"Agent 日志归属哪个 bot"（多 bot 项目需要一个
-//! 归属规则，或者 `logs.bot_id` 可空 = 新迁移）。在没有那个决定之前，把日志硬塞给
-//! 某个 bot 会污染那个 bot 的日志流，比不写更糟。
+//! `AppState::open` 负责把 [`StoreRunLogSink`] 注入 `AgentManager`；会话 ID 由
+//! `EventTurnSink` 以 `[session 3f2a…]` 前缀写进 `line`（`logs` 没有 session 列）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hbot_agent::{ToolCallRequest, ToolOutput};
-use hbot_core::{BotId, Clock};
-use hbot_store::{NewLog, Store};
+use hbot_core::{Clock, SessionId};
+use hbot_store::{NewAgentLog, Store};
 use serde_json::Value;
 
 /// 脱敏后的占位符（日志里出现它就说明这一段被抹掉了）。
@@ -175,6 +171,23 @@ pub fn turn_cancel_line() -> String {
     "agent 本轮已取消".to_owned()
 }
 
+/// 会话前缀里保留的字符数。UUID 前 8 位足够在一个面板里辨认会话。
+pub const SESSION_PREFIX_CHARS: usize = 8;
+
+/// 把会话 ID 转成日志行前缀：`[session 3f2a1b9c…] `。
+///
+/// `logs` 没有 session 列（见 0003 迁移注释）：UI 只需要"这行属于哪个会话"，
+/// 放进 `line` 前缀比为一个展示字段扩表更小。
+pub(crate) fn session_prefix(session_id: &SessionId) -> String {
+    let full = session_id.to_string();
+    let short: String = full.chars().take(SESSION_PREFIX_CHARS).collect();
+    if short.chars().count() < full.chars().count() {
+        format!("[session {short}…] ")
+    } else {
+        format!("[session {short}] ")
+    }
+}
+
 /// `RunLog` 的落点。
 ///
 /// 实现必须是**不阻塞调用方**的：`TurnSink` 的回调是同步 `fn`，跑在 tokio 任务里，
@@ -185,7 +198,7 @@ pub trait RunLogSink: Send + Sync + 'static {
     fn append(&self, level: &str, line: String);
 }
 
-/// 不落库的 sink：装配方没有 bot 归属时用它（默认）。
+/// 不落库的 sink：装配方没有落点时用它（默认）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NullRunLogSink;
 
@@ -193,10 +206,9 @@ impl RunLogSink for NullRunLogSink {
     fn append(&self, _level: &str, _line: String) {}
 }
 
-/// 写到 `logs` 表的 sink：需要 bot 归属（`logs.bot_id` 是 `NOT NULL` 外键）。
+/// 把 Agent 日志写到 `logs` 表：`bot_id = NULL`、`source = 'agent'`。
 pub struct StoreRunLogSink {
     store: Arc<Store>,
-    bot_id: BotId,
     clock: Arc<dyn Clock>,
     /// 上一次 append 派出去的落库任务。
     ///
@@ -209,11 +221,10 @@ pub struct StoreRunLogSink {
 }
 
 impl StoreRunLogSink {
-    /// 绑定到某个 bot 的日志流。
-    pub fn new(store: Arc<Store>, bot_id: BotId, clock: Arc<dyn Clock>) -> Self {
+    /// 构造一个 Agent 日志 sink（不绑定 bot）。
+    pub fn new(store: Arc<Store>, clock: Arc<dyn Clock>) -> Self {
         Self {
             store,
-            bot_id,
             clock,
             tail: std::sync::Mutex::new(None),
         }
@@ -222,8 +233,7 @@ impl StoreRunLogSink {
 
 impl RunLogSink for StoreRunLogSink {
     fn append(&self, level: &str, line: String) {
-        let entry = NewLog {
-            bot_id: self.bot_id,
+        let entry = NewAgentLog {
             level: level.to_owned(),
             line,
             at: self.clock.now().unix_millis(),
@@ -244,7 +254,7 @@ impl RunLogSink for StoreRunLogSink {
                     if let Some(previous) = previous {
                         let _ = previous.await;
                     }
-                    match tokio::task::spawn_blocking(move || store.append_log(entry)).await {
+                    match tokio::task::spawn_blocking(move || store.append_agent_log(entry)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
                             tracing::error!(error = %error, "agent 运行日志落库失败");
@@ -263,7 +273,7 @@ impl RunLogSink for StoreRunLogSink {
             }
             // 没有运行时（同步上下文直接调用）：宁可慢一步也不能丢。
             Err(_) => {
-                if let Err(error) = self.store.append_log(entry) {
+                if let Err(error) = self.store.append_agent_log(entry) {
                     tracing::error!(error = %error, "agent 运行日志落库失败");
                 }
             }
@@ -511,6 +521,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::app::test_support::TempDir;
+    use hbot_core::BotId;
     use hbot_store::{Bot, Project};
     use serde_json::json;
 
@@ -719,9 +730,8 @@ mod tests {
         assert!(!line.contains("sk-live-9"), "实际：{line}");
     }
 
-    /// 端到端：真 `Store` + 真 bot 行 → 行真的进了 `logs` 表，`logs_tail` 读得到。
-    ///
-    /// 这条是 b) 的"能看见"证明：`list_logs` 就是 `logs_tail` 的实现。
+    /// 端到端：真 `Store` → Agent 行真的进了 `logs` 表，`logs_tail { bot_id: null }` 读得到，
+    /// 且 `logs_tail { bot_id: Some(x) }` 看不到（Agent 行不属于任何 bot）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn store_backed_sink_writes_rows_that_logs_tail_can_read() {
         let dir = TempDir::new("agent-run-log");
@@ -748,18 +758,14 @@ mod tests {
             })
             .expect("插 bot");
 
-        let sink = StoreRunLogSink::new(
-            Arc::clone(&store),
-            bot_id,
-            Arc::new(hbot_adapters::SystemClock),
-        );
+        let sink = StoreRunLogSink::new(Arc::clone(&store), Arc::new(hbot_adapters::SystemClock));
         sink.append("info", "agent 工具 fs_read 成功（1 ms）".to_owned());
         sink.append("error", "agent 本轮失败：boom".to_owned());
 
         // 落库是异步的（spawn_blocking）：给它一点时间，再按 `logs_tail` 的读法读。
         let mut rows = Vec::new();
         for _ in 0..200 {
-            rows = store.list_logs(Some(&bot_id), 16).expect("读日志");
+            rows = store.list_logs(None, 16).expect("读日志");
             if rows.len() >= 2 {
                 break;
             }
@@ -771,6 +777,14 @@ mod tests {
         assert!(rows[0].line.contains("boom"));
         assert_eq!(rows[1].level, "info");
         assert!(rows[1].line.contains("fs_read"));
-        assert!(rows.iter().all(|row| row.bot_id == bot_id));
+        assert!(rows.iter().all(|row| row.bot_id.is_none()));
+        assert!(rows.iter().all(|row| row.source == "agent"));
+
+        // 按 bot 过滤时 Agent 行必须被排除（不能挂到任意 bot 的日志流上）。
+        let bot_rows = store.list_logs(Some(&bot_id), 16).expect("读 bot 日志");
+        assert!(
+            bot_rows.is_empty(),
+            "Agent 行不该出现在 bot 日志里：{bot_rows:?}"
+        );
     }
 }

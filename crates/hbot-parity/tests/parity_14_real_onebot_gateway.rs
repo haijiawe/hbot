@@ -172,19 +172,19 @@ async fn real_onebot_case() {
     let relay = ReplyRelay::spawn(replies_rx, Arc::clone(&supervisor));
     supervisor.start().await.expect("supervisor 启动");
 
-    // 适配器自己的客户端连上来（探针之后的那一条连接）。
+    // 适配器自己的客户端连上来（上面那条手工探针之后的新一条连接）。
     //
-    // 注意这里会出现**两条**连接：`OneBotAdapter::subscribe()` 会先跑一次
-    // `probe_connection`（连上即关，只为在 bot_start 之前把配置错误当场报出来），
-    // 之后才是真客户端的持续连接。`wait_ready` 等到「最新一条且全部已稳定」的连接，
-    // 也就是真客户端那条；探测连接这时候已经关了。
+    // 这里只会多**一条**连接：`OneBotAdapter::subscribe()` 的启动前探测会把连上的
+    // 这条连接直接交给常驻客户端（probe → handoff），不再像旧实现那样"探测一条 +
+    // 真客户端一条"。`wait_ready` 等到「最新一条且全部已稳定」的连接，也就是交接
+    // 过去的那条；手工探针连接这时候早已关闭。
     let ready_generation = gateway
         .wait_ready(Duration::from_secs(10))
         .await
         .expect("真客户端应当连上网关");
     assert!(
         ready_generation > probe_generation,
-        "真客户端应当是手工探针之后的新连接（探针={probe_generation}，真连接={ready_generation}）"
+        "适配器的连接应当是手工探针之后的新连接（探针={probe_generation}，适配器={ready_generation}）"
     );
 
     // ---------- ① 三条群消息：handler 顺序 + 回复顺序 ----------

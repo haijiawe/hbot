@@ -34,6 +34,7 @@ import type {
   Event as CoreEvent,
   FileContent,
   Response,
+  RunLog,
 } from '../generated'
 import type { Command, FileNode, ReadFileResult, WriteFileResult } from './ipc'
 
@@ -399,6 +400,13 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
       return callWireVoid('bot_start', { type: 'bot_start', botId: command.botId })
     case 'bot.stop':
       return callWireVoid('bot_stop', { type: 'bot_stop', botId: command.botId })
+    case 'logs.tail':
+      // `botId: null` 是全项目日志（含 Agent 行）；核心按从旧到新返回。
+      return callWire<RunLog[]>('logs_tail', {
+        type: 'logs_tail',
+        botId: command.botId,
+        limit: command.limit,
+      })
     case 'agent.send':
       return agentSend(command.text, command.sessionId)
     case 'agent.cancel':

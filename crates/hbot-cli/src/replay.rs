@@ -12,7 +12,8 @@
 //!    `passive_reply_id`），这是库里唯一可靠的"这条回复来自哪条消息"的外键；用时间窗口
 //!    做不到（同一毫秒可能多条入站，`ctx.sleep` 也能跨事件延迟回复）；
 //! 4. 用**与生产同一条路径**在新 isolate 里重跑：`manifest::load` → `compile_project_with_entry`
-//!    → `Sandbox::spawn` → 逐条 `dispatch_collecting`；事件 JSON 逐字复刻生产的 `event_json`；
+//!    → `Sandbox::spawn` → 逐条 `dispatch_collecting`；事件 JSON 由 `hbot_bot::event_json`
+//!    统一拼装（生产与回放共用同一份实现）；
 //! 5. 逐条对比，归类为 **一致 / 多出 / 缺少 / 顺序不同**。
 //!
 //! 退出码三档，**不许把"有差异"和"跑挂了"混成一个码**：
@@ -34,12 +35,13 @@ use std::str::FromStr as _;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
+use hbot_bot::{EventSource, event_json};
 use hbot_code::manifest;
 use hbot_code::{Sandbox, compile_project_with_entry};
-use hbot_rpc::app::runtime::{conversation_kind_from_str, conversation_kind_str};
-use hbot_store::{BotId, InboundReplayRow, Store};
+use hbot_core::{MessageId, Timestamp};
+use hbot_store::{BotId, Store};
 
 use crate::Outcome;
 use crate::cli::ReplayArgs;
@@ -546,7 +548,20 @@ fn collect(
                 entry.error = Some(error.clone());
             }
             Ok(payload) => {
-                let event = event_json(&bot_id, row, payload);
+                let event = event_json(&EventSource {
+                    bot_id,
+                    conversation_id: row.message.conversation_id,
+                    message_id: MessageId::from_uuid(*row.message.id.as_uuid()),
+                    external_id: row.message.external_id.as_str(),
+                    sender_id: row.message.sender_id.as_str(),
+                    text: payload.get("text").and_then(Value::as_str),
+                    kind: hbot_rpc::app::runtime::conversation_kind_from_str(
+                        &row.conversation_kind,
+                    ),
+                    conversation_external_id: row.conversation_external_id.as_str(),
+                    received_at: Timestamp::from_unix_millis(row.message.received_at),
+                    payload,
+                });
                 match sandbox.dispatch_collecting(&event) {
                     Ok(outcome) => entry.replayed = outcome.replies,
                     Err(failure) => {
@@ -592,35 +607,6 @@ fn find_project_row(store: &Store, project_dir: &Path) -> Option<hbot_store::Pro
         }
     }
     None
-}
-
-/// 复刻生产的 `event_json`（`hbot_rpc::app::runtime::sandbox_handler::event_json`，私有）。
-///
-/// **两处必须一起改**：那边函数的文档注释里写着同一句话（`sandbox_handler.rs` 的
-/// `event_json`）。要彻底消掉这份复制，得把「事件对象」提升成跨越生产/回放的共用 DTO，
-/// 属于跨 crate 改造；在那之前，`hbot-code/src/dts.rs` 的字段名漂移测试是最后一道网
-/// （`botId/conversationId/messageId/externalId/senderId/text/kind/
-/// conversationExternalId/receivedAt/payload`）。
-///
-/// 沙箱把 `reply` / `log` / `sleep` 挂在事件对象本身上，所以这些字段**就是** `ctx` 的字段；
-/// 少一个字段或改一次名字，回放就不再是"同一条路径"了。生产的 `MessageCtx` 由
-/// `hbot_bot::supervisor` 从同一批库列重建，所以这里从 `InboundReplayRow` 直接取。
-fn event_json(bot_id: &BotId, row: &InboundReplayRow, payload: &Value) -> Value {
-    json!({
-        "botId": bot_id.to_string(),
-        "conversationId": row.message.conversation_id.to_string(),
-        "messageId": row.message.id.to_string(),
-        "externalId": row.message.external_id.as_str(),
-        "senderId": row.message.sender_id.as_str(),
-        // 与生产一致：缺 `text` 时是空串，不是 `null`（纯图片/表情入站会走到这儿）。
-        // 生产侧见 `sandbox_handler.rs` 的 `event_json`：`ctx.text()` 是 `Option<&str>`，
-        // 而 `hbot.d.ts` 声明 `text: string`，两边都取 `unwrap_or_default`。
-        "text": payload.get("text").and_then(Value::as_str).unwrap_or_default(),
-        "kind": conversation_kind_str(conversation_kind_from_str(&row.conversation_kind)),
-        "conversationExternalId": row.conversation_external_id.as_str(),
-        "receivedAt": row.message.received_at,
-        "payload": payload,
-    })
 }
 
 /// 对比历史出站与本次重跑结果（纯函数，不含 IO）。

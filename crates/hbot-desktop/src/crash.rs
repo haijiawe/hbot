@@ -3,8 +3,9 @@
 //! 只有两件事：
 //!
 //! 1. **写**：装一个 panic hook，崩溃时把现场写到 `<data_dir>/logs/crash-<时间戳>.log`。
-//! 2. **读**：下次启动时把最近一份**还没上报过的**崩溃变成一条 `error` 的 `RunLog`
-//!    事件，让用户知道"上次是崩了"，而不是以为程序自己退出了。
+//! 2. **读**：下次启动时把最近一份**还没上报过的**崩溃写进 `logs` 表（`error` 级、
+//!    `bot_id = NULL`、`source = 'agent'`），`logs_tail { bot_id: null }` 能读到；同时在
+//!    stderr 打一条 `tracing::error!` —— 不需要先有机器人、也不依赖窗口订阅。
 //!
 //! 三条硬约束（来自任务书）：
 //!
@@ -20,8 +21,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hbot_rpc::app::agent::log::redact_text;
-use hbot_rpc::{AppState, Event, LogLevel};
+use hbot_rpc::AppState;
+use hbot_rpc::app::agent::log::{RunLogSink, StoreRunLogSink, redact_text};
 
 /// 崩溃报告落在这个子目录下（与 `hbot.db` 同级）。
 pub const LOGS_DIR: &str = "logs";
@@ -35,12 +36,14 @@ const CRASH_SUFFIX: &str = ".log";
 /// 已上报的标记后缀（`crash-X.reported.log`）。
 const REPORTED_SUFFIX: &str = ".reported.log";
 
-/// 等 WebView 订阅上来的最长时间（毫秒）：30 秒。窗口还没渲染完就有事件发出去的话，
-/// `broadcast` 会把事件丢掉（没有重放），用户就看不到这条崩溃提示了。
-const SUBSCRIBER_WAIT_MS: u64 = 30_000;
+/// 等崩溃日志真正落进 `logs` 表的最长时间（毫秒）。
+///
+/// `StoreRunLogSink::append` 是异步落库（`spawn_blocking`）；超时不等于写失败，
+/// 只是这次不标记 `.reported`，下次启动会再试一次。
+const LOG_PERSIST_WAIT_MS: u64 = 5_000;
 
-/// 轮询间隔（毫秒）。
-const SUBSCRIBER_POLL_MS: u64 = 250;
+/// 检查 `logs` 表时的轮询间隔（毫秒）。
+const LOG_PERSIST_POLL_MS: u64 = 100;
 
 /// 一条崩溃报告（纯数据，构造完就能渲染/落盘）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,14 +185,19 @@ pub fn mark_reported(path: &Path) -> io::Result<PathBuf> {
     Ok(reported)
 }
 
-/// 下次启动时把最近一份崩溃摆给用户看：一条 `error` 级 `RunLog`。
+/// 下次启动时把最近一份崩溃摆给用户看：`logs` 表里一条 `error` 级 Agent 行。
 ///
-/// 为什么必须等订阅者：`EventBus` 是 `broadcast`，**没有订阅者时事件直接丢**（没有重放）。
-/// 窗口还没把 `EVENT_CHANNEL` 订阅上就发出去的话，这条提示等于没发。
+/// `logs.bot_id` 从 0003 迁移起可空，所以这里不再需要"库里先有一个 bot"才能上报：
+/// `bot_id = NULL`、`source = 'agent'` 的行只属于这次崩溃，不属于任何机器人。
 ///
-/// 为什么可能"报不出来"：`logs` 表的 `bot_id` 是外键（`REFERENCES bots(id)`），
-/// 空数据库里没有任何 bot 时插不进日志行。这种情形只在"从没建过机器人就崩了"时发生，
-/// 此时保留文件等下次启动再试，并明确告警，不静默吞掉。
+/// 两条证据：
+///
+/// 1. `tracing::error!` 打 stderr —— 不依赖数据库、不依赖窗口订阅，终端启动时永远可见；
+/// 2. `StoreRunLogSink` 写 `logs` 表 —— `logs_tail { bot_id: null }`（全项目视图）能查到。
+///
+/// 写表是异步的（sink 内部 `spawn_blocking`），这里轮询到那一行出现才 `mark_reported`；
+/// 超时/失败就不标记，文件保留，下次启动再试。壳只依赖 `hbot-core` + `hbot-rpc`，
+/// 所以通过 rpc 公开的 sink 写，而不是直接依赖 `hbot-store`。
 pub async fn report_pending(data_dir: PathBuf, state: Arc<AppState>) {
     let Some(path) = pending(&data_dir) else {
         return;
@@ -203,63 +211,21 @@ pub async fn report_pending(data_dir: PathBuf, state: Arc<AppState>) {
         }
     };
 
-    wait_for_subscriber(&state).await;
+    // 第一条证据：不依赖任何订阅者/数据库，下一次启动的 stderr 一定能读到。
+    let line = format!("上次运行异常退出：{summary}（报告：{}）", path.display());
+    tracing::error!(path = %path.display(), "{line}");
 
-    let store = Arc::clone(state.store());
-    let bots = match tokio::task::spawn_blocking(move || store.list_bots()).await {
-        Ok(Ok(bots)) => bots,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "列机器人失败，崩溃提示留到下次启动");
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(%error, "列机器人的任务挂了，崩溃提示留到下次启动");
-            return;
-        }
-    };
-
-    let Some(bot) = bots.first() else {
+    // 第二条证据：logs 表（bot_id = NULL、source = 'agent'），UI 的全项目 logs_tail 能读到。
+    let sink = StoreRunLogSink::new(Arc::clone(state.store()), Arc::clone(state.clock()));
+    sink.append("error", line.clone());
+    if !wait_until_logged(&state, &line).await {
         tracing::warn!(
             path = %path.display(),
-            "上次运行崩溃过，但库里还没有机器人，日志外键插不进去；文件保留，下次启动再报"
+            "崩溃提示写 logs 表失败或超时；stderr 已有记录，文件保留，下次启动再报"
         );
         return;
-    };
-
-    let at = state.clock().now();
-    let line = format!("上次运行异常退出：{summary}（报告：{}）", path.display());
-
-    if path.exists() {
-        let bot_id = bot.id;
-        // 写日志表走 `AppState::append_log`：壳只依赖 hbot-core + hbot-rpc，
-        // 构造 `NewLog` 这件事留在 rpc 层（依赖方向由 `xtask deps` 钉着）。
-        let state_for_store = Arc::clone(&state);
-        let line_for_store = line.clone();
-        let appended = tokio::task::spawn_blocking(move || {
-            state_for_store.append_log(bot_id, "error", line_for_store)
-        })
-        .await;
-        match appended {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "崩溃提示写不进日志表");
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "写崩溃日志的任务挂了");
-                return;
-            }
-        }
-
-        // 事件同时发：面板靠它立刻显示；日志表那行留给下次打开时回放。
-        let delivered = state.events().send(Event::RunLog {
-            bot_id,
-            level: LogLevel::Error,
-            line,
-            at,
-        });
-        tracing::info!(delivered, "已上报上次崩溃");
     }
+    tracing::info!("已上报上次崩溃（logs.source=agent）");
 
     match mark_reported(&path) {
         Ok(reported) => tracing::info!(path = %reported.display(), "崩溃报告已标记为已上报"),
@@ -267,16 +233,26 @@ pub async fn report_pending(data_dir: PathBuf, state: Arc<AppState>) {
     }
 }
 
-/// 等 `EVENT_CHANNEL` 有订阅者上来（最多 [`SUBSCRIBER_WAIT_MS`]）。
-async fn wait_for_subscriber(state: &Arc<AppState>) {
-    let rounds = SUBSCRIBER_WAIT_MS / SUBSCRIBER_POLL_MS;
+/// 轮询 `logs` 表直到出现 [`report_pending`] 写的那一行（最多 [`LOG_PERSIST_WAIT_MS`]）。
+///
+/// 判据用整行文本相等：同一毫秒内可能有别的 `error` 行，但这条带"上次运行异常退出"
+/// 与报告文件路径，不会撞。最多看最近 100 行（崩溃刚发生在启动最前面，不会被挤掉）。
+async fn wait_until_logged(state: &Arc<AppState>, line: &str) -> bool {
+    let rounds = LOG_PERSIST_WAIT_MS / LOG_PERSIST_POLL_MS;
     for _ in 0..rounds {
-        if state.events().receiver_count() > 0 {
-            return;
+        let store = Arc::clone(state.store());
+        match tokio::task::spawn_blocking(move || store.list_logs(None, 100)).await {
+            Ok(Ok(rows)) => {
+                if rows.iter().any(|row| row.line == line) {
+                    return true;
+                }
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "读 logs 表检查崩溃提示失败"),
+            Err(error) => tracing::warn!(%error, "检查崩溃提示的任务挂了"),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(SUBSCRIBER_POLL_MS)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(LOG_PERSIST_POLL_MS)).await;
     }
-    tracing::warn!("等窗口订阅事件超时，崩溃提示仍会写日志表，但界面可能看不到");
+    false
 }
 
 /// 把报告正文压成一行摘要（日志行只有一行，不能塞整个 backtrace）。
@@ -515,6 +491,62 @@ mod tests {
         let found = pending(&dir).expect("panic 之后必须有报告文件");
         let text = std::fs::read_to_string(&found).expect("报告要能读出来");
         assert!(text.contains("boom-from-test"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：空库（没有 bot）也能把崩溃写成 Agent 日志行，`logs_tail { bot_id: None }`
+    /// 读得到；这就是"崩溃提示出现在界面上"的数据侧证据。密钥必须在入库前被脱敏。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_crash_is_readable_from_logs_tail_without_any_bot() {
+        let dir = unique_dir("logs-tail");
+        let mut crash = report(1_700_000_000_000);
+        crash.message = "connect failed: api_key=sk-live-crash-secret".to_string();
+        let written = crash.write(&dir).expect("写报告");
+
+        let host = crate::DesktopHost::new(dir.clone());
+        match crate::dispatch_on(&host, hbot_rpc::Command::AppInfo).await {
+            hbot_rpc::Response::Ok { .. } => {}
+            other => panic!("AppInfo 应成功，实际：{other:?}"),
+        }
+        let core = host.core().await.expect("核心应能打开");
+        let state = Arc::clone(&core.state);
+
+        report_pending(dir.clone(), state).await;
+
+        let response = crate::dispatch_on(
+            &host,
+            hbot_rpc::Command::LogsTail {
+                bot_id: None,
+                limit: 20,
+            },
+        )
+        .await;
+        let data = match response {
+            hbot_rpc::Response::Ok { data } => data.expect("logs_tail 必须带 data"),
+            hbot_rpc::Response::Error { error } => panic!("logs_tail 失败：{error:?}"),
+        };
+        let logs: Vec<hbot_rpc::RunLog> =
+            serde_json::from_value(data).expect("data 应是 RunLog 数组");
+        let row = logs
+            .iter()
+            .find(|row| row.line.contains("上次运行异常退出"))
+            .unwrap_or_else(|| panic!("logs_tail 里没有崩溃行：{logs:?}"));
+        assert_eq!(row.level, hbot_rpc::LogLevel::Error);
+        assert_eq!(row.source, "agent");
+        assert!(
+            row.line.contains("api_key=<redacted>"),
+            "密钥必须脱敏：{}",
+            row.line
+        );
+        assert!(!row.line.contains("sk-live-crash-secret"), "{}", row.line);
+        assert!(!written.exists(), "已上报的报告应被改名");
+        assert!(
+            written
+                .with_file_name("crash-20231114T221320Z.reported.log")
+                .exists(),
+            "报告文件必须保留（只改名）"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

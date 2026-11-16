@@ -34,8 +34,8 @@ pub(crate) const INBOUND_COLUMNS: &str =
 pub(crate) const OUTBOUND_COLUMNS: &str =
     "id, bot_id, conversation_id, target_json, text, reply_to, attempts, created_at";
 
-/// `logs` 表的显式列清单。
-pub(crate) const LOG_COLUMNS: &str = "id, bot_id, level, line, at";
+/// `logs` 表的显式列清单（顺序见 [`row_to_log`]）。
+pub(crate) const LOG_COLUMNS: &str = "id, bot_id, level, line, at, source";
 
 /// 把一行 `projects` 读成 [`Project`]。
 pub(crate) fn row_to_project(row: &Row<'_>) -> rusqlite::Result<Project> {
@@ -113,10 +113,16 @@ pub(crate) fn row_to_outbound(row: &Row<'_>) -> rusqlite::Result<OutboundRow> {
 pub(crate) fn row_to_log(row: &Row<'_>) -> rusqlite::Result<LogRow> {
     Ok(LogRow {
         id: row.get(0)?,
-        bot_id: parse_id(1, row.get::<_, String>(1)?)?,
+        // Agent 行的 bot_id 是 NULL；`Option<String>` 只把 NULL 映射成 None，
+        // 非 NULL 仍走强类型解析（坏 UUID 照样报错，不会静默变成 None）。
+        bot_id: match row.get::<_, Option<String>>(1)? {
+            Some(raw) => Some(parse_id(1, raw)?),
+            None => None,
+        },
         level: row.get(2)?,
         line: row.get(3)?,
         at: row.get(4)?,
+        source: row.get(5)?,
     })
 }
 

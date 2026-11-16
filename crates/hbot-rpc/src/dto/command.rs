@@ -213,8 +213,8 @@ pub enum Command {
 
     /// 取最近 N 条运行日志。
     LogsTail {
-        /// Bot ID。
-        bot_id: BotId,
+        /// Bot ID；`None` 表示全项目（含 Agent 行）。
+        bot_id: Option<BotId>,
         /// 条数上限。
         limit: usize,
     },

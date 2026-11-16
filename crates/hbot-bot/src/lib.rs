@@ -52,6 +52,7 @@ pub mod adapter;
 pub mod bot;
 pub mod dedupe;
 pub mod event;
+mod event_json;
 pub mod handler;
 mod ids;
 pub mod outbox;
@@ -63,6 +64,7 @@ pub use adapter::{AdapterSubscription, BotAdapter, OutboundEnvelope};
 pub use bot::BotHandle;
 pub use dedupe::{Admission, Inbox};
 pub use event::{ConversationRef, PlatformEvent};
+pub use event_json::{EventSource, event_json};
 pub use handler::{HandlerExecutor, MessageCtx};
 pub use ids::conversation_id_for;
 pub use outbox::{

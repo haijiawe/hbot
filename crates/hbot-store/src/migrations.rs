@@ -11,6 +11,7 @@
 use rusqlite::{Connection, params};
 
 use crate::error::{Result, StoreError};
+use crate::startup_trace;
 
 /// 一条嵌入式迁移。SQL 通过 `include_str!` 编译进二进制，运行时不读文件。
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +36,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0002_outbound_routing_and_status",
         sql: include_str!("migrations/0002_outbound_routing_and_status.sql"),
     },
+    Migration {
+        version: 3,
+        name: "0003_agent_logs",
+        sql: include_str!("migrations/0003_agent_logs.sql"),
+    },
 ];
 
 /// 本二进制支持的最新版本。
@@ -56,9 +62,17 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 /// 需要 `&mut Connection` 以开启事务。安全点：任何一条失败都 `Err` 返回且该条回滚，
 /// 之前的迁移保持已提交状态——下次启动会从失败那条重试。
 pub(crate) fn apply(conn: &mut Connection, applied_at: i64) -> Result<u32> {
+    let phase = startup_trace::Phase::start("mig_schema_table");
     conn.execute_batch(CREATE_SCHEMA_MIGRATIONS)?;
+    phase.done();
 
+    let phase = startup_trace::Phase::start("mig_read_applied");
     let applied = read_applied(conn)?;
+    if startup_trace::enabled() {
+        phase.done_with(&format!("rows={}", applied.len()));
+    } else {
+        phase.done();
+    }
     let supported = latest_version();
 
     for (version, recorded) in &applied {
@@ -79,7 +93,9 @@ pub(crate) fn apply(conn: &mut Connection, applied_at: i64) -> Result<u32> {
         }
     }
 
+    let phase = startup_trace::Phase::start("mig_user_version");
     let user_version = read_user_version(conn)?;
+    phase.done();
     if user_version > i64::from(supported) {
         return Err(StoreError::SchemaTooNew {
             found: u32::try_from(user_version).unwrap_or(supported),
@@ -94,6 +110,7 @@ pub(crate) fn apply(conn: &mut Connection, applied_at: i64) -> Result<u32> {
         {
             continue;
         }
+        let phase = startup_trace::Phase::start("mig_apply_one");
         let transaction = conn.transaction()?;
         transaction
             .execute_batch(migration.sql)
@@ -118,6 +135,7 @@ pub(crate) fn apply(conn: &mut Connection, applied_at: i64) -> Result<u32> {
                 source,
             })?;
         transaction.commit()?;
+        phase.done();
         tracing::info!(
             version = migration.version,
             name = migration.name,
@@ -126,10 +144,12 @@ pub(crate) fn apply(conn: &mut Connection, applied_at: i64) -> Result<u32> {
     }
 
     // 老库（user_version 未维护）补齐水位，保证单调。
+    let phase = startup_trace::Phase::start("mig_user_version_fixup");
     let current = read_user_version(conn)?;
     if current < i64::from(supported) {
         conn.execute_batch(&format!("PRAGMA user_version = {supported};"))?;
     }
+    phase.done();
 
     Ok(supported)
 }

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
 
@@ -40,6 +40,79 @@ pub const MENU_SHOW: &str = "desktop/tray/show";
 pub const MENU_AUTOSTART: &str = "desktop/tray/autostart";
 /// 菜单项 id：退出（真退出）。
 pub const MENU_QUIT: &str = "desktop/tray/quit";
+
+/// 托盘菜单 id 对应的动作（纯数据，不碰窗口）。
+///
+/// 存在的理由：真实鼠标点击系统托盘在 Windows 上不可靠，但「菜单 id → 动作」的
+/// 派发必须能被脚本重复验证。所以把这一层抽成纯函数：真实点击走的
+/// [`on_menu_event`] 和隐藏入口 `--tray-action` 都先过 [`handle_menu`]，再走同一个
+/// [`dispatch_menu_action`]。**这只验证派发，不验证「鼠标点中托盘图标」本身。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    /// 显示并聚焦主窗口。
+    Show,
+    /// 翻转开机自启（系统 + `desktop.json`）。
+    ToggleAutostart,
+    /// 停止机器人并优雅退出。
+    Quit,
+    /// 不是本应用的托盘菜单项。
+    Unhandled,
+}
+
+impl MenuAction {
+    /// 稳定的字符串形式，只用于日志与脚本断言（不是菜单 id）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Show => "show",
+            Self::ToggleAutostart => "toggleAutostart",
+            Self::Quit => "quit",
+            Self::Unhandled => "unhandled",
+        }
+    }
+}
+
+/// 菜单 id → 动作。纯函数；三个 id 的映射由单元测试钉住。
+pub fn handle_menu(id: &MenuId) -> MenuAction {
+    match id.0.as_str() {
+        MENU_SHOW => MenuAction::Show,
+        MENU_AUTOSTART => MenuAction::ToggleAutostart,
+        MENU_QUIT => MenuAction::Quit,
+        _ => MenuAction::Unhandled,
+    }
+}
+
+/// `--tray-action` 的取值 → 菜单 id。
+///
+/// 接受三个短名（`show` / `autostart` / `quit`，方便脚本写）与完整菜单 id
+/// （与真实事件里的 id 完全一致，方便证明走的是同一张表）。未知值原样包成
+/// `MenuId`，交给 [`handle_menu`] 判为 [`MenuAction::Unhandled`] 并留下告警。
+pub fn menu_id_for_cli(value: &str) -> MenuId {
+    match value {
+        "show" => MenuId::new(MENU_SHOW),
+        "autostart" => MenuId::new(MENU_AUTOSTART),
+        "quit" => MenuId::new(MENU_QUIT),
+        other => MenuId::new(other),
+    }
+}
+
+/// 执行一个托盘菜单动作。
+///
+/// `source` / `menu_id` 只进日志：脚本按 `source="cli"` 断言这个动作确实由隐藏入口
+/// 触发（而不是别的东西碰巧把窗口显示了），同时保留真实点击的 `source="tray-menu"`。
+pub(crate) fn dispatch_menu_action(
+    app: &AppHandle,
+    action: MenuAction,
+    source: &str,
+    menu_id: &str,
+) {
+    tracing::info!(source, menu_id, action = action.as_str(), "托盘动作派发");
+    match action {
+        MenuAction::Show => show_main_window(app),
+        MenuAction::ToggleAutostart => toggle_autostart(app),
+        MenuAction::Quit => request_quit(app),
+        MenuAction::Unhandled => tracing::warn!(source, menu_id, "未处理的托盘菜单项"),
+    }
+}
 
 /// 托盘/窗口层的运行时状态。
 struct ShellState {
@@ -169,13 +242,12 @@ pub fn show_main_window(app: &AppHandle) {
 }
 
 /// 菜单点击分发（由 `lib.rs` 的 `Builder::on_menu_event` 转进来）。
+///
+/// 这里只负责把真实事件翻译成 [`MenuAction`]，执行在 [`dispatch_menu_action`] ——
+/// 与 `--tray-action` 隐藏入口共用同一段派发逻辑。
 pub fn on_menu_event(app: &AppHandle, event: MenuEvent) {
-    match event.id().0.as_str() {
-        MENU_SHOW => show_main_window(app),
-        MENU_AUTOSTART => toggle_autostart(app),
-        MENU_QUIT => request_quit(app),
-        other => tracing::debug!(id = other, "未处理的托盘菜单项"),
-    }
+    let id = event.id();
+    dispatch_menu_action(app, handle_menu(id), "tray-menu", id.0.as_str());
 }
 
 /// 托盘图标事件：左键单击 = 显示主窗口（右键出菜单是平台默认行为）。
@@ -344,5 +416,37 @@ mod tests {
         // 窗口标签与托盘 id 都用 "main"：`tray_by_id` 与 `get_webview_window` 依赖它。
         assert_eq!(TRAY_ID, "main");
         assert_eq!(MAIN_WINDOW, "main");
+    }
+
+    #[test]
+    fn the_three_menu_ids_map_to_their_actions() {
+        assert_eq!(handle_menu(&MenuId::new(MENU_SHOW)), MenuAction::Show);
+        assert_eq!(
+            handle_menu(&MenuId::new(MENU_AUTOSTART)),
+            MenuAction::ToggleAutostart
+        );
+        assert_eq!(handle_menu(&MenuId::new(MENU_QUIT)), MenuAction::Quit);
+        assert_eq!(
+            handle_menu(&MenuId::new("desktop/tray/unknown")),
+            MenuAction::Unhandled
+        );
+    }
+
+    #[test]
+    fn cli_short_names_and_full_ids_resolve_to_the_same_menu_ids() {
+        // 隐藏入口既能写短名，也能写真实事件里的完整 id。
+        for (short, full) in [
+            ("show", MENU_SHOW),
+            ("autostart", MENU_AUTOSTART),
+            ("quit", MENU_QUIT),
+        ] {
+            assert_eq!(menu_id_for_cli(short), MenuId::new(full));
+            assert_eq!(menu_id_for_cli(full), MenuId::new(full));
+        }
+        assert_eq!(
+            menu_id_for_cli("nope"),
+            MenuId::new("nope"),
+            "未知值原样保留，由 handle_menu 判为 Unhandled"
+        );
     }
 }

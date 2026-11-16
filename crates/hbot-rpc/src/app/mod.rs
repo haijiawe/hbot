@@ -108,28 +108,41 @@ impl AppState {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> Result<Self, HbotError> {
+        let total = hbot_store::startup_trace::Phase::start("appstate_open_total");
         let data_dir = data_dir.as_ref().to_path_buf();
+        let phase = hbot_store::startup_trace::Phase::start("app_create_data_dir");
         std::fs::create_dir_all(&data_dir).map_err(|err| {
             HbotError::internal(format!(
                 "cannot create data dir `{}`: {err}",
                 data_dir.display()
             ))
         })?;
-        let store = Store::open(data_dir.join("hbot.db")).map_err(store_failed)?;
+        phase.done();
+        let phase = hbot_store::startup_trace::Phase::start("app_store_open");
+        let store = Arc::new(Store::open(data_dir.join("hbot.db")).map_err(store_failed)?);
+        phase.done();
 
         // 事件出口与 ID/时钟先建好再共享：`agent` 也要用同一份（否则 UI 收不到
         // agent.delta，且 EditId 会与别处撞号）。
+        let phase = hbot_store::startup_trace::Phase::start("app_agent_manager");
         let events = Arc::new(EventBus::new());
+        // Agent 日志不属于任何 bot：`StoreRunLogSink` 写 `bot_id = NULL`、`source = 'agent'`。
+        let run_log = Arc::new(agent::StoreRunLogSink::new(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+        ));
         let agent = Arc::new(agent::AgentManager::new(
             data_dir.clone(),
             Arc::clone(&events),
             Arc::clone(&ids),
             Arc::clone(&clock),
+            run_log,
         ));
+        phase.done();
 
-        Ok(Self {
+        let state = Self {
             data_dir,
-            store: Arc::new(store),
+            store,
             workspace: RwLock::new(None),
             files: RwLock::new(ActiveFiles::default()),
             events,
@@ -140,7 +153,9 @@ impl AppState {
             adapter_factory: Arc::new(runtime::PlatformRouter),
             clock,
             ids,
-        })
+        };
+        total.done();
+        Ok(state)
     }
 
     /// 换掉适配器工厂。

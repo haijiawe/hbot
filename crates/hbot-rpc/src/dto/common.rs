@@ -253,7 +253,8 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
-/// `LogsTail` 命令的 data 元素，也是 `run.log` 事件的载荷（除 `botId` 外同形）。
+/// `LogsTail` 命令的 data 元素；与 `run.log` 事件载荷相比多 `source`、少 `botId`
+/// （事件只投影单个 bot 的实时日志）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RunLog {
@@ -263,6 +264,8 @@ pub struct RunLog {
     pub level: LogLevel,
     /// 日志正文（已脱敏）。
     pub line: String,
+    /// 日志来源：`bot` / `agent`（`logs_tail` 用它区分 Agent 行）。
+    pub source: String,
 }
 
 /// 命令的返回结果。

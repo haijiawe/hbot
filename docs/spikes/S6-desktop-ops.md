@@ -3,7 +3,7 @@
 - 状态：**已实现，Windows 上真机验证；Linux/macOS 部署物未在真机运行**
 - 日期：2026-11-16
 - 写域：`crates/hbot-desktop/**`、`scripts/verify-*.ps1`、`packaging/**`、本文档、`docs/02-architecture.md` §17
-- 一句话结论：五件事**代码都写了**，其中「单实例 / 关窗进托盘 / 优雅退出 / 开机自启开关 / 崩溃文件落盘」在 Windows 上有**真进程、真退出码、真注册表、真日志**的证据；托盘菜单项**被鼠标点中**这件事、Linux systemd/logrotate、macOS 全平台、以及「崩溃提示以 RunLog 出现在界面上」都**没有端到端验证**，逐条列在 §9。
+- 一句话结论：五件事**代码都写了**，其中「单实例 / 关窗进托盘 / 优雅退出 / 开机自启开关 / 崩溃文件落盘 + 下次启动上报」在 Windows 上有**真进程、真退出码、真注册表、真日志**的证据；托盘三个菜单项的**菜单 id → 动作派发**（隐藏 CLI 入口，不是鼠标）已实测；但**鼠标真的点中菜单项**、托盘图标外观、Linux systemd/logrotate、macOS 全平台、重启后自启、以及「崩溃提示在界面上渲染」仍**没有端到端验证**，逐条列在 §9。
 
 > 本文档遵守一条规矩：**"代码写了"不等于"功能可用"**。下面每个结论后面都跟着它是怎么被验证的，或者明确写「未验证」。
 
@@ -14,10 +14,10 @@
 | # | 能力 | 实现位置 | 验证状态 |
 |---|---|---|---|
 | 1 | 单实例（第二次启动把已有窗口带到前台后 `exit 0`） | `tauri-plugin-single-instance` v2.5.5 + `lib.rs` 的 `.plugin(...)` | **已验证**（`scripts/verify-single-instance.ps1` 全绿；"真的在最前"见 §9） |
-| 2 | 关窗进托盘 + 托盘菜单（显示 / 自启开关 / 退出） | `settings.rs` + `shell.rs` + `tauri.conf.json` 的 `app.trayIcon` | **部分验证**：关窗隐藏、第二次启动恢复窗口、`closeToTray=false` 时优雅退出 0 都实测；**菜单项被点击**未验证 |
+| 2 | 关窗进托盘 + 托盘菜单（显示 / 自启开关 / 退出） | `settings.rs` + `shell.rs` + `tauri.conf.json` 的 `app.trayIcon` | **部分验证**：关窗隐藏、第二次启动恢复窗口、`closeToTray=false` 时优雅退出 0 都实测；**三个菜单 id → 动作派发**（`scripts/verify-tray-actions.ps1`，show / autostart / quit 全绿，见 §3.3）；**鼠标真的点中菜单项**未验证（§9-2） |
 | 3 | 开机自启（默认关，可切换，幂等） | `autostart.rs` + `cli.rs`（`--set-autostart`）+ `settings.rs` | **已验证**（`scripts/verify-autostart.ps1` 全绿，含注册表/幂等/删除）；Linux `.desktop`、macOS plist 只有单测 |
 | 4 | Linux 后台服务部署物 | `packaging/systemd/hbot.service`、`packaging/logrotate.d/hbot`、`packaging/README.md` | **未验证**（从未在真实 Linux 上跑过，`hbot serve` 本身既有且不在本次范围） |
-| 5 | 崩溃上报（只写本地文件 + 下次启动提示） | `crash.rs` | **部分验证**：真 panic 落盘、`text 脱敏`、下次启动检测到并给出提示路径都实测；**「作为一条 error RunLog 出现在界面」未验证**（原因见 §6.4） |
+| 5 | 崩溃上报（只写本地文件 + 下次启动提示） | `crash.rs` | **已验证（日志/数据侧）**：真 panic 落盘、`text 脱敏`、下次启动 stderr 提示、`logs_tail` 读到 `source=agent` 的 `error` 行、报告改名 `.reported.log` 全实测（§6.2–§6.3）；**界面是否渲染这一行**未验证（§6.4） |
 
 Windows 真机验证环境：Windows（`x86_64-pc-windows-msvc`），`rustc 1.96.0`，Tauri 2.12.5，WebView2 运行时；构建目录 `E:\hbot-target\dux`，`-j 2`。
 
@@ -178,6 +178,42 @@ A 段日志里的 `托盘已就绪，菜单已挂上 source="config"` 是「配�
 
 `WM_CLOSE` 而不是模拟点击，是因为托盘菜单项没法用脚本点（要 `TrackPopupMenu` 级别的 UI 自动化）。`WM_CLOSE` 打的是**同一个** `CloseRequested` 处理器，所以"关窗隐藏"这条真的验到了；「鼠标点菜单」见 §9。
 
+### 3.3 托盘菜单三个动作的派发实测（`scripts/verify-tray-actions.ps1`，pwsh 7，EXIT=0）
+
+真实鼠标点击 Windows 通知区域里的托盘菜单不可靠，所以这里验证的是**菜单 id → 动作**这一段，不是鼠标：第二个进程带隐藏参数 `--tray-action <id>` 启动，单实例插件把 argv 转交给已运行的实例，第一个实例用与 `on_menu_event` **完全相同**的 `shell::handle_menu` + `shell::dispatch_menu_action` 执行。脚本只按结果断言：
+
+```
+== A. 托盘动作 show：主窗口隐藏后应被隐藏入口重新显示
+  [PASS] 前置条件：窗口已隐藏: Visible=False
+  [PASS] show 转发进程退出码 = 0: HasExited=True ExitCode=0
+  [PASS] 派发 show 后窗口重新可见（IsWindowVisible=true）: Visible=True
+  [PASS] 日志证明动作来自隐藏入口（source=cli / menu_id / action=show）: ...
+== B. 托盘动作 autostart：第一次应开（写注册表），第二次应关（删注册表）
+  [PASS] 第 1 次 desktop.json.autostart = True: 实际=True
+  [PASS] 第 1 次注册表 HKCU Run\hbot 已写入且指向当前 exe: 实际="E:\hbot-target\dux\debug\hbot-desktop.exe" 期望="E:\hbot-target\dux\debug\hbot-desktop.exe"
+  [PASS] 第 2 次 desktop.json.autostart = False: 实际=False
+  [PASS] 第 2 次注册表 HKCU Run\hbot 已删除: 实际=
+== C. 托盘动作 quit：第一个实例应优雅退出（退出码 0）
+  [PASS] 第一个实例自行退出（不是被杀的）: HasExited=True
+  [PASS] 第一个实例退出码 = 0: ExitCode=0
+  [PASS] 日志证明走了优雅退出路径: stderr 找 "桌面端开始优雅退出" 与 "空库（没有机器人）"
+```
+
+三个动作的完整日志（第一个实例 stderr）：
+
+```
+INFO hbot_desktop::shell: 托盘动作派发 source="cli" menu_id="desktop/tray/show" action="show"
+INFO hbot_desktop::shell: 托盘动作派发 source="cli" menu_id="desktop/tray/autostart" action="toggleAutostart"
+INFO hbot_desktop::shell: 开机自启已切换 autostart=true
+INFO hbot_desktop::shell: 托盘动作派发 source="cli" menu_id="desktop/tray/autostart" action="toggleAutostart"
+INFO hbot_desktop::shell: 开机自启已切换 autostart=false
+INFO hbot_desktop::shell: 托盘动作派发 source="cli" menu_id="desktop/tray/quit" action="quit"
+INFO hbot_desktop::shell: 桌面端开始优雅退出：先停机器人
+INFO hbot_desktop::shell: 空库（没有机器人），写队列无内容可排
+```
+
+**这条证据的边界（非常重要）**：它验证的是「菜单 id → `MenuAction` → 动作」的派发，**不是**「鼠标点中系统托盘图标/菜单项」这一步；后者仍列在 §9-2，未验证。
+
 ---
 
 ## 4. 开机自启（默认关）
@@ -276,9 +312,10 @@ Linux/macOS 的实现只有单测（`desktop_entry_quotes_paths_with_reserved_ch
    - **脱敏**：整份文本过一遍既有的 `hbot_rpc::app::agent::log::redact_text`（它组合了 `redact_bearer` / `redact_named_values` / `redact_hex_runs`）。
 2. **下次启动时提示**（`report_pending()`，在核心装配完成、事件泵挂好之后）：
    - 找 `logs/` 下最新的、没被标记过的 `crash-*.log`；
-   - 等窗口订阅事件（最多 30s，250ms 轮询 `EventBus::receiver_count()`）—— 太早发事件会被丢弃（broadcast 没有回放）；
-   - 写一条 `error` 级 RunLog：`上次运行异常退出：<panic 摘要>（报告：<路径>）`，走 `AppState::append_log`（`logs` 表）+ `EventBus::send(Event::RunLog{ level: Error, .. })`；
-   - 成功后把文件改名成 `crash-*.reported.log`（下次不再重复提示）。
+   - 先 `tracing::error!(path=..., "{line}")` 打到 stderr（**空库也能看到**），`line` = `上次运行异常退出：<panic 摘要>（报告：<路径>）`；
+   - 通过 `hbot_rpc::app::agent::log::StoreRunLogSink` 写 `logs` 表：`level='error'`、`bot_id=NULL`、`source='agent'`（迁移 `0003_agent_logs.sql` 已把 `logs.bot_id` 改为可空，并新增 `source` 列）；
+   - 最多等 5s（50 × 100ms）轮询 `Store::list_logs(None, 100)` 确认这一行已落库；确认成功才把文件改名成 `crash-*.reported.log`，失败则保留文件下次重试（不假装上报成功）；
+   - **不再发 `Event::RunLog`**：该 DTO 仍要求 `bot_id: BotId`，崩溃场景没有 bot 行可指。
 3. **不联网**：没有任何 HTTP 调用、没有遥测 SDK、没有 Sentry。
 
 ### 6.2 实测证据（真 panic，不是我构造的）
@@ -314,43 +351,76 @@ backtrace:
 
 （`/rustc/<redacted>/` 是**脱敏的副作用**：`redact_hex_runs` 把 rustc 的 40 位 commit hash 当成"疑似密钥"抹了。功能上无害，可读性上略损失，记在这里以免下次有人以为文件被改坏了。）
 
-### 6.3 「下次启动发现上次崩溃」实测
+### 6.3 崩溃两次启动端到端实测（`scripts/verify-crash-report.ps1`，pwsh 7，EXIT=0）
 
-把上面那个**真**崩溃文件放进一个全新的隔离数据目录，再启动应用，stderr 里出现：
+`HBOT_TEST_PANIC_ON_START=1` 只在**同时满足**「`debug_assertions` 编译期」+「显式环境变量」时触发（见 `lib.rs` 的 `maybe_trigger_test_panic`），release 构建里这个函数体被 `#[cfg(debug_assertions)]` 整个编掉。脚本用隔离的 `APPDATA`/`USERPROFILE` 跑两次启动：
 
 ```
-WARN hbot_desktop::crash: 上次运行崩溃过，但库里还没有机器人，日志外键插不进去；文件保留，下次启动再报
-  path=...\appdata\hbot\logs\crash-20261116T014904Z.log
+== A. 崩溃第一次启动（HBOT_TEST_PANIC_ON_START=1）
+  [PASS] 进程已退出（panic 没有被吞掉）: HasExited=True
+  [PASS] 退出码 = 101（Rust panic 默认）: ExitCode=101
+  [PASS] crash-*.log 已落盘: 未上报报告数: 1
+  [PASS] 文件名形如 crash-YYYYMMDDTHHMMSSZ.log（无冒号）: crash-20261116T092019Z.log
+  [PASS] 报告含稳定标记 S6-CRASH-E2E: 报告里查找 marker
+  [PASS] 报告里密钥被写成 <redacted>: 报告里查找 api_key=<redacted>
+  [PASS] 报告不含测试密钥原文: 报告里不得出现 SecretLiteral
+
+== B. 第二次正常启动（不设 HBOT_TEST_PANIC_ON_START）
+  [PASS] stderr 出现「上次运行异常退出」+ 标记: ...
+  [PASS] stderr 出现「已上报上次崩溃（logs.source=agent）」: ...
+  [PASS] 原报告改名为 *.reported.log: reported 文件数: 1
+
+== C. --logs-tail 50：logs 表里必须查到 source=agent 的 error 行
+  [PASS] --logs-tail 进程退出码 = 0: HasExited=True ExitCode=0
+  [PASS] logs_tail 里找到崩溃行: 匹配行数: 1
+  [PASS] 该行 level = error: level=error
+  [PASS] 该行 source = agent（bot_id=NULL 的 Agent 行）: source=agent
+  [PASS] 该行同样不含测试密钥原文: logs_tail 行检查 SecretLiteral
+  [PASS] 第一个实例收到 quit 后自行退出: HasExited=True ExitCode=0
 ```
 
-这证明：崩溃文件被**找到**了、`report_pending()` **跑了**、并且诚实地报告了「插不进 logs 表」的原因，同时**保留文件**等下一次（不是静默丢掉）。
+A 段报告里的 panic 行（真实落盘内容）：
+
+```
+panic: HBOT_TEST_PANIC_ON_START=1：启动期自检 panic（marker=S6-CRASH-E2E；api_key=<redacted>
+位置: crates\hbot-desktop\src\lib.rs:491:13
+```
+
+C 段 `--logs-tail 50` 的返回片段：
+
+```json
+[{"at":1794820820500,"level":"error","line":"上次运行异常退出：panic: HBOT_TEST_PANIC_ON_START=1：启动期自检 panic（marker=S6-CRASH-E2E；api_key=<redacted> / 位置: crates\\hbot-desktop\\src\\lib.rs:491:13 / ...（报告：...\\logs\\...reported.log）","source":"agent"}]
+```
+
+这证明：崩溃文件**真的落盘**并经过脱敏；第二次正常启动**真的发现并上报**到 `logs` 表（`source=agent`、`bot_id=NULL`、`level=error`），且 `logs_tail`（`bot_id=None` 的全项目视图）**真的能读到**；最后文件改名避免重复上报。
+
+> `lib.rs` 的精确行号会随并发单元对启动追踪的改动漂移（上面是本次实测输出）；定位本任务的 panic 入口以 `maybe_trigger_test_panic` 函数为准。
 
 ### 6.4 未验证的部分（重要）
 
-- **「崩溃提示作为一条 error RunLog 出现在界面上」没有端到端验证。** 卡点：`logs.bot_id` 有外键，必须有 bot 行才能写；而 RPC 的命令枚举里**没有 BotCreate**（只有 `BotStart`/`BotStop`/`BotInject`），`insert_bot` 只是 `hbot-rpc` 里的测试辅助函数。所以要么连真 QQ 平台建 bot，要么改进 rpc 暴露创建入口 —— 两者都超出本任务的写域。覆盖它的是**单元测试**（`write_lands_in_the_logs_subdir_then_reports_once` 断言了 `append_log` + 事件发送 + 改名），以及上面 §6.3 的真机「检测到 + 提示路径」；但**界面上真的看到这一行**没有被观测。
+- **「崩溃提示在界面上真的渲染出来」没有验证。** 目前验证到的是数据层与 CLI 读取层：`logs_tail` 的 DTO 里有这一行（§6.3 C 段），但负责显示它的 `apps/web` 面板不在本任务写域，且没有 tauri-driver / 截图类 UI 自动化可断言「屏幕上出现了这一行」。**不要把它理解成已看到 UI。**
 - 崩溃发生在 `AppState` 打开**之前**（比如 WebView 创建失败）时，`report_pending` 也不会跑（它挂在核心装配成功之后）。这是取舍：没有核心就没有 UI 可提示，此时文件仍然留在磁盘上，用户能手动找到。
 
 ---
 
-## 7. 六条验收命令（真实输出）
+## 7. 验收命令（真实输出）
+
+本轮（2026-11-16 托盘与崩溃补验）实际跑过的：
 
 | # | 命令 | 结果 |
 |---|---|---|
-| 1 | `cargo build -p hbot-desktop -j 2` | **EXIT=0** |
-| 2 | `cargo clippy -p hbot-desktop --all-targets -- -D warnings` | **EXIT=0** |
+| 1 | `cargo test -j 2 -p hbot-desktop` | **EXIT=0**，`39 passed; 0 failed; 0 ignored` |
+| 2 | `cargo clippy -j 2 -p hbot-desktop --all-targets -- -D warnings` | **EXIT=0** |
 | 3 | `cargo fmt -p hbot-desktop -- --check` | **EXIT=0** |
-| 4 | `node scripts/check-tauri-conf.mjs` | **EXIT=0**（`通过 61 项检查（警告 0 条）`） |
-| 5 | `pwsh -File scripts/verify-single-instance.ps1` | **EXIT=0**（§2.2） |
-| 6 | `pwsh -File scripts/verify-tray-close.ps1` / `verify-autostart.ps1` | **EXIT=0 / EXIT=0**（§3.2、§4.2） |
+| 4 | `cargo build -p hbot-desktop`（debug） | **EXIT=0** |
+| 5 | `pwsh -File scripts/verify-tray-actions.ps1` | **EXIT=0**（§3.3，三个菜单 id 全绿） |
+| 6 | `pwsh -File scripts/verify-crash-report.ps1` | **EXIT=0**（§6.3，两次启动全绿） |
+| 7 | `node scripts/check-tauri-conf.mjs` | **EXIT=0**（`通过 61 项检查（警告 0 条）`） |
+| 8 | `cargo run -q -p xtask -- deps` | **EXIT=0**（`deps: 0 violation(s)（15 个 crate，47 条内部边）`） |
 
-附加门（本仓库的硬约束，都在写域外但会影响我的 crate）：
+既有真机脚本（历史记录，本轮未复跑）：`verify-single-instance.ps1`（§2.2）、`verify-tray-close.ps1`（§3.2）、`verify-autostart.ps1`（§4.2）均为 **EXIT=0**。
 
-| 命令 | 结果 |
-|---|---|
-| `cargo test -p hbot-desktop -j 2` | **EXIT=0**，`33 passed; 0 failed; 0 ignored` |
-| `cargo run -q -p xtask -- deps -j 2` | **EXIT=0**，`deps: 0 violation(s)（15 个 crate，46 条内部边）` |
-
-> `xtask deps` 这条一开始是红的：我为了写 `logs` 表给 `hbot-desktop` 加了 `hbot-store` 依赖，而闸门只允许壳依赖 `hbot-core` + `hbot-rpc`。**没有放宽规则**，改成走 `hbot_rpc::app::AppState::append_log()`（由 lead 在 rpc 侧加的入口），依赖删掉，闸门恢复绿。这条记在这里，是因为"加个依赖省事"是这个仓库里最容易犯的错。
+> `xtask deps` 曾经是红的：一开始为了写 `logs` 表给 `hbot-desktop` 加了 `hbot-store` 依赖，而闸门只允许壳依赖 `hbot-core` + `hbot-rpc`。**没有放宽规则**，改成走 `hbot_rpc::app::agent::log::StoreRunLogSink`（rpc 侧封装 `NewAgentLog`，桌面壳不直接依赖 store），依赖删掉，闸门恢复绿。这条记在这里，是因为"加个依赖省事"是这个仓库里最容易犯的错。
 
 ---
 
@@ -370,11 +440,11 @@ WARN hbot_desktop::crash: 上次运行崩溃过，但库里还没有机器人，
 ## 9. 未验证清单（**不要当成已验证**）
 
 1. **「第二个实例把窗口真的抬到最前」**：脚本在**有另一个应用占着前台**时观测到 `[WARN]`（两次实测的前台分别是 DSH 窗口与 Chrome）：窗口确实从最小化恢复、确实可见，但 `GetForegroundWindow()` 仍是别的窗口。这符合 Windows 前台锁的规则（后台进程不允许随便抢焦点，插件只是调了 `AllowSetForegroundWindow`），但我们**没有**在"没有别的窗口抢焦点"的干净桌面上复测过 `-StrictForeground` 全绿。**结论：窗口会被恢复并请求聚焦；"一定在你眼前"不保证。**
-2. **托盘菜单项真的被鼠标点击**：`显示主窗口` / `开机自启` / `退出` 三个菜单项的 `on_menu_event` 分支没有被真实点击触发过（脚本只能发 `WM_CLOSE`）。它们调用的函数各自被间接验证过（`show_main_window` 由单实例回调验证、`request_quit` 由 C 段验证、自启开关由 CLI 验证），但**菜单项 → 函数的这段派发**只靠代码审阅。
+2. **托盘菜单项真的被鼠标点击**：仍未验证。`scripts/verify-tray-actions.ps1` 验证的是「菜单 id → `MenuAction` → 动作」的派发（§3.3，A/B/C 全绿），事件来源是单实例插件转交的隐藏 `--tray-action` argv，**不是鼠标**；`TrackPopupMenu` 级别的 UI 自动化没有做。
 3. **托盘图标在真实桌面上长什么样**（是否被 Windows 折叠进"隐藏的图标"、tooltip 是否可读）：没有截图、没有人工确认。
 4. **Linux**：systemd unit、logrotate、`hbot serve` 在 systemd 下的实际行为 **全部未验证**，从未在真实 Linux 主机上运行。`.desktop` 自启文件只有单测。
 5. **macOS**：全部未验证（plist 内容有单测；`tauri.macos.conf.json` 的 dmg 构建没跑过；命令隔离在 macOS 上不可用这件事也与本任务无关但与桌面壳共存）。
-6. **崩溃提示出现在界面上**（见 §6.4）。
+6. **崩溃提示出现在界面上**（见 §6.4）：数据层已验证（`logs_tail` 能查到 `source=agent`、`level=error` 的崩溃行），但 **UI 是否渲染这一行仍未验证**。
 7. **开机自启真的在下次登录时拉起应用**：只验证了"注册表项写对/删对/幂等"，**没有重启机器**去确认它真的自启。
 8. **`closeToTray=false` 且**有**机器人在跑时的优雅退出**：C 段是空库（`空库（没有机器人），写队列无内容可排`），"停真实 bot → 等 ≤5s 宽限 → 写屏障"这条**有 bot 的分支**没有真机验证（要连真 QQ 平台）。代码路径是既有的 `BotRegistry::stop_all()`，但从没在这个壳里跑过真实 bot。
 9. **多显示器 / 高 DPI 下的托盘与窗口恢复**：未测。
@@ -386,7 +456,7 @@ WARN hbot_desktop::crash: 上次运行崩溃过，但库里还没有机器人，
 - **没有自动更新**（`createUpdaterArtifacts: false` 保持不动），没有签名/公证流水线。
 - **没有服务器端崩溃上报**：崩溃只落本地文件，用户得自己找到 `<data_dir>/logs/`。也没有"崩溃后一键打包诊断包"的入口。
 - **没有 `desktop.json` 的设置界面**：只能改文件或用 `--set-autostart`；`closeToTray` 目前**只能手改 JSON**（没有 UI 开关，也没做 CLI 参数）。
-- **没有单实例的"传递命令行参数"语义**：第二次启动的 argv 会被递过来，但回调里忽略了（只拉起窗口）。比如将来 `hbot --open-project X` 在已运行时不会真的打开项目。
+- **单实例只识别 `--tray-action`**：第二个进程的 argv 会被插件递过来，但回调只处理隐藏的 `--tray-action`（测试/运维入口），其余参数仍忽略（比如 `hbot --open-project X` 在已运行时不会真的打开项目）。
 - **没有托盘气泡通知**（崩溃/崩溃提示只走 RunLog，不弹系统通知）。
 - **没有"最小化到托盘"的动画/首次提示**：用户第一次关窗口可能会以为程序退出了（只有一个托盘图标）。产品上通常需要一次性提示。
 - **systemd unit 没有 `ExecReload`**、没有配套的 `hbot.socket`、没有 SELinux/AppArmor profile。
@@ -405,10 +475,12 @@ cargo clippy -p hbot-desktop --all-targets -j 2 -- -D warnings
 cargo fmt -p hbot-desktop -- --check
 node scripts/check-tauri-conf.mjs
 
-# 5~6：真机行为（必须 pwsh 7；脚本自己隔离 APPDATA，不动你的真实数据目录）
+# 5~8：真机行为（必须 pwsh 7；脚本自己隔离 APPDATA，不动你的真实数据目录）
 pwsh -File scripts/verify-single-instance.ps1
 pwsh -File scripts/verify-tray-close.ps1
-pwsh -File scripts/verify-autostart.ps1   # 会备份/还原你的 HKCU Run 值与 desktop.json
+pwsh -File scripts/verify-autostart.ps1      # 会备份/还原你的 HKCU Run 值与 desktop.json
+pwsh -File scripts/verify-tray-actions.ps1   # 三个菜单 id 的派发（不是鼠标点击）
+pwsh -File scripts/verify-crash-report.ps1   # 崩溃两次启动 + --logs-tail 断言
 ```
 
 每个脚本失败时打印「失败项: …」并以 1 退出；日志目录会打印在最后一行。

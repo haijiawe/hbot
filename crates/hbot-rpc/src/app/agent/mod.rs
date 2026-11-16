@@ -112,18 +112,19 @@ pub struct AgentManager {
     approval_store: Arc<ApprovalStore>,
     config_source: ConfigSource,
     provider_factory: Box<ProviderFactory>,
-    /// Agent 运行日志的落点（`logs` 表）。默认不写：Agent 会话没有 bot 归属，
-    /// 装配方定下归属后用 [`Self::with_run_log_sink`] 注入。
+    /// Agent 运行日志的落点（`logs` 表）。由装配方显式注入：Agent 会话没有 bot
+    /// 归属，生产装配用 [`StoreRunLogSink`]（`bot_id = NULL`、`source = 'agent'`）。
     run_log: Arc<dyn RunLogSink>,
 }
 
 impl AgentManager {
-    /// 生产装配。
+    /// 生产装配。`run_log` 由 `AppState::open` 注入。
     pub fn new(
         data_dir: PathBuf,
         events: Arc<EventBus>,
         ids: Arc<dyn IdGenerator>,
         clock: Arc<dyn Clock>,
+        run_log: Arc<dyn RunLogSink>,
     ) -> Self {
         Self {
             data_dir,
@@ -136,11 +137,11 @@ impl AgentManager {
             approval_store: Arc::new(ApprovalStore::new()),
             config_source: ConfigSource::Resolve,
             provider_factory: Box::new(default_provider_factory),
-            run_log: Arc::new(NullRunLogSink),
+            run_log,
         }
     }
 
-    /// 换一个 `RunLog` 落点（见 [`log`] 模块文档：需要 bot 归属才能写 `logs` 表）。
+    /// 换一个 `RunLog` 落点（测试/诊断用；生产装配由 [`Self::new`] 注入）。
     pub fn with_run_log_sink(mut self, sink: Arc<dyn RunLogSink>) -> Self {
         self.run_log = sink;
         self
@@ -168,7 +169,7 @@ impl AgentManager {
         Self {
             config_source,
             provider_factory,
-            ..Self::new(data_dir, events, ids, clock)
+            ..Self::new(data_dir, events, ids, clock, Arc::new(NullRunLogSink))
         }
     }
 
@@ -595,14 +596,21 @@ impl EventTurnSink {
         vec![ChatMessage::assistant_text(self.text.clone())]
     }
 
+    /// 给日志行加会话前缀：`logs` 没有 session 列，面板靠 `[session 3f2a…]` 区分会话。
+    fn run_log_line(&self, line: String) -> String {
+        format!("{}{line}", log::session_prefix(&self.session_id))
+    }
+
     /// 整轮失败：写一行 `error`（`logs_tail` 里能看见"这一轮为什么没做成"）。
     fn log_failure(&self, error: &str) {
-        self.run_log.append("error", log::turn_failure_line(error));
+        self.run_log
+            .append("error", self.run_log_line(log::turn_failure_line(error)));
     }
 
     /// 整轮取消：写一行 `info`（取消不是故障，别用 error 吓人）。
     fn log_cancel(&self) {
-        self.run_log.append("info", log::turn_cancel_line());
+        self.run_log
+            .append("info", self.run_log_line(log::turn_cancel_line()));
     }
 }
 
@@ -633,7 +641,7 @@ impl TurnSink for EventTurnSink {
             .remove(call_id)
             .map_or(Duration::ZERO, |started| started.elapsed());
         let (level, line) = log::tool_result_line(call, output, elapsed);
-        self.run_log.append(level, line);
+        self.run_log.append(level, self.run_log_line(line));
 
         let now = self.clock.now();
         let content = truncate_chars(&output.content, MAX_TOOL_RESULT_CHARS);
@@ -810,10 +818,13 @@ mod tests {
         let lines = capture.lines();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].0, "error");
-        assert!(lines[0].1.starts_with("agent 本轮失败："), "{}", lines[0].1);
+        // `logs` 没有 session 列：会话 ID 必须体现在行前缀里。
+        assert!(lines[0].1.starts_with("[session "), "{}", lines[0].1);
+        assert!(lines[0].1.contains("agent 本轮失败："), "{}", lines[0].1);
         assert!(!lines[0].1.contains("sk-live-999"), "{}", lines[0].1);
         assert_eq!(lines[1].0, "info");
         assert!(lines[1].1.contains("已取消"));
+        assert!(lines[1].1.starts_with("[session "), "{}", lines[1].1);
     }
 
     /// 没有对应调用的结果（乱序/重复回调）不写日志，也不能 panic。
@@ -824,17 +835,17 @@ mod tests {
         assert!(capture.lines().is_empty());
     }
 
-    /// `with_run_log_sink` 真的换掉了落点（`start_turn` 读的就是这个字段）。
+    /// 构造时注入的落点就是 `start_turn` 读的那个字段。
     #[test]
-    fn run_log_sink_can_be_replaced() {
+    fn run_log_sink_is_injected_by_constructor() {
         let capture: Arc<dyn RunLogSink> = Arc::new(CaptureSink::default());
         let manager = AgentManager::new(
             std::env::temp_dir(),
             Arc::new(EventBus::new()),
             Arc::new(crate::app::ids::UuidIds),
             Arc::new(hbot_adapters::SystemClock),
-        )
-        .with_run_log_sink(Arc::clone(&capture));
+            Arc::clone(&capture),
+        );
         assert!(Arc::ptr_eq(manager.run_log_sink(), &capture));
     }
 

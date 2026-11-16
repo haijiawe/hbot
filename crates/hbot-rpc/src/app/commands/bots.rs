@@ -303,11 +303,17 @@ async fn inject_inner(
 }
 
 /// 读取最近 `limit` 条日志行，数组内**最旧在前**（UI 直接往下追加）。
-pub async fn logs_tail(state: &AppState, bot_id: BotId, limit: usize) -> Response {
+///
+/// `bot_id = None` 是全项目视图：包含所有 bot 行与 Agent 行（`source = 'agent'`）。
+pub async fn logs_tail(state: &AppState, bot_id: Option<BotId>, limit: usize) -> Response {
     let capped = u32::try_from(limit.min(MAX_LOG_LIMIT)).unwrap_or(u32::MAX);
     let store = Arc::clone(state.store());
     let rows = match state
-        .blocking(move || store.list_logs(Some(&bot_id), capped).map_err(store_failed))
+        .blocking(move || {
+            store
+                .list_logs(bot_id.as_ref(), capped)
+                .map_err(store_failed)
+        })
         .await
     {
         Ok(rows) => rows,
@@ -320,6 +326,7 @@ pub async fn logs_tail(state: &AppState, bot_id: BotId, limit: usize) -> Respons
             at: Timestamp::from_unix_millis(row.at),
             level: log_level(&row.level),
             line: row.line,
+            source: row.source,
         })
         .collect();
     // 仓储按 `ORDER BY id DESC` 返回（新→旧），DTO 要旧→新。
@@ -575,6 +582,7 @@ async fn report_start_failure(state: &AppState, bot_id: BotId, message: &str) {
 mod tests {
     use super::*;
     use hbot_core::ProjectId;
+    use hbot_store::NewAgentLog;
 
     use crate::app::test_support::{async_temp_state_with_project, temp_state};
 
@@ -589,6 +597,18 @@ mod tests {
         match data {
             serde_json::Value::Array(items) => items,
             other => panic!("bot_list 的 data 应该是 JSON 数组，实际是 {other}"),
+        }
+    }
+
+    /// 取 `logs_tail` 的 data 并断言它是数组。
+    fn log_array_of(response: Response) -> Vec<serde_json::Value> {
+        let data = response
+            .into_result()
+            .expect("logs_tail 不该失败")
+            .expect("logs_tail 必须带 data");
+        match data {
+            serde_json::Value::Array(items) => items,
+            other => panic!("logs_tail 的 data 应该是 JSON 数组，实际是 {other}"),
         }
     }
 
@@ -727,5 +747,49 @@ mod tests {
             array_of(bot_list(&state).await)[0]["status"],
             json!("stopped")
         );
+    }
+
+    // Agent 行没有 bot 归属：`bot_id: null` 的全项目视图必须包含它，按 bot 过滤时必须排除它。
+    #[tokio::test]
+    async fn logs_tail_none_reads_agent_rows_and_some_filters_them_out() {
+        let (_dir, state, _root) = async_temp_state_with_project().await;
+        let root = state.project_root().expect("已打开项目");
+        let project = insert_project(&state, &root).await;
+        let bot_id = insert_bot(&state, project.id, "日志 bot").await;
+
+        state
+            .append_log(bot_id, "info", "bot 日志")
+            .expect("写 bot 日志");
+        let store = Arc::clone(state.store());
+        let at = state.clock().now().unix_millis();
+        state
+            .blocking(move || {
+                store
+                    .append_agent_log(NewAgentLog {
+                        level: "info".to_owned(),
+                        line: "[session 3f2a1b9c…] agent 工具 fs_read 成功（1 ms）".to_owned(),
+                        at,
+                    })
+                    .map_err(store_failed)
+            })
+            .await
+            .expect("写 Agent 日志");
+
+        let all = log_array_of(logs_tail(&state, None, 50).await);
+        assert_eq!(all.len(), 2, "全项目视图应包含 bot 行与 Agent 行：{all:?}");
+        assert_eq!(all[0]["source"], json!("bot"));
+        assert_eq!(all[1]["source"], json!("agent"));
+        assert_eq!(
+            all[1]["line"],
+            json!("[session 3f2a1b9c…] agent 工具 fs_read 成功（1 ms）")
+        );
+
+        let bot_only = log_array_of(logs_tail(&state, Some(bot_id), 50).await);
+        assert_eq!(
+            bot_only.len(),
+            1,
+            "按 bot 过滤不该看到 Agent 行：{bot_only:?}"
+        );
+        assert_eq!(bot_only[0]["source"], json!("bot"));
     }
 }

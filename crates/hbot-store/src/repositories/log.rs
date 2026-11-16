@@ -5,13 +5,22 @@ use rusqlite::{Connection, params};
 use crate::error::Result;
 use crate::ids::BotId;
 use crate::mappers::{LOG_COLUMNS, row_to_log};
-use crate::models::{LogRow, NewLog};
+use crate::models::{LogRow, NewAgentLog, NewLog};
 
-/// 追加一条日志。`id` 由 SQLite AUTOINCREMENT 生成，保证同一毫秒内的先后可区分。
+/// 追加一条 Bot 日志。`id` 由 SQLite AUTOINCREMENT 生成，保证同一毫秒内的先后可区分。
 pub(crate) fn append(conn: &Connection, entry: &NewLog) -> Result<()> {
     conn.execute(
-        "INSERT INTO logs (bot_id, level, line, at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO logs (bot_id, level, line, at, source) VALUES (?1, ?2, ?3, ?4, 'bot')",
         params![entry.bot_id.to_string(), entry.level, entry.line, entry.at],
+    )?;
+    Ok(())
+}
+
+/// 追加一条 Agent 日志：没有 bot 归属，`bot_id = NULL`、`source = 'agent'`。
+pub(crate) fn append_agent(conn: &Connection, entry: &NewAgentLog) -> Result<()> {
+    conn.execute(
+        "INSERT INTO logs (bot_id, level, line, at, source) VALUES (NULL, ?1, ?2, ?3, 'agent')",
+        params![entry.level, entry.line, entry.at],
     )?;
     Ok(())
 }

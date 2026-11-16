@@ -24,6 +24,10 @@
 //! 4. **TLS 只校验、不降级**：`wss://` 走 rustls（见 `crate::tls`），对端证书
 //!    校验失败报 [`AdapterError::Tls`]，**不会**退回明文、也没有跳过校验的开关。
 //!    私有 CA / 自签部署用 [`OneBotConfig::with_extra_root_certificates`] 追加信任根。
+//! 5. **探测与常驻共用一条连接（probe → handoff）**：[`probe_session`] 连上并完成
+//!    OneBot 生命周期确认后，把这条连接（连同握手期间已读到的帧）交给
+//!    [`OneBotClient::start_with_session`]。`bot_start` 因此只对平台开**一次** WS 连接；
+//!    探测失败仍然当场报错。断线重连依旧走 [`connect_ws`]，与 handoff 无关。
 //!
 //! 动作（`send_group_msg` 等）用 `echo` 与响应配对；`ActionHandle` 可以在
 //! 多个任务里 `clone`（内部同一个有界队列 + 单调 echo 计数器）。
@@ -71,6 +75,14 @@ const MAX_FRAME_TEXT_BYTES: usize = 8 * 1024 * 1024;
 /// 没有这道闸，对端把 SYN 吞掉或 TLS 握手卡住时 `supervise` 会永远停在
 /// "正在连接"——既不报错也不重连，表现为"机器人上线了但收不到消息"。
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 连上之后等 OneBot 生命周期握手的确认窗口。
+///
+/// OneBot 11 的实现（NapCat / LLOneBot 等）在 WS 升级完成后**立刻**推
+/// `meta_event/lifecycle`，局域网与常见跨地域 RTT 都在这个窗口里。窗口到期仍没收到
+/// 任何帧**不算失败**（见 [`probe_session`]：有界宽限），所以这个值只影响"确认得多快"，
+/// 不影响"能不能启动"。
+pub const LIFECYCLE_CONFIRM_WINDOW: Duration = Duration::from_millis(500);
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -327,10 +339,11 @@ pub struct OneBotClient {
 }
 
 impl OneBotClient {
-    /// 启动客户端（立即返回，连接在后台建立/重连）。
+    /// 只校验配置：**不碰网络、不起任务**。
     ///
-    /// 校验失败（空容量、非 `ws://`）直接返回错误，不起任务。
-    pub fn start(config: OneBotConfig) -> Result<Self, AdapterError> {
+    /// [`OneBotClient::start`] / [`OneBotClient::start_with_session`] / 平台适配器
+    /// （`bot_start` 的配置期）共用这一份判据，别在两处各写一遍。
+    pub fn validate(config: &OneBotConfig) -> Result<(), AdapterError> {
         validate_ws_url(&config.ws_url)?;
         if config.event_capacity == 0 {
             return Err(AdapterError::unsupported("event capacity must be > 0"));
@@ -338,11 +351,42 @@ impl OneBotClient {
         if config.action_capacity == 0 {
             return Err(AdapterError::unsupported("action capacity must be > 0"));
         }
+        Ok(())
+    }
+
+    /// 启动客户端（立即返回，连接在后台建立/重连）。
+    ///
+    /// 校验失败（空容量、非 `ws://`）直接返回错误，不起任务。
+    pub fn start(config: OneBotConfig) -> Result<Self, AdapterError> {
+        Self::launch(config, None)
+    }
+
+    /// 用探测拿到的连接启动客户端：**第一条会话**就是 [`probe_session`] 建立的那条。
+    ///
+    /// 这就是 probe → handoff：探测不再"连上就断"，那次 WS 升级（以及其中最贵的
+    /// TLS 握手）直接交给常驻会话用，平台侧一次 `bot_start` 只看到一次 accept。
+    /// 探测期间已经读到的帧（`meta_event/lifecycle`、心跳）随会话一起补喂，不丢。
+    ///
+    /// 之后的重连与 [`OneBotClient::start`] 完全一致 —— `supervise` 的退避循环、
+    /// attempt 归零、心跳看门狗都是同一份代码（见 [`run_session`]），只有第一次
+    /// 迭代拿的是"别人连好的"套接字。
+    pub fn start_with_session(
+        config: OneBotConfig,
+        session: ConnectedSession,
+    ) -> Result<Self, AdapterError> {
+        Self::launch(config, Some(session))
+    }
+
+    fn launch(
+        config: OneBotConfig,
+        initial: Option<ConnectedSession>,
+    ) -> Result<Self, AdapterError> {
+        Self::validate(&config)?;
         let (events_tx, events_rx) = mpsc::channel(config.event_capacity);
         let (actions_tx, actions_rx) = mpsc::channel(config.action_capacity);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let next_echo = Arc::new(AtomicU64::new(0));
-        let task = tokio::spawn(supervise(config, events_tx, actions_rx, cancel_rx));
+        let task = tokio::spawn(supervise(config, events_tx, actions_rx, cancel_rx, initial));
         Ok(Self {
             actions: ActionHandle {
                 tx: actions_tx,
@@ -557,18 +601,36 @@ enum SessionOutcome {
 }
 
 /// 超级循环：连 → 跑 → 断了按退避重连，直到 cancel。
+///
+/// `initial` 是 probe → handoff 交接过来的连接：只有**第一次**迭代用它，之后一律
+/// 自己 [`connect_ws`]（重连语义与没有 handoff 时逐字相同）。
 async fn supervise(
     config: OneBotConfig,
     events_tx: mpsc::Sender<NormalizedInbound>,
     mut actions_rx: mpsc::Receiver<ActionCommand>,
     mut cancel_rx: watch::Receiver<bool>,
+    initial: Option<ConnectedSession>,
 ) {
     let mut attempt: u32 = 0;
+    let mut handoff = initial;
     loop {
         if *cancel_rx.borrow() {
             break;
         }
-        let outcome = session(&config, &events_tx, &mut actions_rx, &mut cancel_rx).await;
+        let outcome = match handoff.take() {
+            Some(session) => {
+                run_session(
+                    &config,
+                    session.stream,
+                    session.frames,
+                    &events_tx,
+                    &mut actions_rx,
+                    &mut cancel_rx,
+                )
+                .await
+            }
+            None => session(&config, &events_tx, &mut actions_rx, &mut cancel_rx).await,
+        };
         match outcome {
             SessionOutcome::Cancelled => break,
             SessionOutcome::Ended {
@@ -605,7 +667,7 @@ async fn supervise(
     tracing::info!("onebot supervisor stopped");
 }
 
-/// 单次连接会话。
+/// 单次连接会话：自己建连接，再交给 [`run_session`]。
 async fn session(
     config: &OneBotConfig,
     events_tx: &mpsc::Sender<NormalizedInbound>,
@@ -622,12 +684,42 @@ async fn session(
         }
     };
     tracing::info!(url = %config.ws_url, "onebot websocket connected");
+    run_session(config, ws, Vec::new(), events_tx, actions_rx, cancel_rx).await
+}
+
+/// 在一条**已经连上**的套接字上跑一次会话（探测交接与重连共用这一份）。
+///
+/// `buffered` 是探测阶段已经从套接字里读走的帧（`meta_event/lifecycle`、心跳，以及
+/// 恰好排在它们后面的消息）：进主循环**之前**按原顺序补喂一遍，一个字节都不丢。
+async fn run_session(
+    config: &OneBotConfig,
+    ws: WsStream,
+    buffered: Vec<String>,
+    events_tx: &mpsc::Sender<NormalizedInbound>,
+    actions_rx: &mut mpsc::Receiver<ActionCommand>,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> SessionOutcome {
     let (mut write, mut read) = ws.split();
     let mut pending: HashMap<String, oneshot::Sender<Result<Value, AdapterError>>> = HashMap::new();
     let mut watchdog = config
         .heartbeat_timeout
         .map(|timeout| HeartbeatWatchdog::new(timeout, Instant::now()));
     let mut had_activity = false;
+
+    for text in buffered {
+        let outcome = feed_text(
+            &text,
+            config,
+            &mut watchdog,
+            events_tx,
+            &mut pending,
+            &mut had_activity,
+        )
+        .await;
+        if let Some(outcome) = outcome {
+            return outcome;
+        }
+    }
 
     loop {
         // 没有看门狗时给一个很远的唤醒点（1h），保持 select 结构统一。
@@ -726,16 +818,16 @@ async fn session(
                             tracing::debug!("onebot: dropped frame that is not valid utf-8 text");
                             continue;
                         };
-                        if let Some(watchdog) = watchdog.as_mut() {
-                            watchdog.observe(Instant::now());
-                        }
-                        let frame = classify_frame(&text, config.clock.as_ref());
-                        if let Some(outcome) = dispatch_frame(
-                            frame,
+                        let outcome = feed_text(
+                            &text,
+                            config,
+                            &mut watchdog,
                             events_tx,
                             &mut pending,
                             &mut had_activity,
-                        ).await {
+                        )
+                        .await;
+                        if let Some(outcome) = outcome {
                             return outcome;
                         }
                     }
@@ -768,6 +860,26 @@ fn frame_text(message: &WsMessage) -> Option<String> {
         WsMessage::Binary(bytes) => std::str::from_utf8(bytes.as_ref()).ok().map(str::to_owned),
         _ => None,
     }
+}
+
+/// 一帧文本的完整处理：刷新心跳看门狗 → 分类 → 分发。
+///
+/// 抽出来是因为有两条入口：会话主循环从套接字读到的帧，以及探测阶段已经读走、
+/// 交接时补喂的帧（[`run_session`] 的 `buffered`）。两条路必须完全一致，
+/// 否则"交接的帧算不算活跃"会变成第二份判据。
+async fn feed_text(
+    text: &str,
+    config: &OneBotConfig,
+    watchdog: &mut Option<HeartbeatWatchdog>,
+    events_tx: &mpsc::Sender<NormalizedInbound>,
+    pending: &mut HashMap<String, oneshot::Sender<Result<Value, AdapterError>>>,
+    had_activity: &mut bool,
+) -> Option<SessionOutcome> {
+    if let Some(watchdog) = watchdog.as_mut() {
+        watchdog.observe(Instant::now());
+    }
+    let frame = classify_frame(text, config.clock.as_ref());
+    dispatch_frame(frame, events_tx, pending, had_activity).await
 }
 
 /// 让所有在等的动作立即失败（连接断了，响应不会来了）。
@@ -897,16 +1009,170 @@ fn ws_connect_error(err: tokio_tungstenite::tungstenite::Error) -> AdapterError 
     }
 }
 
+/// 一次**已经连上、且刚做完 OneBot 生命周期确认**的连接（probe → handoff）。
+///
+/// [`probe_session`] 建它，[`OneBotClient::start_with_session`] 把它接进常驻会话：
+/// 探测与常驻因此共用**同一条** WS 连接，平台侧一次 `bot_start` 只看到一次 accept。
+///
+/// 字段私有 —— 外部只能"拿着"，不能凭空造一条连接（`WsStream` 本就不对外）。
+pub struct ConnectedSession {
+    stream: WsStream,
+    /// 握手期间已经从套接字读走的文本帧（按读到的顺序）：接进会话后先按原顺序补喂。
+    frames: Vec<String>,
+    lifecycle_seen: bool,
+}
+
+impl ConnectedSession {
+    /// 握手期间是否真的看到了 `meta_event/lifecycle` 或心跳。
+    ///
+    /// `false` 表示走了宽限路径（连上了但对端在窗口内没说话）：连接可用，只是这个
+    /// 端点不推 lifecycle —— 调用方应当据此打一条 warn，而不是静默当成正常。
+    pub fn lifecycle_seen(&self) -> bool {
+        self.lifecycle_seen
+    }
+}
+
+impl fmt::Debug for ConnectedSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectedSession")
+            .field("buffered_frames", &self.frames.len())
+            .field("lifecycle_seen", &self.lifecycle_seen)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 连一次、**留着这条连接**：成功即"探测通过 + 第一条连接已就绪"。
+///
+/// 与 [`probe_connection`] 的唯一区别在结尾：这里不关连接，而是把已经握过手的
+/// [`ConnectedSession`] 交回去，由 [`OneBotClient::start_with_session`] 接成常驻会话。
+/// 一次 `bot_start` 因此只有**一条** WS 连接（探测和常驻是同一条），而"地址 /
+/// token / 证书 / 协议对不对"仍然在启动时当场报出来。
+///
+/// 连上之后还要等 OneBot 生命周期握手（[`lifecycle_handshake`]）：对端推
+/// `meta_event/lifecycle` 或心跳就算**强确认**；窗口内不说话、或握手期间直接关连接，
+/// 都算**宽限通过**（WS 升级本身已经成功，这条连接是能用的；旧实现同样是"连上即通过"，
+/// 区别只是这里会先等一个有界窗口把确认证据记下来）。真正的探测失败只有
+/// [`connect_ws`] 本身：DNS / 拒绝 / TLS / 401 / WS 升级超时，语义与文案都不变。
+pub async fn probe_session(config: &OneBotConfig) -> Result<ConnectedSession, AdapterError> {
+    validate_ws_url(&config.ws_url)?;
+    let mut stream = connect_ws(config).await?;
+    let (frames, lifecycle_seen) = lifecycle_handshake(&mut stream, LIFECYCLE_CONFIRM_WINDOW).await;
+    tracing::info!(
+        url = %config.ws_url,
+        lifecycle_seen,
+        buffered = frames.len(),
+        "onebot websocket connected (probe → handoff: 这条连接直接交给常驻客户端)"
+    );
+    Ok(ConnectedSession {
+        stream,
+        frames,
+        lifecycle_seen,
+    })
+}
+
+/// 在**已经连上**的套接字上等 OneBot 生命周期握手，期间读到的帧全部留下来。
+///
+/// 返回 `(已读到的文本帧, 是否确认到 lifecycle/心跳)`：
+///
+/// * 看到 `meta_event/lifecycle`（或第一帧心跳）→ 立刻确认成功（`true`）；
+/// * 窗口到期什么都没收到 → `false`（有界宽限）。OneBot 11 只规定实现"可以"推
+///   lifecycle；自建/精简实现可能一帧都不推，这类对端连得上就该能启动，否则
+///   `bot_start` 会因为对端安静而永远失败。
+/// * 对端在窗口内关闭 / 连接重置 / 读错误（协议层坏帧）/ pong 写失败 → 也返回
+///   `false`：WS 升级已经成功，这些都属于"对端不说话就挂了"，不该把一条连得上的
+///   端点判成配置错误。会话接手后若真的不可用，由心跳看门狗 / 重连按既有逻辑处理。
+///
+/// 因此这个函数**不产生** `AdapterError`：探测的失败语义只由 `connect_ws` 决定。
+async fn lifecycle_handshake(stream: &mut WsStream, window: Duration) -> (Vec<String>, bool) {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut frames: Vec<String> = Vec::new();
+    loop {
+        let message = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(err))) => {
+                tracing::warn!(
+                    error = %err,
+                    buffered = frames.len(),
+                    "onebot: 生命周期确认窗口内连接出错（按宽限继续，由常驻会话的心跳/重连兜底）"
+                );
+                return (frames, false);
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    buffered = frames.len(),
+                    "onebot: 生命周期确认窗口内连接被对端关闭（按宽限继续，由常驻会话的重连兜底）"
+                );
+                return (frames, false);
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+                    buffered = frames.len(),
+                    "onebot: 连接已建立，但对端在确认窗口内没有推 meta_event/lifecycle（按宽限继续）"
+                );
+                return (frames, false);
+            }
+        };
+        match &message {
+            WsMessage::Ping(payload) => {
+                if let Err(err) = stream.send(WsMessage::Pong(payload.clone())).await {
+                    tracing::warn!(
+                        error = %err,
+                        "onebot: 生命周期确认窗口内回 pong 失败（按宽限继续）"
+                    );
+                    return (frames, false);
+                }
+            }
+            WsMessage::Pong(_) => {}
+            WsMessage::Close(_) => {
+                tracing::warn!(
+                    buffered = frames.len(),
+                    "onebot: 生命周期确认窗口内收到 Close 帧（按宽限继续，由常驻会话的重连兜底）"
+                );
+                return (frames, false);
+            }
+            WsMessage::Text(_) | WsMessage::Binary(_) => {
+                let Some(text) = frame_text(&message) else {
+                    tracing::debug!("onebot: dropped frame that is not valid utf-8 text");
+                    continue;
+                };
+                let confirmed = is_lifecycle_or_heartbeat(&text);
+                frames.push(text);
+                if confirmed {
+                    return (frames, true);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 这一帧是不是"OneBot 实现已经在正常工作"的证据：`meta_event/lifecycle` 或心跳。
+fn is_lifecycle_or_heartbeat(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if value.get("post_type").and_then(Value::as_str) != Some("meta_event") {
+        return false;
+    }
+    matches!(
+        value.get("meta_event_type").and_then(Value::as_str),
+        Some("lifecycle" | "heartbeat")
+    )
+}
+
 /// 连一次、握手成功就断开：给"测试连接"这类命令用。
 ///
 /// 为什么不复用 [`OneBotClient::start`]：`start` 是永续重连语义（spawn 一个后台
 /// 循环），证书不对它只会一直重连 + 打 warn 日志，调用方拿不到"确定失败"。
 /// 这个函数把"地址与证书能不能用"变成一次可以当场报出来的结果 —— 尤其是
 /// `wss://` 部署里最常见的两类问题（根证书没装、证书主机名对不上）。
+///
+/// 走的是与 probe → handoff 完全相同的一条路（[`probe_session`]），所以"测试连接
+/// 通过"与"`bot_start` 能通过"是同一个判据；区别只是这里用完就关。
 pub async fn probe_connection(config: &OneBotConfig) -> Result<(), AdapterError> {
-    validate_ws_url(&config.ws_url)?;
-    let mut stream = connect_ws(config).await?;
-    if let Err(err) = stream.close(None).await {
+    let mut connected = probe_session(config).await?;
+    if let Err(err) = connected.stream.close(None).await {
         // 关闭失败不影响结论：握手已经成功，这里只是尽力礼貌地收掉连接。
         tracing::debug!(error = %err, "onebot probe: close failed");
     }
