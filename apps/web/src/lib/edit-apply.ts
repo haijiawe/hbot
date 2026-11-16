@@ -4,6 +4,8 @@
  * 这里只有纯逻辑（不 import monaco、不 import store），三件事：
  * 1. **按缓冲区校验**：hunk 的行号与上下文行以**用户屏幕上的缓冲区**为准（不是磁盘）。
  *    对不上就拒绝该文件，绝不静默改写用户正在编辑的内容（docs/06-ide.md §5.2）。
+ *    纯插入的 hunk 没有原文行可比，改按 `verifyInsertionAnchor` 要求插入点之前的前缀
+ *    与磁盘逐行一致（行号是磁盘坐标，前面被改过行就会插错位置）。
  * 2. **一次应用 = 一个 undo 组**：`applyEditsAsOneUndoGroup` 只做
  *    `pushStackElement()` → `pushEditOperations(整批)` → `pushStackElement()`。
  * 3. 拒绝时产出可直接并进问题面板的诊断条目。
@@ -142,6 +144,47 @@ export function verifyHunkAgainstLines(hunk: DiffHunk, lines: readonly string[])
         return `第 ${start + index} 行超出文件末尾（文件共 ${lines.length} 行）`
       }
       if (actual !== oldLines[index]) return `第 ${start + index} 行对不上`
+    }
+  }
+  return null
+}
+
+/**
+ * 纯插入 hunk（old 侧 0 行）的**锚点**校验：插入点之前的每一行，缓冲区与磁盘必须逐行一致。
+ *
+ * 为什么需要单独一条：`diff_hunks` 产出的 hunk 没有上下文行（`lines` 里只有 `-` / `+`），
+ * 纯插入连一行可比对的原文都没有 —— `verifyHunkAgainstLines` 对它恒返回 `null`。
+ * 而行号是**磁盘坐标**：用户在插入点之前插过/删过行时，照搬 `oldStart` 会插到错误的位置
+ * （磁盘 `a/b/c`、缓冲区 `u/a/b/c`、hunk 说"第 3 行之前插入 X"，直接应用会变成
+ * `u/a/X/b/c`，而作者的意图是 `c` 之前）。
+ *
+ * 判据取最保守的一条：插入点之前的前缀逐行相同 ⇒ 两套坐标在插入点之前对齐，
+ * `oldStart` 在缓冲区里指向同一个位置；否则拒绝（hunk 没有上下文行，无法再锚回去）。
+ *
+ * `diskLines === undefined` 表示没有磁盘副本可对照：脏文件直接拒绝，不靠猜。
+ */
+export function verifyInsertionAnchor(
+  hunk: DiffHunk,
+  bufferLines: readonly string[],
+  diskLines: readonly string[] | undefined,
+): string | null {
+  const { oldLines } = splitHunkLines(hunk.lines)
+  if (oldLines.length > 0) return null
+  const start = hunk.oldStart
+  if (!Number.isInteger(start) || start < 1) return `行号 ${start} 不合法`
+  const anchorCount = start - 1
+  // 插到第 1 行之前：位置就是文件开头，与前面有没有别的行无关，无需比对。
+  if (anchorCount === 0) return null
+  if (diskLines === undefined) return '插入位置无法确认：磁盘版本未读入，先刷新再应用'
+  if (anchorCount > diskLines.length) {
+    return `第 ${start} 行超出磁盘版本的行数（磁盘共 ${diskLines.length} 行）`
+  }
+  if (anchorCount > bufferLines.length) {
+    return `插入点之前缺少 ${anchorCount - bufferLines.length} 行（缓冲区比磁盘短）`
+  }
+  for (let index = 0; index < anchorCount; index += 1) {
+    if (bufferLines[index] !== diskLines[index]) {
+      return `插入点之前的第 ${index + 1} 行与磁盘不一致`
     }
   }
   return null
@@ -313,6 +356,9 @@ function conflictDiagnostic(
  * "应用后磁盘应该是什么"（决定脏标记），不参与行号定位 —— 否则用户有未保存改动时
  * hunk 的行号会整体错位。
  *
+ * 一个例外：纯插入的 hunk 自带不了原文行，改成拿磁盘版本的前缀验锚点
+ * （`verifyInsertionAnchor`）—— 那里必须读磁盘，否则无法判断缓冲区行号是否还对齐。
+ *
  * 一个文件被拒不等于整次应用失败：其余文件照常应用（`decisions` 里各拿各的结论）。
  */
 export function planEditApply(
@@ -337,11 +383,16 @@ export function planEditApply(
     }
 
     const bufferLines = splitDocumentLines(buffer)
+    // 磁盘文本只用来给纯插入验锚点（见 `verifyInsertionAnchor`）：替换类 hunk
+    // 自带原文行，按缓冲区校验就够。
+    const diskLines = disk === undefined ? undefined : splitDocumentLines(disk)
     const edits: LineEdit[] = []
     let rejectedHunk: DiffHunk | undefined
     let rejectReason: string | null = null
     for (const hunk of hunks) {
-      const mismatch = verifyHunkAgainstLines(hunk, bufferLines)
+      const mismatch =
+        verifyHunkAgainstLines(hunk, bufferLines) ??
+        verifyInsertionAnchor(hunk, bufferLines, diskLines)
       if (mismatch !== null) {
         rejectedHunk = hunk
         rejectReason = mismatch

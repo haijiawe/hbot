@@ -78,6 +78,20 @@ export function createEditApplyHooks(): EditApplyHooks {
         if (model === null) {
           // 文件没在编辑器里打开（或编辑器还没挂载）：直接改 store 里的缓冲区，
           // 之后模型按 `contents` 建出来就是新文本。
+          //
+          // 但绝不能覆盖这期间用户又敲进去的字：`precheck` 之后隔着一次
+          // `edit.apply` 往返回核心，缓冲区可能已经变了。变了就只报问题、
+          // 不写缓冲区（磁盘已由核心落盘，用户手上那份留给他自己保存/重试）。
+          const latest = useWorkspaceStore.getState().contents[decision.path]
+          if (latest !== undefined && latest !== decision.before) {
+            useWorkspaceStore.getState().reportProblems([
+              mismatchProblem(
+                decision.path,
+                `已落盘 ${decision.path}，但缓冲区在这期间又有改动：没有覆盖你的输入，先保存或刷新再重试。`,
+              ),
+            ])
+            continue
+          }
           useWorkspaceStore.getState().updateContent(decision.path, decision.after)
           continue
         }

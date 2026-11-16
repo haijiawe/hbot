@@ -27,6 +27,9 @@ export function DiffCard({ edit, dirtyPaths, onAccept, onReject }: DiffCardProps
   const dirty = new Set(dirtyPaths)
   const stats = editStats(edit.files)
   const title = edit.files.map((file) => file.path).join('、') || '（空编辑）'
+  // 提示里必须带文件名：用户看到"有未保存改动"却不知道是哪个文件，就可能直接把
+  // 卡片点掉（那正是本条不变量要防的"以为字丢了"）。只列这张卡片里的文件。
+  const dirtyFiles = edit.files.filter((file) => dirty.has(file.path)).map((file) => file.path)
 
   return (
     <article className={`diff-card diff-card--${edit.status}`} aria-label={`改动待审阅：${title}`}>
@@ -44,7 +47,11 @@ export function DiffCard({ edit, dirtyPaths, onAccept, onReject }: DiffCardProps
               {file.path}
             </span>
             {dirty.has(file.path) ? (
-              <span className="diff-card__dirty" role="note">
+              <span
+                className="diff-card__dirty"
+                role="note"
+                aria-label={`${file.path} 有未保存改动`}
+              >
                 有未保存改动
               </span>
             ) : null}
@@ -80,8 +87,8 @@ export function DiffCard({ edit, dirtyPaths, onAccept, onReject }: DiffCardProps
       </div>
 
       <p className="diff-card__note">
-        {dirty.size > 0
-          ? '标了「有未保存改动」的文件：接受时会先按你手上的缓冲区校验，冲突的块会被拒并留在这张卡片上，不会覆盖你没存的字。'
+        {dirtyFiles.length > 0
+          ? `标了「有未保存改动」的文件（${dirtyFiles.join('、')}）：接受时会先按你手上的缓冲区校验，冲突的块会被拒并留在这张卡片上，不会覆盖你没存的字。`
           : '接受后由核心按块落盘（`edit_apply`，哈希过期会拒绝并保留这张卡片）；拒绝则丢弃这次编辑。'}
       </p>
     </article>
