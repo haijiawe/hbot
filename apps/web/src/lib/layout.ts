@@ -51,8 +51,11 @@ export const DEBUG_STACK_WIDTH = 240
  */
 export type SidebarView = 'explorer' | 'settings'
 
-/** 底部面板当前页签（同样随布局一起持久化）。`tryrun` 是「本地试跑」面板。 */
-export type BottomPanelTab = 'logs' | 'problems' | 'search' | 'debug' | 'tryrun'
+/**
+ * 底部面板当前页签（同样随布局一起持久化）。
+ * `tryrun` 是「本地试跑」面板，`device` 是「设备能力」面板（docs/09-device-capability.md）。
+ */
+export type BottomPanelTab = 'logs' | 'problems' | 'search' | 'debug' | 'tryrun' | 'device'
 
 /** 可持久化的布局状态（只存"用户意图"，不存像素级派生值）。 */
 export interface LayoutState {

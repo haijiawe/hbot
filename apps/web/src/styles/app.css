@@ -210,6 +210,24 @@ body.is-resizing {
   opacity: 0.5;
 }
 
+/*
+ * 破坏性按钮（撤销设备会话、以后别的"立刻停止一切"）。
+ *
+ * 为什么单独一档而不是就地改 `.button--primary` 的颜色：撤销设备会话是**安全问题**的
+ * 出口（docs/09-device-capability.md §7：撤销是全局失效），它必须在视觉上和"开始/确认"
+ * 完全分开 —— 红框 + 红字，而不是靠位置或文案让用户自己判断。
+ */
+.button--danger {
+  background: rgba(240, 106, 106, 0.14);
+  border-color: var(--danger);
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.button--danger:hover:not(:disabled) {
+  background: rgba(240, 106, 106, 0.26);
+}
+
 .icon-button {
   padding: 2px 6px;
   border-radius: 4px;
@@ -1664,4 +1682,287 @@ body.is-resizing {
 
 .tryrun__empty {
   margin: 0;
+}
+
+/* ---------- 设备能力（docs/09-device-capability.md） ---------- */
+
+/*
+ * 设备面板挂在底部面板的「设备」页签里：面板高度/开合由 `--bottom-panel-height` 决定
+ * （`lib/layout.ts`），这里只管内部排布，不再引入第二套尺寸常量。
+ * 滚动交给 `.bottom-panel__body`，面板自己不要再套一层 overflow（会出现双滚动条）。
+ */
+.device-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+/* 待处理的 Agent 请求：黄框 + 左侧粗边，和下方的"当前状态"区块明显分层。 */
+.device-panel__request {
+  padding: 8px 10px;
+  border: 1px solid var(--warn);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: rgba(224, 179, 65, 0.08);
+}
+
+.device-panel__request-title {
+  margin: 0 0 6px;
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/*
+ * 请求理由：Agent 写的**不可信文本**，只做纯文本渲染。
+ * `pre-wrap` 保留它自己的换行（多行理由更可读），但绝不解释成 HTML。
+ */
+.device-panel__request-reason {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.device-panel__status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.device-panel__status-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.device-panel__state {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.device-panel__state--active {
+  color: var(--ok);
+}
+
+.device-panel__countdown {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* 剩余不足 1 分钟：整块反色描边 + 红字，扫一眼就能看出"要到了"。 */
+.device-panel__countdown--urgent {
+  padding: 1px 6px;
+  border: 1px solid var(--danger);
+  border-radius: 3px;
+  background: rgba(240, 106, 106, 0.12);
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.device-panel__spacer {
+  flex: 1 1 auto;
+}
+
+.device-panel__section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.device-panel__section-title {
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.device-panel__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.device-panel__capability {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.device-panel__capability-label {
+  color: var(--fg);
+}
+
+.device-panel__capability-hint {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.device-panel__code {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.device-panel__app {
+  font-size: 12px;
+}
+
+/*
+ * 「不允许任何应用」：这不是提示，是**安全语义**（空数组 = 全拒，不是无限制）。
+ * 所以用红框而不是普通的 `.panel-hint` 灰字。
+ */
+.device-panel__deny {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--danger);
+  border-radius: 4px;
+  background: rgba(240, 106, 106, 0.08);
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.device-panel__hint {
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.device-panel__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.device-panel__footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: auto;
+  padding-top: 4px;
+}
+
+/* 授权对话框：`.palette` 给了宽度与层级，这里补内边距与纵向排布。 */
+.device-dialog {
+  gap: 10px;
+  max-height: 78vh;
+  padding: 14px 16px;
+  overflow: auto;
+}
+
+.device-dialog__title {
+  margin: 0;
+  font-size: 14px;
+}
+
+/* 那句必须读的话：黄框 + 左侧粗边，视觉上比普通 hint 重一档。 */
+.device-dialog__warning {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--warn);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: rgba(224, 179, 65, 0.08);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.device-dialog__group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.device-dialog__label {
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.device-dialog__option {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.device-dialog__option-label {
+  color: var(--fg);
+}
+
+.device-dialog__option-id {
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.device-dialog__option-hint {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.device-dialog__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.device-dialog__field--inline {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.device-dialog__textarea,
+.device-dialog__select {
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+
+.device-dialog__textarea {
+  resize: vertical;
+}
+
+.device-dialog__textarea:focus,
+.device-dialog__select:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: -1px;
+}
+
+.device-dialog__hint {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.device-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }

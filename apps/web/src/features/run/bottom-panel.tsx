@@ -1,8 +1,8 @@
 /**
- * 底部面板（lazy chunk）：日志 / 问题 / 搜索 / 调试 / 试跑五个页签 + 启停控制。
+ * 底部面板（lazy chunk）：日志 / 问题 / 搜索 / 调试 / 试跑 / 设备六个页签 + 启停控制。
  *
- * 五个页签共用同一块区域，高度只来自 `lib/layout.ts` 的 `--bottom-panel-height`，
- * 不另起第二套布局常量。默认导出是 React.lazy 的要求；试跑面板同样 **lazy**，
+ * 六个页签共用同一块区域，高度只来自 `lib/layout.ts` 的 `--bottom-panel-height`，
+ * 不另起第二套布局常量。默认导出是 React.lazy 的要求；试跑面板与设备面板同样 **lazy**，
  * 别改成静态 import（首屏预算被钉住了，见 AGENTS.md §5.6）。
  */
 
@@ -23,13 +23,19 @@ const TryRunPanel = lazy(() =>
   import('../tryrun/tryrun-panel').then((module) => ({ default: module.TryRunPanel })),
 )
 
-const TABS: readonly BottomPanelTab[] = ['logs', 'problems', 'search', 'debug', 'tryrun']
+/** 设备面板：第六个页签，同样 lazy —— 设备能力只有真机才用得上，别进首屏。 */
+const DevicePanel = lazy(() =>
+  import('../device/device-panel').then((module) => ({ default: module.DevicePanel })),
+)
+
+const TABS: readonly BottomPanelTab[] = ['logs', 'problems', 'search', 'debug', 'tryrun', 'device']
 const TAB_LABEL: Record<BottomPanelTab, string> = {
   logs: '日志',
   problems: '问题',
   search: '搜索',
   debug: '调试',
   tryrun: '试跑',
+  device: '设备',
 }
 const TAB_ID: Record<BottomPanelTab, string> = {
   logs: 'bottom-tab-logs',
@@ -37,6 +43,7 @@ const TAB_ID: Record<BottomPanelTab, string> = {
   search: 'bottom-tab-search',
   debug: 'bottom-tab-debug',
   tryrun: 'bottom-tab-tryrun',
+  device: 'bottom-tab-device',
 }
 
 /** 页签上的计数（`null` = 不显示徽标）。 */
@@ -58,6 +65,9 @@ function tabCount(
       return null
     case 'tryrun':
       // 试跑没有"条数"可看（回复区自带计数语义），挂徽标只会误导。
+      return null
+    case 'device':
+      // 设备页签的"条数"是会话能力数，不是待处理事项，别挂在页签上。
       return null
     default: {
       const exhaustive: never = tab
@@ -86,6 +96,12 @@ function panelBody(tab: BottomPanelTab) {
       return (
         <Suspense fallback={<p className="panel-empty">正在加载试跑面板…</p>}>
           <TryRunPanel />
+        </Suspense>
+      )
+    case 'device':
+      return (
+        <Suspense fallback={<p className="panel-empty">正在加载设备面板…</p>}>
+          <DevicePanel />
         </Suspense>
       )
     default: {

@@ -38,6 +38,7 @@ import type {
   BotSummary,
   Command as WireCommand,
   ConversationSummary,
+  DeviceStatus,
   Diagnostic,
   DirEntry,
   Event as CoreEvent,
@@ -497,6 +498,35 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
         type: 'debug_step',
         botId: command.botId,
         kind: command.kind,
+      })
+    // 设备能力（docs/09-device-capability.md §8.1）：状态与授权都有 `data`，撤销与请求只回 null。
+    // `device_status` 用 `callWire`（data 必须非 null）：`DeviceStatus` 的 dto 注释写明
+    // 「`state: 'none'` 表示从来没有过会话，此时 sessionId/grantedAt/deadline 为 null」，
+    // 也就是"没有会话"仍是一个对象，`data: null` 只该出现在真出错时。
+    // ⚠️ 但 docs/09 §8.1 把返回类型写成 `DeviceStatus | null`：若核心真的对无会话回 null，
+    // 这里会抛"没有返回数据"而不是画出 `state: 'none'` 的状态条。两边对齐之前，这条路径
+    // 的失败会以错误形式显示在设备面板上（不静默），改契约时先改这里再改面板。
+    case 'deviceStatus':
+      return callWire<DeviceStatus>('device_status', {
+        type: 'device_status',
+        botId: command.botId,
+      })
+    case 'deviceGrant':
+      return callWire<DeviceStatus>('device_grant', {
+        type: 'device_grant',
+        botId: command.botId,
+        sub: command.sub,
+        allowedApps: command.allowedApps,
+        minutes: command.minutes,
+      })
+    case 'deviceRevoke':
+      return callWireVoid('device_revoke', { type: 'device_revoke', botId: command.botId })
+    case 'deviceRequest':
+      return callWireVoid('device_request', {
+        type: 'device_request',
+        botId: command.botId,
+        sub: command.sub,
+        reason: command.reason,
       })
     case 'project.open':
       // `project_open` 成功时 data 是 `ProjectOpenResult{path}`（兼容旧的裸字符串）；

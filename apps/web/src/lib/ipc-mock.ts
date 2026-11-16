@@ -16,7 +16,7 @@
  * "假结果"（`crates/hbot-rpc/src/app/commands/files.rs` 的 `search` 在 cancelled 时直接返回）。
  */
 
-import type { Event as CoreEvent, RunLog } from '../generated'
+import type { DeviceStatus, Event as CoreEvent, RunLog } from '../generated'
 import type {
   BotStatus,
   Command,
@@ -45,6 +45,63 @@ const MOCK_SESSION_ID = 'mock-session'
  * 下始终停在"未在调试"。
  */
 const mockBreakpoints = new Map<string, number[]>()
+
+/**
+ * mock 的设备会话（与核心的 `device_sessions` 同字段语义，见
+ * `docs/09-device-capability.md` §3）。`null` = 没有会话。
+ *
+ * 两条 mock 纪律（与 `debug.paused` 同口径）：
+ * 1. **空 `allowedApps` 必须真的拒绝**：空数组在核心那边是"全拒"，mock 收下它会让前端
+ *    以为"无限制"这条路走得通，而这正是界面必须显式写清的语义。
+ * 2. **不伪造 `device.status` 事件**：真实核心在授权/撤销/到期后推事件，mock 只在命令
+ *    返回值里回状态。少造一条假事件，前端就不会靠"mock 恰好推了"来通过测试 ——
+ *    浏览器里撤销之后面板停在旧状态是**诚实的**，别补一条假的把它圆过去。
+ */
+interface MockDeviceSession {
+  botId: string
+  sessionId: string
+  state: string
+  sub: string[]
+  allowedApps: string[]
+  grantedAt: number
+  deadline: number
+}
+
+let mockDevice: MockDeviceSession | null = null
+
+/** 真机上会话 ID 由核心的 `state.ids()` 分配；mock 用固定串（一台机只有一个设备）。 */
+const MOCK_DEVICE_SESSION_ID = 'mock-device-session'
+const MOCK_DEVICE_DEFAULT_MINUTES = 5
+/** 契约上限：`device_grant` 的 `minutes` 超过 30 → `-32002`（docs/09 §8.1）。 */
+const MOCK_DEVICE_MAX_MINUTES = 30
+
+/** 当前 bot 的设备状态快照；没有会话时 `state: 'none'`（与核心一致，不是 `null`）。 */
+function mockDeviceStatus(botId: string): DeviceStatus {
+  const session = mockDevice
+  if (session === null || session.botId !== botId) {
+    return {
+      botId,
+      sessionId: null,
+      state: 'none',
+      sub: [],
+      allowedApps: [],
+      grantedAt: null,
+      deadline: null,
+      remainingMs: null,
+    }
+  }
+  return {
+    botId,
+    sessionId: session.sessionId,
+    state: session.state,
+    sub: [...session.sub],
+    allowedApps: [...session.allowedApps],
+    grantedAt: session.grantedAt,
+    deadline: session.deadline,
+    // 与核心一样按"现在到 deadline"算；UI 拿它当倒计时起点。
+    remainingMs: Math.max(session.deadline - Date.now(), 0),
+  }
+}
 
 /**
  * mock 里登记过的项目（内存表，重启即清空）。
@@ -519,6 +576,47 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
     case 'debug.resume':
     case 'debug.step':
       // mock 没有插桩执行器，收下命令即可；不会推 `debug.paused`。
+      return null
+
+    // 设备能力：状态与授权有 `data`，撤销与请求只回 null（docs/09 §8.1）。
+    // 真机的这四条目前还是桩（`crates/hbot-rpc/src/app/commands/device.rs`），
+    // 但**形状**已经冻结，所以 mock 按最终契约实现，前端测试才有东西可测。
+    case 'deviceStatus':
+      if (command.botId !== BOT_ID) throw new Error(`device_status: 未知 bot（${command.botId}）`)
+      return mockDeviceStatus(command.botId)
+
+    case 'deviceGrant': {
+      if (command.botId !== BOT_ID) throw new Error(`device_grant: 未知 bot（${command.botId}）`)
+      // 空列表 = 全拒而不是"无限制"：在这里拒绝，前端才不会以为空数组是放行。
+      if (command.allowedApps.length === 0) {
+        throw new Error('device_grant: allowedApps 不能为空（空数组等于全拒，-32002）')
+      }
+      const minutes = command.minutes ?? MOCK_DEVICE_DEFAULT_MINUTES
+      if (!Number.isInteger(minutes) || minutes <= 0 || minutes > MOCK_DEVICE_MAX_MINUTES) {
+        throw new Error(`device_grant: minutes 必须在 1..30 之间（收到 ${minutes}，-32002）`)
+      }
+      const grantedAt = Date.now()
+      mockDevice = {
+        botId: command.botId,
+        sessionId: MOCK_DEVICE_SESSION_ID,
+        state: 'active',
+        sub: [...command.sub],
+        allowedApps: [...command.allowedApps],
+        grantedAt,
+        deadline: grantedAt + minutes * 60_000,
+      }
+      return mockDeviceStatus(command.botId)
+    }
+
+    case 'deviceRevoke':
+      if (command.botId !== BOT_ID) throw new Error(`device_revoke: 未知 bot（${command.botId}）`)
+      // 幂等：没有会话时也回成功（核心 `device_revoke` 同语义）。
+      mockDevice = null
+      return null
+
+    case 'deviceRequest':
+      if (command.botId !== BOT_ID) throw new Error(`device_request: 未知 bot（${command.botId}）`)
+      // mock 不自动放行、也不假造 `device.request` 事件：请求必须由人点「允许」。
       return null
 
     // 打开项目：核心规范化路径并切换 workspace（`system.rs` 的 `project_open`）。

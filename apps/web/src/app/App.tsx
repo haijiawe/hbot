@@ -24,6 +24,7 @@ import { SettingsView } from '../features/settings/settings-view'
 import { restoreSessionIfSameProject, startSessionPersistence } from '../lib/session-persistence'
 import { useRunStore } from '../stores/run-store'
 import { useDebugStore } from '../stores/debug-store'
+import { useDeviceStore } from '../stores/device-store'
 import { useWorkspaceStore } from '../stores/workspace-store'
 import { ActivityBar } from './activity-bar'
 import { CommandPalette, type PaletteMode } from '../features/command-palette/command-palette'
@@ -59,6 +60,10 @@ export function App() {
   // 调试的单位是 bot 而不是会话，所以 botId 由外壳从 runStore 注入 debugStore
   // （两个 store 之间不互相 import，AGENTS.md §0.11）。
   const setDebugBotId = useDebugStore((state) => state.setBotId)
+  // 设备会话同样按 bot 记（docs/09-device-capability.md §3）：botId 由外壳注入，
+  // deviceStore 自己不 import runStore（AGENTS.md §0.11）。
+  const setDeviceBotId = useDeviceStore((state) => state.setBotId)
+  const refreshDevice = useDeviceStore((state) => state.refresh)
   const debugResume = useDebugStore((state) => state.resume)
   const debugStep = useDebugStore((state) => state.step)
 
@@ -98,6 +103,14 @@ export function App() {
   useEffect(() => {
     setDebugBotId(runBotId)
   }, [runBotId, setDebugBotId])
+
+  // 设备会话也是按 bot 的：换 bot 就把设备页签的现场换成新 bot 的（`setBotId` 内部会清），
+  // 有 bot 时顺手读一次状态 —— 否则用户打开设备页签看到的是"还没有读到设备状态"。
+  // 之后一律以 `device.status` 事件为准（IDE 不拥有运行时真相）。
+  useEffect(() => {
+    setDeviceBotId(runBotId)
+    if (runBotId.length > 0) void refreshDevice(runBotId)
+  }, [runBotId, setDeviceBotId, refreshDevice])
 
   // 核心事件（bot.status / run.log / agent.*）与 bot 列表播种都在这个 hook 里。
   useCoreEvents()

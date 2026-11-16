@@ -19,6 +19,7 @@ import type {
   BotStatus as BotStatusDto,
   BotSummary as BotSummaryDto,
   ConversationSummary as ConversationSummaryDto,
+  DeviceStatus as DeviceStatusDto,
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
   ProjectOpenResult as ProjectOpenResultDto,
@@ -220,6 +221,29 @@ export interface CommandInputs {
    * `name` / `path` 为空、目标是文件 → `-32002`。
    */
   'project.create': { path: string; name: string }
+  /**
+   * 读设备会话状态（wire `device_status`，docs/09-device-capability.md §8.1）。
+   *
+   * `botId` 是设备会话的归属单位；读到的是核心的快照，之后以 `device.status` 事件为准。
+   */
+  deviceStatus: { botId: string }
+  /**
+   * 开始一次设备会话（wire `device_grant`）。
+   *
+   * `sub` 是子能力（`screen` / `ocr` / `input` / `window` / `clipboard`，开放字符串），
+   * `allowedApps` 是进程名白名单（**空数组 = 全拒**，不是"无限制"），`minutes` 为 `null`
+   * 时用核心默认值，上限 30 分钟（不合法的 sub 或 minutes 超出范围 → `-32002`）。
+   */
+  deviceGrant: { botId: string; sub: string[]; allowedApps: string[]; minutes: number | null }
+  /** 撤销当前 bot 的设备会话（wire `device_revoke`，幂等；没有会话时也算成功）。 */
+  deviceRevoke: { botId: string }
+  /**
+   * Agent 主动请求设备能力（wire `device_request`）。
+   *
+   * 只落库 + 推 `device.request` 事件给界面，**不**发放任何权限：用户在界面上点「允许」
+   * 之后才会走 `deviceGrant`。
+   */
+  deviceRequest: { botId: string; sub: string[]; reason: string }
 }
 
 export type CommandType = keyof CommandInputs
@@ -261,6 +285,17 @@ export interface CommandOutputs {
   'project.open': ProjectOpenResult
   /** 新建出来的项目摘要（`path` 是规范化根，`entry` 形如 `src/main.ts`）。 */
   'project.create': ProjectSummaryDto
+  /**
+   * 当前会话状态。`state: 'none'`（从未开始）是**正常返回值**，不是错误；
+   * `remainingMs` 是倒计时的唯一起点（别用 `deadline` 减本机时钟）。
+   */
+  deviceStatus: DeviceStatusDto
+  /** 授权成功后的会话（拿它覆盖 `status`，不必再等一次 `device.status`）。 */
+  deviceGrant: DeviceStatusDto
+  /** 撤销只回"命令已接受"（`data: null`）；状态以随后的 `device.status` 事件为准。 */
+  deviceRevoke: null
+  /** 请求只回"已经转给用户"（`data: null`）；结果走 `device.request` 事件与后续授权。 */
+  deviceRequest: null
 }
 
 export type CommandResult<T extends Command> = CommandOutputs[T['type']]

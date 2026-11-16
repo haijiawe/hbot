@@ -39,6 +39,7 @@ const BOTTOM_PANEL_TABS: readonly BottomPanelTab[] = [
   'search',
   'debug',
   'tryrun',
+  'device',
 ]
 
 /** 只要求 localStorage 的两个方法，测试可以注入假的（node 环境没有 localStorage）。 */
