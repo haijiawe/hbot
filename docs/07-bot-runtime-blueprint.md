@@ -123,7 +123,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 
 1. **没声明 = 没有**。`ctx.kv` 在声明里没有 `kv` 时，`hbot.d.ts` 里就不出现（编译期就报错，而不是运行期 denied）。
 2. **声明了也未必有**。宿主自己的能力矩阵决定上限（例如手机上 `jobs` 只能 30 秒，桌面 10 分钟）；超出的部分在 d.ts 里标成 `@host-limited`，运行时返回 `HOST_LIMIT` 而不是静默降级。
-3. **能力闸在授权闸之前**。现有网关七步（参数→存在→沙箱档→realpath→审批→执行→审计）在前面插一步 `Capability`：没声明的能力直接 `denied`，**不进审批、不弹窗**（弹窗等于把这个不存在的选项摆给用户）。
+3. **能力闸在授权闸之前**（已落地）。网关八步（能力→参数→存在→沙箱档→realpath→审批→执行→审计）的**第一步**是 `Capability`：没声明的能力直接 `denied`，**不进审批、不弹窗**（弹窗等于把这个不存在的选项摆给用户）。
 
 ---
 
@@ -218,13 +218,14 @@ ctx.jobs.enqueue('settle-war', { warId })
 
 ## 7. 权限与安全
 
-### 7.1 网关顺序（在现有七步前插一步）
+### 7.1 网关顺序（已在 2026-11-17 落地，八步）
 
 ```text
 Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → Approval → Execute → Audit
 ```
 
-- `Capability`：`hbot.json` 没声明的能力 → `denied`，不弹审批。
+- `Capability`：`hbot.json` 没声明的能力 → `denied`，不弹审批。实现是 `GatewayStep::Capability`（`crates/hbot-agent/src/gateway.rs` 的第一个变体）+ `ManifestCapabilityGate`（`crates/hbot-rpc/src/app/device/capabilities.rs`，**每次重读清单，不快照**）。**只在工具声明了 `required_capabilities()` 时才出现在轨迹里**，所以现有 8 个工具（全是 `&[]`）的行为一个字节没变。
+- **声明层只答"代码有没有资格要"，管不住撤销与到期。** 设备还有一条运行时判据，Agent 侧由 `app/device/agent_backend.rs` 的 `SessionScopedBackend` 包住后端实现（每次调用先问 live 会话）。少了它，用户点撤销只停住 bot 代码、停不住 IDE 里的 Agent —— 这是 2026-11-17 发现的真实缺口，细节见 `docs/09` §11.2 ③。
 - `SandboxMode`：`read-only` 下所有写与出站一律拒（已实现）。
 - 网络：清单写了什么就放行什么（策略 C，见 `docs/02` §6.6），包括私网——这是用户明确选定的，代价写在那一节。
 

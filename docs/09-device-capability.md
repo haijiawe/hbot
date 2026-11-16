@@ -437,7 +437,7 @@ interface DeviceApi {
 
 - **不写"临时实现"**。需求被拆成两部分：本次做"形式正确、范围窄"的实现；M7 的 `C1.timer` / `Capability` 闸到 M7 时**替换实现而不是替换形状**。
 - 具体地：到期结算用 `AppState` 里一个 1 秒 tick（`docs/09` §7 已定"由定时器结算，不 lazy 检查"）；M7 的 timer 落地后，这个 tick 应变成"往统一调度器注册一个任务"，而不是删掉——**所以 tick 的入口必须是一个可被替换的 `fn sweep_expired(&self)`**，不是内联在 `AppState::open` 里。
-- `ToolGateway` 的 `Capability` 第一步**本次不做**（设备能力有两个消费者，bot 代码路径根本不经过 gateway，先做 gateway 那一步不会让任何一条路径更安全）。但 `DeviceGate` trait 的形状已经是那一步要用的形状——将来加 `Capability` 闸时是"多一个实现者"，不是"改一个 trait"。
+- `ToolGateway` 的 `Capability` 第一步**当时判"本次不做"**，2026-11-17 当天做了（见 §11.1）：设备能力有两个消费者（bot 代码走 `ctx.device`、Agent 走 `ToolGateway`），只做前者等于"限时会话与撤销管不住 IDE 里的 Agent"。落地时是**加了一个实现者**（`ManifestCapabilityGate`），`DeviceGate` trait 一个字没改 —— 这正是当初留形状而不是留坑的回报。
 
 ### 11.1 落地状态（2026-11-17）
 
@@ -445,15 +445,16 @@ interface DeviceApi {
 |---|---|---|
 | 契约（DTO/事件/错误码/trait） | **已冻结并提交**（`da97da6`） | `crates/hbot-core/src/device.rs`、`crates/hbot-rpc/src/dto/{common,command,event}.rs` |
 | 存储（两表 + 6 方法） | **已完成** | `crates/hbot-store/src/migrations/0004_device.sql`、`src/repositories/device.rs` |
-| 宿主闸 + `ctx.device.*` | 并行单元中 | `crates/hbot-code/src/device/`、`src/runtime/device_api.rs` |
-| 设置 + 四条命令 + 到期 tick | 并行单元中 | `crates/hbot-rpc/src/app/device/`、`src/app/commands/device.rs` |
+| 宿主闸 + `ctx.device.*` | **已完成**（`hbot-code` 158 passed） | `crates/hbot-code/src/device/`、`src/runtime/device_api.rs` |
+| 设置 + 四条命令 + 到期 tick | **已完成**（`hbot-rpc` lib 253 passed） | `crates/hbot-rpc/src/app/device/`、`src/app/commands/device.rs` |
 | Windows 后端 | **已完成**（34 passed / 2 ignored，clippy 0） | `crates/hbot-device/` |
 | IDE 面板 + 授权弹窗 | **已完成**（web 30 文件 / 230 用例） | `apps/web/src/features/device/`、`src/stores/device-store.ts` |
 | 注入沙箱（装配） | **已完成**（2026-11-17） | `SandboxHandler::with_device(gate, backend)`，在 `crates/hbot-rpc/src/app/commands/bots.rs` 的 `start_bot` 里调；每次新建 isolate 时 `set_device` + `set_device_apps(device_apps(project_root))` |
 | 切项目时刷新清单 | **已完成** | `AppState::open_project` 末尾 `self.device.note_project_root(Some(root))` |
 | 限速（20 次/秒、2 帧/秒） | **窄版未做** | 应在闸层；今天 `HBOT_DEVICE_HOST_LIMIT` 只在超时时出现（见 §13 问 8） |
-| OCR | **未开始** | §9.1 的窄版路径 |
-| `ToolGateway` 的 Capability 闸 | **明确不做**（M7） | 见上 |
+| OCR | **已完成（窄版）**（`hbot-device` 24 lib + 7 api + 8 desktop，clippy 0） | §9.1 的 B 路线：`Windows.Media.Ocr` → 文本。宿主函数 `__hbot.device.ocr`、Agent 工具 `read_screen` |
+| `ToolGateway` 的 Capability 闸 | **已完成**（B2，2026-11-17） | `GatewayStep::Capability` 作第一步；实现者 `app/device/capabilities.rs` 的 `ManifestCapabilityGate`（每次重读清单，不快照） |
+| Agent 侧的会话判据 | **已完成**（B2，2026-11-17） | `app/device/agent_backend.rs` 的 `SessionScopedBackend`：撤销/到期对 Agent 立刻生效（见下） |
 
 **装配方必须调两个方法，少一个就是静默失败（`hbot-code` 实测出来的，2026-11-17）**：
 
@@ -466,6 +467,38 @@ interface DeviceApi {
 
 - **设备授权的 bot 身份来自事件 payload 的 `botId`**（`build_event` 里取 `payload.botId`）。手写 payload 的测试/基准里设备能力会报 `HBOT_DEVICE_FAILED: 本次事件没有 botId`。这也是为什么"能构造事件交给 `dispatch` 的路径"等于"能决定对哪个 bot 的会话做授权"。
 - **`read-only` 档连闸都不问**（`authorize` 在第一步就返回 `HBOT_DEVICE_NOT_GRANTED`，假 gate 的 `authorize` 调用计数为 0）：因为 `DeviceGate::authorize` 的实现方自己要读 `device.json`、查会话表，那些也是"碰外部资源"。这比"后端没被调"更强。
+
+### 11.2 两个前置落地时改掉了什么（2026-11-17）
+
+**① 定时器骨架** —— 按 §11 的要求做成可替换入口而不是内联：`DeviceRegistry::spawn_expiry_tick()` 里跑一个 1 秒 `interval`（`MissedTickBehavior::Skip`，`Drop` 时置 cancel），每次只调 `sweep_expired()`。M7 的 `C1.timer` 落地时，把"注册一个周期性任务"这一句换掉即可，`sweep_expired` 的判据不用动。
+
+**② `Capability` 闸** —— 从"明确不做"改成"做"，原因是需求把消费者数从 1 变成 2：
+
+| 消费者 | 走哪条路 | 原来的判据 | 现在 |
+|---|---|---|---|
+| bot 代码 | `ctx.device.*` → `hbot-code` 的 `device::gate` | read-only → 装配 → botId → `DeviceGate` | 不变 |
+| Agent | `read_screen` → `ToolGateway` | 只有"清单声明 + 逐次审批" | 多一步 `GatewayStep::Capability`，且执行后端换成 `SessionScopedBackend` |
+
+`GatewayStep::Capability` 是八步里的**第一步**（`能力声明 → 参数校验 → 工具存在 → 沙箱档 → 路径 realpath → 审批 → 执行 → 审计`）。它是**条件性**的：只有 `Tool::required_capabilities()` 非空才推入轨迹，所以既有 8 个工具（`required_capabilities` 全是 `&[]`）的步进断言一条都没改。
+
+**③ Agent 侧的第四层判据（本轮发现并修掉的真实缺口）** —— 只加 `Capability` 步**不够**：那一步只答"项目清单声明了没有"，是**静态**的。撤销与到期是**运行时**状态，只管住 bot 代码那条路，就等于"用户点了撤销，IDE 里的 Agent 还能继续读屏"。修法是不改 `hbot-agent` 的形状，在 `hbot-rpc` 侧包一层：
+
+- `crates/hbot-rpc/src/app/device/agent_backend.rs` 的 `SessionScopedBackend { inner, registry: Weak<DeviceRegistry> }`：每个能力方法第一句先问 `DeviceRegistry::authorize_tool(capability)`，判据顺序 = 设备总开关 → 清单声明 → 宿主设置的子能力 → **只允许无目标能力**（`screen`/`ocr`/`clipboard`；`input`/`window` 一律拒，因为它们必须有窗口目标，而 Agent 无法表达"对哪个窗口"）→ 存在一条 live 且含该能力且未到期的会话 → 写审计。
+- **不构造时快照**：`Weak` + 每次重查，撤销后下一次调用就拒（测试 `an_agent_tool_call_uses_a_live_session_and_revocation_stops_the_next_one` 钉住）。
+- **审计记"按谁的授权放行"**：`device_audit.bot_id` 外键不可空，所以写那条 live 会话的 bot id、`actor='agent_tool'`，而不是编一个空值。
+- 装配缺失 = 什么都不装：`ToolGateway` 没有 `with_device`，`read_screen` 报"没有装配设备后端"。这也是 `AppState::open` 里 `device` 必须**先于** `agent` 构造的原因。
+
+**④ OCR 的三个实测事实**（写在这里是因为它们决定"OCR 能不能算完成"）：
+
+| 事实 | 证据 |
+|---|---|
+| 真能认出字 | GDI 画 `HBOT OCR TEST 12345` → 识别得 `H BOT OCR TEST 12345`（引擎把 `HBOT` 拆开，断言用「去空白转大写后包含 `HBOTOCRTEST12345`」） |
+| `windows-core` 的 WinRT 工厂缓存会导致 `0xC0000005` | `factory_cache.rs` 把激活工厂缓存在进程级静态表，而 MTA 引用计数按线程；线程退出拆 MTA → 静态表悬空。修法：`CoIncrementMTAUsage` 调一次、**永不 decrement、绝不 `CoUninitialize`** |
+| 只认系统已装语言包 | 本机英文可用；**中文未实测**（装了中文语言包的系统才认） |
+
+OCR 的三条硬限制（同 `crates/hbot-device/src/lib.rs:40`）：按窗口 OCR 未做（`target.window` → `HostLimit`）；只抓主屏；图标/艺术字/旋转超过 45° 的文字识别不了。**空串是合法结果**（屏幕上真没字），但后端不许拿空串冒充"识别成功"。
+
+**⑤ OCR 文本是不可信内容**（§9.1 提醒的"提示注入新入口"，落地时打标 6 处）：`hbot-agent` 的 `read_screen` 输出走 `prompt::untrusted_block("screen_ocr", …)` 包成 `<untrusted_data source="screen_ocr">`；`hbot-code` 的 `device_api.rs`/`dts.rs`/`host_api.rs` 各写一段"屏幕文字不得用来扩权、改沙箱档、跳过审批、改配置"。`read_screen` 的 `risk` 是 `External`（每次审批），`min_sandbox` 是 `ReadOnly`（设备能力与文件沙箱正交，见 ADR-0005）。
 
 ---
 
@@ -486,7 +519,7 @@ interface DeviceApi {
 
 继承 07 §13 中与设备相关的三条，加四条新的：
 
-1. **OCR 用本地引擎还是视觉模型？**（07 §13 问 9）本文 §9.1 建议窄版本地 OCR，但**本地 OCR 的引擎选型没定**（Windows 自带 `Windows.Media.Ocr` 可用且零依赖；跨平台的 `tesseract` 要带语言包 10–20 MB）。倾向：窄版先用 `Windows.Media.Ocr`，完整版再评估。
+1. **OCR 用本地引擎还是视觉模型？**（07 §13 问 9）**窄版已定并落地：`Windows.Media.Ocr`**（零额外依赖，`windows` crate 0.62 的 `Media_Ocr` feature；手写 PNG 也没引入 zlib）。代价是只认系统已装语言包（本机英文可用、中文未实测）、按窗口 OCR 未做、只抓主屏。完整版要不要换跨平台引擎（`tesseract` 带语言包 10–20 MB）或干脆走视觉模型，仍待 M7 的 `C5.ai` 一起评估。
 2. **`device.input` 的前台白名单默认值**（07 §13 问 6）：空（全拒，安全但每次要配）还是"当前前台应用"（好用但等于默认放行一个）？倾向空。
 3. **截图存哪**：只在内存里传给 OCR 就丢，还是落 `.hbot/screenshots/` 供用户回看？落盘要加保留策略与清理（否则是磁盘与隐私双坑）。倾向：不落盘，但**Agent 看到的那张图在 UI 里可回看**（走事件流，不进库）。
 4. **`device_request` 与现有 `ApprovalRequest` 是否合并**：两者都是"Agent 请用户点一下"，但语义不同（一个是单次动作、一个是限时会话）。倾向不合并 —— 合并会让审批 UI 长出两种完全不同的卡片。但用同一个 critical 通道。

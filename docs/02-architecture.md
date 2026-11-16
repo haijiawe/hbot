@@ -218,10 +218,12 @@ turn = user message
 ### 5.3 工具网关顺序（不可交换）
 
 ```text
-参数 schema → 工具存在 → 沙箱档位 → 路径 realpath 守卫
+能力声明 → 参数 schema → 工具存在 → 沙箱档位 → 路径 realpath 守卫
 → 项目权限/生成代码 manifest → 审批 → 执行（超时/取消/输出上限）→ 审计
 ```
 
+- **能力声明在最前**（2026-11-17 落地）：`GatewayStep::Capability`，只有工具声明了 `required_capabilities()` 才进轨迹。判据是项目 `hbot.json` 的 `permissions`，**每次重读、不许构造时快照**（用户改了清单要立刻生效）。
+- **这一层不管撤销**：声明是静态的，撤销/到期是运行时状态。设备能力的运行时判据在 `hbot-rpc` 侧（`SessionScopedBackend` 包住后端），见 [09-device-capability.md](09-device-capability.md) §11.2 ③。
 - 审批规则键：`(tool, 规范化参数/路径, sandbox_mode)`；**always 只登记完整键**。
 - 不存在按 `write`/`command` 大类的放行集合。
 - 所有命令（前台、后台、子代理）走同一个 `CommandRunner`；没有第二条通道。
