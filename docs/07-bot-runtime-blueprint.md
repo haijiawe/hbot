@@ -392,6 +392,7 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 
 - `docs/02-architecture.md`：进程、存储、RPC、安全的技术细节（本文是**能力面**的蓝图，不重复那些）。
 - `docs/08-multi-host.md`：同一套能力怎么在桌面/无头/手机上分别成立，以及**跑在本机还是云端**（§9）。
+- `docs/09-device-capability.md`：C6 的实现设计（本文 §9 的落地稿：两个消费者一份闸、库表、`DeviceBackend`、Windows 选型、窄版范围）。
 - `docs/adr/0005-capability-ceiling-and-device-grant.md`：为什么能力上限不砍、为什么默认全关、三层闸的决策。
 - `docs/adr/0006-execution-backend.md`：运行位置（本机/局域网/云端）与"单一写者、搬家不热迁移"的决策。
 - `docs/04-implementation-plan.md`：里程碑与出口标准（本文的 §11 会成为 M7+ 的输入）。

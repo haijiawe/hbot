@@ -248,7 +248,7 @@
 |---|---|---|
 | **M7 能力底座** | `07` §11 的第 1–5 步：`kv` / `history` / `ai` / `timer` / `jobs` / `session`（含 `bot_waits` 落库与定时器结算） | 聊天/游戏/客服三类示例项目各一个，全在桌面跑通；`07` 的 V1–V11 全绿 |
 | **M9 云端执行宿主** | `wss` + 多客户端 token（`hbot token issue/revoke`）+ 非 loopback 绑定确认 + 未配 TLS 拒绝启动 + 健康检查 + systemd/日志轮转/备份；`L2/L3` 落地 | 真云主机 24h 不断线；桌面 IDE 远程连上能编辑、`bot_start`、看日志；断网 30s 重连不丢未保存内容；`08` 的 H8–H10 全绿 |
-| **M10 设备能力（C6）** | 桌面三平台 `screen`/`ocr`/`input`/`window`/`clipboard`；三道闸（清单 → 设置 → 限时会话）+ 一键全局撤销 + 审计（不含像素与 OCR 原文） | `07` §9 的 V12–V16 全绿；真机手动跑一个"看屏幕并点按钮"的 bot；Wayland 明确返回 `HOST_LIMIT` |
+| **M10 设备能力（C6）** | 桌面三平台 `screen`/`ocr`/`input`/`window`/`clipboard`；三道闸（清单 → 设置 → 限时会话）+ 一键全局撤销 + 审计（不含像素与 OCR 原文）。落地方案见 [`09-device-capability.md`](09-device-capability.md)（含 Windows 窄版：10–12 天可出 demo） | `07` §9 的 V12–V16 全绿；真机手动跑一个"看屏幕并点按钮"的 bot；Wayland 明确返回 `HOST_LIMIT` |
 | **M8 Android 宿主** | 拆 `hbot-mobile` crate、vendor rquickjs bindings、APK 能装能跑、前台服务 + 常驻通知、能力矩阵裁剪 | 真机装上；`local` bot 能跑、`onebot11` 能连局域网协议端、`bot_inject` 有回复；体积 ≤ 25 MB；`08` 的 H1–H7 全绿 |
 | **M11 iOS 宿主**（可选） | macOS + Xcode 构建、IPA、WKWebView 控制台、**仅前台运行** | TestFlight 可装、前台跑通同一链路；按 4.7 备齐审核材料 |
 

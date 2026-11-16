@@ -32,9 +32,10 @@
 | 4 | `docs/06-ide.md` | IDE 布局、编辑器、Agent Diff、运行/调试 |
 | 5 | `docs/07-bot-runtime-blueprint.md` | **能力面**：6 组能力、四类 bot 缺什么、改能力时读这个 |
 | 6 | `docs/08-multi-host.md` | 桌面/无头/手机三宿主，手机端限制（尤其 iOS 后台） |
-| 7 | `docs/05-quality-gates.md` | 命令与预算 |
-| 8 | `docs/adr/0002-agent-in-rust.md` + `0004-one-core-three-hosts.md` + `0005-capability-ceiling-and-device-grant.md` + `0006-execution-backend.md` | 为什么是 Rust、为什么无 Node、为什么三宿主、能力给不给、跑在哪 |
-| 9 | `docs/00-assessment.md` | 旧项目的坑，作为“不变量”证据 |
+| 7 | `docs/09-device-capability.md` | 改设备能力（C6）时读这个：闸只有一份、撤销要即时、审计不记内容 |
+| 8 | `docs/05-quality-gates.md` | 命令与预算 |
+| 9 | `docs/adr/0002-agent-in-rust.md` + `0004-one-core-three-hosts.md` + `0005-capability-ceiling-and-device-grant.md` + `0006-execution-backend.md` | 为什么是 Rust、为什么无 Node、为什么三宿主、能力给不给、跑在哪 |
+| 10 | `docs/00-assessment.md` | 旧项目的坑，作为“不变量”证据 |
 
 不要先读 `_research/`：那是旧项目的原始体检报告，是证据不是规范。
 
