@@ -18,6 +18,7 @@
 import type {
   BotStatus as BotStatusDto,
   BotSummary as BotSummaryDto,
+  ConversationSummary as ConversationSummaryDto,
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
   ProjectOpenResult as ProjectOpenResultDto,
@@ -70,6 +71,14 @@ export interface LogLine {
 
 /** bot 列表的一行（`bot_list` 的 `data`；生成物，勿手改）。 */
 export type BotSummary = BotSummaryDto
+
+/**
+ * 某个 bot 已登记的会话（`bot_conversations` 的 `data` 元素；生成物，勿手改）。
+ *
+ * `kind` 是**开放字符串**（`private` / `group` / `channel`），不要按枚举穷举。
+ * 试跑要用的是 `conversationId`（`bot_inject` 的目标），不是平台侧的 `externalId`。
+ */
+export type ConversationSummary = ConversationSummaryDto
 
 /**
  * 一条诊断（问题面板的一行）。
@@ -149,6 +158,25 @@ export interface CommandInputs {
   'bot.start': { botId: string }
   'bot.stop': { botId: string }
   /**
+   * 列出某个 bot 已登记的会话（wire `bot_conversations`）。
+   *
+   * 键名直接用 wire 的 snake_case（`generated/Command.ts` 的 `"bot_conversations"`）：
+   * 试跑这条链路是照着契约新加的，没有再绕一层点号别名。
+   *
+   * **空数组是合法结果**（这个 bot 还没有会话），所以它走 `callWire` 而不是
+   * `callWireVoid` —— 与 `diagnostics` 同一个先例：能返回数据的调用不能吞掉 `data`。
+   */
+  bot_conversations: { botId: string }
+  /**
+   * 往某个会话注入一条模拟消息（wire `bot_inject`）。
+   *
+   * 本地平台（`platform: "local"`）不联网、`subscribe()` 永不发事件：bot 代码的
+   * `ctx.reply(text)` 会被**逐行**写成 run log，每行前缀 `[reply] `（真源是
+   * `crates/hbot-adapters/src/platforms/local/mod.rs` 的 `REPLY_PREFIX`），所以这条
+   * 命令只回 `data: null`，试跑的"回复"要从 `run.log` 事件里读（见 `features/tryrun/replies.ts`）。
+   */
+  bot_inject: { botId: string; conversationId: string; text: string }
+  /**
    * 读运行日志。
    *
    * `botId: null` = 全项目日志（含没有 bot 归属的 Agent 行，`source: 'agent'`）；
@@ -215,6 +243,10 @@ export interface CommandOutputs {
   /** 启停只回"命令已接受"（`data: null`）；状态看 `bot.status` 事件。 */
   'bot.start': null
   'bot.stop': null
+  /** 会话列表；**空数组是合法结果**（还没登记过会话），不能当成"没有数据"的错误。 */
+  bot_conversations: ConversationSummary[]
+  /** 注入只回"命令已接受"（`data: null`）；bot 的回复走 `run.log` 事件。 */
+  bot_inject: null
   /** 日志行（核心按从旧到新返回，最新一行在末尾；面板按原顺序渲染）。 */
   'logs.tail': RunLogDto[]
   'agent.send': AgentSendResult

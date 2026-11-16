@@ -16,6 +16,10 @@
  *   写回时作为 `baseHash`（wire 的并发保护，禁止静默覆盖）；
  * - `bot.list` → `bot_list`；`bot.start` / `bot.stop` → `bot_start` / `bot_stop`
  *   （启停只回 `data: null`，运行态由 `bot.status` 事件推进）；
+ * - `bot_conversations` → `bot_conversations`（同名）：`data` 是 `ConversationSummary[]`，
+ *   **空数组是合法结果**（这个 bot 还没有会话），所以走 `callWire` 而不是 void 变体；
+ * - `bot_inject` → `bot_inject`（同名）：只回 `data: null`，本地平台的回复由
+ *   `run.log` 事件逐行推来（`[reply] ` 前缀），命令本身没有返回值；
  * - `agent.send` → `agent_send`（`sessionId: null` 表示新建会话，核心回 `data.sessionId`）；
  * - `agent.approve` / `edit.apply` / `edit.reject` → 同名 snake_case 命令；
  * - `search.start` / `search.cancel` → `search_start` / `search_cancel`，两者都只回
@@ -33,6 +37,7 @@ import type {
   ApiError,
   BotSummary,
   Command as WireCommand,
+  ConversationSummary,
   Diagnostic,
   DirEntry,
   Event as CoreEvent,
@@ -433,6 +438,21 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
       return callWireVoid('bot_start', { type: 'bot_start', botId: command.botId })
     case 'bot.stop':
       return callWireVoid('bot_stop', { type: 'bot_stop', botId: command.botId })
+    case 'bot_conversations':
+      // 空数组是合法结果（还没登记会话）：`callWire` 只把 `data: null` 当协议错误，
+      // 空数组照常返回 —— 用 `callWireVoid` 会把这一档成功变成"没有数据"。
+      return callWire<ConversationSummary[]>('bot_conversations', {
+        type: 'bot_conversations',
+        botId: command.botId,
+      })
+    case 'bot_inject':
+      // 本地平台不联网：回复由 `run.log` 事件推来，这里只确认命令被接受。
+      return callWireVoid('bot_inject', {
+        type: 'bot_inject',
+        botId: command.botId,
+        conversationId: command.conversationId,
+        text: command.text,
+      })
     case 'logs.tail':
       // `botId: null` 是全项目日志（含 Agent 行）；核心按从旧到新返回。
       return callWire<RunLog[]>('logs_tail', {

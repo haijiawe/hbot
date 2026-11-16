@@ -8,20 +8,32 @@
  *
  * 这里没有 `hbot://event` 通道，所以自带一条**内存事件总线**（`subscribeMockEvents` /
  * `emitMockEvent`）：`ipc.ts` 的 `onEvent` 在非 Tauri 分支订阅它，否则搜索面板在唯一
- * 能跑的模式下永远是空的。目前只有 `file.search` 走这条总线；`bot.status` 仍靠
- * `bot.list` 的返回值播种（与真机路径一致：UI 不自己编运行态）。
+ * 能跑的模式下永远是空的。目前走这条总线的事件有两条：`file.search`（搜索）与
+ * `run.log`（本地平台试跑的回复，`bot_inject` 之后按 `[reply] ` 前缀逐行推）。
+ * `bot.status` 仍靠 `bot.list` 的返回值播种（与真机路径一致：UI 不自己编运行态）。
  *
  * 取消语义也照核心来：`search_cancel` 之后那条还没送出的事件**不再发**，也不补一条
  * "假结果"（`crates/hbot-rpc/src/app/commands/files.rs` 的 `search` 在 cancelled 时直接返回）。
  */
 
-import type { Event as CoreEvent } from '../generated'
-import type { BotStatus, Command, CommandOutputs, CommandType, FileNode } from './ipc'
+import type { Event as CoreEvent, RunLog } from '../generated'
+import type {
+  BotStatus,
+  Command,
+  CommandOutputs,
+  CommandType,
+  ConversationSummary,
+  FileNode,
+} from './ipc'
 import { searchMatches } from './mock-search'
 
 const BOT_ID = 'demo-bot'
 const BOT_NAME = '演示 bot'
-const BOT_PLATFORM = 'onebot11'
+/**
+ * mock 的 bot 平台是 `local`：试跑链路（`bot_inject` → `[reply] ` 日志）只有本地平台
+ * 才有，换成真实平台名会让"注入之后不该联网"这条语义在浏览器里显得没有依据。
+ */
+const BOT_PLATFORM = 'local'
 /** mock 的会话 ID：真机上由核心的 `state.ids()` 分配。 */
 const MOCK_SESSION_ID = 'mock-session'
 
@@ -271,6 +283,52 @@ function setMockStatus(status: BotStatus): void {
 }
 
 // ---------------------------------------------------------------------------
+// 本地平台试跑：会话 + `[reply] ` 日志（`bot_inject` 的唯一可观察产出）
+// ---------------------------------------------------------------------------
+
+/**
+ * 本地平台的固定会话（与后端契约逐字段对齐，别按"顺手"改）。
+ *
+ * 两个 id 不是一回事：
+ * - `conversationId` 是**内部 UUID**（核心的 conversations 表主键，`bot_inject` 要的是它）；
+ * - `externalId` 才是平台侧的 `local:default` 字面量（`local::DEFAULT_CONVERSATION_EXTERNAL_ID`）。
+ *
+ * 真机上 `local` 平台的 `bot_start` 内部会幂等地把这行建好（重复 start 不会堆孤儿，
+ * `conversationId` 也不变），所以这里固定一个 UUID 形状的值，UI 拿它去注入才和真机同路。
+ * `kind` 是开放字符串（`private` / `group` / `channel`），不要当枚举用。
+ */
+const MOCK_CONVERSATION: ConversationSummary = {
+  conversationId: '11111111-1111-4111-8111-111111111111',
+  externalId: 'local:default',
+  kind: 'private',
+}
+
+/**
+ * 回复前缀的真源是 `crates/hbot-adapters/src/platforms/local/mod.rs` 的 `REPLY_PREFIX`。
+ * UI 侧只按它过滤（`features/tryrun/replies.ts`），mock 也用它拼假回复 —— 两处字符串
+ * 必须一致，否则浏览器里能跑通的链路到真机就一条都读不出来。
+ */
+const REPLY_PREFIX = '[reply] '
+
+/** mock 的运行日志（`logs.tail` 的数据源）；真机是 SQLite 的 run_log 表。 */
+const mockRunLogs: Array<RunLog & { botId: string }> = []
+
+/** mock 的运行日志缓冲上界：与真机的 `logs_tail` 语义对齐（只留最近的一段）。 */
+const MOCK_RUN_LOG_LIMIT = 5_000
+
+/**
+ * 把注入的文本变成 bot 的回复行：**每行一条**，前缀 `[reply] `。
+ *
+ * 末尾换行不算"又多一条空回复"（`a\n` 是一行）；中间的空行保留，因为 `ctx.reply` 真的
+ * 会逐行写出来 —— `[reply] ` 后面是空正文这件事 UI 也要能显示（见 `extractReplies` 的测试）。
+ */
+function injectedReplyLines(text: string): string[] {
+  const lines = text.split(/\r?\n/)
+  while (lines.length > 0 && (lines[lines.length - 1] ?? '').trim().length === 0) lines.pop()
+  return lines.map((line) => `${REPLY_PREFIX}收到：${line}`)
+}
+
+// ---------------------------------------------------------------------------
 // 事件总线（mock 没有 `hbot://event`，用内存订阅模拟）
 // ---------------------------------------------------------------------------
 
@@ -363,18 +421,86 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
       return [mockBotSummary()]
 
     // 启停只回"命令已接受"（真机 `data: null`），运行态由 `bot.status` 事件推进；
-    // mock 的事件总线目前只发 `file.search`，所以这里直接改内部状态，下次 `bot.list` 才看得到。
+    // mock 在这里改内部状态**并补推一条 `bot.status`**：真机核心启停后总会推它，
+    // 少了这条，浏览器里的状态栏/试跑面板会永远停在 stopped。
     case 'bot.start':
+      if (command.botId !== BOT_ID) throw new Error(`bot_start: 未知 bot（${command.botId}）`)
       setMockStatus('running')
+      queueMicrotask(() => {
+        emitMockEvent({ type: 'bot.status', botId: BOT_ID, status: 'running', error: null })
+      })
       return null
 
     case 'bot.stop':
+      if (command.botId !== BOT_ID) throw new Error(`bot_stop: 未知 bot（${command.botId}）`)
       setMockStatus('stopped')
+      queueMicrotask(() => {
+        emitMockEvent({ type: 'bot.status', botId: BOT_ID, status: 'stopped', error: null })
+      })
       return null
 
-    // mock 没有 SQLite：日志面板查询返回空集（Agent 行只存在于真机数据库）。
-    case 'logs.tail':
-      return []
+    // 本地平台的会话是固定的（见 `MOCK_CONVERSATION`）：真机上这条命令查的是适配器
+    // 登记过的会话表，空数组是合法结果（还没登记过任何会话）。
+    case 'bot_conversations':
+      if (command.botId !== BOT_ID) throw new Error(`bot_conversations: 未知 bot（${command.botId}）`)
+      return [MOCK_CONVERSATION]
+
+    // 试跑的核心：把注入的文本逐行回显成 `[reply] ` 日志，并照真机顺序推 `run.log` 事件。
+    // 事件用 `queueMicrotask` 送出，保证它在 `dispatch` 的 Promise 结算之后到达
+    // （与 `search.start` 同一个理由：run-store 先拿到"命令成功"，再收日志）。
+    case 'bot_inject': {
+      if (command.botId !== BOT_ID) throw new Error(`bot_inject: 未知 bot（${command.botId}）`)
+      // 只认内部 UUID：把 `externalId`（`local:default`）传进来必须被拒 —— 真机是
+      // `get_conversation` 查不到 → -32001，UI 若拿错字段，mock 不该替它兜住。
+      if (command.conversationId !== MOCK_CONVERSATION.conversationId) {
+        throw new Error(`bot_inject: 会话不存在（${command.conversationId}）`)
+      }
+      if (mockStatus !== 'running') {
+        // 真机上注入一个没在跑的 bot 是拒绝而不是静默丢弃（试跑面板会把它显示成错误）。
+        throw new Error('bot_inject: bot 未在运行（先点「开始试跑」）')
+      }
+      const lines = injectedReplyLines(command.text)
+      if (lines.length === 0) throw new Error('bot_inject: text 不能为空')
+      const at = Date.now()
+      const rows = lines.map((line, index) => ({
+        botId: command.botId,
+        at: at + index,
+        level: 'info' as const,
+        line,
+        source: 'bot',
+      }))
+      mockRunLogs.push(...rows)
+      if (mockRunLogs.length > MOCK_RUN_LOG_LIMIT) {
+        mockRunLogs.splice(0, mockRunLogs.length - MOCK_RUN_LOG_LIMIT)
+      }
+      queueMicrotask(() => {
+        for (const row of rows) {
+          emitMockEvent({
+            type: 'run.log',
+            botId: row.botId,
+            level: row.level,
+            line: row.line,
+            at: row.at,
+          })
+        }
+      })
+      return null
+    }
+
+    // mock 没有 SQLite：只回本进程里试跑过的那批 run log（真机按 bot 过滤查数据库）。
+    case 'logs.tail': {
+      const rows =
+        command.botId === null
+          ? mockRunLogs
+          : mockRunLogs.filter((row) => row.botId === command.botId)
+      const tail = command.limit > 0 ? rows.slice(-command.limit) : rows
+      return tail.map((row) => ({
+        at: row.at,
+        level: row.level,
+        line: row.line,
+        source: row.source,
+      }))
+    }
 
     case 'agent.send':
       return { sessionId: command.sessionId ?? MOCK_SESSION_ID }

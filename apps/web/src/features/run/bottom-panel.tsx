@@ -1,10 +1,12 @@
 /**
- * 底部面板（lazy chunk）：日志 / 问题 / 搜索 / 调试四个页签 + 启停控制。
+ * 底部面板（lazy chunk）：日志 / 问题 / 搜索 / 调试 / 试跑五个页签 + 启停控制。
  *
- * 四个页签共用同一块区域，高度只来自 `lib/layout.ts` 的 `--bottom-panel-height`，
- * 不另起第二套布局常量。默认导出是 React.lazy 的要求。
+ * 五个页签共用同一块区域，高度只来自 `lib/layout.ts` 的 `--bottom-panel-height`，
+ * 不另起第二套布局常量。默认导出是 React.lazy 的要求；试跑面板同样 **lazy**，
+ * 别改成静态 import（首屏预算被钉住了，见 AGENTS.md §5.6）。
  */
 
+import { lazy, Suspense } from 'react'
 import { formatKeybinding, keybindingById } from '../../lib/keybindings'
 import { useDebugStore } from '../../stores/debug-store'
 import { useRunStore } from '../../stores/run-store'
@@ -16,18 +18,25 @@ import { SearchPanel } from '../search/search-panel'
 import { RunControls } from '../run/run-controls'
 import { RunLog } from '../run/run-log'
 
-const TABS: readonly BottomPanelTab[] = ['logs', 'problems', 'search', 'debug']
+/** 试跑面板：底部面板的第五个页签，按既有惯例 lazy（不静态 import）。 */
+const TryRunPanel = lazy(() =>
+  import('../tryrun/tryrun-panel').then((module) => ({ default: module.TryRunPanel })),
+)
+
+const TABS: readonly BottomPanelTab[] = ['logs', 'problems', 'search', 'debug', 'tryrun']
 const TAB_LABEL: Record<BottomPanelTab, string> = {
   logs: '日志',
   problems: '问题',
   search: '搜索',
   debug: '调试',
+  tryrun: '试跑',
 }
 const TAB_ID: Record<BottomPanelTab, string> = {
   logs: 'bottom-tab-logs',
   problems: 'bottom-tab-problems',
   search: 'bottom-tab-search',
   debug: 'bottom-tab-debug',
+  tryrun: 'bottom-tab-tryrun',
 }
 
 /** 页签上的计数（`null` = 不显示徽标）。 */
@@ -46,6 +55,9 @@ function tabCount(
       // 诊断条数是"有几条问题"的唯一可见指标，别让它只活在面板里。
       return problemCount
     case 'debug':
+      return null
+    case 'tryrun':
+      // 试跑没有"条数"可看（回复区自带计数语义），挂徽标只会误导。
       return null
     default: {
       const exhaustive: never = tab
@@ -70,6 +82,12 @@ function panelBody(tab: BottomPanelTab) {
       return <SearchPanel />
     case 'debug':
       return <DebugPanel />
+    case 'tryrun':
+      return (
+        <Suspense fallback={<p className="panel-empty">正在加载试跑面板…</p>}>
+          <TryRunPanel />
+        </Suspense>
+      )
     default: {
       const exhaustive: never = tab
       return exhaustive

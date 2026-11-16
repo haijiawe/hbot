@@ -48,3 +48,83 @@ describe('mockDispatch：project.create', () => {
     expect(summary).toEqual({ path: 'C:/work/fresh', name: 'fresh', entry: 'src/main.ts' })
   })
 })
+
+/**
+ * 本地试跑（`platform: 'local'`）：`bot_inject` 的**唯一**可观察产出是 run log 里的
+ * `[reply] ` 行（真机也是这条路，`crates/hbot-adapters/src/platforms/local/mod.rs`）。
+ * 所以 mock 必须自己把"注入 → 逐行回显"演出来，否则浏览器里试跑面板永远是空的。
+ */
+describe('mockDispatch：本地试跑', () => {
+  const BOT_ID = 'demo-bot'
+  /** 内部会话 id 是 UUID（conversations 表主键）；`local:default` 是平台侧 externalId。 */
+  const CONVERSATION_ID = '11111111-1111-4111-8111-111111111111'
+  const EXTERNAL_ID = 'local:default'
+  const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+  it('bot_conversations 回本地平台的固定会话：conversationId 是 UUID、externalId 是 local:default', async () => {
+    const conversations = await mockDispatch({ type: 'bot_conversations', botId: BOT_ID })
+
+    expect(conversations).toEqual([
+      { conversationId: CONVERSATION_ID, externalId: EXTERNAL_ID, kind: 'private' },
+    ])
+    // 两个 id 不能混用：`bot_inject` 只认 conversationId，拿错就是真机的 -32001。
+    expect(CONVERSATION_ID).toMatch(UUID_PATTERN)
+    expect(CONVERSATION_ID).not.toBe(EXTERNAL_ID)
+  })
+
+  it('往 externalId 注入被拒绝（mock 不替"字段拿错"兜底）', async () => {
+    await mockDispatch({ type: 'bot.start', botId: BOT_ID })
+
+    await expect(
+      mockDispatch({
+        type: 'bot_inject',
+        botId: BOT_ID,
+        conversationId: EXTERNAL_ID,
+        text: '你好',
+      }),
+    ).rejects.toThrow('会话不存在')
+  })
+
+  it('bot 没在运行时注入被拒绝，而不是静默丢弃', async () => {
+    await mockDispatch({ type: 'bot.stop', botId: BOT_ID })
+
+    await expect(
+      mockDispatch({
+        type: 'bot_inject',
+        botId: BOT_ID,
+        conversationId: CONVERSATION_ID,
+        text: '你好',
+      }),
+    ).rejects.toThrow('未在运行')
+  })
+
+  it('多行文本逐行回显成 [reply] 日志，并能从 logs.tail 读回来', async () => {
+    await mockDispatch({ type: 'bot.start', botId: BOT_ID })
+    await mockDispatch({
+      type: 'bot_inject',
+      botId: BOT_ID,
+      conversationId: CONVERSATION_ID,
+      text: '你好\n第二行',
+    })
+
+    const rows = await mockDispatch({ type: 'logs.tail', botId: BOT_ID, limit: 10 })
+    if (!Array.isArray(rows)) throw new Error('logs.tail 应该回日志数组')
+    const tail = (rows as { line: string; source: string }[]).slice(-2)
+
+    expect(tail.map((row) => row.line)).toEqual(['[reply] 收到：你好', '[reply] 收到：第二行'])
+    expect(tail.every((row) => row.source === 'bot')).toBe(true)
+  })
+
+  it('空文本（含只有空行）不产生日志，按拒绝处理', async () => {
+    await mockDispatch({ type: 'bot.start', botId: BOT_ID })
+
+    await expect(
+      mockDispatch({
+        type: 'bot_inject',
+        botId: BOT_ID,
+        conversationId: CONVERSATION_ID,
+        text: '  \n  ',
+      }),
+    ).rejects.toThrow('text 不能为空')
+  })
+})
