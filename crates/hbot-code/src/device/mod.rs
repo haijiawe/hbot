@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub use gate::DeviceFailure;
 
 use hbot_core::{
-    BotId, DeviceBackend, DeviceCapability, DeviceError, DeviceGate, DeviceTarget, SandboxMode,
-    Screenshot,
+    BotId, DeviceBackend, DeviceCapability, DeviceError, DeviceGate, DeviceRateLimits,
+    DeviceRateWindow, DeviceTarget, SandboxMode, Screenshot,
 };
 
 /// 一帧截图的默认/上限字节数（4 MiB）。
@@ -179,6 +179,13 @@ pub(crate) struct DeviceSlot {
     /// 本次事件的 `botId`。`build_event` 每次 `dispatch` 写入一次；判据要它才能
     /// 回答"哪个机器人的设备会话"。
     bot: Mutex<Option<BotId>>,
+    /// 一秒滑动窗口（`docs/09` §13 问 7 的 20 次/秒、2 帧/秒）。
+    ///
+    /// 放在槽位上而不是闸里：**一个 `Sandbox` 就是一个 bot 的 isolate**，所以
+    /// "按槽位算"天然就是"按 bot 算"，不用再维护一张 `bot → 窗口` 的表。
+    /// 代价是热重载会换一个新 `Sandbox`（窗口随之中零）—— 可以接受：换版本本身
+    /// 就是一次用户可见的停顿，而且新代码立刻狂调设备也会被下一轮窗口拦住。
+    rate: DeviceRateWindow,
 }
 
 #[derive(Default)]
@@ -190,7 +197,10 @@ struct SlotInner {
 
 impl DeviceSlot {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            rate: DeviceRateWindow::new(DeviceRateLimits::default()),
+            ..Self::default()
+        }
     }
 
     /// 装入（或替换）一份装配。已经设置过的白名单保留。
@@ -250,7 +260,13 @@ impl DeviceSlot {
         )?;
         // `authorize` 已经在 `handles` 为 `None` 时返回 `Unavailable`，走不到这里；
         // 仍然不用 `expect` 是因为"静默 panic 在宿主线程"比一个错误码难查。
-        handles.ok_or(DeviceFailure::Unavailable)
+        let handles = handles.ok_or(DeviceFailure::Unavailable)?;
+        // 限速是授权之后的第四步：先确认"你能调"，再确认"你调得太快"。
+        // 顺序反了会把"没授权"也报成 `RATE_LIMITED`，用户会以为等一秒就好。
+        self.rate
+            .admit(capability, std::time::Instant::now())
+            .map_err(DeviceFailure::Backend)?;
+        Ok(handles)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SlotInner> {

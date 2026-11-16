@@ -184,7 +184,7 @@ pub fn budget_of(remaining: Option<Duration>) -> Duration {
 ///
 /// # Errors
 ///
-/// [`DeviceFailure::Backend`]，三种来源：超时（`HBOT_DEVICE_HOST_LIMIT`）、
+/// [`DeviceFailure::Backend`]，三种来源：超时（`HBOT_DEVICE_TIMEOUT`）、
 /// 后端线程 panic（`HBOT_DEVICE_FAILED`）、后端返回的 [`DeviceError`]。
 pub async fn call<T, F>(
     backend: Arc<dyn DeviceBackend>,
@@ -199,12 +199,11 @@ where
         tokio::time::timeout(budget, tokio::task::spawn_blocking(move || work(&*backend))).await;
 
     match joined {
-        // 超时不是"后端坏了"，是这次调用的预算用完了：报宿主限制而不是失败。
-        Err(_elapsed) => Err(DeviceFailure::Backend(DeviceError::HostLimit {
-            detail: format!(
-                "设备后端调用超过 {} ms 未返回",
-                u64::try_from(budget.as_millis()).unwrap_or(u64::MAX)
-            ),
+        // 超时不是"后端坏了"，也不是"宿主不支持"：报一个**独立的**超时码。
+        // 三种码对应三种补救动作（换机器 / 加预算 / 等一等），合成 `HOST_LIMIT`
+        // 会让用户以为这台机器根本做不到设备能力（`docs/09` §13 问 8）。
+        Err(_elapsed) => Err(DeviceFailure::Backend(DeviceError::Timeout {
+            ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
         })),
         Ok(Err(join_error)) => {
             // 后端 panic 不能把 isolate 线程带下去，也不能吞掉：记日志，回一个
@@ -251,6 +250,81 @@ mod tests {
         "00000000-0000-0000-0000-000000000001"
             .parse::<BotId>()
             .expect("固定 UUID 字面量一定能解析")
+    }
+
+    /// 一个只会睡觉的后端：用来证明"预算用完了"报的是超时码，不是宿主限制。
+    struct Slow;
+
+    impl DeviceBackend for Slow {
+        fn capabilities(&self) -> hbot_core::DeviceCapabilityReport {
+            hbot_core::DeviceCapabilityReport::default()
+        }
+
+        fn screenshot(
+            &self,
+            _request: &hbot_core::ScreenshotRequest,
+        ) -> Result<hbot_core::Screenshot, DeviceError> {
+            Err(DeviceError::HostLimit {
+                detail: "not used".to_owned(),
+            })
+        }
+
+        fn ocr(&self, _request: &hbot_core::OcrRequest) -> Result<hbot_core::OcrText, DeviceError> {
+            std::thread::sleep(Duration::from_millis(120));
+            Ok(hbot_core::OcrText {
+                text: "too late".to_owned(),
+                truncated: false,
+            })
+        }
+
+        fn input(
+            &self,
+            _action: &hbot_core::InputAction,
+            _apps: &[String],
+        ) -> Result<(), DeviceError> {
+            Err(DeviceError::HostLimit {
+                detail: "not used".to_owned(),
+            })
+        }
+
+        fn windows(&self) -> Result<Vec<hbot_core::WindowInfo>, DeviceError> {
+            Err(DeviceError::HostLimit {
+                detail: "not used".to_owned(),
+            })
+        }
+
+        fn clipboard(
+            &self,
+            _op: &hbot_core::ClipboardOp,
+        ) -> Result<hbot_core::ClipboardValue, DeviceError> {
+            Err(DeviceError::HostLimit {
+                detail: "not used".to_owned(),
+            })
+        }
+    }
+
+    /// 超时必须是**自己的**码（`docs/09` §13 问 8）：`HOST_LIMIT` 会让用户以为
+    /// 这台机器不支持设备能力，而实际上只是这次预算太短。
+    #[test]
+    fn a_call_that_outlives_its_budget_reports_a_timeout_not_a_host_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime");
+        let failure = runtime
+            .block_on(call(Arc::new(Slow), Duration::from_millis(10), |backend| {
+                backend.ocr(&hbot_core::OcrRequest {
+                    target: DeviceTarget::None,
+                    max_chars: 100,
+                })
+            }))
+            .expect_err("120 ms 的工作给了 10 ms，必须超时");
+        assert_eq!(failure.code(), "HBOT_DEVICE_TIMEOUT");
+        assert!(
+            failure.message().contains("10 毫秒"),
+            "文案要带上预算：{}",
+            failure.message()
+        );
     }
 
     #[test]

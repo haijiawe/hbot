@@ -372,19 +372,25 @@ fn install_ocr<'js>(
     Function::new(
         ctx.clone(),
         Async(move |options: Opt<Value<'js>>| {
+            // **参数错误先于闸**：这里与 `docs/09` §4 的"只读档第一"并不冲突 ——
+            // 只读档说的是"先别碰 OS 资源"，而参数解析只读 JS 值。放在闸前面有
+            // 两个必须的理由：① 被拒的调用不占限速配额（否则同一个 handler 连着
+            // 传错四次参数，第四次会收到 `HBOT_DEVICE_RATE_LIMITED` 而不是"参数
+            // 不合法"，把排查方向带偏）；② 限速文案不会盖住真正的参数错误。
             let request = options
                 .0
                 .as_ref()
                 .map_or_else(default_ocr_request, |value| parse_ocr_options(value));
-            let granted = grant(&device, mode, DeviceCapability::Ocr, &deadline);
+            let device = Arc::clone(&device);
+            let deadline = Arc::clone(&deadline);
             async move {
-                let (granted, request) = match (granted, request) {
-                    (Ok(granted), Ok(request)) => (granted, request),
-                    (Err(message), _) | (_, Err(message)) => {
-                        // 先过闸再报参数错：`grant` 是同步的、不碰后端，所以这里
-                        // 的短路顺序与 read-only 那一路一致（`docs/09` §4）。
-                        return DeviceReply::Ocr(Err(message));
-                    }
+                let request = match request {
+                    Ok(request) => request,
+                    Err(message) => return DeviceReply::Ocr(Err(message)),
+                };
+                let granted = match grant(&device, mode, DeviceCapability::Ocr, &deadline) {
+                    Ok(granted) => granted,
+                    Err(message) => return DeviceReply::Ocr(Err(message)),
                 };
                 let max_chars = request.max_chars;
                 let outcome = call(

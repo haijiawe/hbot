@@ -937,3 +937,54 @@ export default defineBot({
     assert_eq!(recorder.backend_calls(), 0, "参数不合法的调用不许碰后端");
     assert!(recorder.ocr_requests().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// ⑮ 限速：帧配额 2 次/秒 —— 第三次必须被拒，且被拒的那次不许碰后端
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_third_frame_call_in_a_second_is_rate_limited_before_the_backend() {
+    let source = r#"
+import { defineBot } from 'hbot';
+
+export default defineBot({
+  async onMessage(ctx) {
+    for (let i = 0; i < 3; i += 1) {
+      try {
+        const shot = await ctx.device.ocr();
+        ctx.log(`ok ${i} ${shot.text}`);
+      } catch (error) {
+        ctx.log(String(error.message));
+      }
+    }
+  },
+});
+"#;
+    let (_project, sandbox) = sandbox("device-rate", source, HttpConfig::deny_all());
+    let recorder = assemble(&sandbox, Verdict::Allow);
+
+    let outcome = dispatch(&sandbox).expect("限速是 handler 能 catch 的错误");
+    assert_eq!(outcome.logs.len(), 3, "三次都要有记录：{:?}", outcome.logs);
+    assert!(
+        outcome.logs[0].starts_with("ok 0"),
+        "第一次要成功：{}",
+        outcome.logs[0]
+    );
+    assert!(
+        outcome.logs[1].starts_with("ok 1"),
+        "第二次要成功（配额是 2/秒）：{}",
+        outcome.logs[1]
+    );
+    // 第三次：帧配额用尽。文案要点明是"调得太频繁"，而不是"没有授权" ——
+    // 前者等一秒就好，后者要用户去授权，两种指引完全相反。
+    assert!(
+        outcome.logs[2].starts_with("HBOT_DEVICE_RATE_LIMITED:"),
+        "第三次要被限速：{}",
+        outcome.logs[2]
+    );
+    assert_eq!(
+        recorder.backend_calls(),
+        2,
+        "被限速的那次一次后端调用都不许发生"
+    );
+}
