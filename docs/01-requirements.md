@@ -104,7 +104,7 @@
 | 类别 | 要求 | 验证 |
 |---|---|---|
 | 内存 | 桌面整机 < 260 MB（private commit 求和）；核心 < 60 MB；每 bot < 6 MB | 进程采样，见 05 §4（已实测：核心 3.4 MB、整机 206 MB 中位） |
-| 启动 | headless 核心可用 < 800 ms；桌面到 IPC 首次可用 < 1500 ms | 真机分段采样（headless 878 ms 未达标；桌面 1049 ms 中位，其中核心仅 33 ms，见 ADR-0002 §4.2 与 `scripts/startup-probe.ps1`） |
+| 启动 | headless 核心可用 < 800 ms；桌面到 IPC 首次可用 < 1500 ms | 真机分段采样（headless **36.4 ms 中位 / 50 ms p95**，n=7，已达标；桌面 1049 ms 中位，其中核心仅 33 ms。见 `S11-headless-startup.md`、ADR-0002 §4.3 与 `scripts/headless-startup-probe.ps1` / `scripts/startup-probe.ps1`） |
 | 可靠性 | 不丢入站；同会话有序；重复只执行一次 | 注入/断网/杀进程测试 |
 | 恢复 | 崩溃后重放未处理消息；outbox 继续 | 集成测试 |
 | 安全 | 生成代码无 fs/net/process；命令默认审批；密钥不落日志 | 红队用例 |

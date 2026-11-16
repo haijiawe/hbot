@@ -275,9 +275,9 @@ export default defineBot({
 |---|---|---|---|
 | `name` | string | 必填 | 只用于展示与日志 |
 | `entry` | string | `src/main.ts` | 必须落在项目内（拒绝对路径/`..`/盘符/UNC），文件必须存在 |
-| `platform.kind` | string | 必填 | 平台标识，取值与 `bots.json` 的 `platform` 字段一致（`"onebot11"` / `"qq_official"`）。核心**不校验取值**（开放字符串，加平台不改 `hbot-code`）；`hbot check` 对未识别的值只给 warning |
-| `platform.ws` | string | 仅 `onebot11` 必填 | `onebot11`：必填且须 `ws://`/`wss://`（`wss://` 走 TLS 后端）；其它平台不需要（QQ 官方的地址由 `/gateway` 发现），写了不报错，`hbot check` 提示会被忽略 |
-| `permissions.http` | string[] | `[]` | 空 = 全禁；`ctx.http` 尚未实现，字段先占位 |
+| `platform.kind` | string | 必填 | 平台标识，取值与 `bots.json` 的 `platform` 字段一致（`"onebot11"` / `"qq_official"` / `"local"`）。核心**不校验取值**（开放字符串，加平台不改 `hbot-code`）；`hbot check` 对未识别的值只给 warning |
+| `platform.ws` | string | 仅 `onebot11` 必填 | `onebot11`：必填且须 `ws://`/`wss://`（`wss://` 走 TLS 后端）；其它平台不需要（QQ 官方的地址由 `/gateway` 发现，`local` 不联网），写了不报错，`hbot check` 提示会被忽略 |
+| `permissions.http` | string[] | `[]` | 空 = 全禁（fail-closed）；已实现，`http.get` 按此表判权（`crates/hbot-code/src/permissions.rs`）。每项为精确 host、`*.子域`（匹配一层或多层子域，**不匹配裸域**）、`host:port`（不带端口 = 任意端口，端口对比较 host 同时判）；`*` = 全部放行（首次命中打一条 warn）。大小写不敏感、尾点忽略、只允许 `http(s)`；`evil-api.example.com` 不会被 `api.example.com` 放过 |
 | `limits.handlerMs` | number | 2000 | 可调低；超过宿主硬上限直接报错，**不静默 clamp** |
 | `limits.heapMb` | number | 32 | 同上，硬上限 64 |
 
@@ -288,11 +288,11 @@ export default defineBot({
 | 字段（JSON 名） | 类型 | 默认 | 约束 / 说明 |
 |---|---|---|---|
 | `id` | string(UUID) | 必填 | bot 的稳定 id，`bot_start` 用它 |
-| `platform` | string | `onebot11` | `onebot11` / `qq_official`；未知值 → `bot_start` 返回 `-32002` 并列出允许值 |
-| `url` | string | `onebot11` 必填 | OneBot 11 正向 WS 地址；`qq_official` 留空 |
+| `platform` | string | `onebot11` | `onebot11` / `qq_official` / `local`；未知值 → `bot_start` 返回 `-32002` 并列出允许值。`local` = **本地试跑**：不连任何端点、入站靠 `bot_inject`、出站回复只写 run log（见下表后的说明） |
+| `url` | string | `onebot11` 必填 | OneBot 11 正向 WS 地址；`qq_official` / `local` 留空（填了不参与连接） |
 | `token` | string | — | OneBot access token，按 `Authorization: Bearer` 发送；日志/`Debug` 打码 |
-| `appId` | string | `qq_official` 必填 | QQ 开放平台的 AppID |
-| `clientSecret` | string | `qq_official` 必填 | QQ 开放平台的 AppSecret；`Debug` 打码成 `<redacted>`，**不进日志** |
+| `appId` | string | `qq_official` 必填 | QQ 开放平台的 AppID；`local` 不需要 |
+| `clientSecret` | string | `qq_official` 必填 | QQ 开放平台的 AppSecret；`Debug` 打码成 `<redacted>`，**不进日志**；`local` 不需要 |
 | `selfId` | number | — | bot 自己的平台上 id（QQ 号），仅展示 |
 | `name` | string | 项目目录名 | 展示名 |
 | `limits.memoryMb` | number | 32 | 每 isolate 堆上限（Mb） |
@@ -304,6 +304,8 @@ export default defineBot({
 
 - **不用手工插库**。`bot_start` 的 `start_inner` 先 `get_bot`，有就检查 `enabled`，没有就按 `bots.json` 建行（M0 引导路径）。
 - **凭据只能由用户自己填**。仓库里 `projects/` 已被 `.gitignore` 忽略（`bots.json` 含 `token`/`clientSecret`、`.hbot/` 是数据库），不要把它们放进版本控制；QQ 官方的 AppSecret 也不要写进文档或示例。
+
+`platform: "local"` 的语义（**试跑档，不是生产平台**）：不连任何端点、不需要 `url`/`token`/`appId`/`clientSecret`；入站不来自平台，只能由 `bot_inject` 注入；出站回复**不会真的发出去**，而是按 `[reply] <文本>`（一条一行，多行拆开、每行带前缀）写进 run log，IDE 的日志面板因此能看到"bot 会回什么"。用途只有一个：写完 bot 代码后**没有 NapCat、也没有官方机器人**时也能立刻跑一遍。`bot_start`（`local` 时）会幂等建好一行 `conversation_external_id = local:default`、`kind = private` 的会话，`bot_inject` 的 `conversationId` 用它；真机联调仍然必须用 `onebot11` 或 `qq_official`。
 
 真机示例见 `docs/spikes/S9-e2e-qq-official.md`。
 
@@ -345,7 +347,8 @@ export default defineBot({
   | `log(message)` | 已实现 | 进本次事件的捕获输出，转成 `RunLog` |
   | `reply(text)` | 已实现 | 被动回复；`injected` 标记存在时按主动消息发送（`sandbox_handler.rs:621-634`） |
   | `sleep(ms)` | 已实现 | 会被 handler 预算截断：`await sleep(60000)` 在 2s handler 里约 2s 后由中断处理器判超时 |
-  | `ctx.send` / `ctx.kv` / `ctx.http` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
+  | `http.get(url, options?)` | 已实现 | 受 `permissions.http` 约束：默认拒绝（空表 = 全禁）、只 GET、不跟随 3xx 重定向、不支持 gzip；单次超时默认 10s（上限 60s，且被 handler 剩余预算截断）、响应体上限 256 KiB；`read-only` 档**在授权判断之前**就拒绝（不建 socket）。失败以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 前缀 reject，异常消息里的 query 抹成 `?<redacted>`。返回 `{ status, body, headers }`（headers 名小写） |
+  | `ctx.send` / `ctx.kv` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
   | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage`（`isolate.rs:504-510`）；清单里的 `onSchedule` 字段同样未接 |
 
 - **`onMessage(ctx)` 的 `ctx` 真实形状**（由 `hbot-bot/src/event_json.rs` 的 `EventSource` / `event_json` **唯一拼装**，生产 `sandbox_handler` 与 `hbot replay` 共用这一份实现；`isolate.rs:924-942` 只追加宿主函数）：入站字段**平铺**在 ctx 上，不是嵌套在 `ctx.message` 里。
@@ -361,7 +364,7 @@ export default defineBot({
   | `reply` / `log` / `sleep` | 函数 | 与模块导出的同名函数等价 |
 
   新增**入站字段**的顺序（硬）：先 `hbot-bot/src/event_json.rs` 的 `EventSource` / `event_json` → 再 `dts.rs` 的 `HOST_DTS` 声明 → 最后本表与 `dts.rs` 测试里的字段清单；`crates/hbot-rpc/tests/event_shape_dts.rs` 会把 d.ts 声明的字段名集合与 `event_json` 的真实输出逐键比对，漏一处就红。
-  新增宿主 API 的顺序（硬）：先 `HOST_MODULE_SOURCE` 注入 → 再 `build_event` 挂到 ctx → 再 `dts.rs` 声明 → 最后文档这张表，四处同一批改，缺一处就红。
+  新增宿主 API 的顺序（硬）：先 `HOST_MODULE_SOURCE` 注入 → 再 `build_event` 挂到 ctx（模块级导出如 `defineBot` / `http` **不挂 ctx**，`build_event` 只挂 ctx 上的函数）→ 再 `dts.rs` 声明 → 最后文档这张表，四处同一批改，缺一处就红。
 - 超时/内存超限：中断 isolate，记录错误 + 源码位置；该消息进死信，bot 标记 degraded。
 - 异步宿主调用的返回必须经 oneshot 回到同一 isolate 线程；禁止在宿主线程直接 resolve promise。
 
@@ -831,7 +834,7 @@ debug.resumed      { botId }
 | 桌面整机（Rust + WebView2 子进程求和） | < 260 MB | **190–223 MB**，中位 206 MB |
 | 每多一个 bot（连接态） | < 6 MB（含 1 个 isolate 常驻） | **0.10 MB**（首个 bot +1.1 MB） |
 | 每 isolate | < 8 MB（堆上限 32 MB；`memory_usage` 采样） | **0.30 MB**（32 个共 +9.5 MB） |
-| 冷启动到核心可用（headless `hbot serve`） | < 800 ms | **878 ms 中位 / 1264 p95 —— 未达标**，处置见 ADR-0002 §4.2 |
+| 冷启动到核心可用（headless `hbot serve`） | < 800 ms | **36.4 ms 中位 / 50 ms p95（n=7）—— 达标**，见 `docs/spikes/S11-headless-startup.md`。桌面形态另算：到 IPC 首次可用 1049 ms 中位（预算 1500 ms） |
 | 桌面到 IPC 首次可用 | < 1500 ms | **1049 ms 中位 / 1425 p95**（2026-11-16 分段：915 ms 在 Tauri/WebView2 进入 `setup` 前，核心 `AppState::open` 仅 33 ms）；见 `docs/spikes/S2-tauri.md` §3.2 |
 | 二进制 | < 60 MB | `hbot.exe` **16.2 MB** / `hbot-desktop.exe` **33.0 MB** |
 | 编译 50 文件项目（冷/热） | — | **40.9 ms / 4.4 ms**（S1） |

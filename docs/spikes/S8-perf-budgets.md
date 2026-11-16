@@ -323,7 +323,7 @@ cargo run -q --release -p hbot-bench --example search_variance *> variance.log
 |---|---|
 | 桌面整机 < 260 MB、20 标签 UI < 300 MB | 需要 Tauri release 产物 + 真机窗口（30 s 采样窗口）。本次只做 Rust 侧 crate 级量测；且机器正被 8–19 个并发编译占满，起桌面产物会互相污染 |
 | 核心空闲 < 60 MB、每多一个 bot < 6 MB | 需要 `hbot serve` release 二进制 + 至少一个真实平台连接；`crates/hbot-adapters/src/platforms/` 正在被其它 agent 并发改写（本次遇到 `hbot-code` 半成品编译失败一次，等 1 分钟重试才过），跑长连接不稳。历史值见 `docs/spikes/S0-memory.md` 与 ADR-0002 §4（3.4 MB / 0.10 MB/千 bot），**本次未复测** |
-| 冷启动到核心可用 / 到可交互 < 800 ms | 同上，需真实桌面/CLI 产物；ADR-0002 §4 记 878 ms / 924 ms（**当时就不达标**） |
+| 冷启动到核心可用 / 到可交互 < 800 ms | headless 已实测 **36.4 ms 中位**（`S11`，n=7，达标）；桌面到 IPC 首次可用 1049 ms 中位（预算 1500 ms）。表格原先引用的「878 ms」是桌面核心可用被误标成 headless，更正记录见 ADR-0002 §4.3 |
 | 按键延迟 p95 < 16 ms、UI 首屏 < 1 s、初始 JS(gzip) < 1.5 MB | 需要 renderer 运行时（WebView2），Rust 侧量不到；属桌面端 spike |
 | 入站→入队 p95 < 10 ms、handler p95 < 20 ms、本地回复 p95 < 50 ms、1000 条突发不丢、100 会话并行 | 需要真实 QQ/OneBot 链路，属 S4/S7 的端到端 spike，不在本 crate 的接缝范围内 |
 | **真冷盘**搜索/读（清 standby list 后） | 需要管理员权限清文件缓存或重启；本机非管理员、且是共享构建机不能重启。所以「冷」= **进程内第一次调用**（文件刚由夹具写出，仍在 OS 缓存里）—— 这是真冷盘的**乐观下限** |
