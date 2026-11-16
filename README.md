@@ -70,9 +70,9 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | 技术栈 ADR | Proposed（`0002`；转 Accepted 还差 QuickJS 长跑、真 OneBot 网关、macOS 隔离） |
 | 架构 / 目录 / 计划 / 闸门 / IDE | Draft，已按实现回填实测口径（`02`–`06`） |
 | 代码 | **已落地 M0–M2 主体 + M3/M4/M5 部分 + C6 设备能力窄版（Windows）**（Rust 16 crate + `xtask`，`apps/web` 可构建） |
-| 测试 | 最近一次 `cargo test --workspace`：**1335 passed / 0 failed**（99 个 target）；`apps/web`：30 文件 230 用例 |
+| 测试 | 最近一次 `cargo test --workspace`：**1374 passed / 0 failed**（99 个 target）；`apps/web`：31 文件 246 用例 |
 | 真机验证 | QQ 官方群/私聊被动回复已端到端跑通（`docs/spikes/S9-e2e-qq-official.md`）；Windows NSIS 安装包 9.14 MiB、安装冒烟 11/11 |
-| 未完成 | M6 迁移/影子、真 NapCat、Linux/macOS 运行、CI 从未执行（无 remote）、M3 回放 UI、M4 Linux 写隔离、设备多显示器/按窗口 OCR/中文 OCR/`maxActionsPerSession` 计数上限 |
+| 未完成 | M6 迁移/影子、真 NapCat、Linux/macOS 运行、CI 从未执行（无 remote）、M3 回放 UI、M4 Linux 写隔离、设备每屏 DPI 归一/跨屏拼图/按窗口截图、`maxActionsPerSession` 之外的 CPU/IO 限额 |
 
 > 本仓库**没有任何 Go 代码**（0 个 `.go` 文件、0 个 `go.mod`）。Go 只出现在 ADR 的候选对比表里，且未被采用；当前实现是 Rust（核心）+ TypeScript（仅 IDE 前端）。
 
