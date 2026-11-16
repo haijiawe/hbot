@@ -1,7 +1,7 @@
 # S10 真 LLM 20 条评测：OpenAI 契约 vs Anthropic Messages 契约
 
-- 日期：2026-11-16（首轮因凭据 401 作废；同日用户充值后**复跑成功**）
-- 环境：Intel i5-14600KF（14 核 / 20 线程）/ 31.8 GB RAM / Windows 11 10.0.26300 / `rustc 1.96.0 (ac68faa20 2026-05-25)` / `cargo test`（dev 测试 profile）/ `CARGO_TARGET_DIR=E:\hbot-target\eval3`
+- 日期：2026-11-16（首轮因凭据 401 作废；同日用户充值后**复跑成功**）；2026-11-17 **换新 key 复跑 Anthropic 一轮，仍 20/20**（见 §10）
+- 环境：Intel i5-14600KF（14 核 / 20 线程）/ 31.8 GB RAM / Windows 11 10.0.26300 / `rustc 1.96.0 (ac68faa20 2026-05-25)` / `cargo test`（dev 测试 profile）/ `CARGO_TARGET_DIR=E:\hbot-target\eval3`（§10 那轮用 `eval4`）
 - 目的：把 `crates/hbot-agent/tests/real_llm_eval.rs` 的 20 条任务评测跑在 **OpenAI `/chat/completions` 契约**与 **Anthropic `/v1/messages` 契约**两条路径上各一轮，比较通过条数、`turns`、token 与耗时，并判断这些数字能否外推到真 Claude。
 - 结论状态：**两条契约各 20/20 通过**。但两个 provider 的 **prompt token 记账差 5.6 倍**（105,797 vs 19,039），原因未定论，见 §6——**不要把这两列当成"哪条链路更省"**。
 
@@ -118,3 +118,25 @@ completion 量级接近（13.5k vs 11.2k，比值 1.20，与两轮步数/回复�
 - 外推边界：不能代表真 Claude；也不代表真 NapCat/真 QQ 端到端（那条见 [S9](S9-e2e-qq-official.md)）。
 
 复跑命令见 §1；日志路径 `E:\hbot-target\eval3\`（本地、不入库）。
+
+## 10. 2026-11-17 复跑（换新 key，Anthropic 契约）
+
+上一轮的 key 后来失效（`POST /v1/messages` 与 `GET /v1/models` 均 `HTTP 401 {"message":"Invalid token"}`，子代理 `eval-anthropic` 因此拿不到证据）。用户当天提供新 key 后只复跑了 **Anthropic Messages** 一条链：
+
+```powershell
+$env:HBOT_LLM_PROVIDER='anthropic'
+$env:HBOT_LLM_BASE_URL='https://z1rry.cyou/v1'   # base 带 /v1 → endpoint 是 {base}/messages
+$env:HBOT_LLM_API_KEY=(Get-Content 'E:\hbot-target\llm-key.txt' -Raw)   # key 在仓库外，不入库、不打印
+$env:HBOT_LLM_MODEL='deepseek-v4.1-flash-1017'
+$env:CARGO_TARGET_DIR='E:\hbot-target\eval4'
+cargo test -j 2 -p hbot-agent --test real_llm_eval -- --ignored --nocapture *> E:\hbot-target\eval4-anthropic.log
+```
+
+| provider | 通过条数 | turns | prompt tokens | completion tokens | total tokens | `finished in` | exit |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `anthropic` | **20/20** | 20 | 23,231 | 13,262 | 36,493 | 118.78 s | 0 |
+
+- 端点是 `https://z1rry.cyou/v1/messages`（日志里 `endpoint = …` 一行可查）。
+- 20 条逐条 PASS，最慢两条是 D⑬ 两文件互相 import（6 步 / 25.4 s）与 D⑫ 再拆 router（4 步 / 17.8 s）；其余 2.8–7.3 s。单案上限 150 s 没有触顶。
+- 与 11-16 那轮（19,039 prompt / 30,255 total / 155.10 s）是同一后端、不同 key、不同时间：**通过条数一致，token 与耗时不在同一量级上可比**（网关侧的缓存命中率会直接影响 prompt 记账，见 §6 的未定论）。
+- 仍然没有原生 `api.anthropic.com` 凭据，因此 §7 的外推边界不变：这轮证明的还是"Anthropic Messages 请求/流式解析链路可用"，不是真 Claude 的能力与计费。
