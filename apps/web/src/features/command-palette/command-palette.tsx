@@ -49,6 +49,7 @@ export function CommandPalette({ mode: initialMode, onClose, onNotice }: Command
   const toggleBottomPanel = useWorkspaceStore((state) => state.toggleBottomPanel)
   const setBottomPanelTab = useWorkspaceStore((state) => state.setBottomPanelTab)
   const setSidebarView = useWorkspaceStore((state) => state.setSidebarView)
+  const showProjectDialog = useWorkspaceStore((state) => state.showProjectDialog)
   const start = useRunStore((state) => state.start)
   const stop = useRunStore((state) => state.stop)
   const debugPaused = useDebugStore((state) => state.paused !== null)
@@ -157,6 +158,20 @@ export function CommandPalette({ mode: initialMode, onClose, onNotice }: Command
         keys: keys('global-search'),
         run: () => openSearch(),
       },
+      // 项目两条放在末尾：`打开项目面板` 里"问题"两个字是现有过滤测试的锚点，
+      // 这里不抢首项（首项固定是「快速打开文件…」）。
+      {
+        id: 'project.open',
+        title: '打开项目…',
+        hint: '粘贴绝对路径',
+        run: () => showProjectDialog('open'),
+      },
+      {
+        id: 'project.create',
+        title: '新建项目…',
+        hint: '粘贴绝对路径',
+        run: () => showProjectDialog('create'),
+      },
     ]
   }, [
     agentCollapsed,
@@ -169,6 +184,7 @@ export function CommandPalette({ mode: initialMode, onClose, onNotice }: Command
     saveAll,
     setBottomPanelTab,
     setSidebarView,
+    showProjectDialog,
     start,
     stop,
     toggleAgent,

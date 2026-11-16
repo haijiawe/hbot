@@ -57,6 +57,9 @@ export interface EditorTab {
   version: number
 }
 
+/** 项目对话框的两种模式：「打开项目…」/「新建项目…」。 */
+export type ProjectDialogMode = 'open' | 'create'
+
 export interface WorkspaceState {
   rootName: string
   /**
@@ -91,10 +94,22 @@ export interface WorkspaceState {
    * 与"还没查过"是同一件事（面板文案一样，不需要第三种状态）。
    */
   diagnostics: Diagnostic[]
+  /**
+   * 当前打开着的项目对话框（`null` = 没有对话框）。
+   *
+   * 为什么放在 store 而不是命令面板的局部 state：命令面板只负责"发起"，执行完命令就
+   * 卸载了，真正渲染对话框的是 `app/App.tsx`。跨组件的界面意图一律走 store
+   * （同 `reveal`），否则得给面板加一堆回调 props。
+   */
+  projectDialog: ProjectDialogMode | null
 
   loadTree: () => Promise<void>
   /** 记下当前项目根（`project_open` 成功后由 `lib/session-persistence.ts` 调用）。 */
   setProjectRoot: (root: string | null) => void
+  /** 打开项目对话框（`'open'` 打开已有项目 / `'create'` 新建项目）。 */
+  showProjectDialog: (mode: ProjectDialogMode) => void
+  /** 关掉项目对话框（确定成功 / 取消 / Esc）。 */
+  closeProjectDialog: () => void
   /**
    * 把一句"该让用户看到"的错误放进状态栏（`error` 字段由 `StatusBar` 渲染）。
    *
@@ -251,6 +266,7 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
   error: null,
   reveal: null,
   diagnostics: [],
+  projectDialog: null,
 
   async loadTree() {
     try {
@@ -263,6 +279,14 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
 
   setProjectRoot(root) {
     set({ projectRoot: root })
+  },
+
+  showProjectDialog(mode) {
+    set({ projectDialog: mode })
+  },
+
+  closeProjectDialog() {
+    set({ projectDialog: null })
   },
 
   reportError(message) {

@@ -27,6 +27,7 @@ import { useDebugStore } from '../stores/debug-store'
 import { useWorkspaceStore } from '../stores/workspace-store'
 import { ActivityBar } from './activity-bar'
 import { CommandPalette, type PaletteMode } from '../features/command-palette/command-palette'
+import { ProjectDialog } from '../features/command-palette/project-dialog'
 import { ErrorBoundary } from './error-boundary'
 import { Splitter } from '../components/splitter'
 import { StatusBar } from './status-bar'
@@ -41,6 +42,8 @@ const NOTICE_DURATION_MS = 4000
 export function App() {
   const layout = useWorkspaceStore((state) => state.layout)
   const sidebarView = useWorkspaceStore((state) => state.sidebarView)
+  const projectRoot = useWorkspaceStore((state) => state.projectRoot)
+  const projectDialog = useWorkspaceStore((state) => state.projectDialog)
   const loadTree = useWorkspaceStore((state) => state.loadTree)
   const setSidebarWidth = useWorkspaceStore((state) => state.setSidebarWidth)
   const setAgentWidth = useWorkspaceStore((state) => state.setAgentWidth)
@@ -140,9 +143,26 @@ export function App() {
         ) : null}
 
         <div className="workspace-column">
-          <ErrorBoundary name="编辑器">
-            <EditorArea />
-          </ErrorBoundary>
+          {projectRoot === null ? (
+            // 还没有项目：显示一句能照着做的提示，而不是一块空白画布。
+            // 真桌面壳启动时 `projectRoot` 是 null（要等用户打开/新建项目）；
+            // mock 模式由 `startSessionPersistence` 先定成 `mock://project`，所以这条
+            // 空状态在浏览器 dev 里不会挡住演示。
+            <section className="welcome" role="status" aria-label="还没有打开项目">
+              <h2 className="welcome__title">还没有打开项目</h2>
+              <p className="welcome__hint">
+                按 <kbd>Ctrl</kbd> / <kbd>Cmd</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd> 打开命令面板，
+                选「打开项目…」，粘贴项目根的绝对路径。
+              </p>
+              <p className="welcome__note">
+                想从空目录开始？同一面板里的「新建项目…」会交给核心 scaffold。
+              </p>
+            </section>
+          ) : (
+            <ErrorBoundary name="编辑器">
+              <EditorArea />
+            </ErrorBoundary>
+          )}
 
           {resolved.bottomPanelVisible ? (
             <>
@@ -199,6 +219,8 @@ export function App() {
           onNotice={notify}
         />
       ) : null}
+
+      {projectDialog !== null ? <ProjectDialog onNotice={notify} /> : null}
     </div>
   )
 }

@@ -23,6 +23,9 @@
  *   所以这里**不能**编一个结果对象，也不许把 `data: null` 当成错误（用 `callWireVoid`）。
  * - `diagnostics` → `diagnostics`（同名）：`data` 是 `Diagnostic[]`，核心同时再推一条
  *   `diagnostics` 事件；条目为空数组是**合法结果**，不能走 `callWireVoid`。
+ * - `project.open` → `project_open`：`data` 是**规范化后的项目根字符串**（不是
+ *   `ProjectSummary`，见 `projectOpenResult` 的注释），这里归一成 `{ path }`；
+ *   `project.create` → `project_create`：`data` 才是 `ProjectSummary`。
  */
 
 import type {
@@ -33,10 +36,11 @@ import type {
   DirEntry,
   Event as CoreEvent,
   FileContent,
+  ProjectSummary,
   Response,
   RunLog,
 } from '../generated'
-import type { Command, FileNode, ReadFileResult, WriteFileResult } from './ipc'
+import type { Command, FileNode, ProjectOpenResult, ReadFileResult, WriteFileResult } from './ipc'
 
 /** 事件通道名。必须与 `crates/hbot-desktop/src/lib.rs` 的 `EVENT_CHANNEL` 一致。 */
 export const EVENT_CHANNEL = 'hbot://event'
@@ -363,6 +367,30 @@ async function listDir(dir: string, depth: number): Promise<FileNode[]> {
 }
 
 /**
+ * `project_open` 的 data 形状适配。
+ *
+ * 核心现在回的是**规范化后的项目根字符串**：`crates/hbot-rpc/src/app/commands/system.rs`
+ * 的成功分支是 `Response::with_data(serde_json::Value::String(root.display().to_string()))`。
+ * 生成 DTO 那份注释（`src/generated/ProjectSummary.ts`）说 `ProjectSummary` 是
+ * `ProjectCreate` 的 data —— 两处说的是两件事，别把它读成"project_open 也回摘要"。
+ *
+ * 因此这里**同时接受**字符串与 `{ path }`：将来核心若改成回对象，UI 不必跟着改。
+ * 两种都对不上就抛错，绝不猜一个路径 —— 项目根是 journal 的项目身份，猜错会把
+ * A 项目没保存的正文写进 B 项目。
+ */
+function projectOpenResult(raw: unknown): ProjectOpenResult {
+  if (typeof raw === 'string' && raw.length > 0) return { path: raw }
+  if (isRecord(raw) && typeof raw.path === 'string' && raw.path.length > 0) {
+    return { path: raw.path }
+  }
+  throw new IpcError({
+    code: INTERNAL_CODE,
+    message: 'project_open 返回了无法识别的形状（既不是路径字符串，也不是 { path }）',
+    data: null,
+  })
+}
+
+/**
  * 把 M0 手写命令翻译成 wire 命令。
  *
  * 返回值故意是 `unknown`：具体类型由 `ipc.ts` 的 `CommandOutputs` 收窄（与
@@ -444,6 +472,20 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
         type: 'debug_step',
         botId: command.botId,
         kind: command.kind,
+      })
+    case 'project.open':
+      // `project_open` 成功时 data 是路径字符串（不是摘要）；归一化见 `projectOpenResult`。
+      return projectOpenResult(
+        await callWire<unknown>('project_open', {
+          type: 'project_open',
+          path: command.path,
+        }),
+      )
+    case 'project.create':
+      return callWire<ProjectSummary>('project_create', {
+        type: 'project_create',
+        path: command.path,
+        name: command.name,
       })
   }
 }

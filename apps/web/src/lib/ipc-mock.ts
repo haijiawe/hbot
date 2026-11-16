@@ -34,6 +34,38 @@ const MOCK_SESSION_ID = 'mock-session'
  */
 const mockBreakpoints = new Map<string, number[]>()
 
+/**
+ * mock 里登记过的项目（内存表，重启即清空）。
+ *
+ * 内存后端没有真实文件系统：**打开任何路径都落到同一条演示项目上**（`TREE` / `FILES`
+ * 就是它的内容）。所以这张表只用来守住两件事 ——
+ * ① `project_open` 之后文件树立刻有东西可点（否则"打开成功但树是空的"看起来像没接通）；
+ * ② `project_create` 对"已登记同路径"回 `-32003`，与核心一致。
+ */
+interface MockProject {
+  path: string
+  name: string
+  entry: string
+}
+
+const mockProjects = new Map<string, MockProject>()
+
+/** mock 的默认演示项目路径（任务要求给一条假路径，便于在浏览器里走完整流程）。 */
+export const MOCK_PROJECT_PATH = 'C:/work/demo'
+
+/** 归一化 mock 的项目路径：正斜杠、去尾部斜杠、去首尾空白。 */
+function normalizeMockProjectPath(path: string): string {
+  const trimmed = path.trim().replace(/\\/g, '/')
+  if (trimmed.length === 0) throw new Error('project_open: path 不能为空')
+  return trimmed.replace(/\/+$/, '')
+}
+
+/** 从项目路径取末段当项目名（核心用 `hbot.json` 的 name，mock 没有清单文件）。 */
+function projectNameOf(path: string): string {
+  const segments = path.split('/').filter((segment) => segment.length > 0)
+  return segments[segments.length - 1] ?? 'project'
+}
+
 const HBOT_JSON = `{
   "name": "hbot-demo",
   "entry": "src/main.ts",
@@ -277,6 +309,8 @@ const cancelledSearches = new Set<string>()
 export async function mockDispatch(command: Command): Promise<CommandOutputs[CommandType]> {
   switch (command.type) {
     case 'workspace.tree':
+      // 只有一条演示项目（见 `MockProject` 的注释）：无论 `project_open` 打开的是哪个
+      // 路径，树都来自 `TREE`。真机上这里由核心按"当前 project 根"现扫。
       return structuredClone(TREE)
 
     case 'fs.read': {
@@ -360,6 +394,30 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
     case 'debug.step':
       // mock 没有插桩执行器，收下命令即可；不会推 `debug.paused`。
       return null
+
+    // 打开项目：核心规范化路径并切换 workspace（`system.rs` 的 `project_open`）。
+    // mock 只有一条演示项目，所以任何路径都登记到这同一张表上——`TREE` / `FILES`
+    // 就是它的内容，于是"打开项目之后树不是空的"在浏览器里也成立。
+    case 'project.open': {
+      const path = normalizeMockProjectPath(command.path)
+      if (!mockProjects.has(path)) {
+        mockProjects.set(path, { path, name: projectNameOf(path), entry: 'src/main.ts' })
+      }
+      return { path }
+    }
+
+    // 新建项目：核心会 scaffold 目录并回 `ProjectSummary`；mock 不写盘，只登记 + 回摘要。
+    // "已登记同路径"照核心回 -32003（目录非空那条也算它）。
+    case 'project.create': {
+      const path = normalizeMockProjectPath(command.path)
+      const name = command.name.trim()
+      if (name.length === 0) throw new Error('project_create: name 不能为空')
+      if (mockProjects.has(path)) {
+        throw new Error(`project_create: 该路径已登记为项目（${path}，-32003）`)
+      }
+      mockProjects.set(path, { path, name, entry: 'src/main.ts' })
+      return { path, name, entry: 'src/main.ts' }
+    }
 
     default: {
       const exhaustive: never = command

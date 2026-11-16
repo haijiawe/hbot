@@ -20,6 +20,7 @@ import type {
   BotSummary as BotSummaryDto,
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
+  ProjectSummary as ProjectSummaryDto,
   RunLog as RunLogDto,
   StepKind as StepKindDto,
 } from '../generated'
@@ -106,6 +107,18 @@ export interface AgentSendResult {
  * 累加与分组在 `stores/search-store.ts`（事件经 `app/use-core-events.ts` 扇出）。
  */
 
+/**
+ * `project_open` 的结果。
+ *
+ * **只有路径**，因为核心就只回一个路径：`crates/hbot-rpc/src/app/commands/system.rs`
+ * 的 `project_open` 成功分支是 `Response::with_data(Value::String(root))`（规范化后的
+ * 项目根），不是 `ProjectSummary`。`ProjectSummary`（含 `name` / `entry`）只有
+ * `project_create` 才回 —— 别在这里编造 `name`，那会让 UI 显示一个假的项目名。
+ */
+export interface ProjectOpenResult {
+  path: string
+}
+
 /** 每个命令的入参（不含 `type` 字段）。 */
 export interface CommandInputs {
   'workspace.tree': { root?: string }
@@ -163,6 +176,21 @@ export interface CommandInputs {
   'debug.resume': { botId: string }
   /** 单步：`over` 跳过 / `into` 进入 / `out` 跳出。 */
   'debug.step': { botId: string; kind: StepKindDto }
+  /**
+   * 打开一个已存在的项目（wire `project_open`）。
+   *
+   * `path` 是用户粘贴的绝对路径；核心负责规范化并切换 workspace，成功后
+   * `workspace.tree` / `fs.read` 立刻指向新项目。失败：`-32002`（路径空 / 不存在 /
+   * 不是目录）。**不改变任何磁盘内容**。
+   */
+  'project.open': { path: string }
+  /**
+   * 新建项目（wire `project_create`）。
+   *
+   * 目录不存在就连父目录一起建、空目录直接用；非空目录或同路径已登记 → `-32003`；
+   * `name` / `path` 为空、目标是文件 → `-32002`。
+   */
+  'project.create': { path: string; name: string }
 }
 
 export type CommandType = keyof CommandInputs
@@ -196,6 +224,10 @@ export interface CommandOutputs {
   'debug.set-breakpoints': null
   'debug.resume': null
   'debug.step': null
+  /** 规范化后的项目根（见 `ProjectOpenResult`：核心只回路径）。 */
+  'project.open': ProjectOpenResult
+  /** 新建出来的项目摘要（`path` 是规范化根，`entry` 形如 `src/main.ts`）。 */
+  'project.create': ProjectSummaryDto
 }
 
 export type CommandResult<T extends Command> = CommandOutputs[T['type']]
