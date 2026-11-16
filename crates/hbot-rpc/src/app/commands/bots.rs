@@ -52,7 +52,7 @@ use crate::app::runtime::outbox_source::StorePendingOutbox;
 use crate::app::runtime::sandbox_handler::{REPLY_CAPACITY, SandboxHandler, SandboxHandlerConfig};
 use crate::app::runtime::{AdapterPorts, conversation_kind_from_str, conversation_kind_str};
 use crate::app::store_failed;
-use crate::dto::{BotSummary, Command, Event, LogLevel, Response, RunLog};
+use crate::dto::{BotSummary, Command, ConversationSummary, Event, LogLevel, Response, RunLog};
 
 /// `bot_inject` 伪造的发送者 id。
 ///
@@ -75,6 +75,7 @@ pub async fn handle(state: &AppState, command: Command) -> Response {
         } => inject(state, bot_id, conversation_id, text).await,
         Command::LogsTail { bot_id, limit } => logs_tail(state, bot_id, limit).await,
         Command::BotList => bot_list(state).await,
+        Command::BotConversations { bot_id } => bot_conversations(state, bot_id).await,
         other => unimplemented(other.kind()),
     }
 }
@@ -490,6 +491,59 @@ pub async fn bot_list(state: &AppState) -> Response {
     match serde_json::to_value(summaries) {
         Ok(value) => Response::with_data(value),
         Err(error) => failed(HbotError::internal(format!("bot_list 序列化失败：{error}"))),
+    }
+}
+
+/// 列出某个 bot 已登记的会话（`bot_conversations`）。
+///
+/// 这是 UI 拿 `conversationId` 的正路：`bot_inject` 必须给它，而 `bot_start` 的
+/// 返回是 `null`。此前 UI 只能正则匹配 `bot_start` 落的那行 info 日志。
+///
+/// 语义（与 `dto/mod.rs` 的形状表一致）：
+///
+/// * **bot 行不存在** → `-32001`，`data = {entity:"bot", id:"<bot_id>"}`。这条命令的
+///   输入只有 `bot_id`，bot 行在不在就是它能判断的全部；不额外引入"项目未打开"分支
+///   （那是 `bot_list` 的语义，它的输入是"当前项目"）。
+/// * **bot 存在但一个会话都没有** → 成功 + **空数组**。空数组是"还没人跟它说过话"
+///   这个正常状态：不是错误，也不是 `null`（`null` 会让 UI 的 `for … of` 直接炸）。
+/// * **`kind` 原样透传**库里的字符串。契约里它是开放字符串（`private`/`group`/`channel`），
+///   在这里发明枚举或归一化，等于平台每多一种会话形态就要先改这条命令。
+/// * 顺序由存储层固定为 `(kind, external_id)`（见 `Store::list_conversations_for_bot`），
+///   这里不再排序——否则两处排序规则迟早分叉。
+pub async fn bot_conversations(state: &AppState, bot_id: BotId) -> Response {
+    let store = Arc::clone(state.store());
+    // 一次 spawn_blocking 里查两件事：bot 行 + 会话表。拆成两次 await 会落在不同的
+    // 快照上（bot 刚被删、会话还在），而这里没有并发收益可言。
+    let rows = state
+        .blocking(move || {
+            if store.get_bot(&bot_id).map_err(store_failed)?.is_none() {
+                return Err(HbotError::not_found("bot", bot_id.to_string()));
+            }
+            store
+                .list_conversations_for_bot(&bot_id)
+                .map_err(store_failed)
+        })
+        .await;
+
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => return failed(error),
+    };
+
+    let summaries: Vec<ConversationSummary> = rows
+        .into_iter()
+        .map(|row| ConversationSummary {
+            conversation_id: row.id,
+            external_id: row.external_id,
+            kind: row.kind,
+        })
+        .collect();
+
+    match serde_json::to_value(summaries) {
+        Ok(value) => Response::with_data(value),
+        Err(error) => failed(HbotError::internal(format!(
+            "bot_conversations 序列化失败：{error}"
+        ))),
     }
 }
 

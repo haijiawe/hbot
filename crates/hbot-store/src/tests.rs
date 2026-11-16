@@ -11,13 +11,13 @@ use rusqlite::params;
 use crate::error::StoreError;
 use crate::migrations;
 use crate::models::{
-    BOT_STATUS_RUNNING, BOT_STATUS_STOPPED, Bot, NewAgentLog, NewLog, OUTBOUND_STATE_FAILED,
-    OUTBOUND_STATE_SENT, is_valid_bot_status,
+    BOT_STATUS_RUNNING, BOT_STATUS_STOPPED, Bot, Conversation, NewAgentLog, NewLog,
+    OUTBOUND_STATE_FAILED, OUTBOUND_STATE_SENT, is_valid_bot_status,
 };
 use crate::test_support::{
-    TempDir, bot_id, bot_id_at, conversation_id, inbound_id, new_inbound, new_inbound_at, new_log,
-    new_outbound, new_outbound_at, open_store, outbound_id, outbound_target, project_id,
-    project_id_at, raw, seed,
+    TempDir, bot_id, bot_id_at, conversation_id, fixed_uuid, inbound_id, new_inbound,
+    new_inbound_at, new_log, new_outbound, new_outbound_at, open_store, outbound_id,
+    outbound_target, project_id, project_id_at, raw, seed,
 };
 use crate::{BUSY_TIMEOUT_MS, Store};
 
@@ -828,6 +828,87 @@ fn conversations_are_readable_by_id_and_external_key() {
             ))
             .expect("miss by id"),
         None
+    );
+}
+
+/// `list_conversations_for_bot` 只返回该 bot 的行、顺序固定为 `(kind, external_id)`，
+/// 且重复调用逐行相同（UI 每次刷新看到同一个顺序，测试不会 flaky）。
+#[test]
+fn conversations_are_listed_per_bot_in_a_deterministic_order() {
+    let dir = TempDir::new("conversation-list");
+    let store = open_store(&dir);
+
+    // 同一个项目里的另一个 bot：它的会话不能混进 `bot_id()` 的结果。
+    let other_bot = bot_id_at(20);
+    store
+        .insert_bot(&Bot {
+            id: other_bot,
+            project_id: project_id(),
+            name: "other-bot".to_owned(),
+            platform: "local".to_owned(),
+            config_json: "{}".to_owned(),
+            enabled: true,
+            created_at: 4,
+        })
+        .expect("insert other bot");
+    store
+        .insert_conversation(&Conversation {
+            id: crate::ConversationId::from_uuid(fixed_uuid(40)),
+            bot_id: other_bot,
+            external_id: "chat-0".to_owned(),
+            kind: "private".to_owned(),
+            created_at: 5,
+        })
+        .expect("insert other bot's conversation");
+
+    // 刻意按"乱序 + created_at 递增"插入：证明返回顺序既不是插入序、也不是 created_at 序。
+    // 期望顺序只由 (kind, external_id) 决定：channel-1 < group-42 < chat-a < chat-b。
+    for (offset, external_id, kind) in [
+        (41u128, "chat-b", "private"),
+        (42, "channel-1", "channel"),
+        (43, "chat-a", "private"),
+    ] {
+        store
+            .insert_conversation(&Conversation {
+                id: crate::ConversationId::from_uuid(fixed_uuid(offset)),
+                bot_id: bot_id(),
+                external_id: external_id.to_owned(),
+                kind: kind.to_owned(),
+                created_at: offset as i64,
+            })
+            .expect("insert conversation for seeded bot");
+    }
+
+    let listed = store
+        .list_conversations_for_bot(&bot_id())
+        .expect("list conversations");
+    let pairs: Vec<(&str, &str)> = listed
+        .iter()
+        .map(|row| (row.external_id.as_str(), row.kind.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("channel-1", "channel"),
+            ("group-42", "group"),
+            ("chat-a", "private"),
+            ("chat-b", "private"),
+        ],
+        "顺序必须是 (kind, external_id)，且不掺别的 bot 的行"
+    );
+
+    // 确定性：两次调用逐行相同（含顺序）。
+    let again = store
+        .list_conversations_for_bot(&bot_id())
+        .expect("list conversations again");
+    assert_eq!(listed, again, "同一份数据两次查询必须一致");
+
+    // 不存在的 bot 返回空表，不是错误：存在性判断是业务层（`bot_conversations`）的事。
+    assert!(
+        store
+            .list_conversations_for_bot(&bot_id_at(999))
+            .expect("list for unknown bot")
+            .is_empty()
     );
 }
 

@@ -170,6 +170,14 @@ enum StoreOp {
         external_id: String,
         reply: Reply<Option<Conversation>>,
     },
+    /// 按 bot 列出全部会话（`bot_conversations` 的数据源）。
+    ///
+    /// 与同组的两条会话读一样走 db 线程（不是只读连接池）：它排在已入队的写后面，
+    /// 所以 `bot_start` 刚刚幂等建好的 `local:default` 行不会被这条读漏掉。
+    ListConversationsForBot {
+        bot_id: BotId,
+        reply: Reply<Vec<Conversation>>,
+    },
     GetBotStatus {
         id: BotId,
         reply: Reply<Option<BotStatusRow>>,
@@ -620,6 +628,26 @@ impl Store {
         })
     }
 
+    /// 按 bot 列出全部会话，顺序固定为 `(kind, external_id)` 升序。
+    ///
+    /// ## 为什么排序必须是这个
+    ///
+    /// 排序必须是**确定性**的：UI 每次刷新都换一个顺序会被当成"会话在跳"，测试也会
+    /// flaky。选 `(kind, external_id)` 而不是 `(created_at, rowid)` 的理由：
+    ///
+    /// * 两列全是业务列，重建库 / 整库重写之后取值不变；`rowid` 是 TEXT 主键表的隐式
+    ///   列，物理重排可以重写它，按它排等于把顺序绑在物理布局上；
+    /// * 同一 bot 内 `(kind, external_id)` 本身唯一（`UNIQUE(bot_id, external_id)`），
+    ///   所以这是**全序**，不需要再补 tiebreaker；
+    /// * 同 kind 的会话按平台侧 id 排，列表顺序与"发现会话的先后"无关、只与内容有关。
+    ///
+    /// 不在这里判断 bot 行是否存在：那是业务判断（`bot_conversations` 要报 `-32001`），
+    /// 存储层对不存在的 bot 返回空表。
+    pub fn list_conversations_for_bot(&self, bot_id: &BotId) -> Result<Vec<Conversation>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ListConversationsForBot { bot_id, reply })
+    }
+
     /// 读最近的日志，最新在前；`bot_id = None` 表示跨 bot 汇总。
     ///
     /// 按 `logs.id`（AUTOINCREMENT，写入序）降序取前 `limit` 条——不按 `at` 排序，避免调用方
@@ -875,6 +903,9 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                     repositories::conversation::get_by_external(&connection, &bot_id, &external_id),
                 );
             }
+            StoreOp::ListConversationsForBot { bot_id, reply } => {
+                reply_send(reply, conversations_for_bot(&connection, &bot_id));
+            }
             StoreOp::GetBotStatus { id, reply } => {
                 reply_send(reply, repositories::bot::get_status(&connection, &id));
             }
@@ -898,6 +929,29 @@ fn reply_send<T>(reply: Reply<T>, result: Result<T>) {
     if reply.send(result).is_err() {
         tracing::debug!("store caller dropped the reply channel");
     }
+}
+
+/// `SELECT … FROM conversations WHERE bot_id = ?1 ORDER BY kind, external_id`。
+///
+/// 列清单直接复用 [`crate::mappers::CONVERSATION_COLUMNS`] + [`crate::mappers::row_to_conversation`]：
+/// 手抄列名会在加列时静默错位（见 mappers 模块文档）。
+///
+/// 为什么这段 SQL 在 `db.rs` 而不是 `repositories/conversation.rs`：本轮改动边界只允许
+/// 碰 `db.rs`（`repositories/` 不在可改清单里）。`db.rs` 里已经有两处同形状的先例
+/// （`list_inbound_history_for_bot` / `list_outbound_by_reply_to` 的 JOIN 读）。
+/// 边界放开后整段搬进 repository 即可，行为与排序不变。
+fn conversations_for_bot(connection: &Connection, bot_id: &BotId) -> Result<Vec<Conversation>> {
+    let sql = format!(
+        "SELECT {} FROM conversations WHERE bot_id = ?1 ORDER BY kind, external_id",
+        crate::mappers::CONVERSATION_COLUMNS
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([bot_id.to_string()], crate::mappers::row_to_conversation)?;
+    let mut conversations = Vec::new();
+    for row in rows {
+        conversations.push(row?);
+    }
+    Ok(conversations)
 }
 
 // 当前测试线程上打开过的连接数（仅 `cfg(test)` 编译）。
