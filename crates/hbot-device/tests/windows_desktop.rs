@@ -1,26 +1,62 @@
 //! Windows 真机测试：**只验证"不打扰用户"的那些性质**。
 //!
-//! CI 里绝不移动鼠标、绝不截整屏 —— 那会让正在用机器的人莫名其妙。所以这里只做：
+//! CI 里绝不移动鼠标 —— 那会让正在用机器的人莫名其妙。逐条说明这些测试在碰什么：
 //!
-//! - 能力报告（只 `GetDC` 一下、查一次输入桌面名，外加一次惰性的 OCR 引擎探测）；
+//! - 能力报告（`GetDC` 一下、查一次输入桌面名、枚举显示器、惰性的 OCR 引擎探测）；
 //! - 窗口枚举（只读）；
 //! - 空白名单拒绝（在碰 `SendInput` 之前就返回了）；
 //! - 剪贴板**读**（空剪贴板也是合法的成功）；
-//! - 指定了未实现的显示器索引 → 明确 `HostLimit`（连截图都不开始）；
-//! - 按窗口 OCR → 明确 `HostLimit`（连抓图都不开始，不静默截全屏）。
+//! - 显示器清单 + 按序号真截屏（`monitor: Some(i)` 只抓那一块屏，不碰鼠标）；
+//! - 不存在的显示器序号 → 明确 `HostLimit`（连截图都不开始）；
+//! - **按窗口 OCR**：本进程自建一个可见窗口（GDI 画字）→ 真的识别出窗口里的文字；
+//!   最小化 / 无标题的窗口 → 明确 `AppNotAllowed`（绝不返回空串冒充成功）。
 //!
-//! 真截屏、真写剪贴板的两条被 `#[ignore]` 关掉，手动跑：
-//! `cargo test -p hbot-device -- --ignored`。
+//! 真截屏的两条本机可以跑（它们只抓自己的屏，不改用户状态）；但为了不打扰"正在用机器的人"
+//! （截图会读整个桌面内容），仍标 `#[ignore]`，手动跑：`cargo test -p hbot-device -- --ignored`。
 //!
-//! **真 OCR**（画字进 DIB 再识别）在 `src/windows.rs` 的单测里，那里能直接拿到 `Surface`
-//! 与内部识别函数；这里不截整屏做 OCR —— 那会把用户桌面上的字喂进日志。
+//! **真 OCR**（画字进 DIB 再识别、语言清单、中文实测）在 `src/windows.rs` 的单测里，那里能直接
+//! 拿到 `Surface` 与内部识别函数；这里只从公开入口验证"按窗口"那条链路。
 
 #![cfg(windows)]
+
+use std::sync::{Mutex, MutexGuard};
 
 use hbot_device::{
     ClipboardOp, DeviceBackend, DeviceError, DeviceTarget, InputAction, MouseButton, OcrRequest,
     ScreenshotRequest, WindowsBackend, process_name,
 };
+
+/// 串行化所有会创建测试窗口的用例。
+///
+/// **必须串行**：按窗口 OCR 是按**进程映像名**找窗口的，而这些用例都在同一个进程里跑。
+/// 并行时"最小化窗口"用例可能看见另一个用例刚建好的可见窗口，于是得到"能读"的结果 ——
+/// 那不是代码错了，是夹具互相干扰。
+static WINDOW_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn window_test_guard() -> MutexGuard<'static, ()> {
+    WINDOW_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// PNG 文件头（8 字节签名）。
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// 当前测试进程的映像名（小写 basename），按窗口 OCR 就用它当 `process`。
+fn own_process_name() -> String {
+    let path = std::env::current_exe().expect("取当前测试进程的路径");
+    let name = process_name(&path.to_string_lossy());
+    assert!(!name.is_empty(), "当前测试进程的映像名不该是空串");
+    name
+}
+
+/// 只用于比较的归一化：去空白 + 大写（OCR 的空白与大小写不可靠）。
+fn squashed(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_uppercase()
+}
 
 #[test]
 fn capabilities_report_the_four_implemented_sub_capabilities() {
@@ -38,7 +74,12 @@ fn capabilities_report_the_four_implemented_sub_capabilities() {
     );
     assert!(
         detail.contains("OCR"),
-        "能力报告要写明 OCR 的边界（不是「没做」，是「只认已安装语言 + 只支持主屏整屏」）：{detail}"
+        "能力报告要写明 OCR 的边界（不是「没做」，是「只认已安装语言 + 整屏/按窗口」）：{detail}"
+    );
+    // 多显示器的清单必须在 notes 里能看到（模型据此才知道 `monitor` 能给哪些序号）。
+    assert!(
+        detail.contains("显示器"),
+        "能力报告要写明显示器块数与序号规则：{detail}"
     );
     // `ocr` 字段按"引擎能不能建出来"填（没装 OCR 语言包的机器上是 false），说明必须与它一致：
     // 说支持就得写清"只认已安装语言"，说不支持就得写清原因 —— 两者不许打架。
@@ -56,21 +97,162 @@ fn capabilities_report_the_four_implemented_sub_capabilities() {
 }
 
 #[test]
-fn ocr_rejects_a_window_target_as_a_host_limit() {
-    // 只走 trait 的公开入口，而且 target 判定发生在抓图与建引擎**之前** —— 所以这条在
-    // 任何机器上都成立（没装语言包的机器也一样），也不会去读屏幕、不打扰正在用机器的人。
+fn the_display_list_is_non_empty_and_lists_the_primary_first() {
+    // 从 crate 外面走公开函数（`hbot_device::displays()`）—— 这正是"不改 trait 也能列出显示器"
+    // 的交付点，所以必须在集成测试里断言，而不是只在 crate 内部断言。
+    let displays = hbot_device::displays();
+    eprintln!("[display] 本机显示器清单：{displays:?}");
+    assert!(
+        !displays.is_empty(),
+        "在有交互桌面的 Windows 上必须至少枚举出一块显示器"
+    );
+    assert_eq!(
+        hbot_device::display_count(),
+        displays.len(),
+        "display_count() 必须等于 displays().len()"
+    );
+    for (position, display) in displays.iter().enumerate() {
+        assert_eq!(
+            display.index, position as u32,
+            "序号必须是连续下标（第 {position} 个元素的 index 是 {}）：{displays:?}",
+            display.index
+        );
+        assert!(
+            display.width > 0 && display.height > 0,
+            "分辨率必须非零：{display:?}"
+        );
+        assert!(
+            !display.device.trim().is_empty(),
+            "设备名不该为空（抓图要用它建 DC）：{display:?}"
+        );
+    }
+    assert!(
+        displays[0].primary,
+        "序号 0 必须是主屏（`ScreenshotRequest::monitor` 的文档承诺 0 = 主屏）：{displays:?}"
+    );
+    assert_eq!(
+        displays.iter().filter(|display| display.primary).count(),
+        1,
+        "有且只有一块主屏：{displays:?}"
+    );
+}
+
+#[test]
+fn a_nonexistent_monitor_index_is_a_host_limit_listing_the_count() {
+    let displays = hbot_device::displays();
+    if displays.is_empty() {
+        eprintln!("[display] 没有可交互桌面（枚举为空）→ 跳过");
+        return;
+    }
+    let missing = displays.len() as u32 + 6;
+    let error = WindowsBackend::new()
+        .screenshot(&ScreenshotRequest {
+            monitor: Some(missing),
+            max_bytes: 8 * 1024 * 1024,
+        })
+        .expect_err("不存在的显示器序号必须被拒绝，不许静默退回主屏");
+    match error {
+        DeviceError::HostLimit { detail } => {
+            assert!(
+                detail.contains(&displays.len().to_string()),
+                "错误信息要列出可用数量 {}：{detail}",
+                displays.len()
+            );
+            assert!(
+                detail.contains(&missing.to_string()),
+                "错误信息要点出被拒的序号 {missing}：{detail}"
+            );
+            eprintln!("[display] 序号 {missing} 的错误文案：{detail}");
+        }
+        other => panic!("应当是 HostLimit，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn every_enumerated_monitor_can_be_captured_by_index() {
+    // 0 号（主屏）与 1 号（若有第二块屏）都要真的抓出来；没有第二块屏就断言"枚举里确实只有一块"。
+    // 这条不 `#[ignore]`：它只抓自己的屏、不移动鼠标、不改用户状态，而且它是本次改动的**主证据**。
+    let displays = hbot_device::displays();
+    if displays.is_empty() {
+        eprintln!("[display] 没有可交互桌面（枚举为空）→ 跳过");
+        return;
+    }
+    let backend = WindowsBackend::new();
+    let limit = 64 * 1024 * 1024;
+    for display in &displays {
+        let shot = backend
+            .screenshot(&ScreenshotRequest {
+                monitor: Some(display.index),
+                max_bytes: limit,
+            })
+            .expect("枚举出来的显示器必须都能按序号抓图（枚举与抓图用的是同一份清单）");
+        assert_eq!(
+            shot.monitor, display.index,
+            "返回值里的 monitor 必须是实际截的那一块"
+        );
+        assert_eq!(
+            (shot.width, shot.height),
+            (display.width, display.height),
+            "截出来的像素尺寸必须等于枚举到的分辨率（序号 {}：{}）",
+            display.index,
+            display.device
+        );
+        assert_eq!(
+            &shot.png[..8],
+            &PNG_SIGNATURE,
+            "输出必须是 PNG（序号 {}）",
+            display.index
+        );
+        assert_eq!(&shot.png[12..16], b"IHDR", "IHDR 必须紧跟签名");
+        assert!(shot.png.len() <= limit, "不许超过 max_bytes");
+        eprintln!(
+            "[display] 显示器 {}（{}）抓图 {}×{}，PNG {} 字节",
+            display.index,
+            display.device,
+            shot.width,
+            shot.height,
+            shot.png.len()
+        );
+    }
+    // 本机只有一块屏时，1 号必须是 HostLimit（文案带数量）——那是"第二块屏"的对照用例。
+    if displays.len() == 1 {
+        let error = backend
+            .screenshot(&ScreenshotRequest {
+                monitor: Some(1),
+                max_bytes: limit,
+            })
+            .expect_err("本机只有一块显示器时，序号 1 必须被拒绝");
+        match error {
+            DeviceError::HostLimit { detail } => {
+                assert!(
+                    detail.contains('1') && detail.contains("显示器"),
+                    "错误信息要写清只有几块显示器：{detail}"
+                );
+                eprintln!("[display] 本机只有一块屏，序号 1 的错误文案：{detail}");
+            }
+            other => panic!("应当是 HostLimit，实际 {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn window_ocr_without_a_readable_window_is_an_app_not_allowed_error() {
+    // 只走 trait 的公开入口，而且窗口查找发生在抓图与建引擎**之前** —— 所以这条在任何机器上
+    // 都成立（没装语言包的机器也一样），也不会去读屏幕、不打扰正在用机器的人。
+    let process = "hbot-device-never-a-real-window.exe";
     let result = WindowsBackend::new().ocr(&OcrRequest {
         target: DeviceTarget::Window {
-            process: "notepad.exe".to_string(),
+            process: process.to_string(),
         },
         max_chars: 100,
     });
     match result {
-        Err(DeviceError::HostLimit { detail }) => {
-            assert!(detail.contains("窗口"), "要写清按窗口 OCR 未做：{detail}");
-            assert!(detail.contains("notepad.exe"), "要点出被拒的目标：{detail}");
+        Err(DeviceError::AppNotAllowed { process: reported }) => {
+            assert_eq!(reported, process, "要把被拒的进程原样回给调用方");
         }
-        other => panic!("DeviceTarget::Window 必须返回 HostLimit（不静默截全屏），实际：{other:?}"),
+        other => panic!(
+            "没有可读窗口的进程必须返回 AppNotAllowed（不静默截全屏、不空串），实际：{other:?}"
+        ),
     }
 }
 
@@ -96,16 +278,11 @@ fn windows_are_enumerated_with_lowercase_process_names() {
         "最多只有一个窗口是前台"
     );
     // 我们自己的窗口不该出现在列表里（模型点自己的窗口是死循环）。
-    let own = std::env::current_exe()
-        .ok()
-        .map(|path| process_name(&path.to_string_lossy()))
-        .unwrap_or_default();
-    if !own.is_empty() {
-        assert!(
-            windows.iter().all(|window| window.process != own),
-            "自己的进程（{own}）不该出现在可操作窗口列表里"
-        );
-    }
+    let own = own_process_name();
+    assert!(
+        windows.iter().all(|window| window.process != own),
+        "自己的进程（{own}）不该出现在可操作窗口列表里"
+    );
 }
 
 #[test]
@@ -161,25 +338,6 @@ fn clipboard_read_returns_a_value_even_when_the_clipboard_is_empty() {
 }
 
 #[test]
-fn an_unimplemented_monitor_index_is_a_host_limit_not_a_silent_primary_capture() {
-    let error = WindowsBackend::new()
-        .screenshot(&ScreenshotRequest {
-            monitor: Some(1),
-            max_bytes: 8 * 1024 * 1024,
-        })
-        .expect_err("显示器 1 未实现，必须拒绝");
-    match error {
-        DeviceError::HostLimit { detail } => {
-            assert!(
-                detail.contains("monitor 0"),
-                "错误信息要说明只实现了 monitor 0：{detail}"
-            );
-        }
-        other => panic!("应当是 HostLimit，实际 {other:?}"),
-    }
-}
-
-#[test]
 fn an_absurdly_small_byte_limit_is_enforced() {
     // 1 字节的上限：任何一张真 PNG 都放不进去，所以必然 `TooLarge`。
     // 这条会真的截一次屏，但只在被调用时才截，且不会移动鼠标。
@@ -195,8 +353,377 @@ fn an_absurdly_small_byte_limit_is_enforced() {
     }
 }
 
+// ---------------------------------------------------------------- 自建窗口（按窗口 OCR 的夹具）
+
+/// 自建窗口里画的那行字。挑 ASCII + 数字：本机一定有英文字体，不会因为缺字体假失败。
+const WINDOW_TEXT: &str = "HBOT WIN OCR 7788";
+
+/// 窗口过程：`WM_PAINT` / `WM_PRINTCLIENT` 都往给定的 DC 上画同一行字。
+///
+/// `WM_PRINTCLIENT` 是 `PrintWindow` 真正走的那条路（`PW_RENDERFULLCONTENT` 由 DWM 帮忙），
+/// 所以两个分支都要画 —— 否则 `PrintWindow` 抓到的是一张空白窗口。
+unsafe extern "system" fn ocr_window_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, WM_ERASEBKGND, WM_PAINT, WM_PRINTCLIENT,
+    };
+    match message {
+        WM_PAINT => {
+            // SAFETY: `PAINTSTRUCT` 是 POD，全零合法；`BeginPaint` 只在成功时写入。
+            let mut paint: PAINTSTRUCT = unsafe { std::mem::zeroed() };
+            // SAFETY: `hwnd` 由系统给出；`&mut paint` 指向栈上有效内存。
+            let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+            // SAFETY: `hdc` 是刚拿到的有效绘制 DC（BeginPaint 保证）。
+            unsafe { paint_window_text(hwnd, hdc) };
+            // SAFETY: 与上面的 BeginPaint 成对。
+            unsafe { EndPaint(hwnd, &paint) };
+            0
+        }
+        WM_PRINTCLIENT => {
+            // SAFETY: 按 Win32 契约，`WM_PRINTCLIENT` 的 `wparam` 就是要画的 HDC。
+            unsafe { paint_window_text(hwnd, wparam as windows_sys::Win32::Graphics::Gdi::HDC) };
+            0
+        }
+        WM_ERASEBKGND => 1, // 已经自己填了底，别让系统再刷一次（会闪）
+        // SAFETY: 其余消息交给默认过程（与任何自定义窗口过程的契约一致）。
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+/// 往 `hdc` 上画：[`WINDOW_TEXT`]（黑字、白底、96px 粗体）。
+///
+/// SAFETY: 调用方保证 `hwnd`/`hdc` 有效。
+unsafe fn paint_window_text(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
+        DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_BOLD, FillRect, OUT_TT_PRECIS, SelectObject,
+        SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+    // SAFETY: `RECT` 是 POD；`GetClientRect` 只在成功时写入。
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    // SAFETY: `hwnd` 有效；`&mut rect` 指向栈上有效内存。
+    unsafe { GetClientRect(hwnd, &mut rect) };
+    let units: Vec<u16> = WINDOW_TEXT.encode_utf16().collect();
+    let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+    // SAFETY: `hdc` 有效；画笔画完即删；字体名以 NUL 结尾；`units` 调用期间存活。
+    unsafe {
+        let brush = CreateSolidBrush(0x00FF_FFFF); // COLORREF：白
+        assert!(!brush.is_null(), "CreateSolidBrush 失败");
+        let _ = FillRect(hdc, &rect, brush);
+        DeleteObject(brush);
+
+        let font = CreateFontW(
+            -96,
+            0,
+            0,
+            0,
+            FW_BOLD as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_TT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            ANTIALIASED_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            face.as_ptr(),
+        );
+        assert!(!font.is_null(), "CreateFontW 失败");
+        let previous = SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, 0x0000_0000); // COLORREF：黑
+        TextOutW(hdc, 40, 100, units.as_ptr(), units.len() as i32);
+        SelectObject(hdc, previous);
+        DeleteObject(font);
+    }
+}
+
+/// 一个真的可见的测试窗口（Drop 时销毁）。
+struct TestWindow {
+    hwnd: windows_sys::Win32::Foundation::HWND,
+}
+
+/// 类名必须唯一：同一进程里多次 `RegisterClassW` 同名会失败（`ERROR_CLASS_ALREADY_EXISTS`）。
+static CLASS_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl TestWindow {
+    /// 建一个顶层窗口；`visible` 为真时立刻显示（`SW_SHOWNOACTIVATE`：**不抢前台**）。
+    ///
+    /// 不抢前台是刻意的：CI 上抢焦点会打断正在用机器的人，而且"前台窗口优先"这条判据
+    /// 会让本用例变成"测前台"，不是"测按窗口抓图"。
+    fn create(title: &str) -> Self {
+        use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CS_HREDRAW, CS_VREDRAW, CreateWindowExW, RegisterClassW, SW_SHOWNOACTIVATE, ShowWindow,
+            WNDCLASSW, WS_EX_NOACTIVATE, WS_POPUP,
+        };
+
+        let sequence = CLASS_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let class_name: Vec<u16> = format!("HbotDeviceOcrTest{}_{sequence}\0", std::process::id())
+            .encode_utf16()
+            .collect();
+        let title_units: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+
+        // SAFETY: 所有指针都指向调用期间存活的、以 NUL 结尾的 UTF-16 缓冲区。
+        unsafe {
+            let instance =
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+            assert!(!instance.is_null(), "GetModuleHandleW 失败");
+            let class = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(ocr_window_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: instance,
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+            };
+            let atom = RegisterClassW(&class);
+            assert_ne!(atom, 0, "RegisterClassW 失败（拿不到窗口类）");
+
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE, // 显示但不激活：不抢前台
+                class_name.as_ptr(),
+                title_units.as_ptr(),
+                WS_POPUP, // 无标题栏：PrintWindow 抓到的就是纯客户区
+                100,
+                100,
+                1100,
+                320,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "CreateWindowExW 失败（拿不到窗口）");
+            // 先显示再 UpdateWindow：同步走一次 WM_PAINT，保证窗口里真的有内容。
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+            let window = Self { hwnd };
+            window.settle(); // 等 DWM 合成第一帧（见 `settle` 的注释）
+            window
+        }
+    }
+
+    /// 最小化（`IsIconic` 立刻为真）。
+    fn minimize(&self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, ShowWindow};
+        // SAFETY: `hwnd` 由本结构持有，构造时已校验非空。
+        unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
+    }
+
+    /// 窗口句柄（"已关闭"用例要在 `Drop` 之前留一份，事后用它断言真的销毁了）。
+    fn handle(&self) -> windows_sys::Win32::Foundation::HWND {
+        self.hwnd
+    }
+
+    /// 抽一会儿消息，让 DWM 把这一帧真的合成出来。
+    ///
+    /// **这一步是实测出来的必需品**，不是偷懒的 sleep：窗口刚 `ShowWindow` 完、DWM 还没合成
+    /// 第一帧时，`PrintWindow(PW_RENDERFULLCONTENT)` **返回 1 但位图全零**，`GetWindowDC`
+    /// 的 `BitBlt` 读到的也还是窗口出现之前的像素 —— 两条路都拿不到内容，OCR 只能返回空串。
+    /// 真实的被测窗口早就在屏幕上放了很久，不存在这个问题；只有"创建后立刻抓"的夹具才需要等。
+    fn settle(&self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            // SAFETY: `MSG` 是 POD；`PeekMessageW` 只在返回非零时写入。
+            unsafe {
+                let mut message: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for TestWindow {
+    fn drop(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow;
+        // SAFETY: `hwnd` 由本结构持有；DestroyWindow 只调用一次（Drop 只跑一次）。
+        unsafe { DestroyWindow(self.hwnd) };
+    }
+}
+
+/// 本机有没有可交互桌面（没有就别建窗口，直接跳过 —— 那是宿主限制，不是代码问题）。
+fn interactive_desktop() -> bool {
+    let report = WindowsBackend::new().capabilities();
+    if !report.screen {
+        eprintln!("[window-ocr] 当前没有可交互桌面（screen=false）→ 跳过：{report:?}");
+        return false;
+    }
+    true
+}
+
+/// **按窗口 OCR 的真机证据**：自建一个可见窗口，GDI 画字，按进程名让后端去读它。
+///
+/// 这条覆盖三件事：① 按映像名找人 → ② PrintWindow 抓窗口位图 → ③ WinRT OCR 出文字。
+/// 走的是 `DeviceBackend::ocr` 这个公开入口，不是内部夹具。
 #[test]
-#[ignore = "需要真实桌面会话"]
+fn window_ocr_reads_text_from_a_real_window() {
+    let _guard = window_test_guard();
+    if !interactive_desktop() {
+        return;
+    }
+    let window = TestWindow::create("HBOT 按窗口 OCR 夹具");
+    let own = own_process_name();
+    let result = WindowsBackend::new().ocr(&OcrRequest {
+        target: DeviceTarget::Window {
+            process: own.clone(),
+        },
+        max_chars: 200,
+    });
+    match result {
+        Ok(recognized) => {
+            eprintln!(
+                "[window-ocr] 进程 {own} 的窗口：画进去的是 {WINDOW_TEXT:?}，识别结果是 {:?}（truncated={}）",
+                recognized.text, recognized.truncated
+            );
+            let normalized = squashed(&recognized.text);
+            assert!(
+                normalized.contains(&squashed(WINDOW_TEXT)),
+                "窗口里画的字没认全：画的是 {WINDOW_TEXT:?}，认出来是 {:?}",
+                recognized.text
+            );
+        }
+        Err(DeviceError::HostLimit { detail }) => {
+            // 没装 OCR 语言包 / 受限会话：引擎建不出来。这是宿主限制，不是按窗口抓图失败 ——
+            // 打印原因后跳过（"引擎不可用"与"抓不到窗口"必须能区分开，见 `recognize_text` 注释）。
+            eprintln!("[window-ocr] 本机 OCR 引擎不可用，跳过真识别：{detail}");
+        }
+        Err(error) => panic!("自建可见窗口必须能被按窗口 OCR 读到，实际：{error:?}"),
+    }
+    drop(window);
+}
+
+/// **最小化窗口不是可读窗口**：必须是明确错误，绝不返回空串冒充"窗口里没字"。
+///
+/// 空串在契约里是"这一帧没识别到字"的合法结果，所以拿空串当失败信号会让调用方无法区分
+/// "窗口不可读"和"窗口真的是空的"。
+#[test]
+fn a_minimized_window_is_not_window_ocr_readable() {
+    let _guard = window_test_guard();
+    if !interactive_desktop() {
+        return;
+    }
+    let window = TestWindow::create("HBOT 最小化夹具");
+    window.minimize();
+    let own = own_process_name();
+    let result = WindowsBackend::new().ocr(&OcrRequest {
+        target: DeviceTarget::Window {
+            process: own.clone(),
+        },
+        max_chars: 100,
+    });
+    match result {
+        Err(DeviceError::AppNotAllowed { process }) => {
+            assert_eq!(process, own, "要把被拒的进程原样回给调用方");
+            eprintln!("[window-ocr] 最小化窗口按预期被拒：{process}");
+        }
+        Err(DeviceError::HostLimit { detail }) => {
+            eprintln!("[window-ocr] 本机 OCR 引擎不可用（HostLimit），跳过：{detail}");
+        }
+        other => {
+            panic!("最小化的窗口必须返回明确的 AppNotAllowed（不许空串伪装成功），实际：{other:?}")
+        }
+    }
+    drop(window);
+}
+
+/// **无标题窗口不是可读窗口**：模型没有标题可确认，读它没有意义 → 明确 `AppNotAllowed`。
+///
+/// 这条同时也是变异验证的钉子：把 `window_matches_process` 里"标题不能为空"那条删掉，
+/// 这个用例就会读到窗口文字而变成 `Ok`，测试随之失败。
+#[test]
+fn a_window_without_a_title_is_not_window_ocr_readable() {
+    let _guard = window_test_guard();
+    if !interactive_desktop() {
+        return;
+    }
+    let window = TestWindow::create("");
+    let own = own_process_name();
+    let result = WindowsBackend::new().ocr(&OcrRequest {
+        target: DeviceTarget::Window {
+            process: own.clone(),
+        },
+        max_chars: 100,
+    });
+    match result {
+        Err(DeviceError::AppNotAllowed { process }) => {
+            assert_eq!(process, own, "要把被拒的进程原样回给调用方");
+            eprintln!("[window-ocr] 无标题窗口按预期被拒：{process}");
+        }
+        Err(DeviceError::HostLimit { detail }) => {
+            eprintln!("[window-ocr] 本机 OCR 引擎不可用（HostLimit），跳过：{detail}");
+        }
+        other => panic!("无标题的窗口必须返回明确的 AppNotAllowed，实际：{other:?}"),
+    }
+    drop(window);
+}
+
+/// **已经关掉的窗口读不到**：句柄销毁后既不在 `EnumWindows` 里，也拿不到位图 →
+/// 必须是明确的 `AppNotAllowed`（而不是 `Ok(OcrText { text: "" })`）。
+///
+/// 这条与"没有窗口"那条不同：这里窗口**曾经真的存在过、也画过字**，销毁之后才读；
+/// 它能钉住"抓到一个死句柄也照样返回空串"这种退化。
+#[test]
+fn a_closed_window_is_not_window_ocr_readable() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    let _guard = window_test_guard();
+    if !interactive_desktop() {
+        return;
+    }
+    let window = TestWindow::create("HBot 已关闭窗口夹具");
+    let handle = window.handle();
+    let own = own_process_name();
+    drop(window); // DestroyWindow 在这里发生
+    // SAFETY: `handle` 是刚被销毁的句柄；`IsWindow` 对无效句柄只返回 0，不解引用。
+    assert_eq!(
+        unsafe { IsWindow(handle) },
+        0,
+        "夹具窗口应当已经真的销毁（否则这条用例证明不了'关闭后的窗口'）"
+    );
+
+    let result = WindowsBackend::new().ocr(&OcrRequest {
+        target: DeviceTarget::Window {
+            process: own.clone(),
+        },
+        max_chars: 100,
+    });
+    match result {
+        Err(DeviceError::AppNotAllowed { process }) => {
+            assert_eq!(process, own, "要把被拒的进程原样回给调用方");
+            eprintln!("[window-ocr] 已关闭窗口按预期被拒：{process}");
+        }
+        Err(DeviceError::HostLimit { detail }) => {
+            eprintln!("[window-ocr] 本机 OCR 引擎不可用（HostLimit），跳过：{detail}");
+        }
+        other => panic!("关闭的窗口必须返回明确的 AppNotAllowed，实际：{other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "需要真实桌面会话，且会读整屏内容"]
 fn screenshot_captures_the_primary_monitor_as_a_valid_png() {
     let limit = 32 * 1024 * 1024;
     let shot = WindowsBackend::new()
@@ -208,11 +735,7 @@ fn screenshot_captures_the_primary_monitor_as_a_valid_png() {
     assert_eq!(shot.monitor, 0);
     assert!(shot.width > 0 && shot.height > 0, "宽高必须非零");
     assert!(shot.png.len() <= limit, "不许超过 max_bytes");
-    assert_eq!(
-        &shot.png[..8],
-        &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
-        "输出必须是 PNG"
-    );
+    assert_eq!(&shot.png[..8], &PNG_SIGNATURE, "输出必须是 PNG");
     assert_eq!(
         &shot.png[12..16],
         b"IHDR",

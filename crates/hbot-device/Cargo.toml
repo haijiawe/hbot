@@ -38,6 +38,9 @@ windows-sys = { version = "0.59", features = [
     # 刻意不引 `CoUninitialize` —— 见 src/windows.rs 的 `hold_mta_for_process`（拆公寓会让
     # `windows` crate 的进程级激活工厂缓存悬空，实测直接 0xC0000005）。
     "Win32_System_Com",
+    # System_LibraryLoader：`GetModuleHandleW` —— 测试里自建一个可见窗口走通"按窗口 OCR"
+    # 需要它给 `WNDCLASSW.hInstance`（`RegisterClassW` 要求非空实例句柄）。
+    "Win32_System_LibraryLoader",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -51,11 +54,17 @@ windows-sys = { version = "0.59", features = [
 # - Graphics_Imaging：`SoftwareBitmap` + `BitmapPixelFormat`/`BitmapAlphaMode`（OCR 的输入）；
 # - Media_Ocr：`OcrEngine` / `OcrResult` 本体；
 # - Storage_Streams：`DataWriter` 用来把 BGRA 字节变成 `SoftwareBitmap` 需要的 `IBuffer`
-#   （`CreateCopyWithAlphaFromBuffer` 的入参是 `IBuffer`，没有 `&[u8]` 的重载）。
+#   （`CreateCopyWithAlphaFromBuffer` 的入参是 `IBuffer`，没有 `&[u8]` 的重载）；
+# - Globalization：`OcrEngine::AvailableRecognizerLanguages()` 返回
+#   `IVectorView<Globalization::Language>`，`Language::LanguageTag()`/`DisplayName()` 也在
+#   这个 feature 里（"本机装了哪些 OCR 语言"是实测结论的来源，见 src/windows.rs 的单测）；
+# - Foundation_Collections：上面那个 `IVectorView` 的方法（`Size`/`GetAt`）所需。
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
     "Foundation",
+    "Foundation_Collections",
+    "Globalization",
     "Graphics_Imaging",
     "Media_Ocr",
     "Storage_Streams",

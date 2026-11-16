@@ -38,6 +38,15 @@ impl UnsupportedBackend {
             detail: NO_DEVICE_SUPPORT.to_string(),
         })
     }
+
+    /// 显示器清单：这个平台没有实现，所以是空的。
+    ///
+    /// 与其它方法不同，这里**不报错**：返回值是 [`crate::displays`] 的契约（`Vec` 而不是
+    /// `Result`），"没有实现"和"没有屏"在非 Windows 上本来就是一件事，空清单足够让调用方
+    /// 知道"这个宿主没有显示器可截"。真要报错请走 `screenshot`。
+    pub fn displays() -> Vec<crate::DisplayInfo> {
+        Vec::new()
+    }
 }
 
 impl DeviceBackend for UnsupportedBackend {

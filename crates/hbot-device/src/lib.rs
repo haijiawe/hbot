@@ -9,8 +9,8 @@
 //!
 //! | 平台 | 状态 |
 //! |---|---|
-//! | Windows 10/11 | [`WindowsBackend`]：截图、注入、窗口枚举、剪贴板、OCR（主屏整屏）都实现了 |
-//! | 其它 | [`UnsupportedBackend`]：`capabilities()` 全 `false`，每个方法返回 [`DeviceError::HostLimit`] |
+//! | Windows 10/11 | [`WindowsBackend`]：截图（多显示器）、注入、窗口枚举、剪贴板、OCR（整屏 + 按窗口）都实现了 |
+//! | 其它 | `UnsupportedBackend`：`capabilities()` 全 `false`，每个方法返回 [`DeviceError::HostLimit`] |
 //!
 //! 非 Windows 分支**能编译、能过 clippy、也有测试**（`cargo check --target x86_64-unknown-linux-gnu`），
 //! 因为"没实现的平台必须明确拒绝"和"没实现的平台编译不过"是两件事：前者是有意的产品行为。
@@ -30,19 +30,30 @@
 //! - **DRM/受保护内容**（Netflix 等 PlayReady 页面）本来就禁止抓取，结果是黑块；不绕。
 //! - **DirectComposition / 部分 UWP** 窗口 `PrintWindow` 也可能黑（`PW_RENDERFULLCONTENT` 只解决
 //!   了一部分 DWM 内容）。
-//! - **只做主显示器**（`monitor` 只接受 `0`/`None`）：其它索引返回 `HostLimit`。虚拟桌面的负坐标
-//!   （主屏左边的副屏）在 `click` 的坐标归一化里是对的，但截图拿不到那些区域。
+//! - **多显示器**：`monitor` 是[显示器清单](displays)里的**序号**（`None` = 主屏，与 `Some(0)`
+//!   同义）。序号规则见 [`DisplayInfo`]：**0 永远是主显示器**，其余按虚拟桌面左上角
+//!   （`rcMonitor.left`, `rcMonitor.top`）从左到右、从上到下排，坐标相同（克隆模式）时按
+//!   `MONITORINFOEXW::szDevice` 字典序 —— 三条都只看**系统给的静态属性**，不掺枚举回调顺序，
+//!   所以同一台机器上反复调用、重启进程都稳定。不存在的序号返回 `HostLimit` 并列出可用数量，
+//!   绝不静默退回主屏（那会让模型对着错误的画面决策）。
+//!   每块屏用 `CreateDCW(szDevice)` 取它**自己的** DC 抓图：`GetDC(NULL)` 只覆盖主屏，用它去
+//!   `BitBlt` 副屏坐标只会拿到一片黑。
 //! - **DPI**：本 crate 是库，**没法**给宿主进程装 Per-Monitor V2 manifest。宿主没声明 DPI 感知时，
 //!   系统会把窗口矩形与像素虚拟化（150% 缩放下一张 1920 宽的屏可能只有 1280 宽），坐标也会错位。
 //!   这条必须在 `hbot-desktop` 的壳里解决（`docs/09` §6.4），不是 backend 能修的。
-//! - **没有窗口级截图入口**：trait 只有 `monitor` 参数，没有 `window_id`。想"截某个窗口"要先用
-//!   [`windows()`](DeviceBackend::windows) 找到它、切到前台——这正是"窗口级截图未做"的含义。
+//! - **截图没有窗口级入口**：`ScreenshotRequest` 只有 `monitor` 参数，没有 `window_id`。
+//!   想"截某个窗口"要先用 [`windows()`](DeviceBackend::windows) 找到它、切到前台——这正是
+//!   "窗口级**截图**未做"的含义。按窗口**读字**是另一条路（`DeviceTarget::Window{process}`，
+//!   见下面的 OCR 一节），它内部会 `PrintWindow` 那个窗口，但产物是文本，不是 PNG。
 //! - **OCR 是真接了，但只认、也只能认一部分**：Windows 上走 WinRT 的 `Windows.Media.Ocr`
 //!   （`windows` crate，不是 `windows-sys`），输入是**同一套 DIB `BitBlt` 抓的主屏 BGRA**。
 //!   三条限制是机制性的，不是没写完：① 只认**系统已安装语言包**的文字 —— 没装的语言（或没装
 //!   任何 OCR 语言包的机器）引擎根本建不出来，那时 `capabilities().ocr == false` 且 `ocr()`
-//!   返回 `HostLimit`；② 只支持**主屏整屏**（`DeviceTarget::None`），按窗口 OCR 未做，
-//!   `DeviceTarget::Window{..}` 明确返回 `HostLimit` 而不是偷偷截全屏；③ 图标、艺术字、
+//!   返回 `HostLimit`；② 支持**两种目标**：主屏整屏（`DeviceTarget::None`）与**按窗口**
+//!   （`DeviceTarget::Window{process}`，取该进程 Z 序最前的可见、未最小化、有标题的窗口，
+//!   前台窗口优先；用 `PrintWindow` 抓那个窗口，失败退 `GetWindowDC` + `BitBlt`）。
+//!   `process` 是**映像名**（`notepad.exe` 这种），大小写不敏感；这个进程此刻没有可读窗口时
+//!   返回 `AppNotAllowed{process}`（不是空串）；③ 图标、艺术字、
 //!   旋转超过 45° 的文字识别不了（引擎本身的边界）。
 //!   除这三条之外还有一条**契约性**的：识别不出字时返回**空字符串**（`truncated: false`），
 //!   那是合法结果；而引擎建不出来 / 识别过程失败一律是错误（`HostLimit` / `Failed`），
@@ -94,6 +105,52 @@ pub type PlatformBackend = UnsupportedBackend;
 /// 组合根（`hbot-rpc`）只调这一个函数，平台上选谁由 `cfg` 决定，调用方不需要写 `cfg`。
 pub fn platform_backend() -> PlatformBackend {
     PlatformBackend::new()
+}
+
+/// 一块显示器的静态信息（[`displays`] 的返回值）。
+///
+/// 字段全部来自 `EnumDisplayMonitors` + `GetMonitorInfoW(MONITORINFOEXW)`，是**系统给的静态
+/// 属性**，不是我们猜的：
+///
+/// - [`index`](Self::index)：截图时传给 `ScreenshotRequest::monitor` 的序号。**0 永远是主
+///   显示器**，其余按虚拟桌面左上角从左到右、从上到下；坐标完全相同（克隆模式）时按
+///   [`device`](Self::device) 字典序。只依赖这三条，所以同一台机器上每次调用都稳定；
+/// - [`x`](Self::x)/[`y`](Self::y)：`rcMonitor` 左上角在**虚拟桌面坐标系**里的位置。主屏不一定
+///   是 `(0, 0)` —— 主屏左边的副屏是负坐标，主屏本身被系统钉在 `(0, 0)`；
+/// - 宽高是 `rcMonitor` 的尺寸（**物理像素**，与 DPI 虚拟化无关的那一层；见 crate 文档的 DPI 一节）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayInfo {
+    /// 显示器序号（0 起，0 = 主屏）。截图时原样传给 `ScreenshotRequest::monitor`。
+    pub index: u32,
+    /// 是不是主显示器（`MONITORINFOF_PRIMARY`）。
+    pub primary: bool,
+    /// 设备名（`MONITORINFOEXW::szDevice`，形如 `\\.\DISPLAY1`）。`CreateDCW` 用它建 DC。
+    pub device: String,
+    /// `rcMonitor.left`（虚拟桌面坐标系，副屏可以是负数）。
+    pub x: i32,
+    /// `rcMonitor.top`（虚拟桌面坐标系）。
+    pub y: i32,
+    /// `rcMonitor` 宽度（像素）。
+    pub width: u32,
+    /// `rcMonitor` 高度（像素）。
+    pub height: u32,
+}
+
+/// 本机显示器清单，按 [`DisplayInfo::index`] 排好序（0 = 主屏）。
+///
+/// 这是**平台探测的结果**，不是缓存快照：每次调用都重新枚举，所以"刚插上/拔掉一块屏"
+/// 下一次就能看到（与 [`DeviceBackend::capabilities`] 的口径一致）。
+///
+/// 返回空 `Vec` 表示**当前会话没有可交互桌面**（RDP 断开、服务会话、无头模式）；
+/// 需要区分"没有屏"和"枚举失败"的调用方请直接用
+/// [`screenshot`](DeviceBackend::screenshot)（它会把两者分别报成 `Failed` / `HostLimit`）。
+pub fn displays() -> Vec<DisplayInfo> {
+    PlatformBackend::displays()
+}
+
+/// 本机显示器数量（= [`displays`]`.len()`，0 表示当前会话没有可交互桌面）。
+pub fn display_count() -> usize {
+    displays().len()
 }
 
 // 调用方只需要认识这两个 crate 的类型，不必再手写 `hbot_core::device::…` 前缀。

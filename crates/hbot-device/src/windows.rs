@@ -45,8 +45,9 @@ use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GlobalFree, HANDLE, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, ReleaseDC, SRCCOPY,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDCW, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
+    GetWindowDC, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO, MONITORINFOEXW, ReleaseDC, SRCCOPY,
     SelectObject,
 };
 use windows_sys::Win32::Storage::Xps::PrintWindow;
@@ -75,12 +76,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, PW_RENDERFULLCONTENT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW,
+    IsWindowVisible, MONITORINFOF_PRIMARY, PW_RENDERFULLCONTENT, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
+    SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW,
 };
 
 use crate::{
-    Combo, ComboKey, ComboModifier, app_is_allowed, enforce_limit, parse_combo, png, process_name,
+    Combo, ComboKey, ComboModifier, DisplayInfo, app_is_allowed, enforce_limit, parse_combo, png,
+    process_name,
 };
 
 /// 窗口枚举上限（`docs/09` §6.3：列表是给人/模型看的，几百个窗口没有意义）。
@@ -203,24 +205,39 @@ impl WindowsBackend {
 
     /// 截图并编码成 PNG，然后按 `max_bytes` 检查（**不截断**）。
     ///
-    /// `monitor` 只接受 `None` 或 `Some(0)`；其它索引明确未实现（返回 `HostLimit`），
-    /// 而不是悄悄截主屏 —— 静默给错显示器会让模型对着错误的画面决策。
+    /// `monitor` 的语义（见 [`DisplayInfo`] 与 crate 文档）：
+    ///
+    /// - `None` 是**旧路径**：先试 `PrintWindow` 抓前台窗口，失败退主屏 `BitBlt`。这是历史上
+    ///   "快速看一眼当前在干什么"的语义，保持不动；
+    /// - `Some(i)` 是**第 i 块显示器的整屏**（`Some(0)` = 主屏）：显式点名一块屏时不做
+    ///   "前台窗口优先"，否则"截副屏"会变成"截主屏上那个窗口"，与参数承诺不符；
+    /// - 不存在的序号返回 `HostLimit` 并列出可用数量，**绝不静默退回主屏** —— 静默给错显示器
+    ///   会让模型对着错误的画面决策。
     fn capture(&self, request: &ScreenshotRequest) -> Result<Screenshot, DeviceError> {
-        if let Some(monitor) = request.monitor {
-            if monitor != 0 {
-                return Err(DeviceError::HostLimit {
-                    detail: format!(
-                        "只实现了主显示器（monitor 0），显示器 {monitor} 未实现（docs/09 §9.2 窄版范围）"
-                    ),
-                });
-            }
-        }
-        let frame = capture_frame()?;
+        let displays = enumerate_displays()?;
+        let monitor = request.monitor.unwrap_or(0);
+        let Some(target) = displays.get(monitor as usize) else {
+            return Err(DeviceError::HostLimit {
+                detail: format!(
+                    "显示器序号 {monitor} 不存在：本机只有 {} 块显示器（可用序号 0..={}，0 是主屏）",
+                    displays.len(),
+                    displays.len().saturating_sub(1)
+                ),
+            });
+        };
+        // `None`（没点名）= 旧路径"先试前台窗口，失败退主屏"；显式点名任一块屏（含 0）时
+        // 抓那块屏的整屏 —— 参数已经说清是哪块屏，再掺"前台窗口优先"就与承诺不符。
+        let frame = match request.monitor {
+            None => capture_frame()?,
+            Some(_) => blit_display(target)?.read_frame()?,
+        };
         let encoded = png::encode_rgb(frame.width, frame.height, &frame.rgb)?;
         tracing::debug!(
             width = frame.width,
             height = frame.height,
             bytes = encoded.len(),
+            monitor,
+            device = %target.device,
             "截图完成"
         );
         let png = enforce_limit(encoded, request.max_bytes)?;
@@ -228,35 +245,43 @@ impl WindowsBackend {
             width: frame.width,
             height: frame.height,
             png,
-            monitor: 0,
+            monitor,
         })
     }
 
-    /// 抓主屏整屏 → WinRT OCR → 按 `max_chars` 截断。
+    /// 抓目标区域 → WinRT OCR → 按 `max_chars` 截断。
     ///
-    /// `target` 只接受 [`DeviceTarget::None`]（主屏整屏）。`DeviceTarget::Window{..}` 返回
-    /// `HostLimit` 而**不是**忽略它去截主屏：模型要的是"那个窗口里的字"，给它全屏文字等于喂
-    /// 它一堆别处的字，比明确说没做更糟。
+    /// 两种目标：
     ///
-    /// 空字符串是**合法结果**（屏幕上真没字），但"引擎没建出来"和"识别过程中出错"都是错误，
-    /// 不会降级成空串 —— 把失败说成"没识别到字"会让调用方以为截图里真的没有字。
+    /// - [`DeviceTarget::None`]：主屏整屏（`BitBlt` 主屏 DC）；
+    /// - [`DeviceTarget::Window{process}`]：那个进程的**一个可读窗口**（查找规则见
+    ///   [`find_window_for_process`]），用 `PrintWindow` 抓它，失败退 `GetWindowDC` + `BitBlt`。
+    ///
+    /// **为什么读不到窗口返回 `AppNotAllowed{process}` 而不是 `HostLimit`**：`HostLimit` 的契约是
+    /// "当前宿主没有这个能力"（Wayland、无头、无交互桌面），而这里能力是有的，只是**这个进程
+    /// 此刻没有可读的窗口**（没启动 / 只有最小化或无标题窗口）—— 说成 `HostLimit` 会让调用方
+    /// 永久放弃按窗口 OCR。`AppNotAllowed` 至少带上了**具体是哪个进程**，模型能据此换目标或提示
+    /// 用户把窗口开出来。代价是它的展示文案（`DeviceError` 的 `Display`）写的是"不在白名单里"，
+    /// 用在"没有窗口"这个场景上措辞不准 —— 这是已知文案债，改文案要改 `hbot-core`（另一个
+    /// crate，不在本次范围内），先记在这里。
+    ///
+    /// 空字符串是**合法结果**（窗口里真没字），但"引擎没建出来"和"识别过程中出错"都是错误，
+    /// 不会降级成空串 —— 把失败说成"没识别到字"会让调用方以为画面里真的没有字。
     fn recognize_text(&self, request: &OcrRequest) -> Result<OcrText, DeviceError> {
-        match &request.target {
-            DeviceTarget::None => {}
+        let (width, height, bgra) = match &request.target {
+            // 主屏整屏，不复用 `capture_frame()`：后者的首选是"前台窗口"（`PrintWindow`），
+            // 那是**截图**语义。OCR 要的是屏幕上真显示的东西，用 `BitBlt` 主屏那份。
+            DeviceTarget::None => blit_primary_screen()?.read_bgra()?,
             DeviceTarget::Window { process } => {
-                return Err(DeviceError::HostLimit {
-                    detail: format!(
-                        "按窗口 OCR 的窄版未做：只支持主屏整屏（DeviceTarget::None），\
-                         要识别窗口 {process} 的内容请先把它切到前台再整屏 OCR"
-                    ),
-                });
+                let Some(hwnd) = find_window_for_process(process) else {
+                    tracing::debug!(process, "这个进程没有可读的窗口");
+                    return Err(DeviceError::AppNotAllowed {
+                        process: process.clone(),
+                    });
+                };
+                capture_window_for_ocr(hwnd)?.read_bgra()?
             }
-        }
-        // 主屏整屏，不复用 `capture_frame()`：后者的首选是"前台窗口"（`PrintWindow`），
-        // 那是**截图**语义。OCR 要的是屏幕上真显示的东西，用 `BitBlt` 主屏那份，
-        // 与 `capture_primary_screen` 共用同一段 DIB 抓取（`blit_primary_screen`）。
-        let surface = blit_primary_screen()?;
-        let (width, height, bgra) = surface.read_bgra()?;
+        };
         let recognized = recognize_bgra(width, height, &bgra)?;
         tracing::debug!(
             width,
@@ -384,6 +409,32 @@ impl DeviceBackend for WindowsBackend {
         // 一个 `OnceLock` 里（见 `ocr_engine_probe`）。
         let ocr = ocr_engine_probe().is_ok();
 
+        // 显示器清单：**探测结果不是缓存**（刚插上/拔掉一块屏，下一次调用就能看到）。
+        // 探测失败（无交互桌面）时是空清单，那时 `screen` 多半也已经是 `false`。
+        let displays = enumerate_displays().unwrap_or_default();
+        let display_note = if displays.is_empty() {
+            "显示器清单为空：当前会话可能没有可交互桌面".to_string()
+        } else {
+            let list = displays
+                .iter()
+                .map(|item| {
+                    format!(
+                        "[{}] {} {}×{}{}",
+                        item.index,
+                        item.device,
+                        item.width,
+                        item.height,
+                        if item.primary { "（主屏）" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("，");
+            format!(
+                "显示器 {} 块，序号 0 是主屏（其余按虚拟桌面左上角排序）：{list}",
+                displays.len()
+            )
+        };
+
         let mut notes: Vec<String> = Vec::new();
         if !screen {
             notes.push(
@@ -393,17 +444,27 @@ impl DeviceBackend for WindowsBackend {
         if !input {
             notes.push("当前输入桌面不是 Default：锁屏或安全桌面期间拒绝注入".into());
         }
-        notes.push(
-            "截图走 PrintWindow/BitBlt：独占全屏 DirectX 游戏、受 DRM 保护的内容可能全黑；只支持主显示器"
-                .into(),
-        );
+        notes.push(format!(
+            "截图走 PrintWindow/BitBlt：独占全屏 DirectX 游戏、受 DRM 保护的内容可能全黑；\
+             {display_note}；monitor 给序号时抓那块屏的整屏，None 时优先抓前台窗口"
+        ));
         notes.push("输入受 UIPI 限制：完整性级别更高的窗口（提权程序、UAC 对话框）无法注入".into());
         match ocr_engine_probe() {
-            Ok(()) => notes.push(
-                "OCR 走 Windows.Media.Ocr：只识别系统已安装语言包的文字（中文/英文各要装对应语言包），\
-                 图标、艺术字、旋转超 45° 的文字识别不了；只支持主屏整屏，按窗口 OCR 未做"
-                    .into(),
-            ),
+            Ok(()) => {
+                // 语言清单是"能不能认中文"的实测口径，直接写进 notes：模型看到 `zh-*`
+                // 才知道可以读中文界面（只装英文包的机器上中文会识别成空串）。
+                let languages = match available_ocr_languages() {
+                    Ok(tags) if tags.is_empty() => "（空）".to_string(),
+                    Ok(tags) => tags.join("、"),
+                    Err(reason) => format!("（取不到：{reason}）"),
+                };
+                notes.push(format!(
+                    "OCR 走 Windows.Media.Ocr：只识别系统已安装语言包的文字，本机已装：{languages}\
+                     （中文/英文各要装对应语言包），图标、艺术字、旋转超 45° 的文字识别不了；\
+                     支持主屏整屏（None）与按窗口（Window{{process}}：该进程有标题、可见、\
+                     未最小化且 Z 序最前的窗口，前台窗口优先）"
+                ));
+            }
             Err(reason) => notes.push(format!("OCR 不可用：{reason}")),
         }
 
@@ -498,6 +559,128 @@ impl DeviceBackend for WindowsBackend {
     }
 }
 
+// ---------------------------------------------------------------- 显示器清单
+
+impl WindowsBackend {
+    /// 本机显示器清单，按 [`DisplayInfo::index`] 排序（0 = 主屏，见 [`DisplayInfo`] 的说明）。
+    ///
+    /// 探测失败（当前会话没有可交互桌面）时返回空 `Vec`：这个函数的契约是"清单"，不是
+    /// "诊断" —— 需要错误码的路径是 `screenshot`（它会区分 `Failed` 与 `HostLimit`）。
+    pub fn displays() -> Vec<DisplayInfo> {
+        match enumerate_displays() {
+            Ok(displays) => displays,
+            Err(error) => {
+                tracing::debug!(error = %error, "枚举显示器失败，清单返回空");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// `EnumDisplayMonitors` 的回调：把每块屏的 `MONITORINFOEXW` 收集起来。
+///
+/// 回调返回 `1`（TRUE）表示**继续枚举**；这里永远继续（过滤交给调用方，排序更与枚举顺序无关）。
+///
+/// SAFETY: 契约要求 `hwnd` 由系统给出、`lparam` 是调用方传的那个 `&mut Vec<MONITORINFOEXW>`。
+unsafe extern "system" fn monitor_enum_proc(
+    monitor: HMONITOR,
+    _dc: HDC,
+    _rect: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    // SAFETY: `EnumDisplayMonitors` 是同步调用，`lparam` 指向调用栈上的 `Vec`，回调期间有效。
+    let collected = unsafe { &mut *(lparam as *mut Vec<MONITORINFOEXW>) };
+    // SAFETY: `MONITORINFOEXW` 是 POD，全零合法；`cbSize` 必须写对，否则系统拒绝。
+    let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    // `MONITORINFOEXW` 的第一个字段就是 `MONITORINFO`，`GetMonitorInfoW` 只写那一部分，
+    // 所以把整个结构体的地址按 `*mut MONITORINFO` 传进去是合法的（`repr(C)` 保证布局）。
+    let ok = unsafe {
+        GetMonitorInfoW(
+            monitor,
+            &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+        )
+    };
+    if ok != 0 {
+        collected.push(info);
+    }
+    1
+}
+
+/// 枚举显示器并给出**稳定的序号**。
+///
+/// 排序规则（三条，全部只看系统给的静态属性，不掺枚举顺序）：
+///
+/// 1. **主显示器排第一** —— `monitor: None` 的既有语义是"主屏"，让 `Some(0)` 与 `None`
+///    指向同一块屏，向后兼容；
+/// 2. 其余按 `rcMonitor` 左上角的 `(left, top)` 排 —— 也就是虚拟桌面上"从左到右、从上到下"，
+///    这与用户在显示设置里看到的排布一致（副屏在主屏左边时是负坐标，自然排在最前）；
+/// 3. 坐标完全相同（**克隆模式**：两块物理屏镜像同一个逻辑屏，`rcMonitor` 一模一样）时按
+///    `szDevice` 字典序 —— 没有这一条，两块屏的相对次序就只能听枚举回调的（系统不保证）。
+fn enumerate_displays() -> Result<Vec<DisplayInfo>, DeviceError> {
+    let mut collected: Vec<MONITORINFOEXW> = Vec::new();
+    // SAFETY: `EnumDisplayMonitors` 同步调用回调；`&mut collected` 在调用期间有效且
+    // 回调不保存这个指针。`NULL` hdc + `NULL` 裁剪矩形 = 枚举全部显示器。
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            ptr::null_mut(),
+            ptr::null(),
+            Some(monitor_enum_proc),
+            &mut collected as *mut Vec<MONITORINFOEXW> as LPARAM,
+        )
+    };
+    if ok == 0 {
+        return Err(DeviceError::Failed {
+            message: "EnumDisplayMonitors 失败：当前会话没有可用的显示（RDP 已断开 / 无交互桌面）"
+                .to_string(),
+        });
+    }
+    if collected.is_empty() {
+        return Err(DeviceError::Failed {
+            message: "EnumDisplayMonitors 成功但一块显示器都没枚举到".to_string(),
+        });
+    }
+
+    let mut displays: Vec<DisplayInfo> = collected
+        .iter()
+        .map(|info| {
+            let rect = info.monitorInfo.rcMonitor;
+            DisplayInfo {
+                // 序号排序后回填。
+                index: 0,
+                primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+                device: device_name(&info.szDevice),
+                x: rect.left,
+                y: rect.top,
+                width: rect.right.saturating_sub(rect.left).max(0) as u32,
+                height: rect.bottom.saturating_sub(rect.top).max(0) as u32,
+            }
+        })
+        .collect();
+
+    displays.sort_by(|left, right| {
+        // 1) 主屏优先（`false < true`，所以用 `b` 与 `a` 的 primary 比，让 true 排前面）。
+        right
+            .primary
+            .cmp(&left.primary)
+            // 2) 虚拟桌面左上角，先左后上。
+            .then_with(|| left.x.cmp(&right.x))
+            .then_with(|| left.y.cmp(&right.y))
+            // 3) 克隆模式下坐标相同，用设备名兜底，保证稳定。
+            .then_with(|| left.device.cmp(&right.device))
+    });
+    for (index, display) in displays.iter_mut().enumerate() {
+        display.index = index as u32;
+    }
+    Ok(displays)
+}
+
+/// 把 `MONITORINFOEXW::szDevice`（UTF-16，未终止时也要能读）转成 `String`。
+fn device_name(raw: &[u16]) -> String {
+    let end = raw.iter().position(|&unit| unit == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..end])
+}
+
 // ---------------------------------------------------------------- 截图
 
 /// 一张已解码的图像（RGB8，无 alpha）。
@@ -507,12 +690,104 @@ struct Frame {
     rgb: Vec<u8>,
 }
 
-/// 一块 GDI 离屏表面（屏幕 DC + 内存 DC + 32bpp 自顶向下 DIB）。
+/// 抓图用的**源 DC**，以及它的释放方式。
 ///
-/// `Drop` 里按**创建的反序**拆：先恢复原来的位图，再删位图，再删 DC，最后还屏幕 DC。
+/// 三种 DC 的释放 API 不一样，混用会泄漏 GDI 对象（每进程上限 10000 个，泄漏到顶之后
+/// 整个进程的 `CreateDIBSection` 开始失败，表现成"截图突然坏了"）：
+///
+/// - `GetDC(NULL)`（主屏）→ `ReleaseDC(NULL, dc)`；
+/// - `CreateDCW(设备名)`（某块显示器）→ `DeleteDC(dc)`；
+/// - `GetWindowDC(hwnd)`（单个窗口）→ `ReleaseDC(hwnd, dc)`。
+///
+/// 把"DC + 怎么还"绑在一起，是为了让 [`Surface`] 的 `Drop` 不可能还错。
+enum SourceDc {
+    /// `GetDC(NULL)`：只覆盖**主显示器**。
+    Screen(HDC),
+    /// `CreateDCW(szDevice)`：一整块显示器自己的 DC，原点在这块屏的左上角。
+    Device(HDC),
+    /// `GetWindowDC(hwnd)`：整个窗口（含非客户区）的 DC，原点在窗口左上角。
+    Window(HWND, HDC),
+}
+
+impl SourceDc {
+    /// 取 `GetDC(NULL)`（主屏）。
+    fn screen() -> Result<Self, DeviceError> {
+        // SAFETY: `GetDC(NULL)` 取整个屏幕的 DC，返回空指针表示当前会话没有可用显示。
+        let dc = unsafe { GetDC(ptr::null_mut()) };
+        if dc.is_null() {
+            return Err(DeviceError::Failed {
+                message: "GetDC(NULL) 失败：当前会话没有可用的显示（RDP 已断开 / 无交互桌面）"
+                    .to_string(),
+            });
+        }
+        Ok(Self::Screen(dc))
+    }
+
+    /// 取某块显示器自己的 DC。
+    ///
+    /// 为什么不用 `GetDC(NULL)` + 偏移：`GetDC(NULL)` 的 DC 只覆盖主显示器，用它去
+    /// `BitBlt` 副屏坐标拿到的是**主屏在那些坐标上的像素**（常见是全黑），不是副屏内容。
+    /// `CreateDCW(szDevice)` 直接给出这块屏自己的绘制表面，原点就在它左上角。
+    fn device(device: &str) -> Result<Self, DeviceError> {
+        let name: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `name` 以 NUL 结尾且在调用期间有效；其余三个参数为 NULL = 用设备名建 DC。
+        let dc = unsafe { CreateDCW(ptr::null(), name.as_ptr(), ptr::null(), ptr::null()) };
+        if dc.is_null() {
+            return Err(DeviceError::Failed {
+                message: format!("CreateDCW 失败：建不出显示器 {device} 的 DC"),
+            });
+        }
+        Ok(Self::Device(dc))
+    }
+
+    /// 取一个窗口（含边框与标题栏）的 DC。
+    fn window(hwnd: HWND) -> Result<Self, DeviceError> {
+        // SAFETY: `hwnd` 由调用方保证是有效窗口句柄（来自 EnumWindows / GetForegroundWindow）。
+        let dc = unsafe { GetWindowDC(hwnd) };
+        if dc.is_null() {
+            return Err(DeviceError::Failed {
+                message: "GetWindowDC 失败：窗口可能已经销毁".to_string(),
+            });
+        }
+        Ok(Self::Window(hwnd, dc))
+    }
+
+    /// 底层句柄（`BitBlt` 的源）。
+    fn raw(&self) -> HDC {
+        match self {
+            Self::Screen(dc) | Self::Device(dc) | Self::Window(_, dc) => *dc,
+        }
+    }
+
+    /// 按各自的 API 释放。**只调用一次**（由 [`Surface::drop`] 负责）。
+    ///
+    /// SAFETY: 句柄必须来自本枚举的构造器，且尚未释放。
+    unsafe fn release(self) {
+        // SAFETY: 见本方法的契约；三种释放 API 与构造器一一对应。
+        unsafe {
+            match self {
+                Self::Screen(dc) => {
+                    ReleaseDC(ptr::null_mut(), dc);
+                }
+                Self::Device(dc) => {
+                    DeleteDC(dc);
+                }
+                Self::Window(hwnd, dc) => {
+                    ReleaseDC(hwnd, dc);
+                }
+            }
+        }
+    }
+}
+
+/// 一块 GDI 离屏表面（源 DC + 内存 DC + 32bpp 自顶向下 DIB）。
+///
+/// `Drop` 里按**创建的反序**拆：先恢复原来的位图，再删位图，再删 DC，最后还源 DC。
 /// 顺序错了（先删位图再 `SelectObject` 回去）会用到已释放的句柄。
 struct Surface {
-    screen_dc: HDC,
+    /// 源 DC。`Option` 只为让 [`Drop`] 能**取走**它再按各自 API 释放（`release` 拿所有权）；
+    /// `Surface` 存活期间它恒为 `Some`。
+    source: Option<SourceDc>,
     mem_dc: HDC,
     bitmap: HBITMAP,
     previous: HGDIOBJ,
@@ -522,16 +797,29 @@ struct Surface {
 }
 
 impl Surface {
-    /// 建一块 `width × height`、32bpp、**自顶向下**（`biHeight` 为负）的 DIB 表面。
+    /// 建一块 `width × height`、32bpp、**自顶向下**（`biHeight` 为负）的 DIB 表面，源 DC 是主屏。
     ///
     /// 自顶向下是为了让 `bits` 的第一行就是屏幕最上面一行，省掉翻转。
     fn new(width: i32, height: i32) -> Result<Self, DeviceError> {
+        let source = SourceDc::screen()?;
+        Self::with_source(source, width, height)
+    }
+
+    /// 同上，但源 DC 由调用方给（某块显示器 / 某个窗口）。
+    ///
+    /// 源 DC 的**所有权转进来**：任何失败路径都由这里按 [`SourceDc::release`] 还掉，
+    /// 成功路径由 [`Surface::drop`] 还 —— 不会有两处都还或两处都不还。
+    fn with_source(source: SourceDc, width: i32, height: i32) -> Result<Self, DeviceError> {
         if width <= 0 || height <= 0 {
+            // SAFETY: `source` 刚建、未释放。
+            unsafe { source.release() };
             return Err(DeviceError::Failed {
                 message: format!("截图区域尺寸非法（{width}×{height}）"),
             });
         }
         if width > MAX_SCREENSHOT_DIMENSION || height > MAX_SCREENSHOT_DIMENSION {
+            // SAFETY: 同上。
+            unsafe { source.release() };
             return Err(DeviceError::Failed {
                 message: format!(
                     "截图区域过大（{width}×{height}，单边上限 {MAX_SCREENSHOT_DIMENSION}）"
@@ -539,6 +827,8 @@ impl Surface {
             });
         }
         if u64::from(width as u32) * u64::from(height as u32) > MAX_SCREENSHOT_PIXELS {
+            // SAFETY: 同上。
+            unsafe { source.release() };
             return Err(DeviceError::Failed {
                 message: format!(
                     "截图区域过大（{width}×{height}，总像素上限 {MAX_SCREENSHOT_PIXELS}）"
@@ -546,20 +836,11 @@ impl Surface {
             });
         }
 
-        // SAFETY: `GetDC(NULL)` 取整个屏幕的 DC，返回空指针表示当前会话没有可用显示。
-        let screen_dc = unsafe { GetDC(ptr::null_mut()) };
-        if screen_dc.is_null() {
-            return Err(DeviceError::Failed {
-                message: "GetDC(NULL) 失败：当前会话没有可用的显示（RDP 已断开 / 无交互桌面）"
-                    .to_string(),
-            });
-        }
-
-        // SAFETY: 与屏幕 DC 兼容的内存 DC。
-        let mem_dc = unsafe { CreateCompatibleDC(screen_dc) };
+        // SAFETY: 与源 DC 兼容的内存 DC。
+        let mem_dc = unsafe { CreateCompatibleDC(source.raw()) };
         if mem_dc.is_null() {
-            // SAFETY: `screen_dc` 由上面的 `GetDC` 取得且非空。
-            unsafe { ReleaseDC(ptr::null_mut(), screen_dc) };
+            // SAFETY: `source` 有效且未释放。
+            unsafe { source.release() };
             return Err(DeviceError::Failed {
                 message: "CreateCompatibleDC 失败：GDI 句柄可能已耗尽".to_string(),
             });
@@ -586,7 +867,7 @@ impl Surface {
         // 传 `NULL` 段 + `DIB_RGB_COLORS` 表示"自己分配像素内存"。
         let bitmap = unsafe {
             CreateDIBSection(
-                screen_dc,
+                source.raw(),
                 &info,
                 DIB_RGB_COLORS,
                 &mut bits,
@@ -595,10 +876,10 @@ impl Surface {
             )
         };
         if bitmap.is_null() || bits.is_null() {
-            // SAFETY: `mem_dc` 非空且由 `CreateCompatibleDC` 创建；`screen_dc` 同理。
+            // SAFETY: `mem_dc` 非空且由 `CreateCompatibleDC` 创建；`source` 未释放。
             unsafe {
                 DeleteDC(mem_dc);
-                ReleaseDC(ptr::null_mut(), screen_dc);
+                source.release();
             }
             return Err(DeviceError::Failed {
                 message: "CreateDIBSection 失败：内存不足或 GDI 句柄耗尽".to_string(),
@@ -612,7 +893,7 @@ impl Surface {
             unsafe {
                 DeleteObject(bitmap);
                 DeleteDC(mem_dc);
-                ReleaseDC(ptr::null_mut(), screen_dc);
+                source.release();
             }
             return Err(DeviceError::Failed {
                 message: "SelectObject 失败：位图没能选进内存 DC".to_string(),
@@ -620,7 +901,7 @@ impl Surface {
         }
 
         Ok(Self {
-            screen_dc,
+            source: Some(source),
             mem_dc,
             bitmap,
             previous,
@@ -628,6 +909,14 @@ impl Surface {
             width,
             height,
         })
+    }
+
+    /// 源 DC 的裸句柄（`BitBlt` 的源）。只在 `Surface` 存活期间调用，所以必然是 `Some`。
+    fn source_dc(&self) -> HDC {
+        self.source
+            .as_ref()
+            .map(SourceDc::raw)
+            .unwrap_or(ptr::null_mut())
     }
 
     /// 把像素读成一份**自有**的 BGRA 拷贝（不做任何转换）。
@@ -658,13 +947,17 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        // SAFETY: 这些句柄都是 `Surface::new` 成功时取得的，且只在这里释放一次。
-        // 顺序：先把旧位图选回去（否则删位图时它还在 DC 里），再删位图、内存 DC、屏幕 DC。
+        // SAFETY: 这些句柄都是 `Surface::with_source` 成功时取得的，且只在这里释放一次。
+        // 顺序：先把旧位图选回去（否则删位图时它还在 DC 里），再删位图、内存 DC，最后还源 DC。
         unsafe {
             SelectObject(self.mem_dc, self.previous);
             DeleteObject(self.bitmap);
             DeleteDC(self.mem_dc);
-            ReleaseDC(ptr::null_mut(), self.screen_dc);
+        }
+        // SAFETY: `source` 只在 `with_source` 里建过一次，且只在这里释放（取走后 `source`
+        // 恒为 `None`，重复 drop 是不可能的 —— `Drop::drop` 只跑一次）。
+        if let Some(source) = self.source.take() {
+            unsafe { source.release() };
         }
     }
 }
@@ -732,7 +1025,49 @@ fn blit_primary_screen() -> Result<Surface, DeviceError> {
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     let surface = Surface::new(width, height)?;
-    // SAFETY: 两个 DC 都有效且尺寸匹配；`SRCCOPY` 是不做变换的逐位拷贝。
+    blit_into(
+        &surface,
+        width,
+        height,
+        "BitBlt 失败：屏幕 DC 可能不可读（独占全屏或受保护内容）",
+    )?;
+    Ok(surface)
+}
+
+/// 把某块显示器**整屏** `BitBlt` 进一张自带像素内存的 DIB。
+///
+/// 与 [`blit_primary_screen`] 的区别只在源 DC：这里用 `CreateDCW(szDevice)` 取那块屏
+/// 自己的 DC（`GetDC(NULL)` 只覆盖主屏）。抓图口径仍只有一份（[`blit_into`]）。
+fn blit_display(display: &DisplayInfo) -> Result<Surface, DeviceError> {
+    let width = display.width as i32;
+    let height = display.height as i32;
+    let source = SourceDc::device(&display.device)?;
+    let surface = Surface::with_source(source, width, height)?;
+    blit_into(
+        &surface,
+        width,
+        height,
+        "BitBlt 失败：显示器 DC 可能不可读（独占全屏或受保护内容）",
+    )?;
+    Ok(surface)
+}
+
+/// 把某个窗口（含边框与标题栏）的像素 `BitBlt` 进 DIB —— `PrintWindow` 失败时的退路。
+fn blit_window(hwnd: HWND, width: i32, height: i32) -> Result<Surface, DeviceError> {
+    let source = SourceDc::window(hwnd)?;
+    let surface = Surface::with_source(source, width, height)?;
+    blit_into(
+        &surface,
+        width,
+        height,
+        "BitBlt 失败：窗口 DC 可能不可读（窗口已销毁或被保护）",
+    )?;
+    Ok(surface)
+}
+
+/// 从表面的源 DC `(0, 0)` 起拷 `width × height` 到它的 DIB。两条抓图路径共用。
+fn blit_into(surface: &Surface, width: i32, height: i32, failure: &str) -> Result<(), DeviceError> {
+    // SAFETY: 源 DC 与内存 DC 都有效且尺寸匹配；`SRCCOPY` 是不做变换的逐位拷贝。
     let copied = unsafe {
         BitBlt(
             surface.mem_dc,
@@ -740,7 +1075,7 @@ fn blit_primary_screen() -> Result<Surface, DeviceError> {
             0,
             width,
             height,
-            surface.screen_dc,
+            surface.source_dc(),
             0,
             0,
             SRCCOPY,
@@ -748,10 +1083,183 @@ fn blit_primary_screen() -> Result<Surface, DeviceError> {
     };
     if copied == 0 {
         return Err(DeviceError::Failed {
-            message: "BitBlt 失败：屏幕 DC 可能不可读（独占全屏或受保护内容）".to_string(),
+            message: failure.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// 用 `PrintWindow(PW_RENDERFULLCONTENT)` 把窗口画进一张 DIB（不读屏幕，走窗口自己的绘制）。
+fn print_window(hwnd: HWND, width: i32, height: i32) -> Result<Surface, DeviceError> {
+    let surface = Surface::new(width, height)?;
+    // SAFETY: `hwnd` 有效；`surface.mem_dc` 是有效的内存 DC 且已选入同尺寸位图。
+    // `PW_RENDERFULLCONTENT` 让 DWM 内容也参与渲染（对部分 UWP/合成窗口是必需的）。
+    let printed = unsafe { PrintWindow(hwnd, surface.mem_dc, PW_RENDERFULLCONTENT) };
+    if printed == 0 {
+        return Err(DeviceError::Failed {
+            message: "PrintWindow 返回 0：窗口可能拒绝渲染或被 DWM 保护".to_string(),
         });
     }
     Ok(surface)
+}
+
+// ---------------------------------------------------------------- 按窗口 OCR 的窗口查找
+
+/// 按窗口 OCR 时"可读窗口"的判据，四条（顺序就是筛选顺序，全部必须满足）：
+///
+/// 1. `IsWindowVisible` —— 不可见的窗口没有屏幕内容可抓；
+/// 2. `IsIconic` 为假 —— **最小化**的窗口要么抓出来是黑块，要么抓到的是任务栏按钮那一小块，
+///    与其给模型一张错图，不如说"现在没有可读的窗口"；
+/// 3. 标题非空 —— 无标题窗口基本是消息窗口、IME 候选框、托盘宿主这类，它们的"内容"不是用户
+///    想读的界面；
+/// 4. 进程映像名（小写，`QueryFullProcessImageNameW` → [`process_name`]）与请求**不区分大小写**
+///    地相等。
+///
+/// **多块匹配时的次序**：先看 `GetForegroundWindow`，它是就选它（用户正在看的那个窗口最可能
+/// 是他要的）；否则取 `EnumWindows` 的**第一个**命中 —— `EnumWindows` 按 Z 序**从上到下**
+/// 枚举，所以第一个就是"最上面那个"。
+///
+/// 与 [`enum_window_proc`] 的一处**故意不同**：这里**不跳过本进程的窗口**。`windows()` 跳过
+/// 自己的窗口是为了别让模型点到自己；OCR 是只读的，没有回环风险，而且进程读自己的窗口是
+/// 测试"按窗口 OCR 全链路"的唯一可行做法（测试进程必须能读到它自己建的窗口）。
+fn find_window_for_process(process: &str) -> Option<HWND> {
+    // 只比映像名：调用方可能传 `C:\Windows\notepad.exe`，也可能传 `notepad.exe`。
+    let wanted = process_name(process);
+    if wanted.is_empty() {
+        return None;
+    }
+
+    // 1) 前台窗口优先。
+    // SAFETY: 无参数，返回前台窗口句柄（可能为空）。
+    let foreground = unsafe { GetForegroundWindow() };
+    if !foreground.is_null() && window_matches_process(foreground, &wanted) {
+        return Some(foreground);
+    }
+
+    // 2) 否则 Z 序最前（`EnumWindows` 从上到下）。
+    let mut search = WindowSearch {
+        wanted,
+        found: None,
+    };
+    // SAFETY: `EnumWindows` 同步调用回调；`&mut search` 在调用期间有效，回调不保存这个指针。
+    unsafe {
+        EnumWindows(
+            Some(find_window_proc),
+            &mut search as *mut WindowSearch as LPARAM,
+        )
+    };
+    search.found
+}
+
+/// [`find_window_for_process`] 用到的枚举上下文。
+struct WindowSearch {
+    /// 已经过 [`process_name`] 归一化（小写）的映像名。
+    wanted: String,
+    /// 第一个命中的窗口（Z 序最上面那个）。
+    found: Option<HWND>,
+}
+
+/// 单个窗口是否满足"可读窗口"的四条判据（见 [`find_window_for_process`]）。
+fn window_matches_process(hwnd: HWND, wanted: &str) -> bool {
+    // SAFETY: `hwnd` 由调用方保证来自系统枚举或 `GetForegroundWindow`。
+    if unsafe { IsWindowVisible(hwnd) } == 0 || unsafe { IsIconic(hwnd) } != 0 {
+        return false;
+    }
+    if window_title(hwnd).is_empty() {
+        return false;
+    }
+    // SAFETY: `hwnd` 同上；`&mut pid` 指向栈上变量。
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == 0 {
+        return false;
+    }
+    process_name_of_pid(pid).is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+}
+
+/// `EnumWindows` 回调：找第一个满足判据的窗口，找到就返回 `0`（FALSE）**停止枚举**。
+///
+/// SAFETY: 契约要求 `lparam` 是调用方传的 `&mut WindowSearch`，回调期间有效。
+unsafe extern "system" fn find_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: 见本函数的契约。
+    let search = unsafe { &mut *(lparam as *mut WindowSearch) };
+    if search.found.is_some() {
+        // 停下来：Z 序第一个命中就是"最上面那个"，再往后只会更靠下。
+        return 0;
+    }
+    // SAFETY: `hwnd` 由系统给出。
+    if window_matches_process(hwnd, &search.wanted) {
+        search.found = Some(hwnd);
+        return 0;
+    }
+    1
+}
+
+/// 抓一个窗口的位图（给 OCR 用）：**先 `PrintWindow`，失败或画出来全黑就退 `GetWindowDC` + `BitBlt`**。
+///
+/// 为什么留退路（两条都是实测出来的）：
+///
+/// 1. `PrintWindow` 对部分窗口返回 0（拒绝渲染、被 DWM 保护、纯 GDI 且不处理 `WM_PRINT`）；
+/// 2. **更阴的一条：`PrintWindow` 返回 1，但位图一个像素都没画**（新 DIB 是全零，于是整张图纯黑）。
+///    实测场景：窗口刚 `ShowWindow` 完、DWM 还没合成第一帧时立刻抓图 —— 返回 1、位图全零。
+///    如果只看返回值，这里就会把"没抓到"当成"抓到了纯黑窗口"，然后 OCR 返回空串，
+///    调用方无法区分"窗口里没字"和"我们根本没抓到图"——那正是契约禁止的"空串冒充成功"。
+///    所以退路判据是**内容**（全零）而不只是返回值。
+/// 3. 两条都拿不到内容时**明确失败**（`Failed`），不返回空位图。
+fn capture_window_for_ocr(hwnd: HWND) -> Result<Surface, DeviceError> {
+    // SAFETY: `RECT` 是 POD，全零合法；`GetWindowRect` 只在成功时写入。
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    // SAFETY: `hwnd` 由调用方保证有效；`&mut rect` 指向栈上有效内存。
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return Err(DeviceError::Failed {
+            message: "GetWindowRect 失败：窗口可能已经销毁".to_string(),
+        });
+    }
+    let width = rect.right.saturating_sub(rect.left);
+    let height = rect.bottom.saturating_sub(rect.top);
+
+    let mut printed_nothing = false;
+    match print_window(hwnd, width, height) {
+        Ok(surface) if !surface_is_blank(&surface) => return Ok(surface),
+        Ok(_) => {
+            printed_nothing = true;
+            tracing::debug!(
+                "PrintWindow 返回成功但位图全零（DWM 还没合成这一帧？），退化为窗口 DC 的 BitBlt"
+            );
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "PrintWindow 抓窗口失败，退化为窗口 DC 的 BitBlt"
+            );
+        }
+    }
+
+    let surface = blit_window(hwnd, width, height)?;
+    if surface_is_blank(&surface) {
+        return Err(DeviceError::Failed {
+            message: format!(
+                "窗口位图是空的（{width}x{height} 全零）：PrintWindow 没能渲染这块窗口\
+                 （DWM 保护 / DRM 内容 / 窗口尚未合成），从窗口 DC 也读不到像素"
+            ),
+        });
+    }
+    if printed_nothing {
+        tracing::debug!("窗口 DC 的 BitBlt 拿到了内容（PrintWindow 那条路是空的）");
+    }
+    Ok(surface)
+}
+
+/// 位图是不是"一个像素都没画"（全零 = 纯黑）。
+///
+/// 只把**纯全零**当空：GDI 新建的 DIB 就是全零，任何真的被渲染过的窗口（哪怕深色主题）
+/// 都会有抗锯齿边缘或非零背景色。判"全零"而不是"接近黑"是为了不把深色窗口误判成没抓到。
+fn surface_is_blank(surface: &Surface) -> bool {
+    match surface.read_bgra() {
+        Ok((_, _, bgra)) => bgra.iter().all(|byte| *byte == 0),
+        // 读不出像素就没法证明它是空的；交给后面的识别链路去报真正的错误。
+        Err(_) => false,
+    }
 }
 
 /// BGRA → RGB：丢掉 alpha（`BI_RGB` 下它是垃圾值），保留行序。
@@ -879,6 +1387,49 @@ fn create_ocr_engine() -> Result<OcrEngine, DeviceError> {
             error.code().0
         ),
     })
+}
+
+/// 本机装了哪些 OCR 识别语言（返回 BCP-47 标签，例如 `en-US`、`zh-Hans-CN`）。
+///
+/// 这是"中文到底能不能识别"的**唯一实测口径**：语言清单里有中文标签，才说明这台机器装了
+/// 中文 OCR 语言包；`TryCreateFromUserProfileLanguages` 走的是**用户配置的**语言，与这个
+/// 全集不是一回事（用户可以只让引擎认英文）。所以两条都要看：
+///
+/// - 引擎建不出来 → `Err`（与 [`ocr_engine_probe`] 同源的 `HostLimit` 文案）；
+/// - 引擎能建、清单里没有中文 → 引擎能用，只是**认不了中文**（不是错误，是事实）。
+fn available_ocr_languages() -> Result<Vec<String>, String> {
+    if let Err(reason) = ocr_engine_probe() {
+        return Err(reason.clone());
+    }
+    let languages = OcrEngine::AvailableRecognizerLanguages().map_err(|error| {
+        format!(
+            "OcrEngine::AvailableRecognizerLanguages 失败（HRESULT 0x{:08X}）：{error}",
+            error.code().0
+        )
+    })?;
+    let count = languages.Size().map_err(|error| {
+        format!(
+            "IVectorView<Language>::Size 失败（HRESULT 0x{:08X}）：{error}",
+            error.code().0
+        )
+    })?;
+    let mut tags = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let language = languages.GetAt(index).map_err(|error| {
+            format!(
+                "IVectorView<Language>::GetAt({index}) 失败（HRESULT 0x{:08X}）：{error}",
+                error.code().0
+            )
+        })?;
+        let tag = language.LanguageTag().map_err(|error| {
+            format!(
+                "Language::LanguageTag 失败（HRESULT 0x{:08X}）：{error}",
+                error.code().0
+            )
+        })?;
+        tags.push(tag.to_string_lossy());
+    }
+    Ok(tags)
 }
 
 /// 把 BGRA 字节变成 OCR 能吃的 `SoftwareBitmap`。
@@ -1709,7 +2260,8 @@ mod tests {
 
     use windows_sys::Win32::Graphics::Gdi::{
         ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
-        FF_DONTCARE, FW_BOLD, OUT_TT_PRECIS, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+        FF_DONTCARE, FW_BOLD, GetTextFaceW, OUT_TT_PRECIS, SetBkMode, SetTextColor, TRANSPARENT,
+        TextOutW,
     };
 
     /// 本机能不能真的跑 OCR。`None` = 建不出引擎（没语言包/受限会话），调用方打印原因后跳过。
@@ -1787,6 +2339,157 @@ mod tests {
             .to_uppercase()
     }
 
+    /// 在**指定字体**下把文字画进一张白底 DIB，并回读 GDI 实际选中的字体名。
+    ///
+    /// 为什么必须回读字体名：`CreateFontW` 对不存在的字体名**不报错**，它静默做字体映射
+    /// （落回某个系统字体）。中文用例里如果本机没有中文字体，`Microsoft YaHei` 会被映射成
+    /// 一个画不出汉字的字体，字会变成方框或空白 —— 那时断言"识别出中文"就是假通过。
+    /// 所以先回读 `GetTextFaceW`，再由调用方自检像素，两条都过才敢说"中文真的画出来并被认出来"。
+    fn surface_with_face(text: &str, face: &str, width: i32, height_px: i32) -> (Surface, String) {
+        let surface = Surface::new(width, height_px)
+            .expect("建 DIB 失败：当前会话大概没有可交互桌面（服务会话/RDP 已断开），GDI 画不出字");
+        let bytes = (width as usize) * (height_px as usize) * 4;
+        // SAFETY: `bits` 指向 `CreateDIBSection` 分配的 `width*height*4` 字节可写映射内存。
+        unsafe { std::ptr::write_bytes(surface.bits, 0xFF, bytes) };
+
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let face_spec: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut actual_face: Vec<u16> = Vec::new();
+        // SAFETY: `mem_dc` 来自刚建的 `Surface`；字体名以 NUL 结尾；`units`/`buffer` 调用期间存活。
+        unsafe {
+            let font = CreateFontW(
+                -96,
+                0,
+                0,
+                0,
+                FW_BOLD as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                OUT_TT_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                ANTIALIASED_QUALITY as u32,
+                (DEFAULT_PITCH | FF_DONTCARE) as u32,
+                face_spec.as_ptr(),
+            );
+            assert!(!font.is_null(), "CreateFontW 失败：拿不到 GDI 字体句柄");
+            let previous = SelectObject(surface.mem_dc, font);
+            let mut buffer = [0u16; 64];
+            let length = GetTextFaceW(surface.mem_dc, buffer.len() as i32, buffer.as_mut_ptr());
+            if length > 0 {
+                actual_face.extend_from_slice(&buffer[..(length as usize).min(buffer.len())]);
+            }
+            SetBkMode(surface.mem_dc, TRANSPARENT as i32);
+            SetTextColor(surface.mem_dc, 0x0000_0000); // COLORREF：黑
+            TextOutW(surface.mem_dc, 30, 60, units.as_ptr(), units.len() as i32);
+            SelectObject(surface.mem_dc, previous);
+            DeleteObject(font);
+        }
+        (surface, String::from_utf16_lossy(&actual_face))
+    }
+
+    /// 白底上"暗像素"的个数：用来证明字**真的画出来了**（不是空白画布，也不是方框雨）。
+    ///
+    /// 阈值取 2000：96px 粗体的几个汉字/十几个字母远远超过这个数，而抗锯齿边缘噪声远低于它。
+    fn dark_pixel_count(bgra: &[u8]) -> usize {
+        bgra.chunks_exact(4)
+            .filter(|pixel| pixel[0] < 128 && pixel[1] < 128 && pixel[2] < 128)
+            .count()
+    }
+
+    /// 「本机装了哪些 OCR 语言」的**非跳过**断言：引擎能建出来就至少有一种语言。
+    ///
+    /// 这条不 `#[ignore]`：它是"OCR 真的可用"的最小钉子。引擎建不出来时由
+    /// [`ocr_engine_or_skip`] 打印原因并跳过（那属于宿主限制，不是代码坏了）。
+    #[test]
+    fn ocr_language_list_is_not_empty() {
+        if ocr_engine_or_skip("ocr_language_list_is_not_empty").is_none() {
+            return;
+        }
+        let languages = available_ocr_languages().expect("引擎可用时必须能列出识别语言");
+        eprintln!(
+            "[ocr] 本机 OCR 语言清单（{} 种）：{languages:?}",
+            languages.len()
+        );
+        assert!(
+            !languages.is_empty(),
+            "引擎能建出来却一种识别语言都没有，这不合理"
+        );
+        for tag in &languages {
+            assert!(!tag.trim().is_empty(), "语言标签不该是空串：{languages:?}");
+        }
+    }
+
+    /// 中文实测：装了中文语言包 + 本机有中文字体时，`你好，世界` 必须被认出来。
+    ///
+    /// **运行时判定，不用 `#[ignore]`**：条件不全时打印"本机不可测"并返回（诚实跳过），
+    /// 条件齐了就必须真认出来。为什么不用 `#[ignore]`：`#[ignore]` 会被无条件跳过，
+    /// 而"这台机器到底能不能认中文"正是要实测的东西 —— 用运行时判定才能让结果随机器说话。
+    ///
+    /// 三道自检，缺一道就可能假通过：
+    /// 1. 语言清单里有 `zh*`（没装中文包时中文必然认不出，这不算代码问题）；
+    /// 2. GDI 实际选中的字体确实是中文字体（`Microsoft YaHei`，回退时说明无中文字体）；
+    /// 3. 画布上有足够多的暗像素（字体在但字形画不出来时是空白）。
+    #[test]
+    fn chinese_text_is_recognized_when_a_chinese_language_pack_is_installed() {
+        if ocr_engine_or_skip(
+            "chinese_text_is_recognized_when_a_chinese_language_pack_is_installed",
+        )
+        .is_none()
+        {
+            return;
+        }
+        let languages = available_ocr_languages().unwrap_or_default();
+        eprintln!("[ocr/zh] 语言清单：{languages:?}");
+        let has_chinese_pack = languages
+            .iter()
+            .any(|tag| tag.to_ascii_lowercase().starts_with("zh"));
+        if !has_chinese_pack {
+            eprintln!(
+                "[ocr/zh] 本机没装中文 OCR 语言包（清单里没有 zh-*）→ 中文识别本机不可测，跳过"
+            );
+            return;
+        }
+
+        const DRAWN: &str = "你好，世界";
+        let (surface, actual_face) = surface_with_face(DRAWN, "Microsoft YaHei", 1200, 260);
+        eprintln!("[ocr/zh] 请求字体 Microsoft YaHei，GDI 实际选中：{actual_face:?}");
+        let lowered = actual_face.to_ascii_lowercase();
+        if !(lowered.contains("yahei")
+            || lowered.contains("simsun")
+            || lowered.contains("simhei")
+            || actual_face.contains("雅黑")
+            || actual_face.contains("宋体")
+            || actual_face.contains("黑体"))
+        {
+            eprintln!(
+                "[ocr/zh] 本机没有中文字体（回退到 {actual_face:?}）→ 中文画不出来，本机不可测，跳过"
+            );
+            return;
+        }
+
+        let (width, height, bgra) = surface.read_bgra().expect("读回 BGRA 像素");
+        let dark = dark_pixel_count(&bgra);
+        eprintln!("[ocr/zh] 画布 {width}×{height}，暗像素 {dark} 个");
+        assert!(
+            dark > 2000,
+            "字体选对了但画布上几乎没有墨迹（{dark} 个暗像素）：中文没画出来，不能拿识别结果说事"
+        );
+
+        let recognized = recognize_bgra(width, height, &bgra)
+            .expect("引擎可用时识别不该失败（失败要查日志里的 HRESULT）");
+        eprintln!("[ocr/zh] 画进去的是 {DRAWN:?}，识别结果是 {recognized:?}");
+        let normalized: String = recognized
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert!(
+            normalized.contains("你好") || normalized.contains("世界"),
+            "装了中文语言包、字也画出来了，却没认出一个中文词：画的是 {DRAWN:?}，认出来是 {recognized:?}"
+        );
+    }
+
     /// 真的识出文字：GDI 画 `HBOT OCR TEST 12345` → 走 `recognize_bgra` → 断言认出来了。
     #[test]
     fn ocr_recognizes_text_drawn_into_a_dib() {
@@ -1839,23 +2542,26 @@ mod tests {
         assert!(!already_empty.truncated, "本来就是空文本：没有东西被截掉");
     }
 
-    /// `DeviceTarget::Window` 必须**明确拒绝**，不能静默忽略 target 去截主屏。
+    /// 找不到可读窗口时必须是 `AppNotAllowed`，**不能**退回截主屏、也不能返回空串。
     ///
-    /// 这条也不依赖引擎：target 判定发生在抓图和建引擎之前，所以没装语言包的机器上也必须成立。
+    /// 这条不依赖 OCR 引擎：窗口查找发生在建引擎之前，所以没装语言包的机器上也必须成立
+    /// （而且查找失败时根本不会去建引擎）。
     #[test]
-    fn ocr_window_target_is_rejected_as_a_host_limit() {
+    fn window_ocr_without_a_readable_window_is_an_app_not_allowed_error() {
+        let process = "hbot-device-never-a-real-window.exe";
         let result = WindowsBackend::new().ocr(&OcrRequest {
             target: DeviceTarget::Window {
-                process: "notepad.exe".to_string(),
+                process: process.to_string(),
             },
             max_chars: 100,
         });
         match result {
-            Err(DeviceError::HostLimit { detail }) => {
-                assert!(detail.contains("窗口"), "要写清是按窗口 OCR 未做：{detail}");
-                assert!(detail.contains("notepad.exe"), "要点出被拒的目标：{detail}");
+            Err(DeviceError::AppNotAllowed { process: reported }) => {
+                assert_eq!(reported, process, "要把被拒的进程原样回给调用方");
             }
-            other => panic!("DeviceTarget::Window 必须返回 HostLimit，实际：{other:?}"),
+            other => panic!(
+                "没有可读窗口的进程必须返回 AppNotAllowed（不许静默截主屏，也不许空串）：{other:?}"
+            ),
         }
     }
 
