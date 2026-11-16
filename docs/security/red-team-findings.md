@@ -9,8 +9,10 @@
   **默认不响，但只跑 `--ignored` 就能立刻复现**。
 * **已修条目要转正**：修好之后去掉 `#[ignore]`、让用例进默认套件（否则修复本身没有回归网），
   条目里保留"修复前的现场"作为取证，并补一段"修法与证据"。
-* **状态**：**已修**：RT-01、RT-02、RT-03、RT-05、RT-07、RT-08（2026-11-16；RT-02 / RT-03 / RT-05
-  见各条「修法与证据」）；**未修**：RT-06。每条末尾给出对应的 run 命令 / 用例名。
+* **状态**：**全部已修**：RT-01、RT-02、RT-03、RT-05、RT-06、RT-07、RT-08（2026-11-16；RT-02 / RT-03 / RT-05
+  见各条「修法与证据」）。RT-06 的 `AuditEvent` 仍保留 `#[derive(Debug)]`，但它唯一可能带密钥的字段是
+  `Option<ApprovalKey>`，而 `ApprovalKey` 已在 RT-03 里改用手写 `Debug`（只打工具名/键名/类型/长度），
+  因此不再泄露。每条末尾给出对应的 run 命令 / 用例名。
 
 ```powershell
 $env:CARGO_TARGET_DIR='E:\hbot-target\redteam'   # 别用 D 盘：本机 D 盘满过一次
@@ -333,30 +335,84 @@ cargo test -p hbot-redteam -- --ignored          # 只剩非安全的 b_helper�
 
 ## RT-06 四个核心类型的 `Debug` 会把密钥 / 入站原文打出来
 
-**严重度：中**　**状态：未修**
+**严重度：中**　**状态：已修（2026-11-16）**
 
-* **位置**：
-  * `crates/hbot-core/src/command.rs:77-78` `CommandSpec`（`#[derive(Clone, Debug, …)]`，含 `env: Vec<(String,String)>`）
-  * `crates/hbot-core/src/domain.rs:155-157` `InboundMessage`（含 `payload: Value` 原文）
-  * `crates/hbot-agent/src/gateway.rs:129-130` `AuditEvent`（含 `key: Option<ApprovalKey>` → 规范化参数原文）
-  * `crates/hbot-agent/src/provider/mod.rs:144` `ToolCallRequest`（含 `arguments: Value`）
-* **复现**：`format!("{:?}", spec)` 出现 `env: [("OPENAI_API_KEY", "sk-test-DEADBEEF")]`；
-  `format!("{:?}", inbound)` 出现 payload 里的 `"authorization": "Bearer sk-test-DEADBEEF"`；
-  `format!("{:?}", call)` 出现完整 `arguments`。
-* **期望**：这四类字段手写 `Debug`，只打键名或 `<redacted>` —— 仓库里已经有正确样例：
-  `BotConfig`（`crates/hbot-rpc/src/app/runtime/config.rs:91-110`）与 `ProviderConfig`
-  （`crates/hbot-rpc/src/app/agent/config.rs:163`）都是手写 `Debug` 把 token 打成 `<redacted>`。
-* **实际**：派生 `Debug` 全量输出。当前"不泄漏"完全依赖纪律：
-  `hbot-rpc` 的 `TracingAudit` 注释明确说「刻意不打印 `event.key` 的规范化参数」。
-  任何人加一行 `tracing::debug!(?event)`、`dbg!(&spec)`，或者让 panic 消息带出这几个值，密钥就落日志了。
-* **影响**：密钥进入持久化日志（`logs` 表 / tracing 文件），且 `InboundMessage` 会把**整条入站原文**
-  （用户隐私）复制到每一处打印它的地方。类型层面没有任何兜底。
-* **最小修法建议**：四个类型各手写一个 `Debug` impl（`CommandSpec`：`env` 打键名 + `<redacted>`；
-  `InboundMessage`：`payload` 打 `{"keys": [...]}`；`AuditEvent`：`key` 打 `tool/sandbox`；
-  `ToolCallRequest`：`arguments` 打键名）。合计约 50 行，无行为变更。
-* **红队用例**：
-  * `crates/hbot-redteam/tests/f_secret_leak.rs::f03_command_spec的debug输出必须脱敏`（覆盖 `CommandSpec` + `ToolCallRequest`）
-  * `crates/hbot-redteam/tests/f_secret_leak.rs::f04_inbound_message的debug输出必须脱敏`
+* **位置**（修复前都是 `#[derive(Debug)]`）：
+  * `crates/hbot-core/src/command.rs:79` `CommandSpec`（`env: Vec<(String,String)>`、`args` 里的 `--token=…`）
+  * `crates/hbot-core/src/domain.rs:155` `InboundMessage`（`payload: Value` 原文）；同文件的 `ToolCall`（`args` / `result`）一并修了
+  * `crates/hbot-agent/src/provider/mod.rs:144` `ToolCallRequest`（`arguments: Value`）
+  * `crates/hbot-adapters/src/normalize.rs` `NormalizedInbound`（`raw: Value`，适配器层的入站原始事件）
+  * `crates/hbot-agent/src/gateway.rs:129` `AuditEvent` —— **本轮仍未改**（写域之外，见「残余风险」）
+* **复现**（修复前）：`format!("{:?}", spec)` 出现 `env: [("API_TOKEN", "sk-live-1234")]`、
+  `args: ["--token=sk-live-1234"]`；`format!("{:?}", inbound)` 出现 payload 里的
+  `"Authorization": "QRBT abc"` 与 `message_scene.ext` 的 `auth_token=xyz`；`format!("{:?}", call)` 出现完整 `arguments`。
+* **影响**：这些 `Debug` 会经 `tracing::warn!(?spec)`、`thiserror` 的 `#[source]` 链、以及工具输出进入
+  **持久化日志**（`logs` 表 / tracing 文件）。用户一旦在 `agent.json` 配了 key，或入站事件带
+  `Authorization` 头（QQ 官方 `message_scene.ext` 里就有 `auth_token=`），密钥就永久落库；
+  `InboundMessage` 还会把**整条入站原文**复制到每一处打印它的地方。
+* **修复**：新增**唯一一份判据** `crates/hbot-core/src/redact.rs`，五处手写 `Debug` 全部经它打印
+  （`CommandSpec` / `InboundMessage` / `ToolCall` / `ToolCallRequest` / `NormalizedInbound`）：
+  * `redact_arg(&str) -> String`：文本级（`--token=…`、`Authorization: Bearer …`、`api_key=…`、`"password":"…"`）
+  * `redact_value(&Value) -> Value`：JSON 递归（嵌套对象 / 数组里的键名命中即**整值** `<redacted>`）
+  * `redact_args(&[String])`：`--api-key <value>` 这种**分开写**的 argv（下一个元素也抹）
+  * `RedactedArgs` / `RedactedEnv` / `RedactedJson`：给手写 `Debug` 用的包装，**字段名全保留**、非敏感值原样
+  * `REDACTED = "<redacted>"`、`is_secret_key(&str)`、`redact_text(&str)`（= `redact_arg` + 裸 32+ 位 hex 抹除，日志侧用）
+* **判据矩阵**（`is_secret_key`，切词后**精确命中**，不是 `contains`）：
+  | 输入 | 结果 | 判据 |
+  |---|---|---|
+  | `token` / `auth_token` / `access_token` / `X-Auth-Token` / `access-token` | 抹 | 词 `token` |
+  | `api_key` / `apikey` / `OPENAI_API_KEY` / `clientSecret` / `secretKey` / `private-key` | 抹 | 词 `apikey` / `key` / `secret` |
+  | `secret` / `client_secret` / `password` / `passwd` / `db-password` | 抹 | 词 `secret` / `password` / `passwd` |
+  | `authorization` / `Authorization` / `X-Authorization` | 抹 | 词 `authorization` |
+  | `credential(s)` / `cookie(s)` / `passphrase` | 抹 | 词表命中 |
+  | `max_tokens` / `prompt_tokens` / `token_count` / `max_keys` | **不抹** | 凭据词被计量词（`max`/`min`/`limit`/`count`/`prompt`/`size`…）修饰 → 是限额 |
+  | `tokenizer` / `monkey` / `keyboard` / `keywords` | **不抹** | 切词后是**一个词**，与 `token`/`key` 不相等 |
+* **为什么 `max_tokens` 不能抹**：它是数字限额（`CompletionRequest.max_tokens`、tracing 里的用量日志），
+  抹掉会让"为什么这次请求被截断 / 花了多少 token"这类调参日志直接失效，而它本身**不装密钥**。
+  上一份实现（`hbot-rpc` 的 `contains` 判据）会把 `max_tokens` 判成密钥 —— 这是本轮的刻意分歧，见下。
+* **注意"递归"不等于"阉割"**：payload 只是把**命中的值**换成 `<redacted>`，键名、非敏感字段、数字、
+  普通字符串全部原样保留；没有一处把整个 payload 打成 `<redacted>`（那样日志就没有排查价值了）。
+* **两份实现（应该合并）**：现在有**两份**脱敏实现 —— `crates/hbot-core/src/redact.rs`（本轮新增的通用版，
+  `Debug` / JSON 用）与 `crates/hbot-rpc/src/app/agent/log.rs`（原有的日志版，`describe_arguments` /
+  `redact_json` / `redact_text` 用）。**应该合并成一份（留 core 的），但 `crates/hbot-rpc/**` 不归本轮写域**，
+  所以没动它。已知差异（合并时以 core 版为准）：
+  ① rpc 版用 `contains` 判键名，会误抹 `max_tokens`；② rpc 版不认 `--token value` 分开写、也不认驼峰 `clientSecret`。
+  此外还有**第三份**临时实现：`crates/hbot-adapters/src/platforms/qq/normalize.rs` 的 `redact_auth_token`
+  （QQ 批自带，只抹 `auth_token=`），同样应合并过来。
+* **测试**（新增 11 条 + 红队 2 条转正）：
+  * `crates/hbot-core/tests/debug_redaction.rs`：`debug_of_command_spec_never_prints_secrets`、
+    `debug_of_inbound_redacts_authorization`、`ordinary_words_containing_key_are_not_redacted`、
+    `debug_of_domain_tool_call_redacts_args`、`sensitive_key_variants_are_recognised`、
+    `redact_value_recurses_into_arrays_and_objects`
+  * `crates/hbot-agent/tests/debug_redaction.rs`：`debug_of_tool_call_redacts_nested_arguments`、
+    `debug_of_tool_call_redacts_flat_credential_keys`、`debug_of_tool_call_keeps_ordinary_words`
+  * `crates/hbot-adapters/tests/debug_redaction.rs`：`debug_of_normalized_inbound_redacts_raw_credentials`、
+    `debug_of_normalized_inbound_keeps_ordinary_words`
+  * `crates/hbot-redteam/tests/f_secret_leak.rs::f03_command_spec的debug输出必须脱敏` 与
+    `::f04_inbound_message的debug输出必须脱敏` —— **去掉了 `#[ignore]`**，现为默认套件（10 passed / 0 ignored）
+* **变异验证**：把 `CommandSpec` 临时换回 `#[derive(Debug)]`（同时删掉手写 impl）后
+  `cargo test -j 2 -p hbot-core --test debug_redaction debug_of_command_spec_never_prints_secrets` → **FAILED**：
+  ```
+  thread 'debug_of_command_spec_never_prints_secrets' panicked at crates\hbot-core\tests\debug_redaction.rs:48:5:
+  CommandSpec 的 Debug 泄漏了密钥：CommandSpec { program: "cmd", args: ["--token=sk-live-1234", "--verbose", "status"],
+  cwd: "", ..., env: [("API_TOKEN", "sk-live-1234"), ("RUST_LOG", "info")], ... }
+  ```
+  还原后同一条 → `ok`（6 passed），`git status --porcelain -- crates/hbot-core crates/hbot-agent
+  crates/hbot-adapters crates/hbot-redteam docs/security` 为空。
+  坑：`Copy-Item` 还原会保留备份的旧 mtime，cargo 直接复用变异产物（第一次还原后仍 FAILED 即是此因），必须 touch 文件再跑。
+* **验收**（2026-11-16，`CARGO_TARGET_DIR=E:\hbot-target\rt06`）：
+  ```
+  cargo test   -j 2 -p hbot-core -p hbot-agent -p hbot-adapters -p hbot-redteam → exit 0
+  cargo clippy -j 2 -p hbot-core -p hbot-agent -p hbot-adapters --all-targets -- -D warnings → exit 0
+  cargo fmt    -p hbot-core -p hbot-agent -p hbot-adapters -- --check → exit 0
+  cargo test   -j 2 -p hbot-rpc --lib → exit 0（193 passed）
+  ```
+* **残余风险**（仍是会装密钥的派生 `Debug`，本轮不修，仅登记）：
+  * `crates/hbot-agent/src/gateway.rs:129` `AuditEvent`（`key: Option<ApprovalKey>`；`ApprovalKey` 自己的 `Debug` 已脱敏，故只**间接**安全）
+  * `crates/hbot-core/src/domain.rs` 的 `Bot`（`config: Value`，里面可能就是 `api_key`）、`OutboundMessage`（`payload: Value`）
+  * `crates/hbot-agent/src/provider/mod.rs` 的 `ChatMessage`（含 `tool_calls`，现已间接安全）、`Completion`、`ToolSpec`（`parameters: Value`）
+  * `crates/hbot-adapters/src/platforms/*` 各 DTO（OneBot / QQ 原始事件结构体里的 `Value` 字段）
+  * 任何第三方 crate 对这五类类型的 `#[derive(Debug)]` 再包装
 
 ---
 
