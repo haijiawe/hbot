@@ -16,7 +16,7 @@
  * "假结果"（`crates/hbot-rpc/src/app/commands/files.rs` 的 `search` 在 cancelled 时直接返回）。
  */
 
-import type { DeviceStatus, Event as CoreEvent, RunLog } from '../generated'
+import type { DeviceSettings, DeviceStatus, Event as CoreEvent, RunLog } from '../generated'
 import type {
   BotStatus,
   Command,
@@ -101,6 +101,77 @@ function mockDeviceStatus(botId: string): DeviceStatus {
     // 与核心一样按"现在到 deadline"算；UI 拿它当倒计时起点。
     remainingMs: Math.max(session.deadline - Date.now(), 0),
   }
+}
+
+/**
+ * mock 里那份**内存**宿主设置（真机在 `<data_dir>/device.json`）。
+ *
+ * 为什么要在 mock 里真的存一份而不是每次回同一个常量：`device_settings_set` 的语义是
+ * "写进去，之后所有窗口读到的是新的那份"。回常量会让浏览器里的保存按钮看起来点了没反应，
+ * 前端测试也就永远测不出"保存之后 get 能读回新值"。
+ *
+ * 只在这一处判断"什么算合法"，判据照抄 docs/09-device-capability.md §4.2：不认识的能力名、
+ * `maxMinutes` 超 30、`defaultMinutes > maxMinutes`、动作上限 < 1 —— 都当场拒绝，
+ * 与核心一样不"就近取一个合法值"。
+ */
+const MOCK_DEVICE_CAPABILITIES = ['screen', 'ocr', 'input', 'window', 'clipboard'] as const
+
+/** 复制一份设置：调用方拿到的数组不该与 mock 的"磁盘"共享引用。 */
+function cloneMockDeviceSettings(settings: DeviceSettings): DeviceSettings {
+  return {
+    ...settings,
+    capabilities: [...settings.capabilities],
+    allowedApps: [...settings.allowedApps],
+  }
+}
+
+/** 校验用的硬上限：与 `MOCK_DEVICE_MAX_MINUTES` 同一个数（契约 30 分钟）。 */
+function checkedMockDeviceSettings(next: DeviceSettings): DeviceSettings {
+  const unknown = next.capabilities.filter(
+    (name) => !MOCK_DEVICE_CAPABILITIES.some((known) => known === name),
+  )
+  if (unknown.length > 0) {
+    throw new Error(`device_settings_set: 不认识的能力（${unknown.join('、')}，-32002）`)
+  }
+  if (
+    !Number.isInteger(next.maxMinutes) ||
+    next.maxMinutes < 1 ||
+    next.maxMinutes > MOCK_DEVICE_MAX_MINUTES
+  ) {
+    throw new Error(
+      `device_settings_set: maxMinutes 必须在 1..30 之间（收到 ${next.maxMinutes}，-32002）`,
+    )
+  }
+  if (!Number.isInteger(next.defaultMinutes) || next.defaultMinutes < 1) {
+    throw new Error(
+      `device_settings_set: defaultMinutes 必须是正整数（收到 ${next.defaultMinutes}，-32002）`,
+    )
+  }
+  if (next.defaultMinutes > next.maxMinutes) {
+    throw new Error(
+      `device_settings_set: defaultMinutes 不能大于 maxMinutes（${next.defaultMinutes} > ${next.maxMinutes}，-32002）`,
+    )
+  }
+  if (!Number.isInteger(next.maxActionsPerSession) || next.maxActionsPerSession < 1) {
+    throw new Error(
+      `device_settings_set: maxActionsPerSession 至少为 1（收到 ${next.maxActionsPerSession}，-32002）`,
+    )
+  }
+  if (next.allowedApps.some((app) => app.trim().length === 0)) {
+    throw new Error('device_settings_set: allowedApps 里不能有空字符串（-32002）')
+  }
+  // 存副本：调用方之后改自己那份数组不该影响 mock 的"磁盘"。
+  return cloneMockDeviceSettings(next)
+}
+
+/** mock 的初始设置：与核心默认值一致（总开关关、能力全不勾、应用不设上限）。 */
+let mockDeviceSettings: DeviceSettings = {
+  enabled: false,
+  capabilities: [],
+  allowedApps: [],
+  defaultMinutes: MOCK_DEVICE_DEFAULT_MINUTES,
+  maxMinutes: MOCK_DEVICE_MAX_MINUTES,
+  maxActionsPerSession: 10_000,
 }
 
 /**
@@ -618,6 +689,17 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
       if (command.botId !== BOT_ID) throw new Error(`device_request: 未知 bot（${command.botId}）`)
       // mock 不自动放行、也不假造 `device.request` 事件：请求必须由人点「允许」。
       return null
+
+    // 宿主设置：get 读回内存里那份，set 校验后**真的覆盖**它（见 `checkedMockDeviceSettings`）。
+    // 不额外推 `device.settings` 事件，理由与 `device.status` 同一条（上面的 mock 纪律）：
+    // 保存成功已经把生效值回给了调用方，前端不该靠"mock 恰好推了事件"才正确。
+    case 'deviceSettingsGet':
+      return cloneMockDeviceSettings(mockDeviceSettings)
+
+    case 'deviceSettingsSet': {
+      mockDeviceSettings = checkedMockDeviceSettings(command.settings)
+      return cloneMockDeviceSettings(mockDeviceSettings)
+    }
 
     // 打开项目：核心规范化路径并切换 workspace（`system.rs` 的 `project_open`）。
     // mock 只有一条演示项目，所以任何路径都登记到这同一张表上——`TREE` / `FILES`

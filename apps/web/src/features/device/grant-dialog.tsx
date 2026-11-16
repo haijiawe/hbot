@@ -167,6 +167,11 @@ export function GrantDialog({ initialSub = [], onClose }: GrantDialogProps) {
             必须至少一个应用；留空等于全拒。写进程名（例如{' '}
             <code className="device-dialog__option-id">PathOfExile.exe</code>），不是窗口标题。
           </span>
+          {/* 说明而不是重做列表：对话框当前的 textarea 没有"可勾选项"，改成按宿主设置的清单
+              渲染会牵动 8 条既有断言（见 device-panel.test.tsx ⑦ "恰好 5 个 checkbox"）。 */}
+          <span className="device-dialog__hint">
+            「宿主设备设置」里也能设「允许的应用」，那是长期上限；这里填的是这次会话的范围。
+          </span>
         </label>
 
         <label className="device-dialog__field device-dialog__field--inline">

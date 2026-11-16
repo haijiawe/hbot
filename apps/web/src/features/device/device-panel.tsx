@@ -16,6 +16,7 @@ import type { DeviceStatus } from '../../generated'
 import { formatClock } from '../../lib/format'
 import { useDeviceStore } from '../../stores/device-store'
 import { DEVICE_SUB_CAPABILITIES, GrantDialog } from './grant-dialog'
+import { DeviceSettingsCard } from './settings-card'
 
 /** 倒计时刷新间隔：契约要求"每 1 秒本地减"，不重新请求核心。 */
 const COUNTDOWN_TICK_MS = 1000
@@ -126,6 +127,8 @@ export function DevicePanel() {
         {requestBlock}
         <p className="panel-empty">先启动一个 bot。</p>
         <p className="panel-hint">设备会话按 bot 记：选一个运行中的 bot 之后才能开始会话。</p>
+        {/* 设置是宿主级的：没有 bot 也要能改，否则第一个 bot 起来之前连"允许什么"都设不了。 */}
+        <DeviceSettingsCard />
         {dialog}
       </div>
     )
@@ -252,6 +255,8 @@ export function DevicePanel() {
           </p>
         </section>
       ) : null}
+
+      <DeviceSettingsCard />
 
       <div className="device-panel__footer">
         <button

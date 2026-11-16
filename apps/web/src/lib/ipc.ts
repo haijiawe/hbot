@@ -19,6 +19,7 @@ import type {
   BotStatus as BotStatusDto,
   BotSummary as BotSummaryDto,
   ConversationSummary as ConversationSummaryDto,
+  DeviceSettings as DeviceSettingsDto,
   DeviceStatus as DeviceStatusDto,
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
@@ -244,6 +245,20 @@ export interface CommandInputs {
    * 之后才会走 `deviceGrant`。
    */
   deviceRequest: { botId: string; sub: string[]; reason: string }
+  /**
+   * 读**宿主级**设备设置（wire `device_settings_get`）。
+   *
+   * 没有 `botId`：设置属于这台机器（`<data_dir>/device.json`），不属于某次会话；
+   * 另一个窗口改了之后以 `device.settings` 事件为准。
+   */
+  deviceSettingsGet: Record<never, never>
+  /**
+   * 写宿主级设备设置（wire `device_settings_set`，**全量覆盖**而不是补丁）。
+   *
+   * 契约里校验失败一律 `-32002`（不认识的能力名、`maxMinutes` 超 30、
+   * `defaultMinutes > maxMinutes`、应用名空串），核心不会"就近取一个合法值"响应用户。
+   */
+  deviceSettingsSet: { settings: DeviceSettingsDto }
 }
 
 export type CommandType = keyof CommandInputs
@@ -296,6 +311,15 @@ export interface CommandOutputs {
   deviceRevoke: null
   /** 请求只回"已经转给用户"（`data: null`）；结果走 `device.request` 事件与后续授权。 */
   deviceRequest: null
+  /**
+   * 宿主级设置。`capabilities` 空 = 全拒、`allowedApps` 空 = **不设上限**（语义故意相反）。
+   */
+  deviceSettingsGet: DeviceSettingsDto
+  /**
+   * 写入后的**生效设置**（`DeviceSettings` 的 dto 注释写明了它是 set 的 `data`）：
+   * 核心可能沿用默认值或规范化大小写，界面用它覆盖本地那份，不再猜。
+   */
+  deviceSettingsSet: DeviceSettingsDto
 }
 
 export type CommandResult<T extends Command> = CommandOutputs[T['type']]

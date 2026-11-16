@@ -9,7 +9,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DeviceStatus } from '../generated'
+import type { DeviceSettings, DeviceStatus } from '../generated'
 import { INITIAL_DEVICE_STATE, useDeviceStore } from './device-store'
 
 const dispatchMock = vi.hoisted(() =>
@@ -45,6 +45,19 @@ function noneStatus(botId = 'bot-1'): DeviceStatus {
     deadline: null,
     remainingMs: null,
   })
+}
+
+/** 一份宿主设置（字段来自 generated/DeviceSettings.ts）。 */
+function settingsOf(overrides: Partial<DeviceSettings> = {}): DeviceSettings {
+  return {
+    enabled: false,
+    capabilities: [],
+    allowedApps: [],
+    defaultMinutes: 5,
+    maxMinutes: 30,
+    maxActionsPerSession: 10_000,
+    ...overrides,
+  }
 }
 
 describe('deviceStore', () => {
@@ -207,5 +220,87 @@ describe('deviceStore', () => {
     expect(state.botId).toBe('bot-2')
     expect(state.status).toBeNull()
     expect(state.pending).toBeNull()
+  })
+
+  it('⑪ loadSettings 读到设置就写进 state，并清掉上一次的错误', async () => {
+    useDeviceStore.setState({
+      ...INITIAL_DEVICE_STATE,
+      settingsBusy: false,
+      settingsError: '上一次失败',
+    })
+    dispatchMock.mockImplementation(async () => settingsOf({ enabled: true, capabilities: ['ocr'] }))
+
+    await useDeviceStore.getState().loadSettings()
+
+    expect(dispatchMock).toHaveBeenLastCalledWith({ type: 'deviceSettingsGet' })
+    const state = useDeviceStore.getState()
+    expect(state.settings).toEqual(settingsOf({ enabled: true, capabilities: ['ocr'] }))
+    expect(state.settingsBusy).toBe(false)
+    expect(state.settingsError).toBeNull()
+  })
+
+  it('⑫ loadSettings 失败只写 settingsError（带后端原文），上一份设置留着', async () => {
+    const previous = settingsOf({ capabilities: ['screen'] })
+    useDeviceStore.setState({ ...INITIAL_DEVICE_STATE, settings: previous })
+    dispatchMock.mockImplementation(async () => {
+      throw new Error('device_settings_get: 读取失败（-32603）')
+    })
+
+    await useDeviceStore.getState().loadSettings()
+
+    const state = useDeviceStore.getState()
+    // 清掉只会让"设置存在但这次没读到"和"这台机器没有设置"分不出来。
+    expect(state.settings).toBe(previous)
+    expect(state.settingsError).toContain('device_settings_get: 读取失败（-32603）')
+    expect(state.settingsBusy).toBe(false)
+  })
+
+  it('⑬ saveSettings 用**后端生效值**覆盖本地，而不是信自己传进去的那份', async () => {
+    useDeviceStore.setState({ ...INITIAL_DEVICE_STATE, settings: settingsOf() })
+    const effective = settingsOf({ enabled: true, capabilities: ['screen'] })
+    dispatchMock.mockImplementation(async () => effective)
+
+    const next = settingsOf({ enabled: true, capabilities: ['screen', 'audio'] })
+    const ok = await useDeviceStore.getState().saveSettings(next)
+
+    expect(ok).toBe(true)
+    expect(dispatchMock).toHaveBeenLastCalledWith({ type: 'deviceSettingsSet', settings: next })
+    // `audio` 被核心丢掉了：界面显示的是核心那份，不是用户刚提交的那份。
+    expect(useDeviceStore.getState().settings).toBe(effective)
+  })
+
+  it('⑭ saveSettings 失败返回 false、原文写进 settingsError、本地那份不动', async () => {
+    const previous = settingsOf({ enabled: false })
+    useDeviceStore.setState({ ...INITIAL_DEVICE_STATE, settings: previous })
+    dispatchMock.mockImplementation(async () => {
+      throw new Error('device_settings_set: maxMinutes 必须在 1..30 之间（收到 999，-32002）')
+    })
+
+    const ok = await useDeviceStore
+      .getState()
+      .saveSettings(settingsOf({ maxMinutes: 999, defaultMinutes: 5 }))
+
+    expect(ok).toBe(false)
+    const state = useDeviceStore.getState()
+    expect(state.settings).toBe(previous)
+    expect(state.settingsError).toContain('maxMinutes 必须在 1..30 之间（收到 999，-32002）')
+  })
+
+  it('⑮ 换 bot 不会清掉宿主设置（那是这台机器的，不是某个 bot 的）', () => {
+    const settings = settingsOf({ enabled: true })
+    useDeviceStore.setState({ ...INITIAL_DEVICE_STATE, botId: 'bot-1', settings })
+
+    useDeviceStore.getState().setBotId('bot-2')
+
+    expect(useDeviceStore.getState().settings).toBe(settings)
+  })
+
+  it('⑯ 收到 device.settings 事件直接覆盖本地设置（别的窗口改的）', () => {
+    useDeviceStore.setState({ ...INITIAL_DEVICE_STATE, settings: settingsOf() })
+    const next = settingsOf({ enabled: true, maxMinutes: 15 })
+
+    useDeviceStore.getState().ingestEvent({ type: 'device.settings', settings: next })
+
+    expect(useDeviceStore.getState().settings).toBe(next)
   })
 })

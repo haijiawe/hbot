@@ -1966,3 +1966,99 @@ body.is-resizing {
   justify-content: flex-end;
   gap: 8px;
 }
+
+/* ---------- 宿主设备设置卡片（features/device/settings-card.tsx） ---------- */
+
+/*
+ * 设置卡片与"会话状态"同处设备页签，用一条上边框把"这台机器允许什么"与"这次会话授权了
+ * 什么"分开：两者语义不同（长期 vs 本次），视觉上不该混成一堆。
+ */
+.device-settings {
+  padding-top: 10px;
+  border-top: 1px solid var(--border-strong);
+}
+
+.device-settings__switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.device-settings__switch-label {
+  color: var(--fg);
+}
+
+.device-settings__group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+/* `fieldset` 的 `legend` 不参与 flex 布局，这里让它能和别的标题对齐。 */
+.device-settings__group > legend {
+  padding: 0;
+  margin-bottom: 2px;
+}
+
+.device-settings__option {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.device-settings__option-label {
+  color: var(--fg);
+}
+
+.device-settings__option-hint {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.device-settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.device-settings__numbers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.device-settings__field--number {
+  min-width: 140px;
+}
+
+.device-settings__textarea,
+.device-settings__number {
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+
+.device-settings__number {
+  width: 96px;
+  font-family: var(--font-mono);
+}
+
+.device-settings__textarea {
+  resize: vertical;
+}
+
+.device-settings__textarea:focus,
+.device-settings__number:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: -1px;
+}

@@ -11,6 +11,7 @@ import type { ApprovalDecision } from "./ApprovalDecision";
 import type { ApprovalId } from "./ApprovalId";
 import type { BotId } from "./BotId";
 import type { ConversationId } from "./ConversationId";
+import type { DeviceSettings } from "./DeviceSettings";
 import type { EditId } from "./EditId";
 import type { SearchId } from "./SearchId";
 import type { SessionId } from "./SessionId";
@@ -188,7 +189,11 @@ sub: Array<string>,
 /**
  * 给用户看的理由（Agent 自己写，**不可信数据**，UI 只展示不执行）。
  */
-reason: string, } | { "type": "debug_set_breakpoints", 
+reason: string, } | { "type": "device_settings_get" } | { "type": "device_settings_set", 
+/**
+ * 新的整份设置（不是补丁：少写的字段按默认值算，调用方要传全量）。
+ */
+settings: DeviceSettings, } | { "type": "debug_set_breakpoints", 
 /**
  * Bot ID。
  */

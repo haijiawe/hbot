@@ -8,6 +8,7 @@ import type { ApprovalId } from "./ApprovalId";
 import type { BotId } from "./BotId";
 import type { BotStatus } from "./BotStatus";
 import type { DebugScope } from "./DebugScope";
+import type { DeviceSettings } from "./DeviceSettings";
 import type { DeviceStatus } from "./DeviceStatus";
 import type { Diagnostic } from "./Diagnostic";
 import type { EditFile } from "./EditFile";
@@ -166,4 +167,8 @@ reason: string,
 /**
  * 请求 ID（用户点"允许"时带回 `device_grant`）。
  */
-requestId: string, };
+requestId: string, } | { "type": "device.settings", 
+/**
+ * 新的整份设置。
+ */
+settings: DeviceSettings, };

@@ -5,7 +5,8 @@
  * 所以"谁收哪些事件"由外壳决定 —— run-store 收 `bot.status` / `run.log`，
  * agent-store 收 `agent.*` / `approval.request`，search-store 收 `file.search`，
  * debug-store 收 `debug.paused` / `debug.resumed`，device-store 收 `device.status` /
- * `device.request`，workspace-store 收 `diagnostics`（问题面板的数据），各自忽略不认识的事件。
+ * `device.request` / `device.settings`，workspace-store 收 `diagnostics`（问题面板的数据），
+ * 各自忽略不认识的事件。
  *
  * 两条事件还顺带抢底部面板的页签：`debug.paused` 切到"调试"（核心在等继续 / 单步，
  * 那是**阻塞**状态），`device.request` 切到"设备"（Agent 在等用户决定要不要把屏幕和键鼠

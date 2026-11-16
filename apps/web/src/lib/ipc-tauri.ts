@@ -38,6 +38,7 @@ import type {
   BotSummary,
   Command as WireCommand,
   ConversationSummary,
+  DeviceSettings,
   DeviceStatus,
   Diagnostic,
   DirEntry,
@@ -527,6 +528,16 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
         botId: command.botId,
         sub: command.sub,
         reason: command.reason,
+      })
+    // 宿主设置（docs/09-device-capability.md §4.2）：get 与 set 的 `data` 都是 `DeviceSettings`
+    // （dto 注释：「`device_settings_get` / `device_settings_set` 的 `data`，也是事件的载荷」），
+    // 所以两条都走 `callWire` —— set 回 `data: null` 说明壳层与契约对不上，要显式报错而不是当成功。
+    case 'deviceSettingsGet':
+      return callWire<DeviceSettings>('device_settings_get', { type: 'device_settings_get' })
+    case 'deviceSettingsSet':
+      return callWire<DeviceSettings>('device_settings_set', {
+        type: 'device_settings_set',
+        settings: command.settings,
       })
     case 'project.open':
       // `project_open` 成功时 data 是 `ProjectOpenResult{path}`（兼容旧的裸字符串）；

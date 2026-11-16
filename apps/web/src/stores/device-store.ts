@@ -12,7 +12,7 @@
  */
 
 import { create } from 'zustand'
-import type { DeviceStatus } from '../generated'
+import type { DeviceSettings, DeviceStatus } from '../generated'
 import { errorMessage } from '../lib/format'
 import type { CoreEvent } from '../lib/ipc'
 import { dispatch } from '../lib/ipc'
@@ -46,6 +46,15 @@ export interface DeviceState {
   pending: DeviceRequestDraft | null
   busy: boolean
   error: string | null
+  /**
+   * 宿主级设备设置（这台机器的，不属于某个 bot）；`null` = 还没读到。
+   *
+   * 与 `status` 分开存：`status` 是"这次会话"，设置是"这台机器允许什么"，
+   * 换 bot / 撤销会话都不该把它清掉。
+   */
+  settings: DeviceSettings | null
+  settingsBusy: boolean
+  settingsError: string | null
 
   setBotId: (botId: string) => void
   /** 发 `device_status`（wire 同名）。没有 bot 时只是把状态清空，不算错误。 */
@@ -56,6 +65,10 @@ export interface DeviceState {
   revoke: () => Promise<void>
   /** 用户点了「拒绝」：只清本地待处理项，不发任何命令（docs/09 §7 的两个入口之一）。 */
   clearPending: () => void
+  /** 读宿主设置（wire `device_settings_get`）。失败只写 `settingsError`，不冲掉已有的那份。 */
+  loadSettings: () => Promise<void>
+  /** 写宿主设置；返回是否成功（设置卡片据此决定要不要清掉本地错误）。 */
+  saveSettings: (next: DeviceSettings) => Promise<boolean>
   ingestEvent: (event: CoreEvent) => void
   dismissError: () => void
 }
@@ -67,7 +80,13 @@ export const INITIAL_DEVICE_STATE = {
   pending: null,
   busy: false,
   error: null,
-} satisfies Pick<DeviceState, 'botId' | 'status' | 'pending' | 'busy' | 'error'>
+  settings: null,
+  settingsBusy: false,
+  settingsError: null,
+} satisfies Pick<
+  DeviceState,
+  'botId' | 'status' | 'pending' | 'busy' | 'error' | 'settings' | 'settingsBusy' | 'settingsError'
+>
 
 export const useDeviceStore = create<DeviceState>()((set, get) => ({
   ...INITIAL_DEVICE_STATE,
@@ -76,13 +95,16 @@ export const useDeviceStore = create<DeviceState>()((set, get) => ({
     // 换 bot 就是换会话：上一个 bot 的会话状态与待处理请求一律丢弃，别让面板显示
     // "别人的会话"（设备会话在核心是按 bot 记的，见 docs/09 §3 的 device_sessions）。
     if (get().botId === botId) return
-    set({ ...INITIAL_DEVICE_STATE, botId })
+    // 只丢**会话**相关状态：宿主设置属于这台机器（不是某个 bot），换 bot 不该让它退回"还没读到"，
+    // 否则设置卡片会永远停在加载态（它的读取只在挂载时做一次）。
+    set({ ...INITIAL_DEVICE_STATE, botId, settings: get().settings })
   },
 
   async refresh(botId) {
     if (botId.length === 0) {
       // 没有 bot 就没有可查的会话：这不是错误，界面显示空状态即可。
-      set({ ...INITIAL_DEVICE_STATE })
+      // 宿主设置同样保留（原因同 `setBotId`）。
+      set({ ...INITIAL_DEVICE_STATE, settings: get().settings })
       return
     }
     set({ botId, busy: true, error: null })
@@ -140,6 +162,33 @@ export const useDeviceStore = create<DeviceState>()((set, get) => ({
     set({ pending: null })
   },
 
+  async loadSettings() {
+    set({ settingsBusy: true, settingsError: null })
+    try {
+      const settings = await dispatch({ type: 'deviceSettingsGet' })
+      set({ settings, settingsBusy: false })
+    } catch (error) {
+      // 读失败不动 `settings`：上一次读到的那份仍然是用户最可能想看的，
+      // 清掉只会让界面在"设置存在但这次没读到"和"这台机器没有设置"之间失去区分。
+      set({ settingsBusy: false, settingsError: `读取设备设置失败：${errorMessage(error)}` })
+    }
+  },
+
+  async saveSettings(next) {
+    set({ settingsBusy: true, settingsError: null })
+    try {
+      // 契约里 set 的 `data` 是**生效后**的设置：用它覆盖本地那份，不自己猜核心做了什么规范化
+      // （未知能力被丢弃、大小写被统一都由核心决定）。
+      const settings = await dispatch({ type: 'deviceSettingsSet', settings: next })
+      set({ settings, settingsBusy: false })
+      return true
+    } catch (error) {
+      // 后端 message 原样带进 `settingsError`（`errorMessage` 只取 message，不吞原文）。
+      set({ settingsBusy: false, settingsError: `保存设备设置失败：${errorMessage(error)}` })
+      return false
+    }
+  },
+
   ingestEvent(event) {
     switch (event.type) {
       case 'device.status': {
@@ -156,6 +205,12 @@ export const useDeviceStore = create<DeviceState>()((set, get) => ({
           botId: state.botId.length > 0 ? state.botId : event.botId,
           pending: { requestId: event.requestId, sub: [...event.sub], reason: event.reason },
         })
+        return
+      }
+      case 'device.settings': {
+        // 别的窗口（或命令自身的广播）改了宿主设置：直接覆盖本地那份。设置与 bot 无关，
+        // 所以这里不用像 `device.status` 那样过滤 botId。
+        set({ settings: event.settings, settingsError: null })
         return
       }
       default:

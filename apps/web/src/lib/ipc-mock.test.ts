@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import type { DeviceSettings } from '../generated'
 import type { FileNode } from './ipc'
 import { MOCK_PROJECT_PATH, mockDispatch } from './ipc-mock'
 
@@ -126,5 +127,49 @@ describe('mockDispatch：本地试跑', () => {
         text: '  \n  ',
       }),
     ).rejects.toThrow('text 不能为空')
+  })
+})
+
+/**
+ * 宿主设备设置（`device_settings_get` / `device_settings_set`）。
+ *
+ * mock 必须**真的存一份**而不是回固定对象：否则浏览器里点"保存"看着毫无反应，
+ * 组件测试也就永远测不出"保存之后读回新值"这条链路。
+ */
+describe('mockDispatch：宿主设备设置', () => {
+  it('set 之后 get 能读回新值（内存里那份被真的覆盖了，不是回常量）', async () => {
+    await mockDispatch({
+      type: 'deviceSettingsSet',
+      settings: {
+        enabled: true,
+        capabilities: ['screen', 'input'],
+        allowedApps: ['PathOfExile.exe'],
+        defaultMinutes: 7,
+        maxMinutes: 20,
+        maxActionsPerSession: 500,
+      },
+    })
+
+    const readBack = (await mockDispatch({ type: 'deviceSettingsGet' })) as DeviceSettings
+
+    expect(readBack.enabled).toBe(true)
+    expect(readBack.capabilities).toEqual(['screen', 'input'])
+    expect(readBack.allowedApps).toEqual(['PathOfExile.exe'])
+    expect(readBack.defaultMinutes).toBe(7)
+    expect(readBack.maxMinutes).toBe(20)
+    expect(readBack.maxActionsPerSession).toBe(500)
+  })
+
+  it('`maxMinutes` 超 30 按 -32002 拒绝，并且原设置一个字段都不动', async () => {
+    const before = (await mockDispatch({ type: 'deviceSettingsGet' })) as DeviceSettings
+
+    await expect(
+      mockDispatch({
+        type: 'deviceSettingsSet',
+        settings: { ...before, maxMinutes: 31 },
+      }),
+    ).rejects.toThrow('-32002')
+
+    expect(await mockDispatch({ type: 'deviceSettingsGet' })).toEqual(before)
   })
 })
