@@ -13,7 +13,7 @@ use hbot_store::Project;
 
 use super::failed;
 use crate::app::{AppState, store_failed};
-use crate::dto::{AppInfo, ProjectSummary, Response};
+use crate::dto::{AppInfo, ProjectOpenResult, ProjectSummary, Response};
 
 /// 产品名（与 `tauri.conf.json` 的 `productName`、`Cargo.toml` 的包名分开写：
 /// 前者是给用户看的，后者是给 cargo 看的）。
@@ -41,9 +41,25 @@ pub fn app_info(state: &AppState) -> Response {
 /// 路径必须存在且是目录：`Workspace::open` 会 canonicalize，不存在时报 `-32001`，
 /// 不是目录时报 `-32002`。不在这里 `create_dir_all`——"打开"和"新建"是两件事
 /// （新建是 [`project_create`]），自动建目录会让打错路径悄悄变成一个空项目。
+///
+/// `data` 是 [`ProjectOpenResult`]（`{ "path": "<规范化后的绝对路径>" }`），不是
+/// [`ProjectSummary`]：打开一个已有目录不要求它已经有 `hbot.json`，所以没有
+/// `name` / `entry` 可回。
 pub async fn project_open(state: &AppState, path: String) -> Response {
     match open_project_root(state, path).await {
-        Ok(root) => Response::with_data(serde_json::Value::String(root.display().to_string())),
+        Ok(root) => {
+            let result = ProjectOpenResult {
+                path: root.display().to_string(),
+            };
+            // 只有字符串字段，序列化不可能失败；仍然显式报错而不是 `unwrap`
+            // （库代码禁 panic，`AGENTS.md` §5）。
+            match serde_json::to_value(result) {
+                Ok(value) => Response::with_data(value),
+                Err(error) => failed(HbotError::internal(format!(
+                    "序列化 ProjectOpenResult 失败：{error}"
+                ))),
+            }
+        }
         Err(error) => failed(error),
     }
 }
@@ -504,6 +520,42 @@ mod tests {
             "过期 d.ts 必须被就地重写成生成器版本"
         );
         assert!(hbot_code::dts::is_host_dts_current(&target).expect("读 d.ts"));
+    }
+
+    /// `project_open` 成功时的 data 必须是 `{ "path": "<规范化后的绝对路径>" }`。
+    ///
+    /// 这条钉的是契约形状：曾经这里回的是**裸字符串**，UI 只能靠"容忍两种形状"
+    /// 才能跑，而 `dto/mod.rs` 那张唯一真源的返回表还写着 `null`。对象形状与键名
+    /// `path` 必须与生成的 `ProjectOpenResult.ts` 一致。
+    #[test]
+    fn project_open_returns_a_project_open_result() {
+        let (dir, state) = temp_state();
+        let target = dir.path().join("待打开的项目");
+        std::fs::create_dir_all(&target).expect("建目录");
+
+        let runtime = runtime();
+        let response = runtime.block_on(project_open(&state, target.display().to_string()));
+        let Response::Ok { data } = response else {
+            panic!("project_open 必须成功，实际 {response:?}");
+        };
+        let value = data.expect("成功必须带 data");
+
+        // ① 不是裸字符串：形状是对象，且只有 `path` 一个键（线上 camelCase）。
+        let object = value.as_object().expect("data 必须是对象，不是裸字符串");
+        let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["path"], "data 的键必须只有 path，实际 {value}");
+
+        // ② 能被生成 DTO 反序列化；值是绝对路径，且就是 canonicalize 之后的那个。
+        let payload: ProjectOpenResult =
+            serde_json::from_value(value.clone()).expect("data 应能解析成 ProjectOpenResult");
+        assert!(
+            Path::new(&payload.path).is_absolute(),
+            "path 必须是绝对路径：{}",
+            payload.path
+        );
+        let canonical = std::fs::canonicalize(&target).expect("canonicalize 临时项目根");
+        assert_eq!(payload.path, canonical.display().to_string());
+        assert_eq!(state.project_root().as_deref(), Some(canonical.as_path()));
     }
 
     /// 同一路径第二次创建 = 冲突（不是覆盖，也不是插出第二行）。

@@ -26,6 +26,7 @@ export type { MessageId } from "./MessageId";
 export type { OutboundId } from "./OutboundId";
 export type { OutboundState } from "./OutboundState";
 export type { ProjectId } from "./ProjectId";
+export type { ProjectOpenResult } from "./ProjectOpenResult";
 export type { ProjectSummary } from "./ProjectSummary";
 export type { Response } from "./Response";
 export type { RiskLevel } from "./RiskLevel";

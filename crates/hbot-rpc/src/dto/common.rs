@@ -7,8 +7,9 @@
 //!
 //! - **事件载荷**：[`SearchMatch`]、[`Diagnostic`]、[`EditFile`]、[`DiffHunk`]、
 //!   [`DebugScope`]、[`StackFrame`]、[`RiskLevel`]、[`LogLevel`]、[`FileChangeKind`]；
-//! - **命令结果**：[`AppInfo`]、[`FileContent`]、[`DirEntry`]、[`RunLog`]，作为
-//!   [`Response::with_data`] 的 `data`（形状对照见 [`super`] 的表格）；
+//! - **命令结果**：[`AppInfo`]、[`ProjectOpenResult`]、[`ProjectSummary`]、
+//!   [`FileContent`]、[`DirEntry`]、[`RunLog`]，作为 [`Response::with_data`] 的
+//!   `data`（形状对照见 [`super`] 的表格）；
 //! - **传输包装**：[`Response`]、[`ApiError`]。
 
 use std::collections::BTreeMap;
@@ -226,6 +227,21 @@ pub struct ProjectSummary {
     pub name: String,
     /// 入口文件的项目内相对路径（默认 `src/main.ts`，`/` 分隔）；UI 打开它即可。
     pub entry: String,
+}
+
+/// `ProjectOpen` 命令的 data：核心规范化后的项目根路径。
+///
+/// **只有路径**：打开一个已有目录不要求它已经有 `hbot.json`（脚手架是
+/// [`super::Command::ProjectCreate`] 的事），所以这里不回 `name` / `entry`。
+/// 需要项目摘要的调用方应当用 `project_create` 的 [`ProjectSummary`]。
+///
+/// 字段是**绝对路径**，Windows 上可能是带 `\\?\` 前缀的 verbatim 路径；它只用来
+/// 标识"哪个项目"（拼 journal / 项目表的键），不要拿它做字符串前缀比较。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectOpenResult {
+    /// 核心规范化后的绝对路径（Windows 上可能带 `\\?\` 前缀）。
+    pub path: String,
 }
 
 /// `FileRead` / `FileWrite` / `FileCreate` 命令的 data：文件内容与内容哈希。

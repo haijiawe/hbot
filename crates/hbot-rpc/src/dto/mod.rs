@@ -30,13 +30,14 @@
 //! # 命令 → `data` 形状
 //!
 //! [`Command`] 的返回值统一是 `Response::Ok { data }`；`data` 为空时是 `null`。
-//! [`crate::dispatch`] 必须按这张表实现，不要各自猜形状（M0 只落地了 `AppInfo`，
-//! 其余命令当前返回 `-32006 尚未实现`）：
+//! [`crate::dispatch`] 必须按这张表实现，不要各自猜形状。25 条命令都已落地
+//! （`crates/hbot-rpc/src/app/commands/`）；**加字段/改形状必须同时改这一行**，
+//! 否则 UI 侧看到的就只是生成物，而这份"唯一真源"会悄悄说谎。
 //!
 //! | 命令 | `data` |
 //! |---|---|
 //! | `AppInfo` | [`AppInfo`] |
-//! | `ProjectOpen` | `null`（项目快照随后由 UI 查询/事件补齐） |
+//! | `ProjectOpen` | [`ProjectOpenResult`]（核心规范化后的项目根；只有 `path`，没有 `name` / `entry`） |
 //! | `ProjectCreate` | [`ProjectSummary`]（新建项目的根、名字、入口文件） |
 //! | `AgentSend` | `{ sessionId }`（新建会话时返回；文本经 `agent.delta` 流式返回） |
 //! | `AgentCancel` | `null` |
@@ -71,7 +72,7 @@ pub mod event;
 pub use command::Command;
 pub use common::{
     ApiError, AppInfo, BotSummary, DebugScope, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry,
-    EditFile, FileChangeKind, FileContent, LogLevel, ProjectSummary, Response, RiskLevel, RunLog,
-    SearchMatch, StackFrame, StepKind,
+    EditFile, FileChangeKind, FileContent, LogLevel, ProjectOpenResult, ProjectSummary, Response,
+    RiskLevel, RunLog, SearchMatch, StackFrame, StepKind,
 };
 pub use event::Event;

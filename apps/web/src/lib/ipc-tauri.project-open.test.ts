@@ -2,12 +2,18 @@
 /**
  * `project_open` / `project_create` 的桌面壳映射（`lib/ipc-tauri.ts`）。
  *
- * 这里钉的是**协议形状**，因为核心与 wire 契约在这一点上不一致、且很容易改错：
- * `crates/hbot-rpc/src/app/commands/system.rs` 的 `project_open` 成功时返回
- * `Response::with_data(Value::String(root))` —— data 是**规范化后的路径字符串**，
- * 不是 `ProjectSummary`（`project_create` 才返回摘要）。web 侧必须把它归一成
- * `{ path }`，并且对 `{ path }` 这种对象形状也要宽容（上层/未来版本若换成对象，
- * UI 不该整条链路炸掉）。
+ * 这里钉的是**协议形状**：`crates/hbot-rpc/src/app/commands/system.rs` 的
+ * `project_open` 成功时返回 `Response::with_data(ProjectOpenResult)` ——
+ * data 是 `{ "path": "<规范化后的绝对路径>" }`，不是裸字符串、也不是 `ProjectSummary`
+ * （`project_create` 才返回摘要）。生成物见 `src/generated/ProjectOpenResult.ts`。
+ *
+ * 两种形状都必须**归一成 `{ path }`**：
+ * - `{ path }` 对象是当前契约（主路径）；
+ * - 裸字符串是旧核心 / 旧快照的形状，桌面壳与 web 产物不是同一刻升级的，判死会让
+ *   "打开项目"在过渡期整条链路失败。
+ *
+ * 其余形状（数字、null、空串）必须抛 `IpcError`：项目根是 journal 的项目身份，
+ * 猜一个路径就会把 A 项目没保存的正文写进 B 项目。
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -32,8 +38,11 @@ afterEach(() => {
 })
 
 describe('dispatchViaTauri：project.open', () => {
-  it('核心返回路径字符串时归一成 { path }，并把 wire 命令原样发出', async () => {
-    const invoke = installFakeCore({ type: 'ok', data: 'C:\\work\\demo' })
+  it('核心返回 { path } 对象时归一成 { path }（当前契约的主路径）', async () => {
+    const invoke = installFakeCore({
+      type: 'ok',
+      data: { path: 'C:\\work\\demo' },
+    })
 
     const result = await dispatchViaTauri({ type: 'project.open', path: 'C:/work/demo' })
 
@@ -43,11 +52,25 @@ describe('dispatchViaTauri：project.open', () => {
     })
   })
 
-  it('核心返回 { path } 对象时也接受（不因为形状变化就整条链路失败）', async () => {
-    installFakeCore({ type: 'ok', data: { path: 'C:/work/demo' } })
+  it('{ path } 里的多余字段被忽略（结果只带 path，不把 name 等串进项目根）', async () => {
+    installFakeCore({
+      type: 'ok',
+      data: { path: 'C:/work/demo', name: '不该被采纳', entry: 'src/main.ts' },
+    })
 
     await expect(dispatchViaTauri({ type: 'project.open', path: 'C:/work/demo' })).resolves.toEqual({
       path: 'C:/work/demo',
+    })
+  })
+
+  it('旧核心返回裸路径字符串时仍能归一（兼容路径，不是主路径）', async () => {
+    const invoke = installFakeCore({ type: 'ok', data: 'C:\\work\\demo' })
+
+    const result = await dispatchViaTauri({ type: 'project.open', path: 'C:/work/demo' })
+
+    expect(result).toEqual({ path: 'C:\\work\\demo' })
+    expect(invoke).toHaveBeenCalledWith('dispatch', {
+      command: { type: 'project_open', path: 'C:/work/demo' },
     })
   })
 
@@ -60,6 +83,14 @@ describe('dispatchViaTauri：project.open', () => {
     await expect(
       dispatchViaTauri({ type: 'project.open', path: 'C:/work/demo' }),
     ).rejects.toThrow('无法识别的形状')
+  })
+
+  it('返回空字符串时也抛 IpcError（空路径不是项目根）', async () => {
+    installFakeCore({ type: 'ok', data: '' })
+
+    await expect(dispatchViaTauri({ type: 'project.open', path: 'C:/work/demo' })).rejects.toThrow(
+      IpcError,
+    )
   })
 
   it('核心回错误时把错误码带出来（-32002 空路径）', async () => {

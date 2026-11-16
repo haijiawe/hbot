@@ -23,8 +23,9 @@
  *   所以这里**不能**编一个结果对象，也不许把 `data: null` 当成错误（用 `callWireVoid`）。
  * - `diagnostics` → `diagnostics`（同名）：`data` 是 `Diagnostic[]`，核心同时再推一条
  *   `diagnostics` 事件；条目为空数组是**合法结果**，不能走 `callWireVoid`。
- * - `project.open` → `project_open`：`data` 是**规范化后的项目根字符串**（不是
- *   `ProjectSummary`，见 `projectOpenResult` 的注释），这里归一成 `{ path }`；
+ * - `project.open` → `project_open`：`data` 是 `ProjectOpenResult{path}`（核心规范化后的
+ *   绝对路径；不是 `ProjectSummary`，见 `projectOpenResult` 的注释）。旧的裸字符串
+ *   形状仍然兼容，统一归一成 `{ path }`；
  *   `project.create` → `project_create`：`data` 才是 `ProjectSummary`。
  */
 
@@ -367,25 +368,29 @@ async function listDir(dir: string, depth: number): Promise<FileNode[]> {
 }
 
 /**
- * `project_open` 的 data 形状适配。
+ * `project_open` 的 data 形状适配（生成 DTO：`src/generated/ProjectOpenResult.ts`）。
  *
- * 核心现在回的是**规范化后的项目根字符串**：`crates/hbot-rpc/src/app/commands/system.rs`
- * 的成功分支是 `Response::with_data(serde_json::Value::String(root.display().to_string()))`。
- * 生成 DTO 那份注释（`src/generated/ProjectSummary.ts`）说 `ProjectSummary` 是
- * `ProjectCreate` 的 data —— 两处说的是两件事，别把它读成"project_open 也回摘要"。
+ * **主路径**：核心回 `{ "path": "<规范化后的绝对路径>" }` —— `system.rs` 的
+ * `project_open` 成功分支把 `dto::ProjectOpenResult` 序列化进 `Response::with_data`。
+ * 只有 `path`：打开一个已有目录不要求它已经有 `hbot.json`，所以没有 `name` / `entry`
+ * （那是 `project_create` 的 `ProjectSummary`）。
  *
- * 因此这里**同时接受**字符串与 `{ path }`：将来核心若改成回对象，UI 不必跟着改。
- * 两种都对不上就抛错，绝不猜一个路径 —— 项目根是 journal 的项目身份，猜错会把
- * A 项目没保存的正文写进 B 项目。
+ * **兼容路径**：旧核心 / 旧快照回的是裸字符串（`Value::String(root)`）。桌面壳与
+ * web 产物不是同一刻升级的，把旧形状判死会让"打开项目"在过渡期整条链路失败。
+ *
+ * 两者都对不上就抛错，绝不猜一个路径 —— 项目根是 journal 的项目身份，猜错会把
+ * A 项目没保存的正文写进 B 项目。空字符串同样算"没给路径"（核心不会回空串）。
  */
 function projectOpenResult(raw: unknown): ProjectOpenResult {
-  if (typeof raw === 'string' && raw.length > 0) return { path: raw }
+  // 主路径：生成 DTO 的形状。多余字段一律忽略，只取 `path`。
   if (isRecord(raw) && typeof raw.path === 'string' && raw.path.length > 0) {
     return { path: raw.path }
   }
+  // 兼容路径：旧核心的裸字符串。
+  if (typeof raw === 'string' && raw.length > 0) return { path: raw }
   throw new IpcError({
     code: INTERNAL_CODE,
-    message: 'project_open 返回了无法识别的形状（既不是路径字符串，也不是 { path }）',
+    message: 'project_open 返回了无法识别的形状（既不是 { path } 对象，也不是路径字符串）',
     data: null,
   })
 }
@@ -474,7 +479,8 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
         kind: command.kind,
       })
     case 'project.open':
-      // `project_open` 成功时 data 是路径字符串（不是摘要）；归一化见 `projectOpenResult`。
+      // `project_open` 成功时 data 是 `ProjectOpenResult{path}`（兼容旧的裸字符串）；
+      // 归一化与"不认识的形状就抛错"见 `projectOpenResult`。
       return projectOpenResult(
         await callWire<unknown>('project_open', {
           type: 'project_open',

@@ -20,6 +20,7 @@ import type {
   BotSummary as BotSummaryDto,
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
+  ProjectOpenResult as ProjectOpenResultDto,
   ProjectSummary as ProjectSummaryDto,
   RunLog as RunLogDto,
   StepKind as StepKindDto,
@@ -108,16 +109,16 @@ export interface AgentSendResult {
  */
 
 /**
- * `project_open` 的结果。
+ * `project_open` 的结果（生成物 `src/generated/ProjectOpenResult.ts`，勿手改）。
  *
- * **只有路径**，因为核心就只回一个路径：`crates/hbot-rpc/src/app/commands/system.rs`
- * 的 `project_open` 成功分支是 `Response::with_data(Value::String(root))`（规范化后的
- * 项目根），不是 `ProjectSummary`。`ProjectSummary`（含 `name` / `entry`）只有
- * `project_create` 才回 —— 别在这里编造 `name`，那会让 UI 显示一个假的项目名。
+ * **只有路径**：打开一个已存在的目录不要求它已经有 `hbot.json`（脚手架是
+ * `project_create` 的事），所以核心不回 `name` / `entry` —— 需要摘要的是
+ * `project.create` 的 `ProjectSummary`，别在这里编造项目名。
+ *
+ * 核心现在回 `{ path }` 对象；旧后端/旧快照可能仍回裸字符串，那一档的兼容由
+ * `ipc-tauri.ts` 的 `projectOpenResult` 归一，本文件只认归一后的形状。
  */
-export interface ProjectOpenResult {
-  path: string
-}
+export type ProjectOpenResult = ProjectOpenResultDto
 
 /** 每个命令的入参（不含 `type` 字段）。 */
 export interface CommandInputs {

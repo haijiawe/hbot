@@ -551,6 +551,8 @@ pub enum Command {
 | `agent_send` | `sessionId` 为 `null` 时返回 `{sessionId}`；给定时返回无 `data` | 会话由核心创建，UI 不自己造 id |
 | `file_read` | `{content,hash}` | `hash` 是 blake3 十六进制，写回时当 `baseHash` |
 | `search_start` | `null` | 结果走 `file.search` 事件；取消后不发假结果 |
+| `project_open` | `ProjectOpenResult{path}` | 返回核心规范化后的绝对路径；**只返回路径不返回 `name`/`entry`**，因为打开一个目录不要求它已经有 `hbot.json`（`project_create` 才会 scaffold） |
+| `project_create` | `ProjectSummary{path,name,entry}` | 新建成功后的项目摘要；`-32003` 表示目录非空或同路径已登记 |
 
 - 桌面：Tauri `#[tauri::command] dispatch(cmd) -> Response`。
 - 后台/浏览器：JSON-RPC 2.0，唯一 method `dispatch`，`params = { command }`。
