@@ -95,6 +95,12 @@ pub struct DeviceRegistry {
     cancel: Arc<AtomicBool>,
     /// 唤醒 tick 用：`Drop` 之后不用等满 1 秒才发现该退出。
     wake: Arc<tokio::sync::Notify>,
+    /// Agent 侧的一秒滑动窗口（`docs/09` §13 问 7）。
+    ///
+    /// 为什么 Agent 侧要有自己的一份、而不是复用 bot 代码那个「槽位窗口」：
+    /// 两条路径各自的窗口实例互不相干——bot 的 isolate 里狂调设备不该吃掉 Agent 的配额，
+    /// 反过来也一样。判据实现仍然只有一份（`hbot_core::DeviceRateWindow`）。
+    rate: hbot_core::DeviceRateWindow,
 }
 
 impl DeviceRegistry {
@@ -119,6 +125,7 @@ impl DeviceRegistry {
             project_root: RwLock::new(None),
             cancel: Arc::new(AtomicBool::new(false)),
             wake: Arc::new(tokio::sync::Notify::new()),
+            rate: hbot_core::DeviceRateWindow::default(),
         }
     }
 
@@ -529,6 +536,11 @@ impl DeviceRegistry {
         let Some(bot_id) = granted_by else {
             return Err(DeviceError::NotGranted { capability });
         };
+
+        // 限速排在授权之后：被拒的调用不该占配额，也不该把"没授权"报成
+        // `HBOT_DEVICE_RATE_LIMITED`（前者要用户去授权，后者等一秒就好——指引相反）。
+        // 被限速的这一次同样不写审计：审计表记的是"放行了什么"。
+        self.rate.admit(capability, std::time::Instant::now())?;
 
         // 审计记 actor=`agent_tool`、目标为空：这条路径没有应用白名单可比。
         append_audit(
@@ -1631,6 +1643,32 @@ mod tests {
         let error = backend.ocr(&ocr_request()).expect_err("撤销后必须拒绝");
         assert_eq!(error.code(), "HBOT_DEVICE_NOT_GRANTED");
         assert_eq!(counting.calls(), 1, "撤销后后端一次都不能多调");
+    }
+
+    #[test]
+    fn agent_tool_calls_are_rate_limited_on_the_agent_side_window() {
+        // Agent 侧有自己的窗口：bot 代码狂调设备不该吃掉 Agent 的配额，这里只验证
+        // Agent 这一份（bot 侧那份由 `hbot-code` 的 `s3_device` 用例钉住）。
+        let fixture = Fixture::new("agent-rate", true, &[DeviceCapability::Ocr]);
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+        fixture
+            .registry
+            .grant(
+                &fixture.bot_id,
+                &caps(&[DeviceCapability::Ocr]),
+                Vec::new(),
+                Some(5),
+                "s-rate".to_owned(),
+            )
+            .expect("grant");
+
+        // 默认帧配额 2 次/秒：前两次过，第三次被限速。
+        assert!(backend.ocr(&ocr_request()).is_ok(), "第一次应放行");
+        assert!(backend.ocr(&ocr_request()).is_ok(), "第二次应放行");
+        let error = backend.ocr(&ocr_request()).expect_err("第三次必须被限速");
+        assert_eq!(error.code(), "HBOT_DEVICE_RATE_LIMITED");
+        assert_eq!(counting.calls(), 2, "被限速的那次不许碰到真后端");
     }
 
     #[test]
