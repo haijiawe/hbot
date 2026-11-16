@@ -52,9 +52,9 @@ use hbot_workspace::{SearchOptions, Workspace};
 use crate::harness::{self, Stats, TempDir, Unit};
 
 /// 固定命中词：只埋在约 1% 的文件里。
-const NEEDLE: &str = "HBOT_NEEDLE_9F3A";
+pub const NEEDLE: &str = "HBOT_NEEDLE_9F3A";
 /// 任何文件都不含的词：强制走完整扫描（最坏情况）。
-const ABSENT: &str = "HBOT_ABSENT_TOKEN_ZZZ";
+pub const ABSENT: &str = "HBOT_ABSENT_TOKEN_ZZZ";
 /// 热缓存口径复跑几次（取中位数）。
 const WARM_RUNS: usize = 3;
 /// 夹具文件数（三层 10×10×100）。
@@ -531,6 +531,39 @@ fn build_fixture(root: &Path) -> Result<Fixture, Box<dyn std::error::Error>> {
     }
     assert_eq!(fixture.files, FILES, "夹具文件数不对");
     Ok(fixture)
+}
+
+/// 夹具规模事实，供机制实验（`examples/search_variance.rs`）复用同一棵树。
+#[derive(Debug, Clone, Copy)]
+pub struct FixtureFacts {
+    /// 文件数。
+    pub files: usize,
+    /// 目录数。
+    pub dirs: usize,
+    /// 含 [`NEEDLE`] 的文件数。
+    pub hit_files: usize,
+    /// 单文件最小字节数。
+    pub min_bytes: usize,
+    /// 单文件最大字节数。
+    pub max_bytes: usize,
+    /// 全部正文的总字节数。
+    pub total_bytes: usize,
+}
+
+/// 造一份与 [`run`] **完全相同**的 10k 夹具，返回规模事实。
+///
+/// 存在的理由只有一个：耗时离散的机制实验必须量在**同一棵树**上，否则它的数字
+/// 与预算行没法互相解释。夹具逻辑只有 [`build_fixture`] 一份，别在这里抄第二份。
+pub fn build_fixture_for_variance(root: &Path) -> Result<FixtureFacts, Box<dyn std::error::Error>> {
+    let fixture = build_fixture(root)?;
+    Ok(FixtureFacts {
+        files: fixture.files,
+        dirs: fixture.dirs,
+        hit_files: fixture.hit_files,
+        min_bytes: fixture.min_bytes,
+        max_bytes: fixture.max_bytes,
+        total_bytes: fixture.total_bytes,
+    })
 }
 
 /// 一个夹具文件的正文：两行头 + 填充常量 + （1% 的文件）一行命中词，
