@@ -20,5 +20,11 @@ hbot-adapters = { path = "../hbot-adapters" }
 hbot-rpc = { path = "../hbot-rpc" }
 async-trait.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+# `net`：`tests/support/gateway.rs` 要自己 bind 一个 `TcpListener`（workspace 的
+# features 列表里没有它），这里只在 dev 侧并上一项，不动根 `Cargo.toml`。
+tokio = { workspace = true, features = ["net"] }
 uuid.workspace = true
+# 手搓 OneBot 11 网关的服务端半边 + 用例里的原生 WS 客户端。`futures-util` 的
+# `sink` 由 tokio-tungstenite 已经启用，这里显式写出来，不依赖特性合并的顺序。
+tokio-tungstenite.workspace = true
+futures-util = { workspace = true, features = ["sink"] }

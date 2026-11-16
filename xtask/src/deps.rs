@@ -79,6 +79,32 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "hbot-rpc",
         ],
     ),
+    // 红队用例集：只含测试，故意能同时看见所有安全边界（路径、命令、沙箱、密钥）。
+    (
+        "hbot-redteam",
+        &[
+            "hbot-core",
+            "hbot-store",
+            "hbot-code",
+            "hbot-bot",
+            "hbot-agent",
+            "hbot-workspace",
+            "hbot-adapters",
+            "hbot-command",
+            "hbot-rpc",
+        ],
+    ),
+    // 性能基准：只量已实现的接缝，不许反向依赖 rpc/desktop。
+    (
+        "hbot-bench",
+        &[
+            "hbot-core",
+            "hbot-code",
+            "hbot-workspace",
+            "hbot-store",
+            "hbot-adapters",
+        ],
+    ),
     // 开发期工具。
     ("xtask", &["hbot-rpc", "hbot-core"]),
 ];

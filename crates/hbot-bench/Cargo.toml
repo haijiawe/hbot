@@ -1,0 +1,20 @@
+[package]
+name = "hbot-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 手动性能量测台：量 `docs/05-quality-gates.md` §4 里还没有实测数字的那几条 IDE 预算。
+# 不进 `scripts/check.sh` 的日常闸门（数字要固定机器、独占 CPU 才有意义），
+# 只由人/夜间任务跑 `cargo run -p hbot-bench --release`。
+publish = false
+
+[dependencies]
+hbot-workspace = { workspace = true }
+hbot-store = { workspace = true }
+hbot-code = { workspace = true }
+serde_json.workspace = true
+uuid.workspace = true
+# 只用于「单事务 1000 条」的参考测量（把 SQLite 事务开销与 store 的队列往返拆开），
+# 不参与任何预算判定。与 `hbot-store` 用同一份 workspace 版本，不产生第二份 rusqlite。
+rusqlite = { workspace = true }

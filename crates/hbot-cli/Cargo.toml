@@ -14,6 +14,8 @@ hbot-core = { path = "../hbot-core" }
 hbot-rpc = { path = "../hbot-rpc" }
 hbot-adapters = { path = "../hbot-adapters" }
 hbot-code = { path = "../hbot-code" }
+# `replay` 要读项目库里的历史入站/出站（只加只读查询，见 hbot-store/src/db.rs）。
+hbot-store = { path = "../hbot-store" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 serde.workspace = true

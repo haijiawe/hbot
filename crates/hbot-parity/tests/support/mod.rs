@@ -7,6 +7,8 @@
 //! 为什么每个用例一个文件而不是 `src/lib.rs`：见 `crates/hbot-parity/Cargo.toml`。
 #![allow(dead_code)]
 
+pub mod gateway;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -187,13 +189,20 @@ pub fn bot_spec(bot_id: BotId, project_id: ProjectId, platform: &str) -> BotSpec
 }
 
 /// 用真实 `SupervisorDeps::new` + 可选调参组装一个真实 supervisor。
-pub fn build_supervisor(
+///
+/// 泛型而不是写死 [`FakeAdapter`]：真实协议用例（`parity_14`）要把**真的**
+/// `OneBotAdapter` 交给 supervisor，只换「外部世界」，supervisor 那一层不许假。
+pub fn build_supervisor<A>(
     store: Arc<Store>,
-    adapter: Arc<FakeAdapter>,
+    adapter: Arc<A>,
     executor: Arc<dyn HandlerExecutor>,
     spec: BotSpec,
     tune: impl FnOnce(&mut SupervisorDeps),
-) -> Arc<Supervisor> {
+) -> Arc<Supervisor>
+where
+    A: BotAdapter + 'static,
+{
+    let adapter: Arc<dyn BotAdapter> = adapter;
     let mut deps = SupervisorDeps::new(
         store,
         Arc::new(UuidIds),
@@ -416,11 +425,12 @@ impl FakeFactory {
             .and_then(|config| config.access_token.clone())
     }
 
-    /// 最近一次 `create()` 收到的 `ws_url`。
+    /// 最近一次 `create()` 收到的 `ws_url`（`BotConfig::ws_url` 是 `Option<String>`，
+    /// QQ 官方平台没有用户可配的地址，所以这里用 `and_then` 摊平一层）。
     pub fn seen_ws_url(&self) -> Option<String> {
         lock(&self.seen_config)
             .as_ref()
-            .map(|config| config.ws_url.clone())
+            .and_then(|config| config.ws_url.clone())
     }
 }
 

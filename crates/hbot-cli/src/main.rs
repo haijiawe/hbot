@@ -25,6 +25,8 @@ fn main() -> ExitCode {
     match runtime.block_on(hbot_cli::run(cli)) {
         Ok(Outcome::Success) => ExitCode::SUCCESS,
         Ok(Outcome::Failure) => ExitCode::FAILURE,
+        // `replay` 的"跑不起来"是 2，与"有差异"（1）分开：CI 要能分辨功能回归与环境坏了。
+        Ok(Outcome::Error) => ExitCode::from(2),
         Err(error) => {
             tracing::error!(error = format!("{error:#}"), "命令失败");
             ExitCode::FAILURE

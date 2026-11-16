@@ -34,6 +34,19 @@ fn write_manifest(dir: &Path) {
     hbot_code::manifest::scaffold(dir, "fixture").expect("脚手架应成功");
 }
 
+/// 骨架一个能编过的项目，然后把 `platform` 块换成测试要的形状。
+///
+/// 用脚手架而不是手抄清单：`entry` 文件、`hbot.d.ts` 都得在，否则 `check` 会先
+/// 在别的检查项上失败，测不到平台这一项。
+fn write_project_with_platform(dir: &Path, platform: &str) {
+    write_manifest(dir);
+    std::fs::write(
+        dir.join("hbot.json"),
+        format!("{{\"name\":\"fixture\",\"platform\":{platform}}}"),
+    )
+    .expect("写 hbot.json");
+}
+
 // ── version ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -203,6 +216,15 @@ fn check_missing_manifest_reports_error_json() {
     let json: Value = serde_json::from_str(&report.to_json().expect("序列化")).expect("JSON");
     assert_eq!(json["ok"], Value::from(false));
     assert!(!json["errors"].as_array().expect("errors 是数组").is_empty());
+    // 形状只加字段不删字段：`warnings` 一定存在，哪怕是空数组。
+    assert!(
+        json["warnings"]
+            .as_array()
+            .expect("warnings 是数组")
+            .is_empty(),
+        "缺清单时没有平台可探：{}",
+        report.to_json().expect("序列化")
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -216,8 +238,13 @@ fn check_with_manifest_passes() {
     assert!(report.ok, "errors：{:?}", report.errors);
     assert!(report.errors.is_empty());
     assert_eq!(
+        report.warnings,
+        Vec::<String>::new(),
+        "OneBot 骨架不该有告警"
+    );
+    assert_eq!(
         report.to_json().expect("序列化"),
-        r#"{"ok":true,"errors":[]}"#
+        r#"{"ok":true,"errors":[],"warnings":[]}"#
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -286,6 +313,132 @@ fn check_reports_a_compile_error_with_its_typescript_line() {
     assert!(
         report.errors[0].contains("src/main.ts"),
         "错误要带文件名：{:?}",
+        report.errors
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── check：平台块（`kind` 开放取值） ────────────────────────────────────────
+
+/// 平台取值是**开放**的：本版本不认识的平台只告警，体检仍通过（退出码 0）。
+#[test]
+fn check_warns_about_an_unrecognised_platform_but_still_passes() {
+    let dir = temp_project("unknown-platform");
+    write_project_with_platform(&dir, r#"{"kind":"telegram"}"#);
+
+    let report = check_project(&dir);
+    assert!(report.ok, "未知平台只告警：errors={:?}", report.errors);
+    assert!(report.errors.is_empty(), "errors：{:?}", report.errors);
+    assert_eq!(report.warnings.len(), 1, "warnings：{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("未被本版本识别"),
+        "warnings：{:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings[0].contains("\"telegram\"") && report.warnings[0].contains("qq_official"),
+        "提示要点名收到的值与合法取值：{:?}",
+        report.warnings
+    );
+
+    let json: Value = serde_json::from_str(&report.to_json().expect("序列化")).expect("JSON");
+    assert_eq!(json["ok"], Value::from(true));
+    assert_eq!(json["errors"].as_array().expect("errors 数组").len(), 0);
+    assert_eq!(json["warnings"].as_array().expect("warnings 数组").len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 未知平台上还留着 `ws`：两条告警（平台不认识 + ws 会被忽略），仍然通过。
+#[test]
+fn check_warns_about_an_ignored_ws_on_an_unknown_platform() {
+    let dir = temp_project("unknown-platform-ws");
+    write_project_with_platform(&dir, r#"{"kind":"telegram","ws":"ws://127.0.0.1:3001"}"#);
+
+    let report = check_project(&dir);
+    assert!(report.ok, "errors：{:?}", report.errors);
+    assert_eq!(report.warnings.len(), 2, "warnings：{:?}", report.warnings);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("未被本版本识别")),
+        "warnings：{:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings.iter().any(|warning| {
+            warning.contains("不需要 ws") && warning.contains("会被忽略")
+        }),
+        "warnings：{:?}",
+        report.warnings
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// QQ 官方项目的正解：只写 `kind`，不写 `ws`。零告警、零错误。
+#[test]
+fn check_accepts_qq_official_without_ws() {
+    let dir = temp_project("qq-official");
+    write_project_with_platform(&dir, r#"{"kind":"qq_official"}"#);
+
+    let report = check_project(&dir);
+    assert!(report.ok, "errors：{:?}", report.errors);
+    assert!(report.errors.is_empty(), "errors：{:?}", report.errors);
+    assert_eq!(report.warnings, Vec::<String>::new(), "不该有告警");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 反过来：QQ 官方写了 `ws`（手写草稿常见），只提示会被忽略，不失败。
+#[test]
+fn check_warns_that_qq_official_ignores_ws() {
+    let dir = temp_project("qq-official-ws");
+    write_project_with_platform(&dir, r#"{"kind":"qq_official","ws":"ws://127.0.0.1:3001"}"#);
+
+    let report = check_project(&dir);
+    assert!(report.ok, "errors：{:?}", report.errors);
+    assert!(report.errors.is_empty(), "errors：{:?}", report.errors);
+    assert_eq!(report.warnings.len(), 1, "warnings：{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("qq_official"),
+        "warnings：{:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings[0].contains("会被忽略"),
+        "warnings：{:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings[0].contains("/gateway"),
+        "要说明地址从哪来：{:?}",
+        report.warnings
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `onebot11` 缺 `ws` 是**硬错误**（exit 1 这条路）：`manifest::load` 拒绝，
+/// `check` 把它报成 `HBOT_MANIFEST_INVALID`，不是 warning。
+#[test]
+fn check_fails_when_onebot11_has_no_ws() {
+    let dir = temp_project("onebot11-no-ws");
+    write_project_with_platform(&dir, r#"{"kind":"onebot11"}"#);
+
+    let report = check_project(&dir);
+    assert!(!report.ok, "onebot11 缺 ws 必须失败");
+    assert_eq!(report.errors.len(), 1, "errors：{:?}", report.errors);
+    assert!(
+        report.errors[0].starts_with("HBOT_MANIFEST_INVALID"),
+        "errors：{:?}",
+        report.errors
+    );
+    assert!(
+        report.errors[0].contains("ws"),
+        "错误要点名字段：{:?}",
         report.errors
     );
 

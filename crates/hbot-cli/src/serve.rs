@@ -170,35 +170,12 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 数据目录：与 `Dispatcher` 的 `default_data_dir` 口径一致（Windows 用
-/// `%APPDATA%\hbot`，Unix 用 `$XDG_DATA_HOME/hbot`）。
+/// 数据目录：算法只有一份，在 [`hbot_core::paths`]。
 ///
-/// 这里复制了一份而不是从 `hbot-rpc` 借：那一份是 `dispatch` 的内部细节，
-/// 而 `serve` 需要的是"数据库放哪"，两者将来会一起改（M1 读配置）。
+/// 以前这里抄了一份 `hbot-rpc::dispatch` 的算法（注释还写着"将来会一起改"），
+/// 结果桌面壳走 Tauri 的 `app_data_dir()`，三端各有各的库。现在统一到 core。
 fn default_data_dir() -> PathBuf {
-    if cfg!(windows) {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join("hbot");
-        }
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            return PathBuf::from(profile)
-                .join("AppData")
-                .join("Roaming")
-                .join("hbot");
-        }
-    } else {
-        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(data_home).join("hbot");
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("hbot");
-        }
-    }
-
-    PathBuf::from("hbot")
+    hbot_core::data_dir()
 }
 
 /// 等 Ctrl-C 或 SIGTERM（Unix）。两者走同一条收尾路径。
