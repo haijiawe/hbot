@@ -128,21 +128,11 @@ impl AppState {
         // agent.delta，且 EditId 会与别处撞号）。
         let phase = hbot_store::startup_trace::Phase::start("app_agent_manager");
         let events = Arc::new(EventBus::new());
-        // Agent 日志不属于任何 bot：`StoreRunLogSink` 写 `bot_id = NULL`、`source = 'agent'`。
-        let run_log = Arc::new(agent::StoreRunLogSink::new(
-            Arc::clone(&store),
-            Arc::clone(&clock),
-        ));
-        let agent = Arc::new(agent::AgentManager::new(
-            data_dir.clone(),
-            Arc::clone(&events),
-            Arc::clone(&ids),
-            Arc::clone(&clock),
-            run_log,
-        ));
-        phase.done();
 
         // 设备能力：设置 + live 会话 + 闸门 + 1 秒到期结算（见 [`device::DeviceRegistry`]）。
+        //
+        // 建在 `agent` **之前**：Agent 侧设备后端要用它做第四层判据
+        // （`device::agent_backend::SessionScopedBackend`，撤销/到期立刻停住 `read_screen`）。
         let device = Arc::new(device::DeviceRegistry::new(
             data_dir.clone(),
             Arc::clone(&store),
@@ -150,6 +140,23 @@ impl AppState {
             Arc::clone(&events),
         ));
         device.spawn_expiry_tick();
+
+        // Agent 日志不属于任何 bot：`StoreRunLogSink` 写 `bot_id = NULL`、`source = 'agent'`。
+        let run_log = Arc::new(agent::StoreRunLogSink::new(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+        ));
+        let agent = Arc::new(
+            agent::AgentManager::new(
+                data_dir.clone(),
+                Arc::clone(&events),
+                Arc::clone(&ids),
+                Arc::clone(&clock),
+                run_log,
+            )
+            .with_device_registry(Arc::clone(&device)),
+        );
+        phase.done();
 
         let state = Self {
             data_dir,

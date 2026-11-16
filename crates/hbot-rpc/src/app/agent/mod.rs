@@ -44,6 +44,7 @@ use hbot_core::{Clock, EditId, HbotError, IdGenerator, SessionId, ToolCall, Tool
 use hbot_workspace::Workspace;
 
 use crate::app::EventBus;
+use crate::app::device::agent_backend::SessionScopedBackend;
 use crate::dto::{DiffHunk, EditFile, Event};
 
 pub use approvals::ApprovalInbox;
@@ -115,6 +116,13 @@ pub struct AgentManager {
     /// Agent 运行日志的落点（`logs` 表）。由装配方显式注入：Agent 会话没有 bot
     /// 归属，生产装配用 [`StoreRunLogSink`]（`bot_id = NULL`、`source = 'agent'`）。
     run_log: Arc<dyn RunLogSink>,
+    /// 设备授权登记表。`None` = **没有设备能力**（工具表里的 `read_screen` 会诚实拒绝）。
+    ///
+    /// 为什么 Agent 也要这一层：`ToolGateway` 的 `Capability` 步只判"项目清单声明了没有"，
+    /// 那是"代码有没有资格要"。撤销/到期必须也能停住 IDE 里的 Agent，
+    /// 否则"限时会话 + 一键撤销"只对 bot 代码那一半消费者有效
+    /// （实现见 [`crate::app::device::agent_backend::SessionScopedBackend`]）。
+    device: Option<Arc<crate::app::device::DeviceRegistry>>,
 }
 
 impl AgentManager {
@@ -138,7 +146,21 @@ impl AgentManager {
             config_source: ConfigSource::Resolve,
             provider_factory: Box::new(default_provider_factory),
             run_log,
+            device: None,
         }
+    }
+
+    /// 注入设备授权登记表（生产装配由 `AppState::open` 调用）。
+    ///
+    /// 不注入时 Agent 侧没有设备能力：`read_screen` 会返回"没有装配设备后端"，
+    /// 而不是绕过会话判据去读屏 —— 装配缺失必须 fail-closed。
+    #[must_use]
+    pub fn with_device_registry(
+        mut self,
+        registry: Arc<crate::app::device::DeviceRegistry>,
+    ) -> Self {
+        self.device = Some(registry);
+        self
     }
 
     /// 换一个 `RunLog` 落点（测试/诊断用；生产装配由 [`Self::new`] 注入）。
@@ -325,7 +347,22 @@ impl AgentManager {
             config.max_steps(),
             project_rules,
         );
-        let gateway = ToolGateway::new(
+        // 设备能力的两层接线（`docs/09-device-capability.md` §4），缺一层都等于没判：
+        //
+        // 1. **声明层**：`hbot.json` 的 `permissions.device.sub` —— 这份项目代码有没有资格
+        //    要这一类能力。闸只存项目根，每次 `authorize` 重读清单（改清单立刻生效）。
+        // 2. **执行层**：当前平台的设备后端。它只执行、不判断（判据在声明层与 `DeviceGate`）。
+        //
+        //    但 Agent 侧的执行层**不是裸后端**：包一层
+        //    [`crate::app::device::agent_backend::SessionScopedBackend`]，每次调用先问
+        //    "这一刻有没有生效的授权"。理由见该类型文档：声明层只答"代码有没有资格要"，
+        //    撤销/到期也必须能停住 Agent，否则"限时会话 + 一键撤销"只对一半消费者有效。
+        //    没装配登记表时**什么都不装** → `read_screen` 报"没有装配设备后端"（fail-closed）。
+        //
+        // 项目根与 `AppState::project_root()` 是同一个值（`Workspace::root()`）；这里拿不到
+        // `AppState`，所以按本函数的 `workspace` 参数取，不另存一份全局状态。
+        let project_root = workspace.root().to_path_buf();
+        let mut gateway = ToolGateway::new(
             registry,
             Arc::clone(&workspace),
             sandbox.mode(),
@@ -333,7 +370,15 @@ impl AgentManager {
             Arc::new(TracingAudit),
         )
         .with_edit_proposer(Arc::clone(self) as Arc<dyn EditProposer>)
-        .with_command_runner(Arc::new(hbot_command::PlatformRunner::system()));
+        .with_command_runner(Arc::new(hbot_command::PlatformRunner::system()))
+        .with_capability_gate(Arc::new(
+            crate::app::device::capabilities::ManifestCapabilityGate::new(project_root),
+        ));
+        if let Some(registry) = &self.device {
+            let backend =
+                SessionScopedBackend::new(Arc::new(hbot_device::platform_backend()), registry);
+            gateway = gateway.with_device(Arc::new(backend) as Arc<dyn hbot_core::DeviceBackend>);
+        }
         let approver = approvals::SessionApprover::new(
             Arc::clone(&self.approvals),
             Arc::clone(&self.ids),

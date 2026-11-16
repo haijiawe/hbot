@@ -556,6 +556,9 @@ fn tool_ctx<'a>(tree: &TempTree) -> ToolCtx<'a> {
         call_id: "red-team-b",
         edits: None,
         command: Some(runner),
+        // 这组红队用例打的是命令注入，不碰设备能力；`None` 让 `read_screen`
+        // 走"没有装配设备后端"的诚实拒绝（与生产装配缺失时同一条路径）。
+        device: None,
     }
 }
 

@@ -36,6 +36,8 @@
 //! tick 持 [`Weak`] 而不是 `Arc`：`AppState` 一析构，登记表就没了，下一轮 `upgrade()` 失败
 //! 自然退出 —— 不需要 `AppState` 加 `Drop`，也不需要 `tokio_util` 之类的取消令牌。
 
+pub mod agent_backend;
+pub mod capabilities;
 pub mod settings;
 
 mod grants;
@@ -468,30 +470,93 @@ impl DeviceRegistry {
         }
     }
 
+    /// Agent 工具的授权判据：**"这一刻有没有一条仍然生效、且包含这个子能力的会话"**。
+    ///
+    /// 为什么需要第四层：`ToolGateway` 的 `Capability` 步只判"项目清单声明了没有"，
+    /// 那是**代码有没有资格要**；会话是**用户此刻批没批**。少了这一层，撤销设备会话
+    /// 停得住 bot 代码、停不住 IDE 里的 Agent（`read_screen` 会一直能读屏），
+    /// 那"限时会话 + 一键撤销"就只对一半消费者有效。
+    ///
+    /// 与 [`Self::authorize`] 的差别只有一处：Agent 会话没有 `BotId`，所以"哪一条会话"
+    /// 的答案是"当前项目里**任意**一条"。这不构成放宽 —— 撤销、到期、改窄 `device.json`
+    /// 都会立刻让这个答案变成拒绝，而每个工具调用都会重问一遍（不缓存、不快照）。
+    pub(crate) fn authorize_tool(&self, capability: DeviceCapability) -> Result<(), DeviceError> {
+        let settings = self.settings();
+        if !settings.enabled {
+            return Err(DeviceError::NotEnabled {
+                toggle: "device.enabled".to_owned(),
+            });
+        }
+        if !self.declared_capabilities().contains(&capability) {
+            return Err(DeviceError::NotDeclared { capability });
+        }
+        if !settings.capabilities.contains(&capability) {
+            return Err(DeviceError::NotEnabled {
+                toggle: "device.capabilities".to_owned(),
+            });
+        }
+        // 没有目标的能力才允许 Agent 直接要：`input`/`window` 必须先指定窗口，
+        // 那是"操作某个应用"，不是"看一眼屏幕"。与 `authorize` 里 `DeviceTarget::None`
+        // 那条判据同一个理由（BotCode 路径的分类，这里按工具路径再判一次）。
+        if !matches!(
+            capability,
+            DeviceCapability::Screen | DeviceCapability::Ocr | DeviceCapability::Clipboard
+        ) {
+            return Err(DeviceError::AppNotAllowed {
+                process: "<none>".to_owned(),
+            });
+        }
+
+        let now = self.clock.now();
+        // 取**一条**可用会话并记住它是谁的：审计表的 `bot_id` 不可空
+        // （`device_audit` 外键指 `bots.id`），而"这条 Agent 调用是按谁的授权放行的"
+        // 恰好是有用的记录 —— 比编一个空值更诚实。按 `BotId` 排序取第一条，
+        // 让同一次调用的审计在多次运行间稳定。
+        let granted_by = {
+            let sessions = self.sessions_read();
+            let mut candidates: Vec<_> = sessions
+                .iter()
+                .filter(|(_, session)| {
+                    session.state.is_live()
+                        && session.sub.contains(&capability)
+                        && now < session.deadline
+                })
+                .map(|(bot_id, _)| *bot_id)
+                .collect();
+            candidates.sort();
+            candidates.first().copied()
+        };
+        let Some(bot_id) = granted_by else {
+            return Err(DeviceError::NotGranted { capability });
+        };
+
+        // 审计记 actor=`agent_tool`、目标为空：这条路径没有应用白名单可比。
+        append_audit(
+            &self.store,
+            &bot_id,
+            DeviceActor::AgentTool,
+            capability.as_str(),
+            None,
+            "ok",
+            now,
+        );
+        Ok(())
+    }
+
     /// 读当前项目的 `hbot.json`，取 `permissions.device.sub`。
     ///
     /// 读不到（没开项目 / 没清单 / 清单坏了 / 没写 `permissions.device`）一律当**没声明**：
     /// 闸门的方向只能是"证明声明过才放行"，不能因为文件读不出来就放行。
+    ///
+    /// 读取本身在 [`capabilities::declared_at`]：能力声明层（`CapabilityGate`）与本登记表
+    /// 问的是同一个问题，必须同一份实现（两份会打架，见
+    /// `docs/09-device-capability.md` §4.1 与 §4.4 的判定表）。
     pub(crate) fn declared_capabilities(&self) -> BTreeSet<DeviceCapability> {
         let root = self.project_root_read().clone();
         let Some(root) = root else {
             return BTreeSet::new();
         };
-        match hbot_code::manifest::load(&root) {
-            Ok(manifest) => manifest
-                .permissions
-                .device
-                .map(|device| device.sub.into_iter().collect())
-                .unwrap_or_default(),
-            Err(error) => {
-                tracing::debug!(
-                    root = %root.display(),
-                    %error,
-                    "读不到项目清单，设备子能力按未声明处理"
-                );
-                BTreeSet::new()
-            }
-        }
+        capabilities::declared_at(&root)
     }
 
     /// 生效子能力 = 清单声明 ∩ 宿主设置 ∩ 本次请求；空集 → `-32002`。
@@ -773,12 +838,17 @@ fn names(capabilities: impl Iterator<Item = DeviceCapability>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
-    use hbot_core::{IdGenerator, ProjectId, SystemClock};
+    use hbot_core::{
+        ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapabilityReport, DeviceError,
+        IdGenerator, InputAction, OcrRequest, OcrText, ProjectId, Screenshot, ScreenshotRequest,
+        SystemClock, WindowInfo,
+    };
     use hbot_store::{Bot, Project};
 
     use super::*;
+    use crate::app::device::agent_backend::SessionScopedBackend;
     use crate::app::ids::{ManualClock, UuidIds};
 
     /// 每个测试自己的临时目录（与 `crates/hbot-rpc/tests` 的做法一致，不引 dev-dependency）。
@@ -812,6 +882,8 @@ mod tests {
         registry: Arc<DeviceRegistry>,
         clock: Arc<ManualClock>,
         events: Arc<EventBus>,
+        /// 与登记表里同一个 `Arc<Store>`：审计断言要直接读表（登记表不暴露 store）。
+        store: Arc<Store>,
         bot_id: BotId,
     }
 
@@ -846,7 +918,7 @@ mod tests {
                 .expect("写入口文件");
             std::fs::write(
                 project_dir.join("hbot.json"),
-                r#"{"name":"device-test","platform":{"kind":"local"},"permissions":{"http":[],"device":{"sub":["screen","input","window","clipboard"],"apps":["game.exe","notepad.exe","anything.exe","other.exe"]}}}"#,
+                r#"{"name":"device-test","platform":{"kind":"local"},"permissions":{"http":[],"device":{"sub":["screen","ocr","input","window","clipboard"],"apps":["game.exe","notepad.exe","anything.exe","other.exe"]}}}"#,
             )
             .expect("写清单");
             registry.note_project_root(Some(project_dir.clone()));
@@ -878,6 +950,7 @@ mod tests {
                 registry,
                 clock,
                 events,
+                store,
                 bot_id,
             }
         }
@@ -1453,5 +1526,220 @@ mod tests {
             "anything.exe"
         ));
         assert!(host_ceiling_allows(&["GAME.exe".to_owned()], "game.exe"));
+    }
+    // ---- Agent 工具路径的会话判据（`agent_backend::SessionScopedBackend`） ----
+    //
+    // 这组测试存在的理由：`ToolGateway` 的 `Capability` 步只判"清单声明了没有"，
+    // 那是"代码有没有资格要"。撤销/到期必须也能停住 IDE 里的 Agent，
+    // 否则"限时会话 + 一键撤销"只对 bot 代码那一半消费者有效。
+
+    /// 数调用次数的假后端（只关心"判据之前/之后有没有被碰到"）。
+    #[derive(Default)]
+    struct CountingBackend {
+        calls: AtomicUsize,
+    }
+
+    impl CountingBackend {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DeviceBackend for CountingBackend {
+        fn capabilities(&self) -> DeviceCapabilityReport {
+            DeviceCapabilityReport {
+                ocr: true,
+                ..DeviceCapabilityReport::default()
+            }
+        }
+
+        fn screenshot(&self, _request: &ScreenshotRequest) -> Result<Screenshot, DeviceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(DeviceError::Failed {
+                message: "fake".to_owned(),
+            })
+        }
+
+        fn ocr(&self, _request: &OcrRequest) -> Result<OcrText, DeviceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(OcrText {
+                text: "fake".to_owned(),
+                truncated: false,
+            })
+        }
+
+        fn input(&self, _action: &InputAction, _apps: &[String]) -> Result<(), DeviceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn windows(&self) -> Result<Vec<WindowInfo>, DeviceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        fn clipboard(&self, _op: &ClipboardOp) -> Result<ClipboardValue, DeviceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(DeviceError::Failed {
+                message: "fake".to_owned(),
+            })
+        }
+    }
+
+    fn ocr_request() -> OcrRequest {
+        OcrRequest {
+            target: DeviceTarget::None,
+            max_chars: 100,
+        }
+    }
+
+    #[test]
+    fn an_agent_tool_call_without_a_live_session_never_reaches_the_backend() {
+        let fixture = Fixture::new("agent-no-session", true, &[DeviceCapability::Ocr]);
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+
+        let error = backend
+            .ocr(&ocr_request())
+            .expect_err("没有生效会话必须拒绝");
+        assert_eq!(error.code(), "HBOT_DEVICE_NOT_GRANTED");
+        assert_eq!(counting.calls(), 0, "判据在装饰器里，后端不能被碰到");
+    }
+
+    #[test]
+    fn an_agent_tool_call_uses_a_live_session_and_revocation_stops_the_next_one() {
+        let fixture = Fixture::new("agent-live", true, &[DeviceCapability::Ocr]);
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+        fixture
+            .registry
+            .grant(
+                &fixture.bot_id,
+                &caps(&[DeviceCapability::Ocr]),
+                Vec::new(),
+                Some(5),
+                "s-agent".to_owned(),
+            )
+            .expect("grant");
+
+        let text = backend.ocr(&ocr_request()).expect("有会话应放行");
+        assert_eq!(text.text, "fake");
+        assert_eq!(counting.calls(), 1);
+
+        // 撤销之后**同一个装饰器实例**的下一次调用就必须拒绝（不快照授权）。
+        fixture.registry.revoke(&fixture.bot_id).expect("撤销");
+        let error = backend.ocr(&ocr_request()).expect_err("撤销后必须拒绝");
+        assert_eq!(error.code(), "HBOT_DEVICE_NOT_GRANTED");
+        assert_eq!(counting.calls(), 1, "撤销后后端一次都不能多调");
+    }
+
+    #[test]
+    fn an_agent_tool_call_is_refused_after_the_session_expires() {
+        let fixture = Fixture::new("agent-expired", true, &[DeviceCapability::Ocr]);
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+        fixture
+            .registry
+            .grant(
+                &fixture.bot_id,
+                &caps(&[DeviceCapability::Ocr]),
+                Vec::new(),
+                Some(1),
+                "s-exp".to_owned(),
+            )
+            .expect("grant");
+        assert!(backend.ocr(&ocr_request()).is_ok());
+
+        // 手动时钟往前推过 1 分钟：到期结算还没被 tick 扫到，判据也必须已经收紧。
+        fixture.clock.advance(61_000);
+        let error = backend.ocr(&ocr_request()).expect_err("到期后必须拒绝");
+        assert_eq!(error.code(), "HBOT_DEVICE_NOT_GRANTED");
+        assert_eq!(counting.calls(), 1);
+    }
+
+    #[test]
+    fn an_agent_tool_call_needs_the_capability_switched_on_in_the_host_settings() {
+        // 会话里有 ocr，但宿主设置没开这个子能力：`grant` 都批不下来，
+        // 这里直接断言判据本身也拒（顺序：总开关 → 清单 → 设置 → 会话）。
+        let fixture = Fixture::new("agent-settings", true, &[DeviceCapability::Screen]);
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+        let error = backend.ocr(&ocr_request()).expect_err("设置没开必须拒绝");
+        assert_eq!(error.code(), "HBOT_DEVICE_NOT_ENABLED", "{}", error);
+        assert_eq!(counting.calls(), 0);
+    }
+
+    #[test]
+    fn an_agent_tool_call_is_refused_when_the_manifest_declares_nothing() {
+        let fixture = Fixture::new("agent-manifest", true, &[DeviceCapability::Ocr]);
+        // 清空项目根：读不到清单 = 没声明（fail-closed，不 panic）。
+        fixture.registry.note_project_root(None);
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+        let error = backend.ocr(&ocr_request()).expect_err("没声明必须拒绝");
+        assert_eq!(error.code(), "HBOT_DEVICE_NOT_DECLARED");
+        assert_eq!(counting.calls(), 0);
+    }
+
+    #[test]
+    fn agent_tools_never_get_input_or_window_even_with_a_session() {
+        // `input`/`window` 必须有窗口目标；Agent 侧没有 target，所以一律拒。
+        let fixture = Fixture::new(
+            "agent-input",
+            true,
+            &[DeviceCapability::Input, DeviceCapability::Window],
+        );
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+        fixture
+            .registry
+            .grant(
+                &fixture.bot_id,
+                &caps(&[DeviceCapability::Input, DeviceCapability::Window]),
+                vec!["game.exe".to_owned()],
+                Some(5),
+                "s-input".to_owned(),
+            )
+            .expect("grant");
+
+        let error = backend
+            .input(
+                &InputAction::Text {
+                    text: "hi".to_owned(),
+                },
+                &[],
+            )
+            .expect_err("Agent 侧不得注入输入");
+        assert_eq!(error.code(), "HBOT_DEVICE_APP_NOT_ALLOWED");
+        let error = backend.windows().expect_err("Agent 侧不得枚举窗口");
+        assert_eq!(error.code(), "HBOT_DEVICE_APP_NOT_ALLOWED");
+        assert_eq!(counting.calls(), 0);
+    }
+
+    #[test]
+    fn an_agent_tool_call_audits_which_bot_granted_it() {
+        let fixture = Fixture::new("agent-audit", true, &[DeviceCapability::Ocr]);
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+        fixture
+            .registry
+            .grant(
+                &fixture.bot_id,
+                &caps(&[DeviceCapability::Ocr]),
+                Vec::new(),
+                Some(5),
+                "s-audit".to_owned(),
+            )
+            .expect("grant");
+        backend.ocr(&ocr_request()).expect("应放行");
+
+        let rows = fixture
+            .store
+            .list_device_audit(&fixture.bot_id, 10)
+            .expect("读审计");
+        let last = rows.last().expect("应有一条审计");
+        assert_eq!(last.actor, "agent_tool");
+        assert_eq!(last.action, "ocr");
+        assert_eq!(last.outcome, "ok");
     }
 }

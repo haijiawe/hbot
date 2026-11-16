@@ -160,6 +160,8 @@ fn c04_网页抓取一律拒绝因此无法注入() {
         call_id: "red-team-c04",
         edits: None,
         command: None,
+        // 这条用例打的是网页抓取注入，不碰设备能力；`None` 与生产装配缺失同一条路径。
+        device: None,
     };
 
     let result = block_on(HttpFetchTool.run(
