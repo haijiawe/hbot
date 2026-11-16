@@ -109,11 +109,12 @@ pub struct PlatformSpec {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Permissions {
-    /// Hosts `ctx.http.fetch` may reach. Empty = no network at all.
+    /// Hosts `http.get` may reach. Empty = no network at all.
     ///
-    /// `ctx.http` is not implemented yet (`docs/02-architecture.md` §6.1 status
-    /// table); the field exists so a project written today does not need a
-    /// migration when it lands.
+    /// Read by [`crate::permissions::authorize`] through
+    /// [`crate::HttpConfig::from_manifest`]; the semantics of one entry (exact
+    /// host, `*.subdomain`, `host:port`, `*`) are documented on
+    /// [`crate::permissions`].
     #[serde(default)]
     pub http: Vec<String>,
 }

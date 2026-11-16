@@ -9,12 +9,15 @@
 //! | `log(msg)` | `(unknown) => void` | [`HostOutput::logs`] |
 //! | `reply(text)` | `(unknown) => void` | [`HostOutput::replies`] |
 //! | `sleep(ms)` | `(number) => Promise<void>` | `tokio::time::sleep` |
+//! | `http.get(url, options?)` | `(string, object?) => Promise<{status, body, headers}>` | [`crate::http::HttpConfig`] |
 //!
-//! `sleep` is the important one: it resolves a JavaScript promise from a Rust
-//! async task. The task is spawned onto the isolate runtime (`Async` /
-//! `ctx.spawn`), so it is polled while the handler awaits — it never blocks the
-//! event loop and never resolves the promise from a foreign thread
-//! (§6.3: "async host returns via oneshot back to the same isolate thread").
+//! `sleep` and `http.get` are the important ones: they resolve (or reject) a
+//! JavaScript promise from a Rust async task. The task is spawned onto the
+//! isolate runtime (`Async` / `ctx.spawn`), so it is polled while the handler
+//! awaits — it never blocks the event loop and never resolves the promise from a
+//! foreign thread (§6.3: "async host returns via oneshot back to the same isolate
+//! thread"). `http.get` adds one rule on top: its network work happens on
+//! `spawn_blocking`, so a slow server cannot stall the isolate thread either.
 //!
 //! The functions are installed twice on purpose:
 //!
@@ -30,10 +33,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rquickjs::prelude::Async;
-use rquickjs::{Ctx, Function, Object};
+use rquickjs::{Ctx, Exception, Function, IntoJs, Object, Value};
 
 use crate::error::CodeError;
+use crate::http::{GetOptions, HttpConfig, HttpResponse};
 use crate::limits::Deadline;
+
+/// The keys [`install`] writes on `globalThis.__hbot`, in one place.
+///
+/// This is data, not prose: `crate::dts`'s drift tests compare it with the
+/// exports of [`HOST_MODULE_SOURCE`] and with the declarations in `hbot.d.ts`,
+/// so a binding added here without its two declarations is a test failure.
+pub(crate) const HOST_BINDING_KEYS: &[&str] = &["log", "reply", "sleep", "http"];
 
 /// Upper bound on captured `log`/`reply` entries per event.
 ///
@@ -113,11 +124,12 @@ fn truncate(message: String) -> String {
     truncated
 }
 
-/// Install `globalThis.__hbot` (`log`, `reply`, `sleep`) into `ctx`.
+/// Install `globalThis.__hbot` (`log`, `reply`, `sleep`, `http.get`) into `ctx`.
 pub(crate) fn install<'js>(
     ctx: &Ctx<'js>,
     output: Arc<Mutex<HostOutput>>,
     deadline: Arc<Deadline>,
+    http: Arc<HttpConfig>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -173,11 +185,132 @@ pub(crate) fn install<'js>(
         .map_err(super::js_error)?
     };
 
+    let http_object = {
+        let config = Arc::clone(&http);
+        let deadline = Arc::clone(&deadline);
+        let get = Function::new(
+            ctx.clone(),
+            Async(move |url: String, options: Value<'js>| {
+                // Parsing rides along with the future instead of returning a
+                // rejected promise here: `Async` already turns an `Err` from
+                // `IntoJs` into a rejection, and this keeps one error shape.
+                let parsed = parse_get_options(&options);
+                let config = Arc::clone(&config);
+                let deadline = Arc::clone(&deadline);
+                async move {
+                    let outcome = match parsed {
+                        Ok(options) => config.get(url, options, &deadline).await,
+                        Err(message) => Err(message),
+                    };
+                    HttpOutcome(outcome)
+                }
+            }),
+        )
+        .and_then(|function| function.with_name("get"))
+        .map_err(super::js_error)?;
+        let http_object = Object::new(ctx.clone()).map_err(super::js_error)?;
+        http_object.set("get", get).map_err(super::js_error)?;
+        http_object
+    };
+
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
     host.set("sleep", sleep).map_err(super::js_error)?;
+    host.set("http", http_object).map_err(super::js_error)?;
+    debug_assert_eq!(
+        host.keys::<String>()
+            .filter_map(Result::ok)
+            .filter(|key| HOST_BINDING_KEYS.contains(&key.as_str()))
+            .count(),
+        HOST_BINDING_KEYS.len(),
+        "every key in HOST_BINDING_KEYS must be installed: {HOST_BINDING_KEYS:?}"
+    );
     ctx.globals().set("__hbot", host).map_err(super::js_error)?;
     Ok(())
+}
+
+/// The JS value `http.get` settles with: a plain object, or a rejection.
+struct HttpOutcome(Result<HttpResponse, String>);
+
+impl<'js> IntoJs<'js> for HttpOutcome {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.0 {
+            Ok(response) => {
+                let object = Object::new(ctx.clone())?;
+                object.set("status", i64::from(response.status))?;
+                object.set("body", response.body.as_str())?;
+                let headers = Object::new(ctx.clone())?;
+                for (name, value) in &response.headers {
+                    headers.set(name.as_str(), value.as_str())?;
+                }
+                object.set("headers", headers)?;
+                Ok(object.into_value())
+            }
+            // A thrown exception is what `.catch()`/`try` sees in the handler;
+            // the code prefix (`HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED`) is part
+            // of the message because the message is all a bot gets to inspect.
+            Err(message) => Err(Exception::throw_message(ctx, &message)),
+        }
+    }
+}
+
+/// Read `http.get(url, options)`'s second argument.
+///
+/// Only the two documented keys are read; `timeoutMs` is clamped later against
+/// both [`crate::http::MAX_TIMEOUT`] and the handler's remaining budget.
+fn parse_get_options<'js>(value: &Value<'js>) -> Result<GetOptions, String> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(GetOptions::default());
+    }
+    let Some(object) = value.as_object() else {
+        return Err(format!(
+            "{}: http.get(url, options): options must be an object",
+            crate::permissions::FAILED_CODE
+        ));
+    };
+
+    let mut options = GetOptions::default();
+    if let Some(headers) = object
+        .get::<_, Option<Object<'js>>>("headers")
+        .map_err(js_message)?
+    {
+        for name in headers.keys::<String>() {
+            let name = name.map_err(js_message)?;
+            let value: Value<'js> = headers.get(name.as_str()).map_err(js_message)?;
+            // No implicit conversion: `{ headers: { x: 1 } }` is a mistake worth
+            // reporting, not a header called "1".
+            if !value.is_string() {
+                return Err(format!(
+                    "{}: http.get(url, options): header `{name}` must be a string",
+                    crate::permissions::FAILED_CODE
+                ));
+            }
+            let text = value
+                .as_string()
+                .and_then(|string| string.to_string().ok())
+                .unwrap_or_default();
+            options.headers.push((name, text));
+        }
+    }
+
+    if let Some(ms) = object
+        .get::<_, Option<f64>>("timeoutMs")
+        .map_err(js_message)?
+    {
+        if !ms.is_finite() || ms <= 0.0 {
+            return Err(format!(
+                "{}: http.get(url, options): timeoutMs must be a positive number",
+                crate::permissions::FAILED_CODE
+            ));
+        }
+        options.timeout = Some(Duration::from_millis(ms.min(MAX_SLEEP_MS) as u64));
+    }
+
+    Ok(options)
+}
+
+fn js_message(error: rquickjs::Error) -> String {
+    format!("{}: {error}", crate::permissions::FAILED_CODE)
 }
 
 fn normalise_sleep_ms(ms: f64) -> Duration {
@@ -221,7 +354,20 @@ export function sleep(ms) {
   return host.sleep(ms);
 }
 
-export default { defineBot, log, reply, sleep };
+/**
+ * HTTP, restricted to the hosts hbot.json's `permissions.http` allows.
+ *
+ * Rejects (never resolves) on a host outside the list, a non-http(s) URL, a
+ * timeout or an oversized response; the message starts with `HBOT_HTTP_DENIED`
+ * or `HBOT_HTTP_FAILED`. GET only, no redirects, no gzip.
+ */
+export const http = {
+  get(url, options) {
+    return host.http.get(url, options);
+  },
+};
+
+export default { defineBot, log, reply, sleep, http };
 "#;
 
 #[cfg(test)]

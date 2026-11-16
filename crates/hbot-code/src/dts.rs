@@ -90,6 +90,24 @@ declare module 'hbot' {
     onMessage(ctx: MessageCtx): void | Promise<void>;
   }
 
+  /** `http.get` 的可选参数。 */
+  export interface HttpGetOptions {
+    /** 额外请求头；值不是字符串时整个调用被拒绝（不做隐式转换）。 */
+    headers?: Record<string, string>;
+    /** 本次请求的超时（毫秒）。超过 60000 按 60000 算，并且会被本次事件的剩余预算截断。 */
+    timeoutMs?: number;
+  }
+
+  /** `http.get` 的响应。只有这三样：重定向链与 gzip 解压运行时都不处理。 */
+  export interface HttpResponse {
+    /** HTTP 状态码。3xx 原样返回，运行时不跟随重定向。 */
+    status: number;
+    /** 响应体（UTF-8）；超过上限（默认 256 KiB）时整次请求失败，不会给半截。 */
+    body: string;
+    /** 响应头，名字已转小写。 */
+    headers: Record<string, string>;
+  }
+
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */
@@ -98,6 +116,11 @@ declare module 'hbot' {
   export function reply(text: string): void;
   /** 等待若干毫秒，等同 ctx.sleep。 */
   export function sleep(ms: number): Promise<void>;
+  /** HTTP 客户端。当前只有 GET，且 host 必须在 hbot.json 的 permissions.http 里。 */
+  export const http: {
+    /** 发一个 GET；失败时 reject，message 以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 开头。 */
+    get(url: string, options?: HttpGetOptions): Promise<HttpResponse>;
+  };
 }
 "#;
 
@@ -181,7 +204,7 @@ mod drift {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::runtime::host_api::HOST_MODULE_SOURCE;
+    use crate::runtime::host_api::{HOST_BINDING_KEYS, HOST_MODULE_SOURCE};
 
     /// `export function <name>` declarations in a piece of source.
     fn function_exports(source: &str) -> BTreeSet<String> {
@@ -190,6 +213,37 @@ mod drift {
             .filter_map(|line| line.trim().strip_prefix("export function "))
             .filter_map(|rest| rest.split_once('(').map(|(name, _)| name.trim().to_owned()))
             .collect()
+    }
+
+    /// `export const <name>` / `export let <name>` declarations in a piece of
+    /// source.
+    ///
+    /// Value exports (`http`) are not functions, so
+    /// [`function_exports`] cannot see them; both halves are needed before the
+    /// module and the `d.ts` can be compared.
+    fn value_exports(source: &str) -> BTreeSet<String> {
+        source
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| {
+                line.strip_prefix("export const ")
+                    .or_else(|| line.strip_prefix("export let "))
+            })
+            .filter_map(|rest| {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                    .collect();
+                if name.is_empty() { None } else { Some(name) }
+            })
+            .collect()
+    }
+
+    /// Everything a module exports, by name, across both declaration forms.
+    fn exported_names(source: &str) -> BTreeSet<String> {
+        let mut names = function_exports(source);
+        names.extend(value_exports(source));
+        names
     }
 
     /// Keys of the runtime module's `export default { a, b, c }` object.
@@ -209,14 +263,26 @@ mod drift {
             .collect()
     }
 
-    /// `export function <name>` declarations inside `declare module 'hbot' { … }`.
-    fn dts_function_exports() -> BTreeSet<String> {
+    /// `export function <name>` / `export const <name>` declarations inside
+    /// `declare module 'hbot' { … }`.
+    fn dts_exported_names() -> BTreeSet<String> {
         let start = HOST_DTS
             .find("declare module 'hbot' {")
             .expect("hbot.d.ts 应有 `declare module 'hbot'`");
         let block = &HOST_DTS[start..];
         let end = block.find("\n}\n").expect("declare 块应有收尾 `}`");
-        function_exports(&block[..end])
+        exported_names(&block[..end])
+    }
+
+    /// The keys `install` sets on `globalThis.__hbot`, read from the real source
+    /// rather than from a hand-kept list.
+    fn installed_host_keys() -> BTreeSet<String> {
+        include_str!("runtime/host_api.rs")
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("host.set(\""))
+            .filter_map(|rest| rest.split_once('"').map(|(name, _)| name.to_owned()))
+            .collect()
     }
 
     /// The keys `build_event` copies onto the `ctx` object, read from the real
@@ -294,12 +360,12 @@ mod drift {
 
     #[test]
     fn hbot_dts_exports_match_the_runtime_module() {
-        let runtime = function_exports(HOST_MODULE_SOURCE);
-        let types = dts_function_exports();
+        let runtime = exported_names(HOST_MODULE_SOURCE);
+        let types = dts_exported_names();
 
         assert!(
             !runtime.is_empty(),
-            "HOST_MODULE_SOURCE 里一个 `export function` 都没解析到，扫描逻辑失效了"
+            "HOST_MODULE_SOURCE 里一个导出都没解析到，扫描逻辑失效了"
         );
         assert_eq!(
             runtime, types,
@@ -309,12 +375,58 @@ mod drift {
 
     #[test]
     fn hbot_dts_default_export_matches_the_named_exports() {
-        let named = function_exports(HOST_MODULE_SOURCE);
+        let named = exported_names(HOST_MODULE_SOURCE);
         let default = runtime_default_exports();
 
         assert_eq!(
             named, default,
             "`export default {{...}}` 的键与具名导出不一致：{named:?} vs {default:?}"
+        );
+    }
+
+    #[test]
+    fn host_bindings_match_the_module_and_the_dts() {
+        // The third leg of the drift test: what `install` actually puts on
+        // `globalThis.__hbot`, what the `hbot` module re-exports, and what
+        // hbot.d.ts declares. `defineBot` is module-level validation only, so it
+        // is not a host binding.
+        let installed = installed_host_keys();
+        assert!(
+            !installed.is_empty(),
+            "host_api.rs 里没解析到 `host.set(\"...\")`，扫描逻辑失效了"
+        );
+        assert_eq!(
+            installed,
+            HOST_BINDING_KEYS
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect::<BTreeSet<String>>(),
+            "HOST_BINDING_KEYS 与 install 实际注入的键不一致"
+        );
+
+        let mut module = exported_names(HOST_MODULE_SOURCE);
+        module.remove("defineBot");
+        assert_eq!(
+            installed, module,
+            "`__hbot` 上注入的键与 `hbot` 模块导出的键不一致：运行时 {installed:?}，模块 {module:?}"
+        );
+
+        let mut declared = dts_exported_names();
+        declared.remove("defineBot");
+        assert_eq!(
+            installed, declared,
+            "`__hbot` 上注入的键与 hbot.d.ts 声明的键不一致：运行时 {installed:?}，类型 {declared:?}"
+        );
+
+        // And `http` must be the namespace shape the bridge installs, not a
+        // function that happens to exist.
+        assert!(
+            HOST_DTS.contains("export const http: {") && HOST_DTS.contains("get(url: string"),
+            "hbot.d.ts 没有把 http 声明成带 get 的对象"
+        );
+        assert!(
+            HOST_MODULE_SOURCE.contains("get(url, options)"),
+            "HOST_MODULE_SOURCE 的 http.get 参数与 d.ts 不一致"
         );
     }
 
@@ -367,13 +479,20 @@ mod drift {
     fn hbot_dts_does_not_promise_unimplemented_apis() {
         // §6.3: 未实现的 API 不得出现在 hbot.d.ts —— Agent 会照着写，然后在
         // 运行时报「不是函数」。This list is the negative half of the drift test.
+        //
+        // `http.get` shipped (S2), so the negative entry is no longer "any `http.`"
+        // — it is the parts of HTTP that are still missing: POST, redirects, fetch
+        // with an init bag. Keep this list precise; a broad entry would have to be
+        // deleted instead of narrowed, and would take the whole check with it.
         for absent in [
             "onStart",
             "onStop",
             "onSchedule",
             "send(",
             "kv.",
-            "http.",
+            "http.post",
+            "http.fetch",
+            "http.request",
             "fetch(",
             "schedule(",
         ] {

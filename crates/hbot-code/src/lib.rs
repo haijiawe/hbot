@@ -11,8 +11,11 @@
 //! * [`dts`] — generate the project's `hbot.d.ts` from the same contract the
 //!   runtime exposes; drift between the two is a test failure.
 //! * [`runtime`] — one QuickJS isolate (`rquickjs`, `!Send`) on its own thread,
-//!   with `log`/`reply`/`sleep` bridged through promises, plus memory and
-//!   wall-clock limits.
+//!   with `log`/`reply`/`sleep`/`http.get` bridged through promises, plus memory
+//!   and wall-clock limits.
+//! * [`permissions`] — the single authorization judgement for
+//!   `hbot.json`'s `permissions.http`; [`http`] holds the transport seam and the
+//!   `http.get` pipeline.
 //! * [`error`] — one error type with stable `HBOT_*` machine codes.
 //!
 //! The intended flow is:
@@ -38,10 +41,12 @@ pub mod compile;
 mod dispatch;
 pub mod dts;
 pub mod error;
+pub mod http;
 mod instrument;
 pub mod limits;
 pub mod manifest;
 pub mod modules;
+pub mod permissions;
 pub mod runtime;
 
 pub use compile::{
@@ -52,6 +57,8 @@ pub use compile::{
 pub use dispatch::EventFailure;
 pub use error::{CodeError, ErrorLocation, SourcePos};
 pub use hbot_core::debug::{Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, PausedAt};
+pub use http::{HttpConfig, HttpRequest, HttpResponse, HttpTransport, TransportError};
 pub use limits::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MEMORY_BYTES, Limits};
 pub use manifest::{Manifest, ManifestLimits, PlatformSpec, ScaffoldReport};
+pub use permissions::{PermissionError, authorize};
 pub use runtime::{EventOutcome, HostOutput, MemoryReport, Sandbox};

@@ -33,6 +33,7 @@ use rquickjs::{
 use crate::compile::CompiledProject;
 use crate::dispatch::EventFailure;
 use crate::error::CodeError;
+use crate::http::HttpConfig;
 use crate::instrument;
 use crate::limits::{Deadline, Limits};
 use crate::modules;
@@ -133,6 +134,26 @@ impl Sandbox {
     /// `defineBot({ onMessage })` is reported as [`CodeError::JsException`] with
     /// an explanatory message, because that is how the isolate sees it.
     pub fn spawn(project: CompiledProject, limits: Limits) -> Result<Self, CodeError> {
+        Self::spawn_with_http(project, limits, HttpConfig::deny_all())
+    }
+
+    /// [`Sandbox::spawn`], with `http.get` allowed to reach the hosts `http`
+    /// lists.
+    ///
+    /// [`Sandbox::spawn`] is this call with a deny-all [`HttpConfig`]: a caller
+    /// that does not think about the network gets no network, which is the
+    /// fail-closed default `hbot.json`'s empty `permissions.http` already
+    /// implies.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sandbox::spawn`].
+    pub fn spawn_with_http(
+        project: CompiledProject,
+        limits: Limits,
+        http: HttpConfig,
+    ) -> Result<Self, CodeError> {
+        let http = Arc::new(http);
         let (commands, inbox) = std::sync::mpsc::sync_channel(COMMAND_BUFFER);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -144,6 +165,7 @@ impl Sandbox {
         let control = Arc::new(DebugControl::new());
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
+        let worker_http = Arc::clone(&http);
         let worker = std::thread::Builder::new()
             .name("hbot-isolate".to_owned())
             .spawn(move || {
@@ -153,6 +175,7 @@ impl Sandbox {
                     limits,
                     worker_debug,
                     worker_control,
+                    worker_http,
                     &started_tx,
                     &finished_tx,
                 )
@@ -583,10 +606,11 @@ fn worker(
     limits: Limits,
     debug: Arc<Mutex<DebugState>>,
     control: Arc<DebugControl>,
+    http: Arc<HttpConfig>,
     started: &Sender<Result<(), CodeError>>,
     finished: &Sender<()>,
 ) {
-    if let Err(error) = serve(inbox, project, limits, debug, control, started) {
+    if let Err(error) = serve(inbox, project, limits, debug, control, http, started) {
         tracing::error!(
             code = error.code(),
             error = %error,
@@ -646,6 +670,7 @@ fn serve(
     limits: Limits,
     debug: Arc<Mutex<DebugState>>,
     control: Arc<DebugControl>,
+    http: Arc<HttpConfig>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -698,11 +723,12 @@ fn serve(
         let project = &project;
         let debug = &debug;
         let control = &control;
+        let http = &http;
         local.block_on(&runtime, async move {
             context
                 .async_with(async |ctx| {
                     bootstrap(
-                        &ctx, &entry, output, deadline, project, debug, control, limits,
+                        &ctx, &entry, output, deadline, project, debug, control, http, limits,
                     )
                     .await
                 })
@@ -783,13 +809,19 @@ async fn bootstrap<'js>(
     project: &Arc<CompiledProject>,
     debug: &Arc<Mutex<DebugState>>,
     control: &Arc<DebugControl>,
+    http: &Arc<HttpConfig>,
     limits: Limits,
 ) -> Result<Persistent<Function<'static>>, CodeError> {
     deadline.reset();
     deadline.arm(limits.handler_timeout);
 
     let result = async {
-        host_api::install(ctx, Arc::clone(output), Arc::clone(deadline))?;
+        host_api::install(
+            ctx,
+            Arc::clone(output),
+            Arc::clone(deadline),
+            Arc::clone(http),
+        )?;
         // The probe functions exist in both builds so the loader never has to
         // care, but `__hbot_dbg` starts `false`: a release build never emits a
         // call, and a debug build never pays for one until a sink is attached.
