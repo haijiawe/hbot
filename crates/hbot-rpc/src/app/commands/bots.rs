@@ -141,15 +141,24 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
 
     // 沙箱执行器：回复先落在有界 channel 上，再由下面的搬运任务转进 outbox。
     let (replies_tx, mut replies_rx) = mpsc::channel(REPLY_CAPACITY);
-    let executor = Arc::new(SandboxHandler::new(SandboxHandlerConfig {
-        bot_id,
-        project_root: root.clone(),
-        limits: config.limits,
-        store: Arc::clone(state.store()),
-        events: Arc::clone(state.events()),
-        clock: Arc::clone(state.clock()),
-        replies: replies_tx,
-    }));
+    let executor = Arc::new(
+        SandboxHandler::new(SandboxHandlerConfig {
+            bot_id,
+            project_root: root.clone(),
+            limits: config.limits,
+            store: Arc::clone(state.store()),
+            events: Arc::clone(state.events()),
+            clock: Arc::clone(state.clock()),
+            replies: replies_tx,
+        })
+        // 设备能力：闸是 `AppState` 那一份（唯一判据），后端是当前平台的那一个。
+        // 生产装配只有这一处 —— 别的路径（测试/bench）不装，`ctx.device.*` 会明确报
+        // `HBOT_DEVICE_UNAVAILABLE`，不会静默成功。
+        .with_device(
+            state.device().gate(),
+            Arc::new(hbot_device::platform_backend()),
+        ),
+    );
 
     let mut deps = SupervisorDeps::new(
         Arc::clone(state.store()),

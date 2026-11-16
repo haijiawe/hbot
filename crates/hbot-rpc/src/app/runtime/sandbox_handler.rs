@@ -274,6 +274,24 @@ pub struct SandboxHandler {
     /// [`SandboxHandlerConfig`] 由 `commands::bots` 用完整结构体字面量构造，那条装配缝
     /// 属于别的单元（见 `crate::app::debug` 的模块文档）。
     debug: Arc<DebugRegistry>,
+    /// 设备能力的闸与后端（§11.1 的"装配方必须调两个方法"）。
+    ///
+    /// `None` = 这台宿主没有装配设备能力（测试、`hbot-bench`、以及任何没走
+    /// `AppState::start_bot` 的路径）。此时生成代码里 `ctx.device.*` 每次调用都回
+    /// `HBOT_DEVICE_UNAVAILABLE`，**不是**静默成功。
+    ///
+    /// 存的是 `Arc<dyn …>`，在**每次新建 isolate 时**才装进沙箱（`:509` 那段），
+    /// 这样热重载换版本时会连白名单一起重读（清单可能刚被 Agent 改过）。
+    device: Option<DeviceAssembly>,
+}
+
+/// 设备能力的两个端口 + 装配时刻。
+///
+/// 为什么白名单不在这里存：应用的清单是**项目文件**，改它不会产生新的 isolate 指纹以外的
+/// 信号；每次起 isolate 时现读一遍最省事，也避免"清单改了但沙箱还拿着旧名单"。
+struct DeviceAssembly {
+    gate: Arc<dyn hbot_core::DeviceGate>,
+    backend: Arc<dyn hbot_core::DeviceBackend>,
 }
 
 impl SandboxHandler {
@@ -298,7 +316,28 @@ impl SandboxHandler {
             compiles: AtomicU64::new(0),
             workers,
             debug: crate::app::debug::registry(),
+            device: None,
         }
+    }
+
+    /// 装配设备能力（闸 + 后端）。在 [`Self::new`] 之后立刻调，其它什么都不用改。
+    ///
+    /// 两件事必须一起做（`hbot-code` 的 `s3_device` 测试钉住）：
+    ///
+    /// 1. `Sandbox::set_device(gate, backend)` —— 不做就是每次调用回
+    ///    `HBOT_DEVICE_UNAVAILABLE: 设备能力尚未装配`；
+    /// 2. `Sandbox::set_device_apps(apps)`（在起 isolate 时按清单读）—— 不做则 **`input`
+    ///    永远被拒且没有任何提示**，因为后端的空名单是 fail-closed 的。
+    ///
+    /// 授权判据不在这里：闸（[`hbot_core::DeviceGate`]）是唯一真源，见
+    /// `crate::app::device`。这里只负责"把闸装进去"。
+    pub fn with_device(
+        mut self,
+        gate: Arc<dyn hbot_core::DeviceGate>,
+        backend: Arc<dyn hbot_core::DeviceBackend>,
+    ) -> Self {
+        self.device = Some(DeviceAssembly { gate, backend });
+        self
     }
 
     /// 覆盖去抖窗口（测试用；生产不要调，§6.4 的 300ms 是验过的值）。
@@ -527,6 +566,13 @@ impl SandboxHandler {
                     return Err(sandbox_start_error(error));
                 }
             };
+
+            // 设备能力：闸 + 后端 + 清单里的应用白名单，都在这里装（每个新 isolate 装一次）。
+            // 漏掉这一步只会让 `ctx.device.*` 全部报"尚未装配"，是明确的失败，不是静默放行。
+            if let Some(assembly) = &self.device {
+                sandbox.set_device(Arc::clone(&assembly.gate), Arc::clone(&assembly.backend));
+                sandbox.set_device_apps(device_apps(&self.project_root));
+            }
             tracing::debug!(
                 bot = %self.bot_id,
                 worker = index,
@@ -890,6 +936,31 @@ impl std::fmt::Debug for SandboxHandler {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 清单里的设备应用白名单（`permissions.device.apps`），已归一化（trim + 小写 + 去重）。
+///
+/// 与 `crate::app::device::DeviceRegistry::declared_apps` **同一份口径**，但这里不能复用：
+/// 那个方法在闸（`AppState` 侧）上，而装沙箱发生在 `spawn_blocking` 里、手上只有项目根。
+///
+/// 读不到清单 / 没写 `device` 段 → 空表。空表在设备后端就是"任何 `input` 目标都不放"
+/// （fail-closed），与 `ctx.device.screen()` 无关（截屏不需要应用白名单）。
+fn device_apps(root: &std::path::Path) -> Vec<String> {
+    let Ok(manifest) = hbot_code::manifest::load(root) else {
+        return Vec::new();
+    };
+    let Some(device) = manifest.permissions.device else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::with_capacity(device.apps.len());
+    for app in device.apps {
+        let app = app.trim().to_ascii_lowercase();
+        if app.is_empty() || out.contains(&app) {
+            continue;
+        }
+        out.push(app);
+    }
+    out
 }
 
 /// 会话 → worker 的稳定映射（FNV-1a，非加密；只要求同会话恒定）。

@@ -37,6 +37,7 @@ pub mod agent;
 pub mod bots;
 pub mod commands;
 pub mod debug;
+pub mod device;
 pub mod events;
 pub mod files;
 pub mod ids;
@@ -68,6 +69,7 @@ pub struct AppState {
     searches: search::SearchRegistry,
     bots: bots::BotRegistry,
     agent: Arc<agent::AgentManager>,
+    device: Arc<device::DeviceRegistry>,
     adapter_factory: Arc<dyn runtime::AdapterFactory>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
@@ -140,6 +142,15 @@ impl AppState {
         ));
         phase.done();
 
+        // 设备能力：设置 + live 会话 + 闸门 + 1 秒到期结算（见 [`device::DeviceRegistry`]）。
+        let device = Arc::new(device::DeviceRegistry::new(
+            data_dir.clone(),
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Arc::clone(&events),
+        ));
+        device.spawn_expiry_tick();
+
         let state = Self {
             data_dir,
             store,
@@ -149,6 +160,7 @@ impl AppState {
             searches: search::SearchRegistry::new(),
             bots: bots::BotRegistry::new(),
             agent,
+            device,
             // 生产工厂是路由：按 bots.platform 选 OneBot 或 QQ 官方（见 runtime::PlatformRouter）。
             adapter_factory: Arc::new(runtime::PlatformRouter),
             clock,
@@ -262,6 +274,14 @@ impl AppState {
         debug::registry()
     }
 
+    /// 设备能力登记表（宿主设置 + live 会话 + 闸门 + 到期结算）。
+    ///
+    /// 设备闸门的消费方（`runtime::sandbox_handler`）用 [`device::DeviceRegistry::gate`] 拿
+    /// `Arc<dyn DeviceGate>` 注入沙箱 —— 它持 `Weak`，不会延长登记表的寿命。
+    pub fn device(&self) -> &Arc<device::DeviceRegistry> {
+        &self.device
+    }
+
     /// 已打开的项目根；没打开项目时 `None`。
     pub fn project_root(&self) -> Option<PathBuf> {
         self.workspace
@@ -295,6 +315,10 @@ impl AppState {
             .workspace
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(workspace));
+        // 设备闸读的是**当前项目**的 `permissions.device`。不在这里同步，就会出现
+        // "刚切到新项目、还没调过任何 device_* 命令"的窗口里，闸还在按上一个项目的清单放行
+        // （旧项目声明过、新项目没声明的能力会被多放一次）。
+        self.device.note_project_root(Some(root.clone()));
         Ok(root)
     }
 
