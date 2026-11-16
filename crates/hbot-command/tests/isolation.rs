@@ -7,12 +7,15 @@
 //! - `environment_is_not_inherited_by_default`
 //! - `working_directory_outside_the_workspace_is_rejected`
 //!
+//! 外加写隔离（`workspace-write` 档）四条：工作区内能写、工作区外写不出去、
+//! 探测不可用时仍旧拒绝、以及反证（关掉隔离后同一份 helper 真的能写到外面去）。
+//!
 //! 子进程用**当前测试二进制自己**（`current_exe` + `--exact helper`），
 //! 因此不需要额外的构建产物；helper 按 `HBOT_HELPER_KIND` 分派行为。
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +27,15 @@ use hbot_core::{
 };
 
 const ENV_KEY: &str = "HBOT_TEST_SECRET";
+
+/// helper 试写的工作区外绝对路径（父进程创建规格时塞进 `HBOT_HELPER_OUTSIDE`）。
+const OUTSIDE_ENV: &str = "HBOT_HELPER_OUTSIDE";
+
+/// `..` 相对逃逸（在 cmd 之外的进程里由内核解析，与 shell 无关）。
+#[cfg(windows)]
+const ESCAPE_RELATIVE: &str = r"..\escaped.txt";
+#[cfg(not(windows))]
+const ESCAPE_RELATIVE: &str = "../escaped.txt";
 
 /// 探测注入：任何隔离层级都"装不上"。
 struct DenyAllProbe;
@@ -41,6 +53,16 @@ fn require_containment() {
     assert!(
         caps.supports(SandboxMode::Danger),
         "本机无法建立进程树隔离，本测试无法验证（{}）",
+        caps.summary_zh()
+    );
+}
+
+/// 同上，但要求**写隔离**真的装得出来（`workspace-write` 档）。
+fn require_write_confinement() {
+    let caps = PlatformRunner::system().capabilities();
+    assert!(
+        caps.supports(SandboxMode::WorkspaceWrite),
+        "本机无法建立写隔离，本测试无法验证（{}）",
         caps.summary_zh()
     );
 }
@@ -275,6 +297,242 @@ fn empty_program_allowlist_allows_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// 6. 写隔离：工作区内写得进去（`workspace-write` 档真能跑命令）
+// ---------------------------------------------------------------------------
+
+/// helper 的输出行：`LABEL=ok` 或 `LABEL=fail(<io error>)`。
+fn outcome(output: &str, label: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(label)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("helper 没报 {label}:；stdout={output:?} stderr=?"))
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn workspace_write_mode_can_write_inside_the_workspace() {
+    require_write_confinement();
+
+    let root = common::test_root("wconf-inside");
+    let mut spec = common::helper_spec(&root, "write");
+    spec.sandbox = SandboxMode::WorkspaceWrite;
+    spec.env.push((
+        OUTSIDE_ENV.to_owned(),
+        root.join("never.txt").display().to_string(),
+    ));
+
+    let output = common::system_runner()
+        .run(spec)
+        .expect("写隔离档应能跑完 helper");
+    assert_eq!(expect_exited(&output), 0, "stderr={:?}", output.stderr);
+    assert_eq!(
+        outcome(&output.stdout, "INSIDE"),
+        "ok",
+        "工作区内写盘必须成功；stdout={:?} stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+
+    // 关键证据：**文件真的在盘上**，不是只看退出码。
+    let written = root.join("inside.txt");
+    assert!(
+        written.is_file(),
+        "工作区内的文件应存在：{}",
+        written.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&written).expect("读回工作区内的文件"),
+        "hbot",
+        "写进去的内容要能原样读回"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. 写隔离：工作区外写不出去（绝对路径 + `..` 相对逃逸，都断言**文件不存在**）
+// ---------------------------------------------------------------------------
+
+/// 独占的「容器 + 工作区」两级目录：工作区是容器的子目录。
+///
+/// 这样 `..` 逃逸的目标（容器目录）既是"工作区外"，又是这条测试独占的位置 ——
+/// `cargo test` 并行跑，若都用 `%TEMP%` 直下当父目录，反证测试写出来的
+/// `%TEMP%\escaped.txt` 会让隔离测试读到「文件居然存在」而假红。
+fn nested_workspace(tag: &str) -> (PathBuf, PathBuf) {
+    let container =
+        std::env::temp_dir().join(format!("hbot-command-it-{tag}-{}", std::process::id()));
+    if container.exists() {
+        let _ = std::fs::remove_dir_all(&container);
+    }
+    let workspace = container.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("建嵌套工作区");
+    (
+        std::fs::canonicalize(&container).expect("规范化容器目录"),
+        std::fs::canonicalize(&workspace).expect("规范化工作区"),
+    )
+}
+
+#[test]
+fn workspace_write_mode_cannot_write_outside_the_workspace() {
+    require_write_confinement();
+
+    let (container, root) = nested_workspace("wconf-outside");
+    let outside = container.join("outside.txt");
+    let escaped = container.join("escaped.txt");
+    for path in [&outside, &escaped] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut spec = common::helper_spec(&root, "write");
+    spec.sandbox = SandboxMode::WorkspaceWrite;
+    spec.env
+        .push((OUTSIDE_ENV.to_owned(), outside.display().to_string()));
+
+    let output = common::system_runner()
+        .run(spec)
+        .expect("写隔离档应能跑完 helper");
+    assert_eq!(expect_exited(&output), 0, "stderr={:?}", output.stderr);
+
+    // helper 必须**真的试过**：两种写都失败了（不是没跑、也不是提前崩了）。
+    assert_eq!(
+        outcome(&output.stdout, "INSIDE"),
+        "ok",
+        "同一个进程里工作区内应能写（证明令牌/句柄都正常）；stdout={:?} stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+    let outside_result = outcome(&output.stdout, "OUTSIDE");
+    assert!(
+        outside_result.starts_with("fail("),
+        "工作区外的绝对路径写盘必须被拒，实际：{outside_result}"
+    );
+    let escape_result = outcome(&output.stdout, "ESCAPE");
+    assert!(
+        escape_result.starts_with("fail("),
+        "`..` 相对逃逸写盘必须被拒，实际：{escape_result}"
+    );
+
+    // 判据落在盘上：目标文件不许存在（只看错误码会被"写到了别的目录"骗过去）。
+    assert!(
+        !outside.exists(),
+        "工作区外的文件不该存在：{}",
+        outside.display()
+    );
+    assert!(
+        !escaped.exists(),
+        "逃逸目标文件不该存在：{}",
+        escaped.display()
+    );
+    let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_file(&escaped);
+    let _ = std::fs::remove_dir_all(&container);
+}
+
+// ---------------------------------------------------------------------------
+// 8. 探测不可用 → `workspace-write` 仍然拒绝（fail-closed 没被这次改动松动）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unavailable_write_confinement_still_denies_workspace_write() {
+    let root = common::test_root("wconf-denied");
+    let mut spec = common::helper_spec(&root, "write");
+    spec.sandbox = SandboxMode::WorkspaceWrite;
+    spec.env.push((
+        OUTSIDE_ENV.to_owned(),
+        root.join("never.txt").display().to_string(),
+    ));
+
+    // 注入一个"永远装不上"的探针：模拟不支持写隔离的机器。
+    let runner = PlatformRunner::with_probe(Arc::new(DenyAllProbe));
+    match runner.run(spec) {
+        Err(CommandDenied::IsolationUnavailable { .. }) => {}
+        other => panic!("探测失败时必须拒绝执行，实际：{other:?}"),
+    }
+
+    // 拒绝必须发生在起进程之前：helper 一次都没跑过。
+    assert!(
+        !root.join("inside.txt").exists(),
+        "被拒的命令不该留下任何产物"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. 反证：把隔离关掉（`danger` 档）后，同一份 helper 真的能把文件写到外面去
+//
+// 这条是给第 7 条做**反证**的：如果第 7 条无论隔离开不开都通过，那它是恒真的、
+// 什么都证明不了。这里用同一个 helper、同一个目标路径，只是换成不要求写隔离的
+// `danger` 档 —— 文件必须真的出现。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn without_write_confinement_the_same_helper_writes_outside() {
+    require_containment();
+
+    let (container, root) = nested_workspace("wconf-counterproof");
+    let outside = container.join("outside.txt");
+    let escaped = container.join("escaped.txt");
+    for path in [&outside, &escaped] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut spec = common::helper_spec(&root, "write");
+    // `danger`：只要进程树隔离，不做写隔离 —— 也就是第 7 条里关掉隔离的那种情形。
+    spec.sandbox = SandboxMode::Danger;
+    spec.env
+        .push((OUTSIDE_ENV.to_owned(), outside.display().to_string()));
+
+    let output = common::system_runner()
+        .run(spec)
+        .expect("danger 档应能跑完 helper");
+    assert_eq!(expect_exited(&output), 0, "stderr={:?}", output.stderr);
+    for label in ["INSIDE", "OUTSIDE", "ESCAPE"] {
+        assert_eq!(
+            outcome(&output.stdout, label),
+            "ok",
+            "关掉写隔离后 {label} 必须成功（否则第 7 条是恒真的）；stdout={:?} stderr={:?}",
+            output.stdout,
+            output.stderr
+        );
+    }
+    assert!(
+        outside.is_file(),
+        "关掉写隔离后工作区外的文件应真的被写出来：{}",
+        outside.display()
+    );
+    assert!(
+        escaped.is_file(),
+        "关掉写隔离后 `..` 逃逸应真的写成：{}",
+        escaped.display()
+    );
+
+    for path in [&outside, &escaped] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(&container);
+}
+
+// ---------------------------------------------------------------------------
+// 10. 能力矩阵：Windows 上写隔离现在必须报"可用"
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[test]
+fn capability_report_advertises_write_confinement() {
+    let caps = PlatformRunner::system().capabilities();
+    assert!(
+        caps.write_confinement.available,
+        "Windows 上写隔离应可用，实际：{}",
+        caps.summary_zh()
+    );
+    assert!(
+        caps.supports(SandboxMode::WorkspaceWrite),
+        "`workspace-write` 档应可用：{}",
+        caps.summary_zh()
+    );
+    // `read-only` 档仍然全平台拒绝 —— 这次改动不许把它带成"可用"。
+    assert!(!caps.supports(SandboxMode::ReadOnly));
+}
+
+// ---------------------------------------------------------------------------
 // helper：被上面的测试当作子进程启动
 // ---------------------------------------------------------------------------
 
@@ -302,6 +560,26 @@ fn helper() {
             };
             println!("SECRET={}", read(ENV_KEY));
             println!("PATH={}", read("PATH"));
+            let _ = std::io::stdout().flush();
+        }
+        "write" => {
+            // 三处写：工作区内的相对路径、工作区外的绝对路径、`..` 相对逃逸。
+            // 结果按 `LABEL=ok` / `LABEL=fail(<io error>)` 打印，父进程据此断言。
+            let attempt = |label: &str, path: &Path| {
+                let result = match std::fs::write(path, b"hbot") {
+                    Ok(()) => "ok".to_owned(),
+                    Err(error) => format!("fail({error})"),
+                };
+                println!("{label}={result}");
+            };
+            attempt("INSIDE", Path::new("inside.txt"));
+            let outside = std::env::var(OUTSIDE_ENV).expect("helper 需要 HBOT_HELPER_OUTSIDE");
+            attempt("OUTSIDE", Path::new(&outside));
+            attempt("ESCAPE", Path::new(ESCAPE_RELATIVE));
+            match std::fs::read_to_string("inside.txt") {
+                Ok(text) => println!("READ_BACK={text}"),
+                Err(error) => println!("READ_BACK=fail({error})"),
+            }
             let _ = std::io::stdout().flush();
         }
         "flood" => {

@@ -9,11 +9,13 @@
 //! - 枚举值用 snake_case；
 //! - 时间为 [`Timestamp`]（Unix 毫秒整数），不引入 `chrono` / `time` 依赖。
 
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{BotId, ConversationId, MessageId, ProjectId, SessionId};
+use crate::redact::{RedactedJson, redact_arg};
 
 /// Unix 毫秒时间戳（UTC，可为负）。
 ///
@@ -152,7 +154,7 @@ pub enum ConversationKind {
 ///
 /// 不变量：`(bot_id, external_id)` 唯一 → 重复投递只处理一次；
 /// 处理完成才写 `processed_at`（`docs/02-architecture.md` §4.1）。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InboundMessage {
     /// 消息 ID（`inbound.id`），也是生成代码拿到的幂等键。
@@ -171,6 +173,31 @@ pub struct InboundMessage {
     pub received_at: Timestamp,
     /// 处理完成时间；`None` 表示未处理（崩溃后应重放）。
     pub processed_at: Option<Timestamp>,
+}
+
+/// 手写 `Debug`（**不要**换回 `#[derive(Debug)]`）：RT-06。
+///
+/// 入站 `payload` 是任意 JSON，平台会把凭据塞在里面 —— QQ 官方机器人的
+/// `message_scene.ext` 就带 `auth_token=…`，OneBot 的实现也可能把整个请求头
+/// （含 `Authorization`）原样放进事件。派生 `Debug` 会把这些打给日志与模型。
+///
+/// `payload` 走 [`RedactedJson`]（**递归**脱敏，命中键名的整个值才抹，其余原样），
+/// 不是整段 `<redacted>` —— 那样等于把排查入站事件的能力阉割掉。
+/// `external_id` / `sender_id` 也过一遍 [`redact_arg`]：正常 ID 原样输出，
+/// 只有里面嵌了 `token=…` 才抹。
+impl fmt::Debug for InboundMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InboundMessage")
+            .field("id", &self.id)
+            .field("bot_id", &self.bot_id)
+            .field("conversation_id", &self.conversation_id)
+            .field("external_id", &redact_arg(&self.external_id))
+            .field("sender_id", &redact_arg(&self.sender_id))
+            .field("payload", &RedactedJson(&self.payload))
+            .field("received_at", &self.received_at)
+            .field("processed_at", &self.processed_at)
+            .finish()
+    }
 }
 
 /// 出站消息：待发送 / 已发送的消息记录（`outbound` 表）。
@@ -259,7 +286,7 @@ pub enum ApprovalDecision {
 ///
 /// 每步落库，崩溃后显示"中断"，不自动重放有副作用的工具
 /// （`docs/02-architecture.md` §5.1）。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     /// 工具调用 ID（provider 的 call id 或本地生成的稳定 ID）。
@@ -282,6 +309,39 @@ pub struct ToolCall {
     pub created_at: Timestamp,
     /// 结束时间；进行中为 `None`。
     pub finished_at: Option<Timestamp>,
+}
+
+/// 手写 `Debug`（**不要**换回 `#[derive(Debug)]`）：RT-06。
+///
+/// 与 provider 层的 `ToolCallRequest`（`hbot-agent`）同理：`args` / `result` 是任意
+/// JSON（工具参数里就可能有 `api_key`、`Authorization`），而 `ToolCall` 会作为
+/// `agent.tool` 事件载荷、并被落库与回放，派生 `Debug` 是把它漏到日志的最短路径。
+impl fmt::Debug for ToolCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolCall")
+            .field("id", &self.id)
+            .field("session_id", &self.session_id)
+            .field("name", &self.name)
+            .field("args", &RedactedJson(&self.args))
+            .field("result", &RedactedJsonRef(&self.result))
+            .field("status", &self.status)
+            .field("approval", &self.approval)
+            .field("created_at", &self.created_at)
+            .field("finished_at", &self.finished_at)
+            .finish()
+    }
+}
+
+/// `Debug` 辅助：`Option<Value>` 的脱敏打印（`None` 仍打 `None`，不当成 `null`）。
+struct RedactedJsonRef<'a>(&'a Option<serde_json::Value>);
+
+impl fmt::Debug for RedactedJsonRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(value) => fmt::Debug::fmt(&RedactedJson(value), f),
+            None => f.write_str("None"),
+        }
+    }
 }
 
 /// 工具调用状态。

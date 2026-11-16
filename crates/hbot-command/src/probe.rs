@@ -10,7 +10,7 @@ use std::fmt;
 use hbot_core::{Platform, SandboxMode};
 use serde::{Deserialize, Serialize};
 
-use crate::containment;
+use crate::{confinement, containment};
 
 /// 隔离层级。
 ///
@@ -26,8 +26,9 @@ pub enum IsolationLevel {
 
     /// 写隔离：被跑起来的程序只能写显式放行的目录。
     ///
-    /// Windows 上是受限令牌 + write SID + 低完整性标签；Linux 上是 landlock / bwrap；
-    /// macOS 上的 `sandbox-exec` 已被弃用，不作为候选。**本 crate 尚未实现任何平台**。
+    /// Windows 上是受限令牌（`WRITE_RESTRICTED` + 由工作区路径派生的 write SID + 该目录上的
+    /// ACE）；Linux 上是 Landlock（**只编译过，未在 Linux 上运行**）；macOS 上的
+    /// `sandbox-exec` 已弃用，不作为候选，探测恒失败。
     WriteConfinement,
 }
 
@@ -90,7 +91,15 @@ impl fmt::Display for ProbeOutcome {
 
 /// 隔离能力探测端口（注入点）。
 ///
-/// 实现必须是**只读探测**：不许为了探测而跑命令、不许改系统设置。
+/// 实现必须是**不自作主张的探测**：不许为探测去跑调用方要求的命令、不许改系统设置
+/// （临时目录里的 ACE 往返可以，但必须当场收拾干净）、不许拿探测结果去"降级放行"。
+///
+/// 唯一被允许起进程的情形是**验证令牌本身**：Windows 上 `CreateRestrictedToken` 成功
+/// 并不代表 `CreateProcessAsUserW` 起得来（缺 `SeAssignPrimaryTokenPrivilege` 时要
+/// 1314），而这一点只有真起一个立刻退出的系统程序才知道。所以写隔离的探测确实会起
+/// `cmd.exe /c exit 0` —— 它不碰用户数据、不写工作区，是整个 crate 里唯一一条
+/// "探测期间起进程"的路径。
+///
 /// 返回 `Err(reason)` 表示该层不可用，`reason` 直接进 [`hbot_core::CommandDenied::IsolationUnavailable`]。
 pub trait IsolationProbe: Send + Sync {
     /// 探测某一层是否可用；`Err` 是给用户看的原因。
@@ -99,8 +108,10 @@ pub trait IsolationProbe: Send + Sync {
 
 /// 真实探测：按当前平台问操作系统"这套机制能不能建起来"。
 ///
-/// Windows 的探测会真的建一个空作业对象并设上限再关掉（约几十微秒，不跑 `powershell`
-/// ——旧项目每条命令多花 1.5 s 的地板价就是那么来的，`AGENTS.md` §4.4 第①条）。
+/// Windows 的 Containment 探测会真的建一个空作业对象并设上限再关掉；WriteConfinement 探测
+/// 会建一个受限令牌、在一处临时目录上跑一遍 ACE 往返（写完立刻删）并用它起一个
+/// `cmd.exe /c exit 0` —— 加起来仍是毫秒级，不跑 `powershell`（旧项目每条命令多花 1.5 s
+/// 的地板价就是那么来的，`AGENTS.md` §5 第 9 条第①点）。结果按进程缓存。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemProbe;
 
@@ -113,32 +124,14 @@ impl IsolationProbe for SystemProbe {
 fn probe_platform(platform: Platform, level: IsolationLevel) -> Result<(), String> {
     match (platform, level) {
         (Platform::Windows, IsolationLevel::Containment) => containment::probe(),
-        (Platform::Windows, IsolationLevel::WriteConfinement) => Err(
-            "Windows 的受限令牌 + write SID + 低完整性标签尚未接入（本原型只做了作业对象）"
-                .to_owned(),
-        ),
+        (Platform::Windows, IsolationLevel::WriteConfinement) => confinement::probe(),
         (Platform::Linux, IsolationLevel::Containment) => containment::probe(),
-        (Platform::Linux, IsolationLevel::WriteConfinement) => {
-            Err(linux_write_confinement_reason())
-        }
+        (Platform::Linux, IsolationLevel::WriteConfinement) => confinement::probe(),
+        // macOS：两层都没有实现（`sandbox-exec` 已弃用），探测如实失败。
         (Platform::MacOs, _) => {
             Err("macOS 上 sandbox-exec 已弃用，本 crate 不提供命令隔离实现".to_owned())
         }
         (Platform::Other, _) => Err(format!("平台 {platform} 未提供命令隔离实现")),
-    }
-}
-
-/// Linux 写隔离的缺什么：把"内核没开 landlock"和"内核开了但我们没接"分开说。
-///
-/// 区分这两者很有用：前者用户换台机器也没用，后者是产品还没做完。
-fn linux_write_confinement_reason() -> String {
-    const LSM_LIST: &str = "/sys/kernel/security/lsm";
-    match std::fs::read_to_string(LSM_LIST) {
-        Ok(list) if list.contains("landlock") => {
-            "内核已启用 landlock，但本 crate 尚未接入写限制层".to_owned()
-        }
-        Ok(_) => format!("内核未启用 landlock（{LSM_LIST} 里没有它），无法建立写隔离"),
-        Err(err) => format!("无法确认 landlock 可用性（读不到 {LSM_LIST}：{err}）"),
     }
 }
 

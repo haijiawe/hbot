@@ -7,11 +7,13 @@
 //! 3. **探测**该层是否可用——不可用就 [`hbot_core::CommandDenied::IsolationUnavailable`]；
 //! 4. 解析程序（绝对路径 + 允许清单）与工作目录（必须在项目根内）；
 //! 5. 构造环境（清空 + 白名单）；
-//! 6. 建隔离范围 → spawn → **立刻**把子进程放进范围（放不进去就杀掉并拒绝）；
+//! 6. 建隔离范围（+ 写隔离档再建一层写限制）→ spawn → **立刻**把子进程放进范围
+//!    （放不进去就杀掉并拒绝）；
 //! 7. 有界读输出，轮询等退出；超时/超限 → 杀整棵树；
 //! 8. 无论怎么结束都收掉整棵树（不留孤儿），再组装结果。
 
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,10 +23,15 @@ use hbot_core::{
     Platform, SandboxMode,
 };
 
+use crate::child::{Exit, Spawned};
+use crate::confinement::WriteConfinement;
 use crate::containment::Containment;
 use crate::output::BoundedOutput;
 use crate::probe::{CapabilityReport, IsolationLevel, IsolationProbe, SystemProbe};
 use crate::{env, path, program};
+
+#[cfg(windows)]
+use crate::confinement::SpawnPlan;
 
 /// 等退出的轮询间隔。10 ms 是"超时精度"与"空转开销"的折中：
 /// 一次 `npm install` 的等待循环也就跑几百次。
@@ -129,22 +136,40 @@ impl CommandRunner for PlatformRunner {
                 reason,
             })?;
 
-        let mut command = Command::new(&program_path);
-        command
-            .args(&spec.args)
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(env_pairs.iter().map(|(name, value)| (name, value)))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        guard.configure(&mut command);
+        // 写隔离层：只有 `workspace-write` 档需要它。**建不出来就拒绝**——探测说可用
+        // 但真建时失败（权限被收回、路径消失）同样不能放行，所以这里再失败一次。
+        let confinement = match level {
+            IsolationLevel::WriteConfinement => Some(
+                WriteConfinement::create(&spec.workspace_root).map_err(|reason| {
+                    tracing::debug!(
+                        workspace = %spec.workspace_root.display(),
+                        %reason,
+                        "写隔离建不起来，拒绝执行",
+                    );
+                    CommandDenied::IsolationUnavailable {
+                        platform: self.platform,
+                        reason,
+                    }
+                })?,
+            ),
+            IsolationLevel::Containment => None,
+        };
 
         let started = Instant::now();
-        let mut child = command.spawn().map_err(|err| CommandDenied::SpawnFailed {
-            program: program_path.display().to_string(),
-            reason: err.to_string(),
-        })?;
+        let mut child = start(
+            &program_path,
+            &spec,
+            &cwd,
+            &env_pairs,
+            &guard,
+            confinement.as_ref(),
+        )?;
+        tracing::debug!(
+            pid = child.id(),
+            program = %program_path.display(),
+            level = %level,
+            "命令已启动",
+        );
 
         // 进不了隔离范围 = 没有隔离：杀掉刚起的进程并拒绝（fail-closed 的最后一米）。
         if let Err(err) = guard.attach(&child) {
@@ -162,7 +187,9 @@ impl CommandRunner for PlatformRunner {
             });
         }
 
-        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let stdout = child.take_stdout();
+        let stderr = child.take_stderr();
+        let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
             let _ = guard.kill_tree(&mut child);
             let _ = child.wait();
             return Err(CommandDenied::IoFailed {
@@ -216,13 +243,13 @@ impl CommandRunner for PlatformRunner {
 
 /// 等待结束的三种情形。
 enum WaitOutcome {
-    Exited(ExitStatus),
+    Exited(Exit),
     TimedOut,
     Overflow(OutputStream),
 }
 
 fn wait_for_finish(
-    child: &mut Child,
+    child: &mut Spawned,
     guard: &Containment,
     output: &BoundedOutput,
     timeout: Duration,
@@ -274,22 +301,69 @@ fn validate_spec(spec: &CommandSpec) -> Result<(), CommandDenied> {
     program::validate_args(&spec.args)
 }
 
-fn map_status(status: ExitStatus) -> CommandStatus {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        CommandStatus::Exited {
-            code: status.code(),
-            signal: status.signal(),
-        }
+fn map_status(exit: Exit) -> CommandStatus {
+    CommandStatus::Exited {
+        code: exit.code(),
+        signal: exit.signal(),
     }
-    #[cfg(not(unix))]
-    {
-        CommandStatus::Exited {
-            code: status.code(),
-            signal: None,
-        }
+}
+
+/// 起子进程：写隔离档走原生 `CreateProcessAsUserW`（要挂受限令牌），其余走
+/// [`std::process::Command`]。
+///
+/// 两条路的**外部行为必须一致**：`current_dir`、清空环境后重设、stdin=/dev/null、
+/// stdout/stderr 管道。差异只在"用谁的令牌、继承哪些句柄"，以及控制台的处理——
+/// 受限令牌那一档不能要控制台（实测 `CREATE_NO_WINDOW` 会让子进程 `0xC0000142`，
+/// 见 `confinement_win.rs` 的 `CONFINED_CREATION_FLAGS`），所以两边旗标本来就不该共用。
+fn start(
+    program_path: &Path,
+    spec: &CommandSpec,
+    cwd: &Path,
+    env_pairs: &[(String, String)],
+    guard: &Containment,
+    confinement: Option<&WriteConfinement>,
+) -> Result<Spawned, CommandDenied> {
+    #[cfg(windows)]
+    if let Some(confinement) = confinement {
+        // 受限令牌下 `std::process::Command` 无计可施（没有设置令牌/属性表的接口），
+        // 所以这里自己拼 `CreateProcessAsUserW` 的全部参数。
+        let plan = SpawnPlan {
+            application: program_path.to_path_buf(),
+            args: spec.args.clone(),
+            cwd: cwd.to_path_buf(),
+            env: env_pairs.to_vec(),
+        };
+        return confinement
+            .spawn(&plan)
+            .map(Spawned::native)
+            .map_err(|err| CommandDenied::SpawnFailed {
+                program: program_path.display().to_string(),
+                reason: err.to_string(),
+            });
     }
+
+    let mut command = Command::new(program_path);
+    command
+        .args(&spec.args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env_pairs.iter().map(|(name, value)| (name, value)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    guard.configure(&mut command);
+    #[cfg(not(windows))]
+    if let Some(confinement) = confinement {
+        // Linux：Landlock 规则集在 `pre_exec` 里装上（fork 后、exec 前）。
+        confinement.configure(&mut command);
+    }
+    command
+        .spawn()
+        .map(Spawned::std)
+        .map_err(|err| CommandDenied::SpawnFailed {
+            program: program_path.display().to_string(),
+            reason: err.to_string(),
+        })
 }
 
 #[cfg(test)]

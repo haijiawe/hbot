@@ -11,6 +11,7 @@
 //! - 拒绝原因必须能直接展示给用户（中文一句话，可操作），所以 [`CommandDenied`]
 //!   自带中文 `Display`，而不是把英文错误码丢给 UI 自己拼。
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::SandboxMode;
+use crate::redact::{RedactedArgs, RedactedEnv};
 
 /// 运行平台。
 ///
@@ -74,7 +76,7 @@ impl std::fmt::Display for Platform {
 ///
 /// 用 [`CommandSpec::new`] 起步，再改需要的字段；不要 `..Default::default()`
 /// （默认超时 0 秒没有意义）。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
     /// 程序。绝对路径，或**裸文件名**（按父进程 `PATH` 解析，绝不搜当前目录）。
     ///
@@ -128,6 +130,33 @@ pub struct CommandSpec {
     /// 这一次打算跑什么"，用来把审批范围钉死在一个具体动作上；拿它当隔离用
     /// 就会重演旧项目的坑（`AGENTS.md` §7 第 7 条）。
     pub allowed_programs: Vec<String>,
+}
+
+/// 手写 `Debug`（**不要**换回 `#[derive(Debug)]`）：RT-06。
+///
+/// 派生实现会把 `env` 的值（`OPENAI_API_KEY=sk-…`）与 `args` 里的
+/// `--token=sk-…` / `Authorization: Bearer …` 原样打进 `tracing::warn!(?spec)`、
+/// `thiserror` 的 `#[source]` 链和工具输出 —— 一次打印就是一条永久落进 `logs` 表的密钥。
+///
+/// 形状与派生实现保持一致（11 个字段名都在、非敏感值原样），只有敏感值变成
+/// [`crate::redact::REDACTED`]：`args` 走 [`RedactedArgs`]（含 `--flag value` 分开的形态），
+/// `env` 走 [`RedactedEnv`]（变量名保留、按键名判值）。判据见 [`crate::redact`]。
+impl fmt::Debug for CommandSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field("args", &RedactedArgs(&self.args))
+            .field("cwd", &self.cwd)
+            .field("workspace_root", &self.workspace_root)
+            .field("env", &RedactedEnv(&self.env))
+            .field("inherit_env", &self.inherit_env)
+            .field("inherit_entire_env", &self.inherit_entire_env)
+            .field("timeout", &self.timeout)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .field("sandbox", &self.sandbox)
+            .field("allowed_programs", &self.allowed_programs)
+            .finish()
+    }
 }
 
 impl CommandSpec {

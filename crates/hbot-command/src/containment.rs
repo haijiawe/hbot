@@ -4,8 +4,9 @@
 //! `attach`（把子进程放进范围）、`kill_tree`（杀整棵）、以及 `probe`（能不能建）。
 //! 调用方（[`crate::PlatformRunner`]）不需要知道 Windows 是作业对象、Linux 是会话。
 
+use crate::child::Spawned;
 use std::io;
-use std::process::{Child, Command};
+use std::process::Command;
 
 #[cfg(windows)]
 #[path = "containment_win.rs"]
@@ -45,12 +46,12 @@ impl Containment {
     /// 把刚 spawn 出来的子进程放进隔离范围。
     ///
     /// 失败等于"没隔离"：调用方必须杀掉这个子进程并拒绝执行。
-    pub(crate) fn attach(&self, child: &Child) -> io::Result<()> {
+    pub(crate) fn attach(&self, child: &Spawned) -> io::Result<()> {
         self.inner.attach(child)
     }
 
     /// 杀掉整棵进程树（不是只杀直接子进程）。
-    pub(crate) fn kill_tree(&self, child: &mut Child) -> io::Result<()> {
+    pub(crate) fn kill_tree(&self, child: &mut Spawned) -> io::Result<()> {
         self.inner.kill_tree(child)
     }
 }

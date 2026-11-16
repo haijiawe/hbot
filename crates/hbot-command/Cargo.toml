@@ -9,8 +9,27 @@ publish = false
 
 [dependencies]
 # 只依赖 hbot-core（方向是 agent → command → core），见 docs/adr/0003-command-isolation.md。
-# 刻意**不引** windows-sys / libc / nix：作业对象与 setsid/kill 用 std + 手写 FFI 就够，
-# 少一个第三方依赖就少一次供应链审查与一次版本漂移。
 hbot-core = { path = "../hbot-core" }
 serde = { workspace = true }
 tracing = { workspace = true }
+
+# 写隔离（WorkspaceWrite 档）要操作系统级原语，std 没有对应接口，只能引平台 crate。
+# 两者都是 target-specific：绝不进入其它平台的依赖图，也不改根 Cargo.toml 的
+# workspace.dependencies（本 crate 单独钉版本，避免替整个 workspace 选版本）。
+[target.'cfg(windows)'.dependencies]
+# 受限令牌（CreateRestrictedToken + WRITE_RESTRICTED）、DACL（SetEntriesInAclW /
+# SetNamedSecurityInfoW）与带令牌的进程创建（CreateProcessAsUserW）都在这里。
+# 只开用到的 feature。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# 只用它拿 Landlock 的 syscall 号与 prctl 常数（规则集本身直接 syscall，不自写 FFI
+# 是因为 syscall 号随架构变化，写死会在非 x86_64 上错）。
+libc = "0.2"

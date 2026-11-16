@@ -4,15 +4,16 @@
 //! `kill(-pgid, SIGKILL)` 一次覆盖整组（`cmd → npm → node` 全在内），
 //! 比逐个 pid 杀可靠，也不依赖 `/proc` 遍历。
 //!
-//! 为什么没有 landlock：写限制层还没接（见 ADR-0003）。**探测会如实回答不可用**，
-//! 于是 `workspace-write` 档在这台机器上仍然拒绝执行——本原型不假装支持。
+//! 为什么没有 landlock：写限制层在 [`crate::confinement`]（同一套 `pre_exec` 里装，
+//! 但那是另一层判断，两层各管各的：这里只管"杀得干净"）。
 //!
-//! 不引 `libc`/`nix`：只需要 `setsid` / `setpgid` / `kill` 三个 POSIX 符号，
-//! 手写声明即可（`std` 已经把 libc 链进来了）。
+//! 不引 `nix` 只为三个 POSIX 符号：手写声明即可（`std` 已经把 libc 链进来了）。
+//! 写隔离那一层要 `syscall` 号码与常量，才用了 `libc` crate。
 
+use crate::child::Spawned;
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command};
+use std::process::Command;
 
 unsafe extern "C" {
     fn setsid() -> i32;
@@ -55,12 +56,12 @@ impl Containment {
         }
     }
 
-    pub(crate) fn attach(&self, _child: &Child) -> io::Result<()> {
+    pub(crate) fn attach(&self, _child: &Spawned) -> io::Result<()> {
         // 会话与进程组在 exec 之前就建好了（见 `configure`），没有额外挂载动作。
         Ok(())
     }
 
-    pub(crate) fn kill_tree(&self, child: &mut Child) -> io::Result<()> {
+    pub(crate) fn kill_tree(&self, child: &mut Spawned) -> io::Result<()> {
         let pid = child.id() as i32;
         // 负 pid = 对整个进程组发信号；组号等于组长（子进程）的 pid。
         // SAFETY: 纯系统调用，参数是有效 pid 与合法信号号。

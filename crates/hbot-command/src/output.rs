@@ -10,7 +10,6 @@
 //! 调用方照样能拿到已经读到的部分输出，不会为了"拿输出"再等一轮超时。
 
 use std::io::{ErrorKind, Read};
-use std::process::{ChildStderr, ChildStdout};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -31,7 +30,14 @@ pub(crate) struct BoundedOutput {
 
 impl BoundedOutput {
     /// 为两个管道各起一个读者线程。
-    pub(crate) fn spawn(stdout: ChildStdout, stderr: ChildStderr, limit: usize) -> Self {
+    ///
+    /// 收 `Box<dyn Read + Send>` 而不是具体的 `ChildStdout`/`ChildStderr`：写隔离档的原生
+    /// spawn 拿到的管道读端是裸 `HANDLE`（包成 `File`），类型与 `std::process` 的不同。
+    pub(crate) fn spawn(
+        stdout: Box<dyn Read + Send>,
+        stderr: Box<dyn Read + Send>,
+        limit: usize,
+    ) -> Self {
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
         let overflow = Arc::new(Mutex::new(None));

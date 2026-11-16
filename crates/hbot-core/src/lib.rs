@@ -18,6 +18,7 @@
 //! - [`ports`]：同步端口 trait（时钟、ID 生成、事件出口、命令执行）+ [`SystemClock`]。
 //!   `SystemClock` 放这里是因为读系统时间不是平台适配；放适配器层会逼着组合根
 //!   （如 `hbot-desktop`）为了一个时钟依赖整个 `hbot-adapters`，那是错误的依赖方向。
+//! - [`paths`]：应用数据目录的唯一算法（桌面端与后台端必须落到同一个库）。
 
 #![warn(missing_docs)]
 
@@ -26,7 +27,9 @@ pub mod debug;
 pub mod domain;
 pub mod errors;
 pub mod ids;
+pub mod paths;
 pub mod ports;
+pub mod redact;
 
 pub use command::{
     CommandDenied, CommandOutput, CommandSpec, CommandStatus, OutputStream, Platform,
@@ -41,4 +44,9 @@ pub use ids::{
     ApprovalId, BotId, ConversationId, EditId, InboundId, MessageId, OutboundId, ProjectId,
     SearchId, SessionId,
 };
+pub use paths::{APP_DIR, data_dir, data_dir_for};
 pub use ports::{Clock, CommandRunner, EventSink, IdGenerator, SystemClock};
+pub use redact::{
+    REDACTED, RedactedArgs, RedactedEnv, RedactedJson, is_secret_key, redact_arg, redact_args,
+    redact_text, redact_value,
+};

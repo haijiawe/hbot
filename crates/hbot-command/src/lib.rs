@@ -6,26 +6,58 @@
 //!
 //! # 诚实的能力矩阵（截至 `docs/adr/0003-command-isolation.md`）
 //!
+//! 两层隔离是分开的两件事：[`IsolationLevel::Containment`] 管"跑飞了要能杀干净"，
+//! [`IsolationLevel::WriteConfinement`] 管"写不出工作区"。档位映射见
+//! [`CapabilityReport::required_level`]：`read-only` 一律拒绝（这一层不提供只读视图）、
+//! `workspace-write` 要写隔离、`danger` 只要 Containment。
+//!
 //! | 平台 | `Containment`（进程树 + 资源上限） | `WriteConfinement`（写隔离） |
 //! |---|---|---|
-//! | Windows | 作业对象：`KILL_ON_JOB_CLOSE` + 活跃进程数/内存上限 | **未实现** → `IsolationUnavailable` |
-//! | Linux | `setsid` + `killpg`（整个进程组） | **未实现**（landlock 未接入） → `IsolationUnavailable` |
-//! | macOS | **未实现**（`sandbox-exec` 已弃用） → `IsolationUnavailable` | **未实现** → `IsolationUnavailable` |
+//! | Windows | 作业对象：`KILL_ON_JOB_CLOSE` + 活跃进程数/内存上限 | 受限令牌：`WRITE_RESTRICTED` + 工作区 write SID + 该目录上的 ACE |
+//! | Linux | `setsid` + `killpg`（整个进程组） | Landlock（`landlock_restrict_self`，在 `pre_exec` 里装）；**只编译过，未在 Linux 上运行** |
+//! | macOS | **未实现**（`sandbox-exec` 已弃用） → `IsolationUnavailable` | **未实现**（同上） → `IsolationUnavailable` |
 //!
-//! 于是当前唯一能真的跑起来的档位是 `danger`（只要 [`IsolationLevel::Containment`]）；
-//! `workspace-write` 因为写隔离还没接入而**一律拒绝**。这是刻意的：**装不上隔离就拒绝执行**，
-//! 不允许"尽力跑一下再报告"。拒绝原因是一句中文、可展示给用户的话
-//! （见 [`hbot_core::CommandDenied`]），不是内部错误码。
+//! 探测是**运行时**的：同样一份代码，装了 Landlock 的 Linux 与没装的是两个结论。
+//! **装不上就拒绝执行**，不允许"尽力跑一下再报告"；拒绝原因是一句中文、可展示给用户的
+//! 话（见 [`hbot_core::CommandDenied::IsolationUnavailable`]），不是内部错误码。
 //!
 //! # 这一层挡住了什么、挡不住什么
 //!
 //! 挡住：命令跑飞了会连带整棵进程树被杀（超时、输出超限、正常退出后的残留后代）、
 //! 单个进程/整个作业的内存与并发进程数有上限、工作目录逃不出项目根、父进程环境变量
-//! 默认不透传、程序清单空时什么都不许跑。
+//! 默认不透传、程序清单空时什么都不许跑；`workspace-write` 档下**写不出工作区**
+//! （Windows：受限令牌的 restricting SID + 目录 ACE；Linux：Landlock 只允许工作区内的
+//! 写类访问）。读不受影响——写限制只参与写类访问检查。
 //!
-//! 挡不住：**写**。`Containment` 不含任何写限制——被跑起来的程序仍能写项目根之外的
-//! 用户目录（受限令牌 / landlock 落地之前这是已知缺口，见 ADR-0003「残余风险」）。
-//! 也不含网络、注册表、GPU、CPU 时间限制。
+//! 挡不住：**网络**（写隔离不管网络）、**注册表**（`HKCU` 的写不经过文件 DACL）、
+//! **已在内存里的敏感数据**、**CPU 时间**；以及**可写句柄**——父进程继承过去的句柄不再
+//! 走访问检查，所以原生 spawn 只继承 stdin/stdout/stderr 三个句柄（`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`），
+//! 别的句柄一律不外泄。
+//!
+//! # Windows 上实测到的启动率代价（本机实测，不是推测）
+//!
+//! `WRITE_RESTRICTED` 挡的不只是文件写：它对**所有**写类访问检查都只认 restricting SID 列表，
+//! 而窗口站、LSA/SSPI、命名对象这些系统对象的 DACL 里没有本 crate 的 write SID。后果是
+//! **相当一部分真实程序在 DLL 初始化阶段就死**（退出码 `0xC0000142` = `STATUS_DLL_INIT_FAILED`）。
+//! 实测（同一 spawn 路径、同一份父环境、cwd 固定、非管道 stdio 以外条件一致）：
+//!
+//! - 起得来：`cmd.exe` 的内建命令、`ping.exe`、`reg.exe`、`ipconfig.exe`、`xcopy.exe`、
+//!   `icacls.exe`、`findstr.exe`、`hostname.exe`，以及静态 CRT 的 Rust 二进制（本仓库的测试二进制）。
+//! - 起不来：`whoami.exe`、`where.exe`、`curl.exe`、`tar.exe`、`powershell.exe`、`pwsh.exe`、
+//!   `node.exe`、`python.exe`、`git.exe`、`cargo.exe`（rustup 代理）、`rustup.exe`、`net1.exe`、
+//!   `certutil.exe`、`tasklist.exe`、`robocopy.exe`。
+//!
+//! 已逐一排除的原因：cwd 的 `\\?\` 前缀、cwd 落在 `System32`/`Windows`、自建环境块与继承父环境、
+//! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`、`DETACHED_PROCESS`、`lpDesktop`、restricting SID 的具体集合
+//! （自建 write SID / Everyone / Users / INTERACTIVE 都试过）、`SANDBOX_INERT`、`LUA_TOKEN`。
+//! 令牌旗标二分把范围锁在 `WRITE_RESTRICTED` 本身：同一 spawn 路径下，只加
+//! `DISABLE_MAX_PRIVILEGE`、或者直接用不加限制的基令牌，全部正常。
+//! **所以这不是 spawn 代码的 bug，是这套机制的代价**：`workspace-write` 目前适合"脚本级命令"，
+//! 不适合跑 `node`/`cargo` 这类工具链；要跑它们得换机制（低完整性标签 / AppContainer /
+//! 私有窗口站），见 ADR-0003 的后续项。
+//!
+//! 另一层现实代价：写隔离只是"写不出去"，所以需要可写缓存目录的命令（`npm`/`pnpm`/`cargo`）
+//! 在被降权后照样失败——本 crate **不**替它们准备可写缓存目录，也不往 ACE 里加临时目录。
 //!
 //! # 用法
 //!
@@ -47,11 +79,14 @@
 //! 同步、阻塞：async 调用方必须把它放进 `spawn_blocking`（见
 //! [`hbot_core::ports::CommandRunner`] 的文档）。
 //!
-//! Linux 分支目前只做到"能编译、逻辑与 Windows 对称"，**未在 Linux 上真机运行**
-//! （见 ADR-0003 §验证）。
+//! Linux 分支的**写隔离**只做到"能交叉编译、逻辑与 Windows 对称"，**未在任何 Linux 上
+//! 运行过**（连一次 `cargo test` 都没跑过）；Landlock 的 ABI 判定与 `pre_exec` 装载
+//! 都只经过类型检查（见 ADR-0003 §验证）。
 
 #![warn(missing_docs)]
 
+mod child;
+mod confinement;
 mod containment;
 mod env;
 mod output;
@@ -59,6 +94,8 @@ mod path;
 mod probe;
 mod program;
 mod runner;
+#[cfg(windows)]
+mod sha256;
 
 pub use probe::{CapabilityReport, IsolationLevel, IsolationProbe, ProbeOutcome, SystemProbe};
 pub use runner::PlatformRunner;

@@ -4,19 +4,19 @@
 //! `cmd → npm → node` 这种链会留下一串孤儿；作业对象是内核维护的集合，
 //! `TerminateJobObject` 一次杀光，且 `KILL_ON_JOB_CLOSE` 保证句柄一关就不留活口。
 //!
-//! 为什么手写 FFI 而不是 `windows-sys`：本 crate 只用 5 个 kernel32 函数，
-//! 为它引一个第三方依赖（以及一次供应链/版本审查）不划算；`AGENTS.md` 也要求
-//! 新增依赖先获批。`std::process` 没有作业对象的抽象，`Command::creation_flags`
+//! 为什么这几行是手写 FFI 而不是 `windows-sys`：作业对象只要 5 个 kernel32 函数，
+//! 手写声明比拉一整套绑定更省事（写隔离那一层要几十个 API、还要结构体定义，才用了
+//! `windows-sys`）。`std::process` 没有作业对象的抽象，`Command::creation_flags`
 //! 只能设标志位（做不到"进程一出生就在作业里"）。
 //!
 //! 已知时间窗（残余风险，见 ADR-0003）：子进程是**先 spawn 再 Assign**，
 //! 在两者之间它若抢先 `spawn` 出孙进程，那个孙进程不在作业里。要做到"出生即入作业"
 //! 需要 `CreateProcessW` + `PROC_THREAD_ATTRIBUTE_JOB_LIST`（Win8+），属于下一批。
 
+use crate::child::Spawned;
 use std::ffi::c_void;
 use std::io;
-use std::os::windows::io::AsRawHandle;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::ptr;
 
 use std::os::windows::process::CommandExt;
@@ -46,7 +46,7 @@ const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x0000_0200;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
 
 /// 不弹控制台窗口（GUI 进程里跑命令时不闪黑框，也不改子进程的 stdin/stdout 语义）。
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 作业内并发进程数上限。
 ///
@@ -148,10 +148,10 @@ impl Containment {
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    pub(crate) fn attach(&self, child: &Child) -> io::Result<()> {
-        // `Child` 在 Windows 上持有的就是 `CreateProcessW` 返回的 hProcess（全权限），
+    pub(crate) fn attach(&self, child: &Spawned) -> io::Result<()> {
+        // 句柄是全权限的（`CreateProcessW` / `CreateProcessAsUserW` 返回的 hProcess），
         // 满足 AssignProcessToJobObject 需要的 PROCESS_SET_QUOTA | PROCESS_TERMINATE。
-        let process = child.as_raw_handle() as Handle;
+        let process = child.process_handle();
         // SAFETY: 两个句柄都由 Rust 侧持有且有效（job 存活于 self，process 存活于 child）。
         let ok = unsafe { AssignProcessToJobObject(self.job, process) };
         if ok == 0 {
@@ -160,7 +160,7 @@ impl Containment {
         Ok(())
     }
 
-    pub(crate) fn kill_tree(&self, child: &mut Child) -> io::Result<()> {
+    pub(crate) fn kill_tree(&self, child: &mut Spawned) -> io::Result<()> {
         // SAFETY: `self.job` 在 Drop 之前一直有效。退出码 1 只是标记"被隔离层杀掉"。
         let ok = unsafe { TerminateJobObject(self.job, 1) };
         if ok == 0 {

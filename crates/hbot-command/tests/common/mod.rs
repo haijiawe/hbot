@@ -40,6 +40,13 @@ pub fn danger_spec(root: &Path) -> CommandSpec {
     spec
 }
 
+/// `workspace-write` 档的规格：要求**写隔离**（`crate::confinement`），不只是进程树。
+pub fn workspace_write_spec(root: &Path) -> CommandSpec {
+    let mut spec = danger_spec(root);
+    spec.sandbox = SandboxMode::WorkspaceWrite;
+    spec
+}
+
 /// 真探测得到的 runner（本机实际能力）。测试自己会先断言所需能力可用，
 /// 免得"隔离不可用"被误读成"实现有 bug"。
 pub fn system_runner() -> PlatformRunner {
