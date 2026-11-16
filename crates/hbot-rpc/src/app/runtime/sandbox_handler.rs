@@ -52,6 +52,7 @@ use tokio::sync::mpsc;
 use crate::app::debug::sink::BotDebugSink;
 use crate::app::debug::{BreakpointTarget, DebugRegistry};
 use crate::app::runtime::fingerprint_cache::FingerprintCache;
+use crate::app::runtime::net::http_config;
 use crate::app::{EventBus, store_failed};
 use crate::dto::{Event, LogLevel};
 
@@ -504,15 +505,21 @@ impl SandboxHandler {
 
             let limits = self.limits;
             let project = Arc::clone(project);
-            let spawned =
-                tokio::task::spawn_blocking(move || Sandbox::spawn((*project).clone(), limits))
-                    .await
-                    .map_err(|error| {
-                        HbotError::internal(format!(
-                            "isolate 启动任务失败（bot {}）：{error}",
-                            self.bot_id
-                        ))
-                    })?;
+            let root = self.project_root.clone();
+            let spawned = tokio::task::spawn_blocking(move || {
+                // `http.get` 的真传输：清单的 `permissions.http`（空表 = 全禁）由
+                // `hbot-code` 判，这里只负责把"清单 + 真 transport"装进沙箱。
+                // 清单缺失/非法时退回全禁，绝不让沙箱因此起不来（见 `net::http_config`）。
+                let http = http_config(&root);
+                Sandbox::spawn_with_http((*project).clone(), limits, http)
+            })
+            .await
+            .map_err(|error| {
+                HbotError::internal(format!(
+                    "isolate 启动任务失败（bot {}）：{error}",
+                    self.bot_id
+                ))
+            })?;
             let sandbox = match spawned {
                 Ok(sandbox) => Arc::new(sandbox),
                 Err(error) => {

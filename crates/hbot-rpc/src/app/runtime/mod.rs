@@ -31,6 +31,7 @@
 pub mod config;
 pub mod fingerprint_cache;
 pub mod local;
+pub mod net;
 pub mod onebot;
 pub mod outbox_source;
 pub mod qq;

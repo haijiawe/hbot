@@ -347,7 +347,7 @@ export default defineBot({
   | `log(message)` | 已实现 | 进本次事件的捕获输出，转成 `RunLog` |
   | `reply(text)` | 已实现 | 被动回复；`injected` 标记存在时按主动消息发送（`sandbox_handler.rs:621-634`） |
   | `sleep(ms)` | 已实现 | 会被 handler 预算截断：`await sleep(60000)` 在 2s handler 里约 2s 后由中断处理器判超时 |
-  | `http.get(url, options?)` | 已实现 | 受 `permissions.http` 约束：默认拒绝（空表 = 全禁）、只 GET、不跟随 3xx 重定向、不支持 gzip；单次超时默认 10s（上限 60s，且被 handler 剩余预算截断）、响应体上限 256 KiB；`read-only` 档**在授权判断之前**就拒绝（不建 socket）。失败以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 前缀 reject，异常消息里的 query 抹成 `?<redacted>`。返回 `{ status, body, headers }`（headers 名小写） |
+  | `http.get(url, options?)` | 已实现 | 受 `permissions.http` 约束：默认拒绝（空表 = 全禁）、只 GET、不跟随 3xx 重定向、不支持 gzip；单次超时默认 10s（上限 60s，且被 handler 剩余预算截断）、响应体上限 256 KiB；`read-only` 档**在授权判断之前**就拒绝（不建 socket）。失败以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 前缀 reject，异常消息里的 query 抹成 `?<redacted>`。返回 `{ status, body, headers }`（headers 名小写）。**传输层由 `hbot-rpc` 注入**（`crates/hbot-rpc/src/app/runtime/net.rs` 的 `AdaptersHttpTransport`，在 `sandbox_handler.rs` 建 isolate 时按 `hbot.json` 装进沙箱），它转调 `hbot-adapters` 的 HTTP/1.1 客户端；**SSRF 判据仍只在 `hbot-adapters` 一份**（回环/内网/云元数据地址即使清单允许也拒），因此「清单允许」不等于一定连得上。清单缺失/非法时退回 `HttpConfig::deny_all()`，沙箱照常启动 |
   | `ctx.send` / `ctx.kv` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
   | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage`（`isolate.rs:504-510`）；清单里的 `onSchedule` 字段同样未接 |
 
@@ -499,7 +499,7 @@ interface MessageContext {
 ```
 
 - `ReplyOptions`：`{ replyTo?, atSender?, mention? }`；被动回复必须带 `replyTo` 或由运行时绑定。
-- `http.fetch` 只允许 `hbot.json` 的 `permissions.http` 域名；默认空 = 禁止。
+- `http.get` 只允许 `hbot.json` 的 `permissions.http` 域名；默认空 = 禁止。传输由 `hbot-rpc` 注入，回环/私网地址在 `hbot-adapters` 仍被拒（SSRF 纵深防御）。
 - `kv` 落在项目 DB，按 bot 隔离；单值上限 1 MB。
 - 所有 promise 失败都以异常抛回 JS；未捕获异常由运行时记录，不静默吞。
 
@@ -688,7 +688,7 @@ debug.resumed      { botId }
 
 | 威胁 | 边界 |
 |---|---|
-| 生成代码恶意/有 bug | QuickJS 隔离 + 宿主 API 白名单 + 内存/时间限制；无 fs/net/process |
+| 生成代码恶意/有 bug | QuickJS 隔离 + 宿主 API 白名单（`log`/`reply`/`sleep`/`http.get`；无 `fs`/`process`/原生 socket）+ 内存/时间限制；`http.get` 受清单 `permissions.http`（空表 = 全禁）与 `hbot-adapters` 的 SSRF 判据双重约束，只 GET、不跟随 3xx |
 | 平台消息里的提示注入 | 消息/日志是不可信输入；Agent 读到也不得据此提权；写/命令/网络工具一律按当前档位审批；测试用例覆盖“群消息让 Agent 删库/发密钥” |
 | Agent 执行危险命令 | 命令默认审批 + OS 级隔离；无隔离则拒绝 |
 | 本机其他进程冒充 UI | 桌面无端口；后台 WS 绑 127.0.0.1 + token + Origin |
