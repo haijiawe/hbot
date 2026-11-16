@@ -11,6 +11,10 @@
 //!   执行的那条）。超限返回 [`QueueError::Backpressure`]，调用方暂停读取后重试；消息
 //!   此刻已经落库（见 [`crate::dedupe`]），所以等待期间不会丢。
 //! * **可观测**：`depth()` 给 UI 显示积压。
+//! * **panic 隔离（RT-07）**：`HandlerExecutor::on_message` panic 只影响**那一条**消息——
+//!   worker 捕获展开后继续处理该会话后续消息；panic 计入 [`FailureTracker`]（连续失败
+//!   降级对它同样生效），并记一条带 `bot` / `conversation` 的 `error` 日志（**不含**消息
+//!   正文）。未完成名额（`depth` / `total` / 并发许可）由 `Drop` 归还，展开也不会漏。
 //! * **空闲会话可回收（D7）**：会话 worker 在首次入队时创建，`depth == 0` 且超过
 //!   [`DEFAULT_SESSION_IDLE_TTL`] 未活动的会话会在下一次入队的扫描里被移除（连同通道，
 //!   worker 随之自然退出），下次同会话入队时重建。**只能在 `depth == 0` 时回收**，且
@@ -19,19 +23,22 @@
 //!
 //! ## 计数口径
 //!
-//! `depth` 从成功入队开始计、到 handler 执行结束（无论成败）为止减一。因此它同时覆盖
-//! “排队中”和“执行中”，UI 看到的就是“这个会话还有多少条没处理完”。背压判断也用同一
-//! 个计数：这样即使 worker 已把消息取出、正在慢慢执行，队列仍然不会无限接收。
+//! `depth` 从成功入队开始计、到 handler 执行结束（无论成败，**含 panic**）为止减一。因此
+//! 它同时覆盖“排队中”和“执行中”，UI 看到的就是“这个会话还有多少条没处理完”。背压判断也用
+//! 同一个计数：这样即使 worker 已把消息取出、正在慢慢执行，队列仍然不会无限接收。
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::FutureExt;
 use hbot_core::{BotId, ConversationId, HbotError};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::handler::{HandlerExecutor, MessageCtx};
@@ -501,8 +508,8 @@ impl SessionQueues {
     /// 回收空闲会话（D7）：`depth == 0` 且超过 TTL 的会话从表里移除。
     ///
     /// 不变量：
-    /// * 只在 `depth == 0` 时回收——`depth` 在 `reserve` 时 +1、handler 返回后 -1，
-    ///   所以 `depth == 0` 蕴含「没有排队、也没有正在跑的」。
+    /// * 只在 `depth == 0` 时回收——`depth` 在 `reserve` 时 +1、handler 结束（含 panic）
+    ///   时 -1，所以 `depth == 0` 蕴含「没有排队、也没有正在跑的」。
     /// * 移除动作与 `try_enqueue` 的插入/发送都在 `sessions` 这把锁里，因此不会出现
     ///   "worker 已退出、新消息塞进旧通道"的静默丢消息。
     ///
@@ -535,6 +542,29 @@ impl SessionQueues {
 }
 
 /// 单会话 worker：串行执行到通道关闭。
+///
+/// ## panic 语义（RT-07）
+///
+/// [`HandlerExecutor::on_message`] 可能 **panic** 而不是返回 `Err`：真实实现要跑 QuickJS
+/// （`hbot-rpc` 的 sandbox handler），而它处理的是不可信入站内容——插件里一次 `unwrap`
+/// 踩空就够。若展开冲出本任务，`JoinHandle` 只会落成**没人 await** 的
+/// `Err(JoinError::panic)`，`depth` / `total` 永不归还：该会话永久背压（`enqueue` 拿不到
+/// 容量）、因 `depth != 0` 永不被回收，后续消息还照样塞进无人读取的通道——用户观感是
+/// "这个会话的机器人突然一句话都不回"，而日志里一行都没有。
+///
+/// 所以这里对 handler 做 [`FutureExt::catch_unwind`]：一次 panic 只影响**那一条**消息，
+/// worker 继续处理该会话后续消息；panic 走 [`FailureTracker::record_failure`]（连续失败
+/// 降级对它同样生效），并记一条带 `bot` / `conversation` 的 `error` 日志。名额归还在
+/// [`InFlightSlot`] 的 `Drop` 里，正常返回与展开走同一条收尾。
+///
+/// 取舍：**只 catch、不回滚**。handler 自己的共享状态（它持的锁、跑过一半的脚本）在 panic
+/// 后可能不一致，`catch_unwind` 只保证"不把整个会话带走"，不假装它已经收拾干净——本 crate
+/// 不认识 handler 的内部状态，回滚只能由 handler 自己实现。也因此**不**丢弃会话重建：那会把
+/// "这条消息没处理"变成"这条消息静默消失"，更糟。
+///
+/// 不用 `tokio::spawn` + `await JoinHandle` 的写法：那会把 panic 变成 `JoinError`，额外
+/// 要求 `Send` 边界，并改变取消语义（abort 与 panic 都落成 `JoinError`，日志还得区分二者）；
+/// 这里是同一任务内的展开，`catch_unwind` 恰好够用。
 async fn run_worker(
     shared: Arc<QueueShared>,
     key: SessionKey,
@@ -558,10 +588,18 @@ async fn run_worker(
                 break;
             }
         };
-        let outcome = shared.handler.on_message(ctx).await;
-        match &outcome {
-            Ok(()) => shared.failures.record_success(),
-            Err(error) => {
+        // 从拿到许可那一刻起，未完成名额就由 `InFlightSlot` 持有：它的 `Drop` 做**全部**
+        // 归还。这样正常返回、返回 `Err`、handler panic 三条路径收尾完全一致，不存在
+        // "panic 了所以后面那五行不执行"的窗口（RT-07 的计数泄漏就是这么来的）。
+        let slot = InFlightSlot::new(&shared, &depth, &last_active, permit);
+        // 只 catch 不吞：payload 会被打印进日志。`AssertUnwindSafe` 是必须的显式承诺
+        // （见上面的"只 catch、不回滚"取舍）；这里没有跨 await 共享的可变状态。
+        let outcome = AssertUnwindSafe(shared.handler.on_message(ctx))
+            .catch_unwind()
+            .await;
+        match outcome {
+            Ok(Ok(())) => shared.failures.record_success(),
+            Ok(Err(error)) => {
                 let degraded = shared.failures.record_failure();
                 tracing::warn!(
                     bot = %key.bot_id,
@@ -571,19 +609,75 @@ async fn run_worker(
                     "handler failed"
                 );
                 if degraded {
-                    tracing::error!(
-                        bot = %key.bot_id,
-                        threshold = shared.failures.threshold(),
-                        "bot degraded: consecutive handler failures"
-                    );
+                    log_degraded(&shared, key);
+                }
+            }
+            // RT-07：panic 与 `Err` 在计数上等价，降级阈值对它同样生效。日志只带
+            // `bot` / `conversation` 与 panic 的说明，**不带**消息正文或 payload 里的任何
+            // 入站内容——入站原文可能含用户隐私。
+            Err(payload) => {
+                let degraded = shared.failures.record_failure();
+                let panic = panic_description(payload.as_ref());
+                tracing::error!(
+                    bot = %key.bot_id,
+                    conversation = %key.conversation_id,
+                    consecutive_failures = shared.failures.consecutive(),
+                    panic = %panic,
+                    "handler panicked; session worker survives and keeps draining the queue"
+                );
+                if degraded {
+                    log_degraded(&shared, key);
                 }
             }
         }
-        drop(permit);
-        depth.fetch_sub(1, Ordering::AcqRel);
-        shared.total.fetch_sub(1, Ordering::AcqRel);
+        drop(slot);
+    }
+    #[cfg(test)]
+    shared.live_workers.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// 一条消息的"未完成名额"：`Drop` 里做**全部**计数归还（RT-07 要求 4）。
+///
+/// 修复前的写法是 handler 调用后面跟五行顺序语句；handler 一 panic，这五行永远不执行，
+/// 于是 `depth` / `total` 泄漏、会话永久背压。把归还挪进 `Drop` 之后，正常路径与展开
+/// 路径**必然**走同一条收尾——即使将来在 `run_worker` 的循环体里别处再次展开也不会漏。
+struct InFlightSlot<'a> {
+    shared: &'a QueueShared,
+    depth: &'a AtomicUsize,
+    last_active: &'a AtomicU64,
+    /// `Option` 只为在 `Drop` 里显式取走一次：归还顺序要一行一行看得见，不依赖字段
+    /// 声明顺序推导出来的隐式 Drop 顺序。
+    permit: Option<SemaphorePermit<'a>>,
+}
+
+impl<'a> InFlightSlot<'a> {
+    fn new(
+        shared: &'a QueueShared,
+        depth: &'a AtomicUsize,
+        last_active: &'a AtomicU64,
+        permit: SemaphorePermit<'a>,
+    ) -> Self {
+        Self {
+            shared,
+            depth,
+            last_active,
+            permit: Some(permit),
+        }
+    }
+}
+
+impl Drop for InFlightSlot<'_> {
+    fn drop(&mut self) {
+        // 顺序与 RT-07 修复前完全一致（既有用例依赖这个时序）。
+        drop(self.permit.take());
+        let previous = self.depth.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous > 0,
+            "session depth underflow: message slot released more than once"
+        );
+        self.shared.total.fetch_sub(1, Ordering::AcqRel);
         // D7：一条消息跑完也算活动，别让"刚跑完就超 TTL"把会话拆掉。
-        last_active.store(now_millis(), Ordering::Release);
+        self.last_active.store(now_millis(), Ordering::Release);
         // D6：**每一次**释放都必须唤醒等待者，不能只在 `total` 归零时唤醒。
         //
         // `enqueue` 等的是"**本会话**腾出容量"，而 `total` 是全部会话的和：会话 A 满、
@@ -594,10 +688,32 @@ async fn run_worker(
         // `notify_waiters` 只唤醒**当时**已注册的等待者，所以 `enqueue` 里
         // `notified.as_mut().enable()` 必须先于 `try_enqueue`（现有写法如此）：先注册、
         // 再试、失败才 await，中间没有丢唤醒的窗口。
-        shared.progress.notify_waiters();
+        self.shared.progress.notify_waiters();
     }
-    #[cfg(test)]
-    shared.live_workers.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// 把 `catch_unwind` 的 payload 变成可写进日志的一句话（RT-07 要求 5）。
+///
+/// `panic!("字面量")` 的 payload 是 `&'static str`，`panic!("{}", x)` / `format!` 出来的
+/// 是 `String`；其他形状（`panic_any`）没有可打印文本，明确写成
+/// `<non-string panic payload>` 而不是空串——空串会让人以为"这个 panic 没有消息"。
+fn panic_description(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "<non-string panic payload>".to_owned()
+    }
+}
+
+/// 降级发生时的统一日志：`Err` 与 panic 两条路径共用，保证口径一致。
+fn log_degraded(shared: &QueueShared, key: SessionKey) {
+    tracing::error!(
+        bot = %key.bot_id,
+        threshold = shared.failures.threshold(),
+        "bot degraded: consecutive handler failures"
+    );
 }
 
 fn millis_u64(duration: Duration) -> u64 {

@@ -470,6 +470,104 @@ impl Store {
         })
     }
 
+    /// 回放（FR-27）：取某个 bot 的**全部历史入站**，按 `(received_at, rowid)` 升序。
+    ///
+    /// 与 [`Store::list_inbound_replay_for_bot`] 只差一处：那个方法带 `processed_at IS NULL`，
+    /// 是**启动补偿**用的；回放要的是"当时真的被处理过的那批"，已处理的行才是历史证据，
+    /// 所以这里刻意不过滤 `processed_at`。
+    ///
+    /// `from_received_at` 是 `--from` 的下界（毫秒，含）；`None` 表示不限。`limit` 是条数上限。
+    /// 走只读连接池：回放不该参与写序，WAL 下读也不会挡住正在写新消息的 db 线程。
+    pub fn list_inbound_history_for_bot(
+        &self,
+        bot_id: &BotId,
+        from_received_at: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<InboundReplayRow>> {
+        self.read(|connection| {
+            // JOIN 之后 `id` / `external_id` 两张表都有，所以每一列都写表名限定。
+            // 前 7 列的顺序与 `mappers::INBOUND_COLUMNS` 一致，`row_to_inbound` 不用改。
+            let sql = "SELECT inbound.id, inbound.bot_id, inbound.external_id,
+                              inbound.conversation_id, inbound.sender_id,
+                              inbound.payload_json, inbound.received_at,
+                              inbound.rowid, c.external_id, c.kind
+                       FROM inbound
+                       JOIN conversations AS c ON c.id = inbound.conversation_id
+                       WHERE inbound.bot_id = ?1
+                         AND (?2 IS NULL OR inbound.received_at >= ?2)
+                       ORDER BY inbound.received_at, inbound.rowid
+                       LIMIT ?3";
+            let mut statement = connection.prepare(sql)?;
+            let rows = statement.query_map(
+                rusqlite::params![bot_id.to_string(), from_received_at, i64::from(limit)],
+                |row| {
+                    Ok(InboundReplayRow {
+                        message: crate::mappers::row_to_inbound(row)?,
+                        rowid: row.get(7)?,
+                        conversation_external_id: row.get(8)?,
+                        conversation_kind: row.get(9)?,
+                    })
+                },
+            )?;
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(row?);
+            }
+            Ok(messages)
+        })
+    }
+
+    /// 回放（FR-27）：取某个 bot 里 `reply_to` 落在给定集合中的历史出站，按
+    /// `(created_at, rowid)` 升序。
+    ///
+    /// **为什么按 `reply_to` 而不是时间窗口**：一条出站行只靠时间无法可靠归属到某条入站 ——
+    /// 同一毫秒可能有多条入站、handler 也可能跨事件延迟回复（`ctx.sleep`）。而被动回复的
+    /// `outbound.reply_to` 就是入站行的 `external_id`（见
+    /// `hbot_rpc::app::runtime::sandbox_handler` 的 `passive_reply_id`），这是库里唯一可靠的
+    /// "这条回复来自哪条消息"的外键。
+    ///
+    /// `reply_to` 为空时直接返回空表（`IN ()` 是 SQL 语法错）。
+    pub fn list_outbound_by_reply_to(
+        &self,
+        bot_id: &BotId,
+        reply_to: &[String],
+    ) -> Result<Vec<OutboundRow>> {
+        if reply_to.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.read(|connection| {
+            // 占位符按集合大小动态生成（没开 rusqlite 的 `rarray` 特性，不能用
+            // `?1 IN rarray(...)`）。`?1` 固定是 bot_id，所以 reply_to 从 `?2` 起。
+            let placeholders = (0..reply_to.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {} FROM outbound
+                 WHERE bot_id = ?1 AND reply_to IN ({placeholders})
+                 ORDER BY created_at, rowid",
+                crate::mappers::OUTBOUND_COLUMNS
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let mut values = Vec::with_capacity(reply_to.len() + 1);
+            values.push(rusqlite::types::Value::Text(bot_id.to_string()));
+            values.extend(
+                reply_to
+                    .iter()
+                    .map(|text| rusqlite::types::Value::Text(text.clone())),
+            );
+            let rows = statement.query_map(
+                rusqlite::params_from_iter(values),
+                crate::mappers::row_to_outbound,
+            )?;
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(row?);
+            }
+            Ok(messages)
+        })
+    }
+
     /// 按主键读会话；不存在返回 `Ok(None)`。
     pub fn get_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>> {
         let id = *id;

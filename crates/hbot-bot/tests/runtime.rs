@@ -599,6 +599,9 @@ async fn outbound_is_persisted_then_retried_until_sent() {
     let mut deps = fixture.deps();
     deps.outbox_config = OutboxConfig {
         max_attempts: 5,
+        // 累计预算远大于本次运行预算：本用例只关心"两次失败后第三次发出去"，
+        // 不想让它在这个距离上撞到死信线（见 `tests/outbox_exhaustion.rs`）。
+        max_send_attempts: 10,
         base_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(5),
         capacity: 16,
@@ -650,6 +653,9 @@ async fn outbound_gives_up_after_max_attempts() {
     let mut deps = fixture.deps();
     deps.outbox_config = OutboxConfig {
         max_attempts: 2,
+        // 累计预算还没到（2 < 10），所以这一轮用完就停在 pending，留给下次启动续发 ——
+        // 这正是本用例要钉的"本次运行预算"语义。真的转死信在 `tests/outbox_exhaustion.rs`。
+        max_send_attempts: 10,
         base_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(2),
         capacity: 16,

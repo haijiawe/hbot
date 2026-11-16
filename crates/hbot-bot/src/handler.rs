@@ -88,12 +88,27 @@ impl MessageCtx {
 /// 消息执行器：一次处理一条入站消息。
 ///
 /// 实现方只需实现 `on_message`；会话串行、幂等、背压都由本 crate 提供。
+///
+/// ## panic 语义
+///
+/// `on_message` **panic** 不会杀死会话 worker（RT-07）：队列会捕获展开，把这次 panic
+/// 当作一次失败计入连续崩溃计数，记一条带 `bot` / `conversation` 的 `error` 日志（**不**
+/// 含消息正文与 payload），然后继续处理该会话后续消息。因此实现方**不必**为了"别把会话
+/// 弄死"而把每个 `unwrap` 都改成 `Err`——但仍然应该返回 `Err` 来表达可预期的失败，
+/// 因为 panic 只说明"这条消息的处理没做完"，不说明原因。
+///
+/// 注意队列**不会回滚** handler 自己的内部状态：panic 时已写入的一半数据、已持有的锁
+/// 都还是 handler 自己的责任。需要一致性保证的实现方应在内部做事务/重建，而不是依赖
+/// 外层捕获。
 #[async_trait]
 pub trait HandlerExecutor: Send + Sync + 'static {
     /// 处理一条消息。
     ///
     /// 返回 `Err` 表示这次执行失败：不会标记 `processed_at`，并且计入 bot 的连续
     /// 崩溃计数。取消/超时由实现方自己映射成 [`HbotError`]。
+    ///
+    /// panic 的语义见 trait 文档：会被队列捕获、计数、记日志，且**不**影响同一会话
+    /// 后续消息的处理。
     async fn on_message(&self, ctx: MessageCtx) -> Result<(), HbotError>;
 }
 

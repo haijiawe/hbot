@@ -9,7 +9,15 @@ license.workspace = true
 hbot-core = { path = "../hbot-core" }
 hbot-store = { path = "../hbot-store" }
 async-trait.workspace = true
+# `AssertUnwindSafe(..).catch_unwind()`：handler panic 的隔离（RT-07）。
+# 手写同等 Future 需要 `unsafe`（`Pin::map_unchecked_mut`），而本 crate 是
+# `#![deny(unsafe_code)]`；futures-util 已在 workspace 依赖里，没有引入新版本。
+futures-util.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# 只给测试用：把 handler panic 那条 `error` 日志抓进内存，断言"日志里没有消息正文"。
+tracing-subscriber.workspace = true

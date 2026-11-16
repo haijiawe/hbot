@@ -19,7 +19,11 @@
 //!    结果必须按**路径组件**逐个等于根前缀；逃逸（`..` 或符号链接指向外部）一律拒绝。
 //! 9. [`Workspace::resolve_new`]：父目录必须已存在、可规范化且在根内；目标已存在时
 //!    要求它也不是逃逸的符号链接；悬空符号链接拒绝写入。
-//! 10. 组件比较在 Windows / macOS 上大小写不敏感（文件系统语义），其余平台按字节比较。
+//! 10. [`Workspace::resolve_write_target`]：写入用的**宽松版** —— 父目录可以尚不存在
+//!     （写入方按 `create_dir_all` 语义逐级创建），但第 1–7 条对**每一段**（含尚不存在的
+//!     父目录段）照旧生效，最深的已存在祖先仍要可规范化且在根内。**宽松只体现在
+//!     “父目录可以缺失”，不体现在“路径可以越界”**：越界路径在创建任何目录之前就被拒绝。
+//! 11. 组件比较在 Windows / macOS 上大小写不敏感（文件系统语义），其余平台按字节比较。
 
 use std::ffi::OsStr;
 use std::fs;
@@ -100,8 +104,8 @@ impl Workspace {
             }
             _ => HbotError::invalid(format!("cannot resolve workspace root `{display}`: {err}")),
         })?;
-        let meta =
-            fs::metadata(&canonical).map_err(|err| io_error("workspace root", &canonical, err))?;
+        let meta = fs::metadata(&canonical)
+            .map_err(|err| io_error(&canonical, "workspace root", &canonical, err))?;
         if !meta.is_dir() {
             return Err(HbotError::invalid(format!(
                 "workspace root `{display}` is not a directory"
@@ -124,12 +128,22 @@ impl Workspace {
         &self.config
     }
 
+    /// 面向调用方（**包括模型**）的路径文案：相对项目根、`/` 分隔。
+    ///
+    /// 错误文案会随工具输出发给模型、可能离开本机，所以这里只做减法（RT-01，
+    /// 见 `docs/security/red-team-findings.md`）：能相对化就相对化，根外只留
+    /// 文件名，绝不再回显绝对路径 / `\\?\` 前缀 / 用户名。详细判据见
+    /// [`display_rel`]。
+    pub(crate) fn display_path(&self, path: &Path) -> String {
+        display_rel(&self.root, path)
+    }
+
     /// 把根内绝对路径转成 UI 用的相对路径（`/` 分隔）；根外路径返回 `Invalid`。
     pub fn relative_path(&self, path: &Path) -> Result<String, HbotError> {
         let rel = strip_root(&self.root, path).ok_or_else(|| {
             HbotError::invalid(format!(
                 "path `{}` is outside the workspace root",
-                path.display()
+                self.display_path(path)
             ))
         })?;
         Ok(ui_path(&rel))
@@ -168,7 +182,7 @@ impl Workspace {
         if !parent_canon.is_dir() {
             return Err(HbotError::invalid(format!(
                 "parent `{}` is not a directory",
-                parent_canon.display()
+                self.display_path(&parent_canon)
             )));
         }
         let target = parent_canon.join(name);
@@ -177,7 +191,7 @@ impl Workspace {
                 let real = fs::canonicalize(&target).map_err(|_| {
                     HbotError::invalid(format!(
                         "`{}` is a dangling symlink; refusing to write through it",
-                        target.display()
+                        self.display_path(&target)
                     ))
                 })?;
                 self.ensure_within(&real, Access::Existing, "path")?;
@@ -185,7 +199,43 @@ impl Workspace {
             }
             Ok(_) => Ok(target),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(target),
-            Err(err) => Err(io_error("path", &target, err)),
+            Err(err) => Err(io_error(&self.root, "path", &target, err)),
+        }
+    }
+
+    /// 解析一个**待写入**的相对路径，允许父目录尚不存在。
+    ///
+    /// 与 [`Workspace::resolve_new`] 的差别只有一条：缺失的父目录不再报
+    /// [`HbotError::NotFound`]，而是像 [`Workspace::resolve_new_dir`] 一样取最深的
+    /// 已存在祖先做规范化与根内校验，再把缺失的父目录段原样拼回去。写入方据此可以
+    /// 逐级 `create_dir_all` 后再落盘（见 [`Workspace::write_file`]）。
+    ///
+    /// **守卫强度不变**：`normalized_rel` 在解析的第一步就对**每一段**（含尚不存在的
+    /// 父目录段）做绝对路径 / `..` / 盘符 / `.git` / `.hbot` / Windows 保留名检查，
+    /// 这一步早于任何目录创建；最深的已存在祖先还要 `canonical_within`（符号链接
+    /// 逃逸）且必须是目录。所以“先建父目录再写”不会变成越界后门。
+    pub fn resolve_write_target(&self, rel: &Path) -> Result<PathBuf, HbotError> {
+        let normalized = self.normalized_rel(rel, Access::New)?;
+        let Some((parent_rel, name)) = normalized.rsplit_once('/') else {
+            // 顶层文件：父目录就是根，沿用 `resolve_new` 的最后一段规则。
+            return self.resolve_new(rel);
+        };
+        let parent = self.resolve_new_dir(Path::new(parent_rel))?;
+        let target = parent.join(name);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let real = fs::canonicalize(&target).map_err(|_| {
+                    HbotError::invalid(format!(
+                        "`{}` is a dangling symlink; refusing to write through it",
+                        self.display_path(&target)
+                    ))
+                })?;
+                self.ensure_within(&real, Access::Existing, "path")?;
+                Ok(target)
+            }
+            Ok(_) => Ok(target),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(target),
+            Err(err) => Err(io_error(&self.root, "path", &target, err)),
         }
     }
 
@@ -210,16 +260,16 @@ impl Workspace {
         if !parent_canon.is_dir() {
             return Err(HbotError::invalid(format!(
                 "parent `{}` is not a directory",
-                parent_canon.display()
+                self.display_path(&parent_canon)
             )));
         }
         let target = parent_canon.join(name);
         match fs::symlink_metadata(&target) {
             Ok(_) => Ok(target),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                Err(HbotError::not_found("path", target.display().to_string()))
+                Err(HbotError::not_found("path", self.display_path(&target)))
             }
-            Err(err) => Err(io_error("path", &target, err)),
+            Err(err) => Err(io_error(&self.root, "path", &target, err)),
         }
     }
 
@@ -237,7 +287,7 @@ impl Workspace {
                     if !canonical.is_dir() {
                         return Err(HbotError::invalid(format!(
                             "`{}` is not a directory",
-                            canonical.display()
+                            self.display_path(&canonical)
                         )));
                     }
                     let mut resolved = canonical;
@@ -248,14 +298,20 @@ impl Workspace {
                 }
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
                     let name = cursor.file_name().ok_or_else(|| {
-                        HbotError::invalid(format!("cannot resolve path `{}`", joined.display()))
+                        HbotError::invalid(format!(
+                            "cannot resolve path `{}`",
+                            self.display_path(&joined)
+                        ))
                     })?;
                     missing.push(name);
                     cursor = cursor.parent().ok_or_else(|| {
-                        HbotError::invalid(format!("cannot resolve path `{}`", joined.display()))
+                        HbotError::invalid(format!(
+                            "cannot resolve path `{}`",
+                            self.display_path(&joined)
+                        ))
                     })?;
                 }
-                Err(err) => return Err(io_error("path", cursor, err)),
+                Err(err) => return Err(io_error(&self.root, "path", cursor, err)),
             }
         }
     }
@@ -381,12 +437,15 @@ impl Workspace {
         access: Access,
         what: &str,
     ) -> Result<PathBuf, HbotError> {
-        let canonical = fs::canonicalize(path).map_err(|err| match err.kind() {
-            io::ErrorKind::NotFound => HbotError::not_found(what, path.display().to_string()),
-            io::ErrorKind::PermissionDenied => {
-                HbotError::denied(format!("cannot access {what} `{}`: {err}", path.display()))
+        let canonical = fs::canonicalize(path).map_err(|err| {
+            let shown = self.display_path(path);
+            match err.kind() {
+                io::ErrorKind::NotFound => HbotError::not_found(what, shown),
+                io::ErrorKind::PermissionDenied => {
+                    HbotError::denied(format!("cannot access {what} `{shown}`: {err}"))
+                }
+                _ => HbotError::invalid(format!("cannot resolve {what} `{shown}`: {err}")),
             }
-            _ => HbotError::invalid(format!("cannot resolve {what} `{}`: {err}", path.display())),
         })?;
         self.ensure_within(&canonical, access, what)?;
         Ok(canonical)
@@ -396,10 +455,10 @@ impl Workspace {
         let rel = strip_root(&self.root, path).ok_or_else(|| {
             HbotError::invalid(format!(
                 "{what} escapes the workspace root: `{}`",
-                path.display()
+                self.display_path(path)
             ))
         })?;
-        let display = path.display().to_string();
+        let display = self.display_path(path);
         for component in rel.components() {
             match component {
                 Component::CurDir => {}
@@ -422,14 +481,41 @@ impl Workspace {
     }
 }
 
+/// 把路径换成**可以发给模型**的文案：相对项目根（`/` 分隔），根外只留文件名。
+///
+/// RT-01 的本体就在这里（见 `docs/security/red-team-findings.md`）：普通拼错文件名
+/// 曾把 `\\?\E:\...\用户名\...` 整条绝对路径写进 `NotFound` 文案，随工具输出发给
+/// 模型、离开本机。所以这里**只做减法**：
+///
+/// - 在根内 → `ui_path`（`src/main.ts`）；根自身 → `.`；
+/// - 在根外 → 只留最后一段文件名（`Path::file_name`），拿不到就 `<path>`。
+///
+/// 无论如何都不回显绝对路径、`\\?\` 前缀或用户目录。唯一的例外是
+/// [`Workspace::open_with_config`] 里"根本身打不开"的文案 —— 那串是**调用方自己传
+/// 进来的根路径**，此时还没有可相对化的基准，也没有项目根可泄漏。
+pub(crate) fn display_rel(root: &Path, path: &Path) -> String {
+    if let Some(rel) = strip_root(root, path) {
+        let shown = ui_path(&rel);
+        return if shown.is_empty() {
+            ".".to_owned()
+        } else {
+            shown
+        };
+    }
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<path>".to_owned())
+}
+
 /// 把 IO 错误映射成 [`HbotError`]：不存在 → `NotFound`，无权限 → `Denied`，其余 → `Internal`。
-pub(crate) fn io_error(context: &str, path: &Path, err: io::Error) -> HbotError {
+///
+/// `root` 只用来把 `path` 相对化（[`display_rel`]）；错误文案里**不出现**它的绝对形态。
+pub(crate) fn io_error(root: &Path, context: &str, path: &Path, err: io::Error) -> HbotError {
+    let shown = display_rel(root, path);
     match err.kind() {
-        io::ErrorKind::NotFound => HbotError::not_found(context, path.display().to_string()),
-        io::ErrorKind::PermissionDenied => {
-            HbotError::denied(format!("{context} `{}`: {err}", path.display()))
-        }
-        _ => HbotError::internal(format!("{context} `{}`: {err}", path.display())),
+        io::ErrorKind::NotFound => HbotError::not_found(context, shown),
+        io::ErrorKind::PermissionDenied => HbotError::denied(format!("{context} `{shown}`: {err}")),
+        _ => HbotError::internal(format!("{context} `{shown}`: {err}")),
     }
 }
 
@@ -638,6 +724,78 @@ mod tests {
             .resolve_new(Path::new("./src/./main.ts"))
             .expect("resolve");
         assert_eq!(resolved, workspace.root().join("src").join("main.ts"));
+    }
+
+    #[test]
+    fn resolve_write_target_allows_missing_parents_without_creating_them() {
+        let temp = TestDir::new("write-target-missing");
+        let workspace = temp.workspace();
+        let target = workspace
+            .resolve_write_target(Path::new("src/lib/x.ts"))
+            .expect("missing parents must be resolvable");
+        assert_eq!(
+            target,
+            workspace.root().join("src").join("lib").join("x.ts")
+        );
+        assert!(
+            !temp.path().join("src").exists(),
+            "resolving a write target must not create directories"
+        );
+    }
+
+    /// 宽松解析不等于放开守卫：每一种越界写法都在**产生任何 IO 之前**被拒。
+    #[test]
+    fn resolve_write_target_rejects_escaping_shapes() {
+        let temp = TestDir::new("write-target-guard");
+        let workspace = temp.workspace();
+        let bad = [
+            "../x.ts",
+            r"C:\x.ts",
+            "/abs/x.ts",
+            "src/../../../x.ts",
+            "src/.git/x.ts",
+            ".hbot/x.ts",
+        ];
+        for rel in bad {
+            let err = workspace
+                .resolve_write_target(Path::new(rel))
+                .expect_err(rel);
+            assert!(
+                matches!(err, HbotError::Invalid { .. }),
+                "expected Invalid for `{rel}`, got {err:?}"
+            );
+        }
+        assert!(
+            !temp.path().join("src").exists() && !temp.path().join(".git").exists(),
+            "rejected paths must not create anything"
+        );
+    }
+
+    #[test]
+    fn resolve_write_target_rejects_symlinked_ancestor_escape() {
+        let temp = TestDir::new("write-target-symlink");
+        let workspace = temp.workspace();
+        let outside = TestDir::new("write-target-symlink-outside");
+
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_dir(outside.path(), temp.path().join("escape"));
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(outside.path(), temp.path().join("escape"));
+        #[cfg(not(any(windows, unix)))]
+        let created: std::io::Result<()> = Err(std::io::Error::other("unsupported platform"));
+
+        if created.is_err() {
+            eprintln!(
+                "skipping symlink write-target test: cannot create symlink (needs privileges)"
+            );
+            return;
+        }
+
+        let err = workspace
+            .resolve_write_target(Path::new("escape/sub/x.ts"))
+            .expect_err("write through escaping symlink must fail");
+        assert!(matches!(err, HbotError::Invalid { .. }), "got {err:?}");
+        assert!(!outside.path().join("sub").exists());
     }
 
     #[test]

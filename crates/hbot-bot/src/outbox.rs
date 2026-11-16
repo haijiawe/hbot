@@ -10,10 +10,18 @@
 //!
 //! ## 重试
 //!
-//! 每条消息最多 [`OutboxConfig::max_attempts`] 次（默认 3）；每次尝试前用
-//! `mark_outbound_attempt` 把 `attempts` 落库，失败按 `base * 2^(n-1)` 退避（上限
-//! [`OutboxConfig::max_backoff`]）。超过上限**保留 `Pending`** 并计数上报（不静默丢、
-//! 也不假装成功）；下一次启动仍可续发。
+//! 两级预算，都在 [`OutboxConfig`] 里可配：
+//!
+//! - [`OutboxConfig::max_attempts`]（默认 3）：**本次运行内**每条消息最多试几次；
+//!   用完就停手、把行**保留 `Pending`**，留给下次启动续发（进程重启不是错误，
+//!   平台临时抖动也不该判死）。
+//! - [`OutboxConfig::max_send_attempts`]（默认 10）：**跨重启累计**的硬上限。累计
+//!   尝试一旦达到它，就把行转**死信**（`state='failed'`，`mark_outbound_failed`）并写
+//!   一条 `error` 级 RunLog 说明放弃原因与尝试次数。
+//!
+//! 两级是必要的：只有第一级时，一条永远发不出去的消息会在每次启动都空转一轮
+//! （`attempts` 2→3→4… 单调增长，永不进死信），既占住 `pending` 队列头部，也让
+//! “重试”失去上界。死信行**保留**（不删）：排障需要原始 `target`/`text`。
 //!
 //! ## 串行
 //!
@@ -36,8 +44,15 @@ use crate::store_ops::run_store;
 /// 出站配置。
 #[derive(Clone, Debug)]
 pub struct OutboxConfig {
-    /// 每条消息最多尝试次数（含首次），默认 3。
+    /// 每条消息在**本次运行内**最多尝试次数（含首次），默认 3。
+    ///
+    /// 用完就停手、行保留 `pending`，等下次启动续发（见 [`OutboxConfig::max_send_attempts`]）。
     pub max_attempts: u32,
+    /// 每条消息**跨重启累计**的尝试硬上限，默认 10。
+    ///
+    /// 达到它就转死信（`state='failed'`）+ 写一条 `error` RunLog，不再无限空转。
+    /// 必须 ≥ `max_attempts`（`sanitized()` 会抬到那个值），否则单次运行就会超限。
+    pub max_send_attempts: u32,
     /// 首次重试的退避基数，默认 200ms。
     pub base_backoff: Duration,
     /// 退避上限，默认 30s。
@@ -52,6 +67,7 @@ impl Default for OutboxConfig {
     fn default() -> Self {
         Self {
             max_attempts: 3,
+            max_send_attempts: 10,
             base_backoff: Duration::from_millis(200),
             max_backoff: Duration::from_secs(30),
             capacity: 1024,
@@ -62,8 +78,12 @@ impl Default for OutboxConfig {
 
 impl OutboxConfig {
     fn sanitized(&self) -> Self {
+        let max_attempts = self.max_attempts.max(1);
         Self {
-            max_attempts: self.max_attempts.max(1),
+            max_attempts,
+            // 总预算不能小于单次运行预算：否则一次运行就会撞死信线，
+            // “留给下次启动”这句话就没有落点了。
+            max_send_attempts: self.max_send_attempts.max(max_attempts),
             capacity: self.capacity.max(1),
             ..self.clone()
         }
@@ -140,7 +160,10 @@ pub struct OutboxStats {
     pub sent: u64,
     /// 重试次数（不含首次）。
     pub retried: u64,
-    /// 超过重试上限、保留 pending 的条数。
+    /// 放弃的条数：本次运行预算用完（保留 pending）**加上**转死信（`state='failed'`）的。
+    ///
+    /// 两种放弃都计数：对运维来说“这条这次没发出去”是同一件事，区别只在行状态
+    /// （`pending` 会在下次启动再试，`failed` 不会）。
     pub failed: u64,
 }
 
@@ -384,13 +407,37 @@ async fn deliver(
             counters.retried.fetch_add(1, Ordering::AcqRel);
         }
         first_attempt = false;
-        if attempts > config.max_attempts {
+        // 这一轮已经试了几次：库里的 `attempts` 是**跨重启累计**的，减去入队/恢复时的
+        // 起点才是本次运行的次数。不减去它，一条重启前已经试过 2 次的消息在重启后会
+        // 立刻被判“本轮预算用完”，一次都不再试 —— “留给下次启动续发”就落空了。
+        let run_attempts = attempts.saturating_sub(envelope.attempts);
+        // 先看跨重启的硬上限，再看本次运行的预算：顺序反了的话，一条累计已超限的
+        // 消息会先被“留给下次启动”放过去，于是每次启动都空转一轮。
+        //
+        // 判据是 `>`：`mark_outbound_attempt` 已经把**这一次**记进库里了，所以
+        // `attempts == max_send_attempts` 表示“这次正好是最后一次允许的尝试”，要照发。
+        if attempts > config.max_send_attempts {
+            dead_letter(
+                Arc::clone(&store),
+                Arc::clone(&clock),
+                counters,
+                config,
+                &envelope,
+                attempts,
+                None,
+            )
+            .await;
+            return;
+        }
+        if run_attempts > config.max_attempts {
             counters.failed.fetch_add(1, Ordering::AcqRel);
             tracing::error!(
                 outbound = %envelope.id,
                 attempts,
+                run_attempts,
                 max_attempts = config.max_attempts,
-                "outbound exceeded retry budget; left pending for next start"
+                max_send_attempts = config.max_send_attempts,
+                "outbound exceeded this run's retry budget; left pending for next start"
             );
             return;
         }
@@ -441,12 +488,29 @@ async fn deliver(
                     %error,
                     "outbound send failed"
                 );
-                if attempts >= config.max_attempts {
+                if attempts >= config.max_send_attempts {
+                    dead_letter(
+                        Arc::clone(&store),
+                        Arc::clone(&clock),
+                        counters,
+                        config,
+                        &envelope,
+                        attempts,
+                        Some(&error),
+                    )
+                    .await;
+                    return;
+                }
+                if run_attempts >= config.max_attempts {
                     counters.failed.fetch_add(1, Ordering::AcqRel);
                     tracing::error!(
                         outbound = %envelope.id,
                         attempts,
-                        "outbound exhausted retries; left pending for next start"
+                        run_attempts,
+                        max_attempts = config.max_attempts,
+                        max_send_attempts = config.max_send_attempts,
+                        %error,
+                        "outbound exhausted this run's retries; left pending for next start"
                     );
                     return;
                 }
@@ -460,6 +524,76 @@ async fn deliver(
                 }
             }
         }
+    }
+}
+
+/// 把一条消息转死信：`state='failed'` + 一条 `error` 级 RunLog。
+///
+/// 三件事必须一起做，缺一件都会让“放弃”变成静默：
+///
+/// - `mark_outbound_failed`：行离开 `pending`，`list_pending_outbound*`（`WHERE state='pending'`）
+///   不再捡它——这是**跨重启生效**的唯一机制，计数留在库里而不是内存里；
+/// - `append_log`：`logs_tail` / `run.log` 里能看见“为什么放弃、试了几次”；
+/// - `counters.failed`：`BotSnapshot.outbox` 上能看见。
+///
+/// 行不删：排障需要原始 `target` / `text`（`models.rs` 的 `OUTBOUND_STATE_FAILED` 注释）。
+#[allow(clippy::too_many_arguments)]
+async fn dead_letter(
+    store: Arc<Store>,
+    clock: Arc<dyn Clock>,
+    counters: &Counters,
+    config: &OutboxConfig,
+    envelope: &OutboundEnvelope,
+    attempts: u32,
+    error: Option<&HbotError>,
+) {
+    counters.failed.fetch_add(1, Ordering::AcqRel);
+    let id = envelope.id;
+    let marked = {
+        let store = Arc::clone(&store);
+        run_store("mark_outbound_failed", move || {
+            store.mark_outbound_failed(&id, attempts)
+        })
+        .await
+    };
+    match &marked {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(outbound = %envelope.id, "dead letter: outbound row missing"),
+        Err(failure) => tracing::error!(
+            outbound = %envelope.id,
+            %failure,
+            "dead letter: marking failed did not persist; row stays pending"
+        ),
+    }
+
+    let reason = error.map_or_else(
+        || "累计尝试次数已达上限".to_owned(),
+        |failure| failure.to_string(),
+    );
+    let line = format!(
+        "出站消息放弃重试（尝试 {attempts} 次，上限 {}）：{reason}",
+        config.max_send_attempts
+    );
+    tracing::error!(
+        outbound = %envelope.id,
+        attempts,
+        max_send_attempts = config.max_send_attempts,
+        %reason,
+        "outbound dead-lettered; giving up"
+    );
+
+    // RunLog 要求 `logs.bot_id` 指向真实 bot 行（外键）：没有就只留 tracing，不要把
+    // 一次日志写失败升级成 panic —— 死信本身已经落库了。
+    let at = clock.now().unix_millis();
+    let bot_id = envelope.bot_id;
+    let entry = hbot_store::NewLog {
+        bot_id,
+        level: "error".to_owned(),
+        line,
+        at,
+    };
+    if let Err(failure) = run_store("append_log", move || store.append_log(entry)).await {
+        tracing::error!(outbound = %envelope.id, %failure, "dead letter: run log not written");
     }
 }
 
@@ -516,5 +650,33 @@ mod tests {
                 failed: 0
             }
         );
+    }
+
+    /// 两级预算：累计上限必须 ≥ 单轮上限，否则第一次运行就会撞死信线，
+    /// “用完留给下次启动”的语义当场失效。
+    #[test]
+    fn total_budget_is_never_below_the_per_run_budget() {
+        let config = OutboxConfig {
+            max_attempts: 7,
+            max_send_attempts: 2,
+            ..OutboxConfig::default()
+        }
+        .sanitized();
+        assert_eq!(config.max_attempts, 7);
+        assert_eq!(config.max_send_attempts, 7, "被抬到单轮预算");
+
+        // 正常配置原样保留。
+        let config = OutboxConfig {
+            max_attempts: 3,
+            max_send_attempts: 12,
+            ..OutboxConfig::default()
+        }
+        .sanitized();
+        assert_eq!(config.max_send_attempts, 12);
+
+        // 默认值就是文档写的 3 / 10。
+        let defaults = OutboxConfig::default();
+        assert_eq!(defaults.max_attempts, 3);
+        assert_eq!(defaults.max_send_attempts, 10);
     }
 }

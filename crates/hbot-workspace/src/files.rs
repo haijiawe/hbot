@@ -54,31 +54,31 @@ impl Workspace {
     pub fn read_file(&self, rel: &Path, max_bytes: u64) -> Result<FileContent, HbotError> {
         let limit = max_bytes.min(MAX_READ_BYTES);
         let path = self.resolve_existing(rel)?;
-        let meta = fs::metadata(&path).map_err(|err| io_error("file", &path, err))?;
+        let meta = fs::metadata(&path).map_err(|err| io_error(self.root(), "file", &path, err))?;
         if meta.is_dir() {
             return Err(HbotError::invalid(format!(
                 "`{}` is a directory, not a file",
-                path.display()
+                self.display_path(&path)
             )));
         }
         if !meta.is_file() {
             return Err(HbotError::invalid(format!(
                 "`{}` is not a regular file",
-                path.display()
+                self.display_path(&path)
             )));
         }
         if meta.len() > limit {
             return Err(HbotError::invalid(format!(
                 "file `{}` is {} bytes, which exceeds the read limit of {limit} bytes",
-                path.display(),
+                self.display_path(&path),
                 meta.len()
             )));
         }
-        let bytes = fs::read(&path).map_err(|err| io_error("file", &path, err))?;
+        let bytes = fs::read(&path).map_err(|err| io_error(self.root(), "file", &path, err))?;
         if bytes.len() as u64 > limit {
             return Err(HbotError::invalid(format!(
                 "file `{}` grew to {} bytes while reading, which exceeds the read limit of {limit} bytes",
-                path.display(),
+                self.display_path(&path),
                 bytes.len()
             )));
         }
@@ -87,7 +87,7 @@ impl Workspace {
         let content = String::from_utf8(bytes).map_err(|_| {
             HbotError::invalid(format!(
                 "file `{}` is not valid UTF-8; open it with an external tool",
-                path.display()
+                self.display_path(&path)
             ))
         })?;
         Ok(FileContent {
@@ -97,39 +97,35 @@ impl Workspace {
         })
     }
 
-    /// 原子写入 UTF-8 文本。
+    /// 原子写入 UTF-8 文本，**按需创建缺失的父目录**（`create_dir_all` 语义）。
     ///
     /// 给了 `expected_hash` 时做乐观并发校验：当前内容哈希不匹配返回
-    /// [`HbotError::Conflict`]（文件不存在也算冲突）。父目录不存在返回 `Invalid`，
-    /// 不自动建目录（建目录用 [`Workspace::create_dir`]）。
+    /// [`HbotError::Conflict`]（文件不存在也算冲突）。校验在**建父目录之前**跑，
+    /// 所以冲突路径不会顺手留下一串空目录。
+    ///
+    /// 父目录缺失不再是错误：路径先过 [`Workspace::resolve_write_target`]（对**每一段**
+    /// 做 `..` / 绝对路径 / 盘符 / `.git` / `.hbot` / Windows 保留名检查，并把最深的
+    /// 已存在祖先规范化到根内），**越界路径在创建任何目录之前就被拒绝**，之后才逐级建
+    /// 父目录。文件本身仍然原子（同目录 tmp → fsync → rename），失败不会留下半截内容。
+    ///
+    /// 失败时可能留下刚建的空父目录（幂等，后续写入或 [`Workspace::create_dir`] 可复用）
+    /// —— 这是有意的取舍：不为“绝对干净”再做一轮回滚删除，删除本身也可能失败。
     pub fn write_file(
         &self,
         rel: &Path,
         content: &str,
         expected_hash: Option<&str>,
     ) -> Result<FileContent, HbotError> {
-        // 父目录必须已存在：不存在是调用方的错误，不是“帮你建一下”。
-        let path = self.resolve_new(rel).map_err(|err| match err {
-            HbotError::NotFound { .. } => HbotError::invalid(format!(
-                "parent directory of `{}` does not exist; create it first",
-                rel.display()
-            )),
-            other => other,
-        })?;
+        // 守卫先跑完（含尚不存在的父目录段）：越界在这里被拒，走不到建目录那一步。
+        let path = self.resolve_write_target(rel)?;
         let parent = path
             .parent()
             .ok_or_else(|| HbotError::invalid("path has no parent directory"))?
             .to_path_buf();
-        if !parent.is_dir() {
-            return Err(HbotError::invalid(format!(
-                "parent directory `{}` does not exist; create it first",
-                parent.display()
-            )));
-        }
         if path.is_dir() {
             return Err(HbotError::invalid(format!(
                 "`{}` is a directory",
-                path.display()
+                self.display_path(&path)
             )));
         }
 
@@ -138,27 +134,33 @@ impl Workspace {
             let current = match fs::read(&path) {
                 Ok(bytes) => Some(hash_bytes(&bytes)),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-                Err(err) => return Err(io_error("file", &path, err)),
+                Err(err) => return Err(io_error(self.root(), "file", &path, err)),
             };
             match current {
                 Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
                 Some(actual) => {
                     return Err(HbotError::conflict(format!(
                         "file `{}` changed on disk (expected hash {expected}, found {actual})",
-                        path.display()
+                        self.display_path(&path)
                     )));
                 }
                 None => {
                     return Err(HbotError::conflict(format!(
                         "file `{}` does not exist, but hash {expected} was supplied",
-                        path.display()
+                        self.display_path(&path)
                     )));
                 }
             }
         }
 
+        // 乐观并发校验通过后再建父目录：冲突路径不留下空目录。
+        if !parent.is_dir() {
+            fs::create_dir_all(&parent)
+                .map_err(|err| io_error(self.root(), "parent directory", &parent, err))?;
+        }
+
         let tmp = parent.join(format!(".hbot-tmp-{}", uuid::Uuid::new_v4()));
-        write_atomic(&tmp, &path, content.as_bytes())?;
+        write_atomic(self.root(), &tmp, &path, content.as_bytes())?;
         Ok(FileContent {
             content: content.to_owned(),
             hash: hash_bytes(content.as_bytes()),
@@ -173,12 +175,13 @@ impl Workspace {
         if !dir.is_dir() {
             return Err(HbotError::invalid(format!(
                 "`{}` is not a directory",
-                dir.display()
+                self.display_path(&dir)
             )));
         }
         let prefix = self.relative_path(&dir)?;
         let mut entries = Vec::new();
-        let reading = fs::read_dir(&dir).map_err(|err| io_error("directory", &dir, err))?;
+        let reading =
+            fs::read_dir(&dir).map_err(|err| io_error(self.root(), "directory", &dir, err))?;
         for item in reading {
             let entry = match item {
                 Ok(entry) => entry,
@@ -253,15 +256,24 @@ impl Workspace {
         Ok(entries)
     }
 
-    /// 建目录（`create_dir_all` 语义）；返回根内规范化绝对路径。
+    /// 建目录（`create_dir_all` 语义，逐级创建）；返回根内规范化绝对路径。
+    ///
+    /// - **幂等**：目标已存在且是目录 → `Ok`（不报 `Conflict`）。
+    /// - 路径上已存在**文件**（不只是最后一段）→ [`HbotError::Invalid`]（`is not a directory`）。
+    /// - 越界 / `..` / 绝对路径 / `.git` / `.hbot` → [`HbotError::Invalid`]，且**不建任何目录**：
+    ///   守卫（[`Workspace::resolve_new_dir`]）先跑完，`create_dir_all` 在后。
+    ///
+    /// 这个方法是 `create_dir` 工具（`crates/hbot-agent/src/tools/fs.rs`）的落点，
+    /// 也是 [`Workspace::write_file`] 隐式建父目录用的同一条守卫。
     pub fn create_dir(&self, rel: &Path) -> Result<PathBuf, HbotError> {
         let path = self.resolve_new_dir(rel)?;
-        fs::create_dir_all(&path).map_err(|err| io_error("directory", &path, err))?;
-        let canonical = fs::canonicalize(&path).map_err(|err| io_error("directory", &path, err))?;
+        fs::create_dir_all(&path).map_err(|err| io_error(self.root(), "directory", &path, err))?;
+        let canonical = fs::canonicalize(&path)
+            .map_err(|err| io_error(self.root(), "directory", &path, err))?;
         if !self.is_within(&canonical) {
             return Err(HbotError::invalid(format!(
                 "directory `{}` escaped the workspace root",
-                canonical.display()
+                self.display_path(&canonical)
             )));
         }
         Ok(canonical)
@@ -284,11 +296,11 @@ impl Workspace {
             Ok(_) => {
                 return Err(HbotError::conflict(format!(
                     "destination `{}` already exists",
-                    destination.display()
+                    self.display_path(&destination)
                 )));
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(io_error("path", &destination, err)),
+            Err(err) => return Err(io_error(self.root(), "path", &destination, err)),
         }
 
         let _guard = self.lock_writes()?;
@@ -296,10 +308,10 @@ impl Workspace {
             if is_cross_device(&err) {
                 HbotError::invalid(format!(
                     "cannot rename `{}` across devices; copy it into the workspace first",
-                    source.display()
+                    self.display_path(&source)
                 ))
             } else {
-                io_error("rename", &destination, err)
+                io_error(self.root(), "rename", &destination, err)
             }
         })?;
         sync_parent_dir(&destination);
@@ -325,7 +337,8 @@ impl Workspace {
 
         let _guard = self.lock_writes()?;
         let trash = self.root().join(".hbot").join("trash");
-        fs::create_dir_all(&trash).map_err(|err| io_error("trash directory", &trash, err))?;
+        fs::create_dir_all(&trash)
+            .map_err(|err| io_error(self.root(), "trash directory", &trash, err))?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis())
@@ -339,21 +352,24 @@ impl Workspace {
             }
             Err(err) if is_cross_device(&err) => {
                 copy_tree_then_remove(&source, &destination)
-                    .map_err(|err| io_error("move to trash", &destination, err))?;
+                    .map_err(|err| io_error(self.root(), "move to trash", &destination, err))?;
                 Ok(destination)
             }
-            Err(err) => Err(io_error("move to trash", &destination, err)),
+            Err(err) => Err(io_error(self.root(), "move to trash", &destination, err)),
         }
     }
 }
 
 /// 同目录 tmp → 写入 → fsync → rename 覆盖；失败清理 tmp。
-fn write_atomic(tmp: &Path, target: &Path, bytes: &[u8]) -> Result<(), HbotError> {
+///
+/// `root` 只用于把错误里的路径相对化（[`io_error`] / [`crate::project::display_rel`]）；
+/// tmp 的名字形如 `.hbot-tmp-<uuid>`，本来就只该在内部错误里出现。
+fn write_atomic(root: &Path, tmp: &Path, target: &Path, bytes: &[u8]) -> Result<(), HbotError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(tmp)
-        .map_err(|err| io_error("temporary file", tmp, err))?;
+        .map_err(|err| io_error(root, "temporary file", tmp, err))?;
     let written = (|| -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -362,7 +378,7 @@ fn write_atomic(tmp: &Path, target: &Path, bytes: &[u8]) -> Result<(), HbotError
     drop(file);
     if let Err(err) = written {
         cleanup_tmp(tmp);
-        return Err(io_error("write temporary file", tmp, err));
+        return Err(io_error(root, "write temporary file", tmp, err));
     }
     match rename_with_retry(tmp, target) {
         Ok(()) => {
@@ -371,7 +387,7 @@ fn write_atomic(tmp: &Path, target: &Path, bytes: &[u8]) -> Result<(), HbotError
         }
         Err(err) => {
             cleanup_tmp(tmp);
-            Err(io_error("replace file", target, err))
+            Err(io_error(root, "replace file", target, err))
         }
     }
 }
@@ -559,8 +575,10 @@ mod tests {
         assert!(matches!(err, HbotError::Invalid { .. }), "got {err:?}");
     }
 
+    /// 越界写入被拒，且**不留临时文件**（旧版这里还断言「父目录必须已存在」，那是
+    /// 2026-11-16 之前的行为；现在父目录按需创建，见下一个测试）。
     #[test]
-    fn write_file_rejects_escaping_path_and_missing_parent() {
+    fn write_file_rejects_escaping_path() {
         let temp = TestDir::new("write-guard");
         let workspace = temp.workspace();
         let escape = workspace
@@ -571,27 +589,113 @@ mod tests {
             "got {escape:?}"
         );
         assert!(!temp.path().parent().unwrap().join("escape.txt").exists());
-
-        let missing_parent = workspace
-            .write_file(Path::new("no/such/dir.txt"), "x", None)
-            .expect_err("missing parent must fail");
-        assert!(
-            matches!(missing_parent, HbotError::Invalid { .. }),
-            "got {missing_parent:?}"
-        );
         assert!(leftover_tmp_files(temp.path()).is_empty());
+    }
+
+    /// 父目录缺失不再是错误：逐级建出来再落盘（真机上模型写 `src/lib/x.ts` 的路径）。
+    #[test]
+    fn write_file_creates_missing_parent_directories() {
+        let temp = TestDir::new("write-implicit-parents");
+        let workspace = temp.workspace();
+        let written = workspace
+            .write_file(
+                Path::new("src/lib/format.ts"),
+                "export const x = 1;\n",
+                None,
+            )
+            .expect("missing parents must be created");
+        assert!(temp.path().join("src").is_dir());
+        assert!(temp.path().join("src").join("lib").is_dir());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("src/lib/format.ts")).unwrap(),
+            "export const x = 1;\n"
+        );
+        let read = workspace
+            .read_file(Path::new("src/lib/format.ts"), MAX_READ_BYTES)
+            .expect("read");
+        assert_eq!(read.hash, written.hash);
+        assert!(leftover_tmp_files(temp.path().join("src/lib").as_path()).is_empty());
+    }
+
+    /// **重点**：每一种越界写法都在建父目录**之前**被拒，磁盘上不留任何新目录
+    /// （隐式建父目录绝不能成为越界后门）。
+    #[test]
+    fn write_file_rejects_every_escape_shape_before_creating_parents() {
+        let temp = TestDir::new("write-escape-shapes");
+        let workspace = temp.workspace();
+        let bad = [
+            "../escape/x.ts",
+            r"C:\x.ts",
+            "/abs/x.ts",
+            "src/../../../x.ts",
+            "src/.git/x.ts",
+            ".hbot/x.ts",
+        ];
+        for rel in bad {
+            let error = workspace
+                .write_file(Path::new(rel), "x", None)
+                .expect_err(rel);
+            assert!(
+                matches!(error, HbotError::Invalid { .. }),
+                "{rel}: expected Invalid, got {error:?}"
+            );
+            assert!(
+                !temp.path().join("src").exists() && !temp.path().join(".git").exists(),
+                "{rel}: must be rejected before any directory is created"
+            );
+        }
+        assert!(!temp.path().parent().unwrap().join("escape").exists());
+        assert!(leftover_tmp_files(temp.path()).is_empty());
+    }
+
+    /// 乐观并发语义不因建父目录而改变：冲突不建目录、不改文件；哈希对上才落盘。
+    #[test]
+    fn write_file_parent_creation_keeps_optimistic_concurrency() {
+        let temp = TestDir::new("write-hash-parents");
+        let workspace = temp.workspace();
+
+        // 文件不存在却给了哈希 → Conflict，且不留下空目录。
+        let conflict = workspace
+            .write_file(Path::new("src/lib/x.ts"), "v1", Some("deadbeef"))
+            .expect_err("new file with hash must conflict");
+        assert!(
+            matches!(conflict, HbotError::Conflict { .. }),
+            "got {conflict:?}"
+        );
+        assert!(
+            !temp.path().join("src").exists(),
+            "conflict must not create parent directories"
+        );
+
+        let first = workspace
+            .write_file(Path::new("src/lib/x.ts"), "v1", None)
+            .expect("first write creates parents");
+        let stale = workspace
+            .write_file(Path::new("src/lib/x.ts"), "v2", Some("deadbeef"))
+            .expect_err("stale hash must conflict");
+        assert!(matches!(stale, HbotError::Conflict { .. }), "got {stale:?}");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("src/lib/x.ts")).unwrap(),
+            "v1"
+        );
+
+        let second = workspace
+            .write_file(Path::new("src/lib/x.ts"), "v2", Some(&first.hash))
+            .expect("matching hash");
+        assert_eq!(second.size, 2);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("src/lib/x.ts")).unwrap(),
+            "v2"
+        );
     }
 
     #[test]
     fn write_file_then_read_roundtrip() {
         let temp = TestDir::new("write-roundtrip");
         let workspace = temp.workspace();
-        let written = workspace.write_file(Path::new("src/main.ts"), "export default 1;\n", None);
-        assert!(written.is_err(), "parent must not be auto-created");
-        std::fs::create_dir_all(temp.path().join("src")).unwrap();
         let written = workspace
             .write_file(Path::new("src/main.ts"), "export default 1;\n", None)
-            .expect("write");
+            .expect("write creates the parent directory");
         let read = workspace
             .read_file(Path::new("src/main.ts"), MAX_READ_BYTES)
             .expect("read");
@@ -662,7 +766,8 @@ mod tests {
         let target = temp.path().join("occupied");
         std::fs::create_dir_all(target.join("inner")).unwrap();
         let tmp = temp.path().join(".hbot-tmp-direct-test");
-        let err = write_atomic(&tmp, &target, b"data").expect_err("rename onto a directory fails");
+        let err = write_atomic(temp.path(), &tmp, &target, b"data")
+            .expect_err("rename onto a directory fails");
         assert!(
             matches!(err, HbotError::Internal { .. } | HbotError::Denied { .. }),
             "got {err:?}"
@@ -729,6 +834,45 @@ mod tests {
             .create_dir(Path::new("../escape"))
             .expect_err("escape must fail");
         assert!(matches!(escape, HbotError::Invalid { .. }));
+    }
+
+    /// 已存在的是**文件**时不能当成目录：末段或中间段都要 `Invalid`，且文件原样保留。
+    #[test]
+    fn create_dir_rejects_existing_file_path() {
+        let temp = TestDir::new("mkdir-file");
+        let workspace = temp.workspace();
+        temp.write("a.txt", "x");
+
+        let last = workspace
+            .create_dir(Path::new("a.txt"))
+            .expect_err("existing file must not become a directory");
+        assert!(matches!(last, HbotError::Invalid { .. }), "got {last:?}");
+
+        let middle = workspace
+            .create_dir(Path::new("a.txt/sub"))
+            .expect_err("file in the middle must be rejected");
+        assert!(
+            matches!(middle, HbotError::Invalid { .. }),
+            "got {middle:?}"
+        );
+
+        assert_eq!(fs::read_to_string(temp.path().join("a.txt")).unwrap(), "x");
+    }
+
+    /// 保留目录（`.git` / `.hbot`）在没有放开策略时一律拒绝，且不建任何目录。
+    #[test]
+    fn create_dir_rejects_reserved_directories() {
+        let temp = TestDir::new("mkdir-reserved");
+        let workspace = temp.workspace();
+        for rel in [".git", ".git/hooks", ".hbot", ".hbot/trash"] {
+            let error = workspace.create_dir(Path::new(rel)).expect_err(rel);
+            assert!(
+                matches!(error, HbotError::Invalid { .. }),
+                "{rel}: got {error:?}"
+            );
+        }
+        assert!(!temp.path().join(".git").exists());
+        assert!(!temp.path().join(".hbot").exists());
     }
 
     #[test]
