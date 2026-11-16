@@ -542,6 +542,16 @@ impl DeviceRegistry {
         // 被限速的这一次同样不写审计：审计表记的是"放行了什么"。
         self.rate.admit(capability, std::time::Instant::now())?;
 
+        // **也要吃会话的动作配额**：`maxActionsPerSession` 是用户在授权对话框里买下的量，
+        // Agent 与 bot 代码共用同一次会话就该共用同一个计数。少了这一句，一个 `while`
+        // 循环里的 Agent 能一直读到会话到期，而 bot 代码早就被 `take_action` 拦住了。
+        {
+            let mut sessions = self.sessions_write();
+            if let Some(session) = sessions.get_mut(&bot_id) {
+                session.take_action()?;
+            }
+        }
+
         // 审计记 actor=`agent_tool`、目标为空：这条路径没有应用白名单可比。
         append_audit(
             &self.store,
@@ -1643,6 +1653,35 @@ mod tests {
         let error = backend.ocr(&ocr_request()).expect_err("撤销后必须拒绝");
         assert_eq!(error.code(), "HBOT_DEVICE_NOT_GRANTED");
         assert_eq!(counting.calls(), 1, "撤销后后端一次都不能多调");
+    }
+
+    #[test]
+    fn agent_tool_calls_also_consume_the_session_action_quota() {
+        // `maxActionsPerSession` 是用户点头买下的量，Agent 与 bot 代码共用同一次会话
+        // 就该共用同一个计数：否则一个循环里的 Agent 能一直读到会话到期。
+        let fixture = Fixture::new("agent-actions", true, &[DeviceCapability::Ocr]);
+        let mut settings = fixture.registry.settings();
+        settings.max_actions_per_session = 1;
+        fixture.registry.replace_settings(settings);
+        let counting = Arc::new(CountingBackend::default());
+        let backend = SessionScopedBackend::new(counting.clone(), &fixture.registry);
+        fixture
+            .registry
+            .grant(
+                &fixture.bot_id,
+                &caps(&[DeviceCapability::Ocr]),
+                Vec::new(),
+                Some(5),
+                "s-actions".to_owned(),
+            )
+            .expect("grant");
+
+        assert!(backend.ocr(&ocr_request()).is_ok(), "第一发在配额内");
+        let error = backend
+            .ocr(&ocr_request())
+            .expect_err("第二发必须被动作上限拦住");
+        assert_eq!(error.code(), "HBOT_DEVICE_HOST_LIMIT");
+        assert_eq!(counting.calls(), 1, "被拦下的那发不许碰到真后端");
     }
 
     #[test]

@@ -451,7 +451,7 @@ interface DeviceApi {
 | IDE 面板 + 授权弹窗 | **已完成**（web 30 文件 / 230 用例） | `apps/web/src/features/device/`、`src/stores/device-store.ts` |
 | 注入沙箱（装配） | **已完成**（2026-11-17） | `SandboxHandler::with_device(gate, backend)`，在 `crates/hbot-rpc/src/app/commands/bots.rs` 的 `start_bot` 里调；每次新建 isolate 时 `set_device` + `set_device_apps(device_apps(project_root))` |
 | 切项目时刷新清单 | **已完成** | `AppState::open_project` 末尾 `self.device.note_project_root(Some(root))` |
-| 限速（20 次/秒、2 帧/秒） | **已完成（2026-11-17）** | 判据只有一份：`hbot_core::DeviceRateWindow`（一秒滑动窗口，先判后记，被拒的那次不占配额）。两处各持一个实例：bot 代码在 `hbot-code` 的 `DeviceSlot`（一个 `Sandbox` = 一个 bot），Agent 在 `hbot-rpc` 的 `DeviceRegistry`。参数错误在闸之前返回，所以传错参数不占配额、也不会被限速文案盖住。超时已拆成 `HBOT_DEVICE_TIMEOUT`（见 §13 问 8） |
+| 限速（20 次/秒、2 帧/秒） | **已完成（2026-11-17）** | 判据只有一份：`hbot_core::DeviceRateWindow`（一秒滑动窗口，先判后记，被拒的那次不占配额）。两处各持一个实例：bot 代码在 `hbot-code` 的 `DeviceSlot`（一个 `Sandbox` = 一个 bot），Agent 在 `hbot-rpc` 的 `DeviceRegistry`。参数错误在闸之前返回，所以传错参数不占配额、也不会被限速文案盖住。Agent 侧调用同样吃该会话的 `maxActionsPerSession` 动作配额（与 bot 代码共用一个计数，否则一个 `while` 循环里的 Agent 能一直读到会话到期）。超时已拆成 `HBOT_DEVICE_TIMEOUT`（见 §13 问 8） |
 | OCR | **已完成（窄版）**（`hbot-device` 24 lib + 7 api + 8 desktop，clippy 0） | §9.1 的 B 路线：`Windows.Media.Ocr` → 文本。宿主函数 `__hbot.device.ocr`、Agent 工具 `read_screen` |
 | `ToolGateway` 的 Capability 闸 | **已完成**（B2，2026-11-17） | `GatewayStep::Capability` 作第一步；实现者 `app/device/capabilities.rs` 的 `ManifestCapabilityGate`（每次重读清单，不快照） |
 | Agent 侧的会话判据 | **已完成**（B2，2026-11-17） | `app/device/agent_backend.rs` 的 `SessionScopedBackend`：撤销/到期对 Agent 立刻生效（见下） |
