@@ -117,6 +117,26 @@ if !FIRST_DISPATCH.swap(true, std::sync::atomic::Ordering::Relaxed) {
 
 **处置边界（不许静默放宽）**：桌面目标应拆成「headless core ready < 800 ms」与「桌面到 IPC 首次可用 < 1500 ms」两个口径；若要把桌面「核心可用」压到 800 ms，必须先把核心初始化挪到 Tauri `setup` 之前并行启动并实测，只改 store 无效。详见 [ADR-0002 §4.2](../adr/0002-agent-in-rust.md)。
 
+#### 3.2.1 预取插件实测（同一条「挪到 setup 之前」的尝试，2026-11-16 复测）
+
+上一条「必须先把核心初始化挪到 Tauri `setup` 之前」已经有人试过了：`crates/hbot-desktop/src/lib.rs:172-205` 的 `CorePrefetchPlugin`（插件名 `hbot-core-prefetch`）注册在单实例插件之后、窗口创建之前，在 `initialize` 里 `tauri::async_runtime::spawn` 调 `host.core()`，把 `AppState::open` 丢到后台线程，与 WebView2 初始化重叠。
+
+同一份产物（`E:\hbot-target\coldstart\release\hbot-desktop.exe`，28,634,624 B）、`HBOT_STARTUP_TRACE=1`、3 次、25 ms 轮询，实测：
+
+| 分段 | 中位（ms） | p95（ms） | min / max |
+|---|---:|---:|---|
+| 进程启动 → `setup_enter` | 761.9 | 851.2 | 728.5 / 851.2 |
+| 进程启动 → `core_ready`（预取任务完成） | 803.8 | 899.6 | 757.3 / 899.6 |
+| `appstate_open_total` | 28.0 | 29.7 | 17.8 / 29.7 |
+
+**结论：预取没能把核心打开藏到 `setup` 之前。** `core_ready` 比 `setup_enter` 还晚约 **42 ms**，也就是说预取线程真正跑起来时窗口创建阶段（约 760 ms）已经过完了；核心本身只值 28 ms，即使完美重叠也最多省下这 28 ms。
+
+**保留它的理由**：预取确实把核心就绪与 `setup` 之后的装配重叠了，属净收益（省掉 `setup` 里的串行 28 ms），因此**保留**，不要当成无效代码删掉。但**不要指望它救 800 ms**：桌面侧的 760 ms 是 Tauri runtime + WebView2 初始化 + 窗口创建，属于宿主成本，Rust 侧无从优化。要真压到 800 ms 以内只有两条路——换原生 UI，或让 WebView2 预热常驻——都不在本轮范围。
+
+复测命令与原始日志：`E:\hbot-target\prefetch-check.log`（3 次）；探针脚本 `scripts/startup-probe.ps1`。
+
+> 待确认：`CorePrefetchPlugin` 目前没有断言它的测试（`startup_trace` 只在 `HBOT_STARTUP_TRACE=1` 时产生可见证据）。若将来重构 `run()` 的插件注册顺序，需要重新跑一次上面的探针确认 `core_ready` 仍早于 `setup_exit`。
+
 ### 3.3 未测原因（不编数字）
 
 | 未测项 | 原因 |
