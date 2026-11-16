@@ -238,6 +238,20 @@
 
 **Stop / Go**：S1 两周内不稳 → 换 `deno_core` 或改“生成 JS”；S0 显示桌面总 RSS >300 MB → 重新评估 Tauri/原生 UI；M1 评测集通过率 <40% → 先改提示与工具，不加功能。
 
+### M7–M9：能力底座与手机端（**设计稿，未排期**）
+
+2026-11-17 补的三份蓝图（[`07-bot-runtime-blueprint.md`](07-bot-runtime-blueprint.md)、[`08-multi-host.md`](08-multi-host.md)、[`adr/0004-one-core-three-hosts.md`](adr/0004-one-core-three-hosts.md)）把"不限制 bot 形态 + 手机端跑 bot"这件事拆成了三段。**它们不在当前 M0–M6 的关键路径上**，等 M6 收尾后再排。
+
+| 里程碑 | 内容 | 出口标准（可测） |
+|---|---|---|
+| **M7 能力底座** | `07` §11 的第 1–5 步：`kv` / `history` / `ai` / `timer` / `jobs` / `session`（含 `bot_waits` 落库与定时器结算） | 聊天/游戏/客服三类示例项目各一个，全在桌面跑通；`07` 的 V1–V11 全绿 |
+| **M8 Android 宿主** | 拆 `hbot-mobile` crate、vendor rquickjs bindings、APK 能装能跑、前台服务 + 常驻通知、能力矩阵裁剪 | 真机装上；`local` bot 能跑、`onebot11` 能连局域网协议端、`bot_inject` 有回复；体积 ≤ 25 MB；`08` 的 H1–H7 全绿 |
+| **M9 iOS 宿主**（可选） | macOS + Xcode 构建、IPA、WKWebView 控制台、**仅前台运行** | TestFlight 可装、前台跑通同一链路；按 4.7 备齐审核材料 |
+
+**两条已定的硬事实（不要在设计里回避）**：
+- **iOS 上"后台 24 小时在线"做不到**：退后台约 5 秒后进程挂起，`UIBackgroundModes` 里没有任何"保持网络连接"的类别（详见 `08` §4.1）。
+- **Android 上"常驻"= 前台服务 + 常驻通知 + Play 申报**，且电池优化豁免大概率拿不到（能用 FCM 的即时通讯类不被接受，详见 `08` §4.2）。
+
 ---
 
 ## 3. 为什么是这个顺序

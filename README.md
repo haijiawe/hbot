@@ -91,6 +91,9 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | [`docs/04-implementation-plan.md`](docs/04-implementation-plan.md) | M0–M6、出口标准、parity、风险、切换/回滚 |
 | [`docs/05-quality-gates.md`](docs/05-quality-gates.md) | 一条命令、闸门、测试分层、性能预算、CI |
 | [`docs/06-ide.md`](docs/06-ide.md) | **IDE 设计**：布局、编辑器、Agent Diff、运行/调试、搜索、性能 |
+| [`docs/07-bot-runtime-blueprint.md`](docs/07-bot-runtime-blueprint.md) | **起 bot 的架构蓝图**：三层分离、6 组能力、四类 bot 缺什么、状态/定时/作业、网关顺序 |
+| [`docs/08-multi-host.md`](docs/08-multi-host.md) | **多宿主与手机端**：桌面/无头/手机能力矩阵、iOS/Android 后台真相、npm 打包、移动端风险 |
+| [`docs/adr/0004-one-core-three-hosts.md`](docs/adr/0004-one-core-three-hosts.md) | 决策：一个核心三宿主、手机不做完整 IDE、为什么 QuickJS 对 iOS 也成立 |
 | [`docs/spikes/`](docs/spikes/) | 实测记录（内存、QuickJS、启动、打包、QQ 官方握手、**QQ 真机端到端**、性能预算） |
 | [`AGENTS.md`](AGENTS.md) | Agent/新人入口：规则、地图、命令、坑 |
 | [`_research/`](_research/) | 旧项目四份只读审查原始证据（不是产品文档） |
@@ -104,7 +107,7 @@ crates/            Rust workspace：core / store / agent / code / bot / workspac
                    rpc / cli / desktop / command / parity / redteam / bench（+ xtask）
 apps/web/          React IDE（generated/ 由 Rust 生成）
 docs/              设计与决策（00 体检、01 需求、ADR、02 架构、03 目录、04 计划、05 闸门、
-                   06 IDE、spikes 实测、security 红队）
+                   06 IDE、07 bot 能力蓝图、08 多宿主与手机端、spikes 实测、security 红队）
 scripts/           闸门、打包、真机验证脚本
 packaging/         systemd / logrotate 部署物
 AGENTS.md          Agent 入口
@@ -150,7 +153,11 @@ node scripts/smoke-nsis-install.ps1                # 安装/卸载冒烟
 
 ## 内存与性能
 
-目标（内存口径 = 进程树 private commit，**不是** WorkingSet，理由见 [ADR-0002](docs/adr/0002-agent-in-rust.md) §4）：桌面整机 < 260 MB，核心 < 60 MB，每 bot < 6 MB，冷启动 < 800 ms。**已实测**：核心 3.4 MB、每 bot 0.10 MB、每 isolate 0.30 MB、整机 206 MB（中位）、`hbot.exe` 16.2 MB；冷启动 878 ms 中位**未达标**。数据见 [`docs/spikes/S0-memory.md`](docs/spikes/S0-memory.md)。
+目标（内存口径 = 进程树 private commit，**不是** WorkingSet，理由见 [ADR-0002](docs/adr/0002-agent-in-rust.md) §4）：桌面整机 < 260 MB，核心 < 60 MB，每 bot < 6 MB。
+
+**已实测**（2026-11-16，i5-14600KF / Win11 / Defender 开）：核心 3.4 MB、每 bot 0.10 MB、每 QuickJS isolate 0.30 MB、桌面整机 private 中位 **206 MB**（其中 Rust 主进程 13.9 MB，WebView2 子进程 191.6 MB）、`hbot.exe` 18.05 MiB、NSIS 安装包 9.14 MiB。
+
+**冷启动要分两个口径，别混**：无头 `hbot serve` 到 ready **36.4 ms 中位 / 50 ms p95**（n=7，达标）；桌面到窗口可交互 **525 ms**、到 IPC 首次可用 **1049 ms**（预算 1500 ms，达标）。这两个数的时间都花在 Tauri/WebView2 初始化上，不是 SQLite。数据见 [`docs/spikes/S0-memory.md`](docs/spikes/S0-memory.md)、[`S2-tauri.md`](docs/spikes/S2-tauri.md)、[`S11-headless-startup.md`](docs/spikes/S11-headless-startup.md)。
 
 ---
 

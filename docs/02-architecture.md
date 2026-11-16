@@ -3,6 +3,7 @@
 - 状态：Draft（与 [ADR-0002](adr/0002-agent-in-rust.md) 对齐）
 - 日期：2026-11-16
 - 取代：旧版“Tauri + Node daemon + 低代码节点”架构
+- 配套：**能力面**看 [`07-bot-runtime-blueprint.md`](07-bot-runtime-blueprint.md)（bot 能用什么、四类 bot 缺什么）；**多宿主与手机端**看 [`08-multi-host.md`](08-multi-host.md)（本文只讲单宿主内部的技术形态）
 
 ---
 
