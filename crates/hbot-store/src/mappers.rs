@@ -11,7 +11,10 @@ use std::str::FromStr;
 use rusqlite::Row;
 use rusqlite::types::Type;
 
-use crate::models::{Bot, BotStatusRow, Conversation, InboundRow, LogRow, OutboundRow, Project};
+use crate::models::{
+    Bot, BotStatusRow, Conversation, DeviceAuditRow, DeviceSessionRow, InboundRow, LogRow,
+    OutboundRow, Project,
+};
 
 /// `projects` 表的显式列清单（顺序见 [`row_to_project`]）。
 pub(crate) const PROJECT_COLUMNS: &str = "id, name, path, created_at";
@@ -36,6 +39,15 @@ pub(crate) const OUTBOUND_COLUMNS: &str =
 
 /// `logs` 表的显式列清单（顺序见 [`row_to_log`]）。
 pub(crate) const LOG_COLUMNS: &str = "id, bot_id, level, line, at, source";
+
+/// `device_sessions` 表的显式列清单（顺序见 [`row_to_device_session`]）。
+pub(crate) const DEVICE_SESSION_COLUMNS: &str = concat!(
+    "id, bot_id, state, sub_json, allowed_apps_json, ",
+    "granted_at, deadline, ended_at, created_at"
+);
+
+/// `device_audit` 表的显式列清单（顺序见 [`row_to_device_audit`]）。
+pub(crate) const DEVICE_AUDIT_COLUMNS: &str = "id, at, bot_id, actor, action, target, outcome";
 
 /// 把一行 `projects` 读成 [`Project`]。
 pub(crate) fn row_to_project(row: &Row<'_>) -> rusqlite::Result<Project> {
@@ -123,6 +135,36 @@ pub(crate) fn row_to_log(row: &Row<'_>) -> rusqlite::Result<LogRow> {
         line: row.get(3)?,
         at: row.get(4)?,
         source: row.get(5)?,
+    })
+}
+
+/// 把一行 `device_sessions` 读成 [`DeviceSessionRow`]。
+///
+/// `state` / `sub_json` / `allowed_apps_json` 原样读出（存储层不解释领域枚举，也不解 JSON）。
+pub(crate) fn row_to_device_session(row: &Row<'_>) -> rusqlite::Result<DeviceSessionRow> {
+    Ok(DeviceSessionRow {
+        id: row.get(0)?,
+        bot_id: parse_id(1, row.get::<_, String>(1)?)?,
+        state: row.get(2)?,
+        sub_json: row.get(3)?,
+        allowed_apps_json: row.get(4)?,
+        granted_at: row.get(5)?,
+        deadline: row.get(6)?,
+        ended_at: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+/// 把一行 `device_audit` 读成 [`DeviceAuditRow`]。
+pub(crate) fn row_to_device_audit(row: &Row<'_>) -> rusqlite::Result<DeviceAuditRow> {
+    Ok(DeviceAuditRow {
+        id: row.get(0)?,
+        at: row.get(1)?,
+        bot_id: parse_id(2, row.get::<_, String>(2)?)?,
+        actor: row.get(3)?,
+        action: row.get(4)?,
+        target: row.get(5)?,
+        outcome: row.get(6)?,
     })
 }
 

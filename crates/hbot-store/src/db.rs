@@ -39,9 +39,9 @@ use crate::error::{Result, StoreError};
 use crate::ids::{BotId, ConversationId, InboundId, OutboundId};
 use crate::migrations;
 use crate::models::{
-    BOT_STATUSES, Bot, BotStatusRow, Conversation, InboundReplayRow, InboundRow, LogRow,
-    NewAgentLog, NewInbound, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project,
-    is_valid_bot_status,
+    BOT_STATUSES, Bot, BotStatusRow, Conversation, DeviceAuditRow, DeviceSessionRow,
+    InboundReplayRow, InboundRow, LogRow, NewAgentLog, NewDeviceAudit, NewDeviceSession,
+    NewInbound, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project, is_valid_bot_status,
 };
 use crate::repositories;
 use crate::startup_trace;
@@ -186,6 +186,39 @@ enum StoreOp {
         bot_id: Option<BotId>,
         limit: u32,
         reply: Reply<Vec<LogRow>>,
+    },
+    /// 插入一条设备会话，返回落库后的行（读回，不回显入参）。
+    InsertDeviceSession {
+        session: NewDeviceSession,
+        reply: Reply<DeviceSessionRow>,
+    },
+    /// 取某个 bot 最近一次设备会话。**必须与写同序**（走 db 线程而不是只读池）：
+    /// 撤销返回后紧接着的这条读不能还看到 `active`（`docs/09` §4.3 要求撤销立即生效）。
+    LatestDeviceSession {
+        bot_id: BotId,
+        reply: Reply<Option<DeviceSessionRow>>,
+    },
+    UpdateDeviceSessionState {
+        id: String,
+        state: String,
+        ended_at: Option<i64>,
+        reply: Reply<bool>,
+    },
+    /// 撤销 / 到期的统一落点：把该 bot 所有 `active` 行一次 UPDATE 置为新状态。
+    EndLiveDeviceSessions {
+        bot_id: BotId,
+        state: String,
+        ended_at: i64,
+        reply: Reply<usize>,
+    },
+    AppendDeviceAudit {
+        entry: NewDeviceAudit,
+        reply: Reply<()>,
+    },
+    ListDeviceAudit {
+        bot_id: BotId,
+        limit: usize,
+        reply: Reply<Vec<DeviceAuditRow>>,
     },
 }
 
@@ -661,6 +694,89 @@ impl Store {
         })
     }
 
+    /// 插入一条设备会话，返回落库后的行。
+    ///
+    /// 走 db 线程（不是只读连接池）：刚建好的会话必须能被紧接着的
+    /// [`Store::latest_device_session`] 读到，否则会出现"刚批准就说没批准"。
+    pub fn insert_device_session(&self, session: NewDeviceSession) -> Result<DeviceSessionRow> {
+        self.submit(|reply| StoreOp::InsertDeviceSession { session, reply })
+    }
+
+    /// 取这个 bot 最近一次设备会话；从没有过时返回 `Ok(None)`。
+    ///
+    /// 排序是 `(created_at DESC, id DESC)`，**不是** `id` 的字典序——UUIDv4 没有时间含义，
+    /// `id DESC` 只在同一毫秒的两行之间做确定性定序（不依赖 rowid / 插入顺序）。
+    ///
+    /// 走 db 线程与写同序：撤销（[`Store::end_live_device_sessions`]）返回之后，下一次读
+    /// 一定看到撤销后的状态。这条是安全性质，不是性能选择（撤销必须立即生效，`docs/09` §4.3）。
+    pub fn latest_device_session(&self, bot_id: &BotId) -> Result<Option<DeviceSessionRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::LatestDeviceSession { bot_id, reply })
+    }
+
+    /// 改一条会话的状态（`ended_at` 一起写）；返回是否命中一行。
+    ///
+    /// `state` 原样落库，存储层不校验：合法取值是 `hbot_core::DeviceSessionState` 的
+    /// `as_str()` 清单，判据在上层（存储层再抄一份状态表就是第二份真源）。`ended_at = None`
+    /// 会清成 NULL；只想改状态、保留结束时刻的调用方要把原值一起传回来。
+    pub fn update_device_session_state(
+        &self,
+        id: &str,
+        state: &str,
+        ended_at: Option<i64>,
+    ) -> Result<bool> {
+        let id = id.to_owned();
+        let state = state.to_owned();
+        self.submit(|reply| StoreOp::UpdateDeviceSessionState {
+            id,
+            state,
+            ended_at,
+            reply,
+        })
+    }
+
+    /// 把这个 bot 所有 `state='active'` 的会话置为新状态并写 `ended_at`，返回处理行数。
+    ///
+    /// 撤销与到期共用它（`docs/09` §7）：一条 UPDATE 原子完成全局失效，不需要先读再逐条改
+    /// —— 后者会在两条语句之间留下"库里已撤销、另一个读者还看到 active"的窗口。
+    /// 非 `active` 行不动（它们已经结束，改写会擦掉历史）。
+    pub fn end_live_device_sessions(
+        &self,
+        bot_id: &BotId,
+        state: &str,
+        ended_at: i64,
+    ) -> Result<usize> {
+        let bot_id = *bot_id;
+        let state = state.to_owned();
+        self.submit(|reply| StoreOp::EndLiveDeviceSessions {
+            bot_id,
+            state,
+            ended_at,
+            reply,
+        })
+    }
+
+    /// 追加一条设备审计。
+    ///
+    /// `target` 只允许进程名 / 窗口 id / 子能力名；**像素、剪贴板文本、OCR 原文一律不许**
+    /// （`docs/09` §3.2、§4.3）。表里根本没有能装内容的列——这是结构约束，不是调用约定。
+    pub fn append_device_audit(&self, entry: NewDeviceAudit) -> Result<()> {
+        self.submit(|reply| StoreOp::AppendDeviceAudit { entry, reply })
+    }
+
+    /// 读某个 bot 最近的设备审计，最新在前：`at DESC, id DESC`。
+    ///
+    /// 只按 bot 过滤（不跨 bot 汇总）：审计要回答"这个 bot 刚才动了什么"。同一毫秒的多条
+    /// 用 `id`（AUTOINCREMENT = 写入序）定序，`at` 是调用方给的时钟，回拨时不保证单调。
+    pub fn list_device_audit(&self, bot_id: &BotId, limit: usize) -> Result<Vec<DeviceAuditRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ListDeviceAudit {
+            bot_id,
+            limit,
+            reply,
+        })
+    }
+
     /// 把操作投递给 db 线程并等回复。
     ///
     /// `op` 在持有通道锁时构造，保证 `Shutdown` 之后不会再有请求入队。
@@ -917,6 +1033,56 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::log::list(&connection, bot_id.as_ref(), limit),
+                );
+            }
+            StoreOp::InsertDeviceSession { session, reply } => {
+                reply_send(
+                    reply,
+                    repositories::device::insert_session(&connection, &session),
+                );
+            }
+            StoreOp::LatestDeviceSession { bot_id, reply } => {
+                reply_send(
+                    reply,
+                    repositories::device::latest_session(&connection, &bot_id),
+                );
+            }
+            StoreOp::UpdateDeviceSessionState {
+                id,
+                state,
+                ended_at,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::device::update_state(&connection, &id, &state, ended_at),
+                );
+            }
+            StoreOp::EndLiveDeviceSessions {
+                bot_id,
+                state,
+                ended_at,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::device::end_live_sessions(&connection, &bot_id, &state, ended_at),
+                );
+            }
+            StoreOp::AppendDeviceAudit { entry, reply } => {
+                reply_send(
+                    reply,
+                    repositories::device::append_audit(&connection, &entry),
+                );
+            }
+            StoreOp::ListDeviceAudit {
+                bot_id,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::device::list_audit(&connection, &bot_id, limit),
                 );
             }
         }

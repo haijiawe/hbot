@@ -41,6 +41,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0003_agent_logs",
         sql: include_str!("migrations/0003_agent_logs.sql"),
     },
+    Migration {
+        version: 4,
+        name: "0004_device",
+        sql: include_str!("migrations/0004_device.sql"),
+    },
 ];
 
 /// 本二进制支持的最新版本。

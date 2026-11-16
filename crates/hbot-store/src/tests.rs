@@ -1121,7 +1121,7 @@ fn upgrading_from_0001_keeps_rows_and_adds_new_columns() {
     }
 
     let store = Store::open(dir.db_path()).expect("open and upgrade legacy store");
-    assert_eq!(store.schema_version().expect("schema version"), 3);
+    assert_eq!(store.schema_version().expect("schema version"), 4);
 
     let pending = store.list_pending_outbound(10).expect("list pending");
     assert_eq!(pending.len(), 1, "升级不得丢旧行");
@@ -1187,7 +1187,7 @@ fn upgrading_from_0002_keeps_existing_logs_with_bot_id_and_bot_source() {
     }
 
     let store = Store::open(dir.db_path()).expect("open and upgrade v2 store");
-    assert_eq!(store.schema_version().expect("schema version"), 3);
+    assert_eq!(store.schema_version().expect("schema version"), 4);
 
     let rows = store
         .list_logs(Some(&bot_id()), 10)
@@ -1209,7 +1209,7 @@ fn upgrading_from_0002_keeps_existing_logs_with_bot_id_and_bot_source() {
     let user_version: i64 = raw
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user_version");
-    assert_eq!(user_version, 3, "user_version 必须推进到 3");
+    assert_eq!(user_version, 4, "user_version 必须推进到 4");
 
     let table_sql: String = raw
         .query_row(

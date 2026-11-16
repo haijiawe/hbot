@@ -240,3 +240,77 @@ pub const BOT_STATUSES: &[&str] = &[
 pub fn is_valid_bot_status(status: &str) -> bool {
     BOT_STATUSES.contains(&status)
 }
+
+// ---------------------------------------------------------------------------
+// 设备能力（C6）：会话与审计（`docs/09-device-capability.md` §3）
+// ---------------------------------------------------------------------------
+
+/// `device_sessions` 行（行级 DTO）。
+///
+/// `state` / `sub_json` / `allowed_apps_json` 都是**列里的原样字符串**：存储层不认识
+/// `hbot_core::DeviceSessionState`，也不解析 JSON —— 映射由上层做，与 [`BotStatusRow`]
+/// 把 `status` 当字符串存的口径一致（`AGENTS.md` §0.4：契约只有一份，不在存储层再抄一遍）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSessionRow {
+    /// UUIDv4 字符串（TEXT 主键；调用方生成）。
+    pub id: String,
+    pub bot_id: BotId,
+    /// 取值见 `hbot_core::DeviceSessionState::as_str()`：
+    /// `requested` / `active` / `expired` / `revoked` / `denied`。
+    pub state: String,
+    /// 本次批准的子能力 JSON 数组；`[]` = 一个都没有。
+    pub sub_json: String,
+    /// 允许的应用 JSON 数组（进程映像名）；`[]` = 全拒。
+    pub allowed_apps_json: String,
+    /// 授权时刻（Unix 毫秒）；`None` = 还没批（`requested` 态）。
+    pub granted_at: Option<i64>,
+    pub deadline: Option<i64>,
+    /// 结束时刻；`None` = 还没结束。
+    pub ended_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// `device_sessions` 的插入参数。新会话一定还没结束，所以没有 `ended_at` 字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDeviceSession {
+    pub id: String,
+    pub bot_id: BotId,
+    pub state: String,
+    pub sub_json: String,
+    pub allowed_apps_json: String,
+    pub granted_at: Option<i64>,
+    pub deadline: Option<i64>,
+    /// 会话创建时刻（Unix 毫秒）—— 也是 `latest_device_session` 的第一排序键，必须由
+    /// 调用方给，存储层不读时钟。
+    pub created_at: i64,
+}
+
+/// `device_audit` 行（行级 DTO）。`id` 是 AUTOINCREMENT，同一毫秒内的定序靠它。
+///
+/// **没有内容字段**：`target` 只放进程名 / 窗口 id / 子能力名，像素、剪贴板文本、
+/// OCR 原文一律不进库（`docs/09` §3.2、§4.3）。表结构层面就不给这些内容留列。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceAuditRow {
+    pub id: i64,
+    pub at: i64,
+    pub bot_id: BotId,
+    /// 谁在请求：`bot_code` / `agent_tool`。
+    pub actor: String,
+    /// 动作名。
+    pub action: String,
+    /// 目标标识符（进程名 / 窗口 id / 子能力名），`None` = 无目标。
+    pub target: Option<String>,
+    /// 结果：`ok` / `denied` / `failed`。
+    pub outcome: String,
+}
+
+/// `device_audit` 的插入参数（`id` 由 AUTOINCREMENT 生成）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDeviceAudit {
+    pub at: i64,
+    pub bot_id: BotId,
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+    pub outcome: String,
+}

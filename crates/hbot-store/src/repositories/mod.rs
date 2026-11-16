@@ -5,6 +5,7 @@
 
 pub(crate) mod bot;
 pub(crate) mod conversation;
+pub(crate) mod device;
 pub(crate) mod inbound;
 pub(crate) mod log;
 pub(crate) mod outbound;
