@@ -1,0 +1,20 @@
+# hbot 的日志文件轮转
+#
+# 现状（别照抄理想化文档）：`hbot serve` 的运行日志走 **stderr → journald**，
+# 由 journald 自己按 `SystemMaxUse` 轮转。这个文件只管 `<data-dir>/logs/` 里
+# 应用自己写的文件 —— 目前是**崩溃报告**（`crash-<时间戳>.log`，以及标记过
+# 已上报的 `crash-*.reported.log`）。
+#
+# 用 copytruncate 而不是 create：进程自己`持有`文件句柄，没有"收到信号后重开"
+# 的逻辑（崩溃报告是一次性 write 完就关，但它可能正在写），copytruncate 不需要
+# 应用配合。代价是"复制那一瞬"可能截断到半行，对崩溃报告可以接受。
+/var/lib/hbot/logs/*.log {
+    weekly
+    rotate 4
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su hbot hbot
+}

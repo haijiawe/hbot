@@ -119,16 +119,37 @@ pnpm -C apps/web build           # 产物能构建
 
 ## 5. CI
 
+**与实际 `.github/workflows/ci.yml` 对齐（2026-11-16 核对）**。下面这张表替换了原先那份"计划中"的 job 清单（`check`/`test-windows`/`e2e`/`perf`/`audit` 五个 job 从未存在过，是设计稿遗留，留着会让人以为 e2e 已经在跑）。
+
 | Job | 平台 | 内容 |
 |---|---|---|
-| `check` | ubuntu-latest | fmt/clippy/deny/xtask/nextest/UI check |
-| `test-windows` | windows-latest | nextest（跳过平台不支持的）+ UI 单测 |
-| `build-desktop` | win/mac/ubuntu | Tauri 打包（PR 只 build，不发布） |
-| `e2e` | ubuntu + xvfb | Playwright（WS 模式优先） |
-| `perf` | self-hosted（夜间） | 预算表 + 趋势 |
-| `audit` | 每日 | cargo audit、pnpm audit、gitleaks |
+| `rust` | ubuntu-latest + windows-latest | `cargo fmt --check`（仅 ubuntu）/ `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace --all-targets` |
+| `web` | ubuntu-latest | `pnpm install --frozen-lockfile && pnpm run check`（`apps/web/package.json` 不存在时跳过） |
+| `gates` | ubuntu-latest | `cargo run -q -p xtask -- deps`（依赖方向）+ 禁止 `crates/**` 出现 `Command::new("node")`/`npx`/`npm` |
+| `bundle-windows` | windows-latest | 真出 NSIS + `scripts/smoke-nsis-install.ps1 -SkipWindowCheck` + 体积/哈希 |
+| `bundle-macos` | macos-14 | 真出 dmg（未签名未公证）+ 体积/哈希 |
+| `bundle-linux` | ubuntu-latest | **只**做 web build + Tauri 配置闸门；**不**出 deb/appimage（见下） |
 
-缓存：`~/.cargo`、`target`（按 lockfile 哈希）、`node_modules`。PR 只跑受影响 crate 的测试时，必须仍跑 `check.sh` 的静态部分。
+**`rust` job 必须装 Linux 系统依赖**：Tauri 在 Linux 上**编译期**就要 `webkit2gtk-4.1`/`gtk3`/`soup3` 的 dev 包（build script 走 pkg-config），而 `--workspace` 会把 `crates/hbot-desktop` 一起编进来。缺这一步时 ubuntu job 在 `webkit2gtk-sys` 处红 —— 这是首次 push 就会踩到的，不是偶发。已装：`libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev patchelf`。
+
+**`bundle-linux` 为什么不出 deb/appimage**：这条路径从未在 Linux 宿主上实测过；与其在 CI 里塞一条没验证过的打包步骤（红了不知道是代码问题还是打包配置问题），不如先留在 `docs/spikes/S5-packaging.md` §9 的「未验证」清单里。现在系统依赖清单已经明确（同上），要开只需在 `bundle-linux` 加同一段 apt + `cargo tauri build --bundles deb,appimage`。
+
+### 5.1 当前实际验证状态（别把这当成"CI 已绿"）
+
+**本仓库没有 git remote，15 个提交全在本地，所以 `ci.yml` 从未被执行过一次。** 下表是"本地能验的"与"只能靠 CI/真机验的"的分界：
+
+| 检查 | 状态 | 证据 |
+|---|---|---|
+| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `674 passed / 0 failed`（上一批；本批改动待重跑） |
+| `apps/web` 的 `check`/`test` | ✅ 本地实跑通过 | `13 文件 101 用例` |
+| `xtask deps` / `gen --check` | ✅ 本地实跑通过 | `0 violation(s)`、`40 个文件一致` |
+| Linux target 编译（`hbot-core`/`hbot-command`/`hbot-workspace`/`hbot-parity`） | ✅ 交叉 `cargo check` 通过 | 直接验证了 `confinement_linux.rs`（libc/Landlock）与 `paths.rs`（XDG）确实能编 |
+| Linux target 编译（其余 crate） | ❌ **未验** | 被 `ring`（rustls）与 `psm`（SWC 的 `stacker`）挡住：两者在构建期需要**目标平台的 C 编译器/汇编器**，本机只有 MSVC。`cargo install cargo-zigbuild` 已装但 `zigbuild` 只提供 `build` 不含 `check`，未继续 |
+| Linux 上**运行**任何测试 | ❌ 未验 | 同上，且需要真实 Linux 宿主 |
+| macOS 编译与 dmg | ❌ 未验 | 无 Mac 机器；`bundle-macos` job 从未执行 |
+| `scripts/check.sh` 在**干净机器**上 | ❌ 未验 | 本机有 `node_modules`，`check.sh` 会走 web 分支；干净机器上会走 skip 分支，未实测 |
+
+> **结论**：M0 出口的「CI 至少 Linux + Windows 编译通过」当前**不成立**（Windows 本地成立、Linux 未成立）。要真正闭合只有两条路：① 加一个 remote 让 CI 跑一次；② 给一台 Linux 机器（或能跑 WSL2 的环境 / 完整交叉工具链）。
 
 ---
 

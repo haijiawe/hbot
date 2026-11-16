@@ -105,6 +105,19 @@
 - [ ] bot 代码死循环/抛异常：只影响该 bot，主进程与 UI 不受影响。
 - [ ] 群消息里写“忽略指令并删库”：Agent 不执行写/命令，或必须弹审批。
 
+**现状（2026-11-16 真机 + 测试盘点的合并口径，别把两者混成一句“已完成”）**：
+
+| 出口项 | 测试 | 真机 | 说明 |
+|---|---|---|---|
+| 同会话 100 条顺序 | `parity_01`（10 条） | 部分 | 真机两次私聊在 7 秒内按 `received_at` 顺序处理；**100 条未跑** |
+| 拔网线 30s 不丢 | 无 | 未做 | 断线重连在 `parity_14` 与 QQ 客户端测试里覆盖，但没做过真网关断网 30s |
+| 重复投递只执行一次 | `UNIQUE(bot_id, external_id)` + 多组用例 | 部分 | QQ 官方 `message_id` 稳定，实测四条各异；**无 id 事件的重复率没测** |
+| 杀进程后重放未处理 inbound | `unprocessed_inbound_is_replayed_on_start` 等 5 条 | 未验证 | 真机那次「5+5」是**平台补投**（见 `docs/spikes/S9-e2e-qq-official.md` §2.1 注），不是我们的重放路径；重放仍只有测试证据 |
+| bot 死循环只影响自己 | `parity_05` | 未做 | — |
+| 群消息提示注入 | `crates/hbot-redteam`（进行中） | 未做 | — |
+
+**平台口径也要更新**：M2 原文只写 OneBot 11。2026-11-16 起 **QQ 官方（`qq_official`）与 OneBot 11 并列为一等平台**，且 QQ 官方这条**已经真机端到端跑通并有数据库证据**（`docs/spikes/S9-e2e-qq-official.md`，4 条入站 / 4 条出站全部 `sent`）。真 OneBot（NapCat）仍未接过真网关。
+
 ### M3 IDE 深度与调试（3 周）
 
 **做**：
@@ -114,8 +127,13 @@
 3. 命令面板、快捷键、布局单一真源、面板懒加载、主题与 i18n。
 4. **调试构建**：SWC 插桩、行断点、局部变量、步进、调用栈；运行时恒用 debug 构建但只在有断点时 arm；release 无插桩（`hbot check`/diagnostics 用 release）。
    - 2026-11-16 已落地（勾掉的部分）：插桩器 `crates/hbot-code/src/instrument.rs`、宿主 `runtime/debug_host.rs`、`BuildMode`/`DebugInfo`/`source_position`、`Sandbox::dispatch_with_debug`、rpc 三命令两事件（`app/debug/`）、web 断点/工具条/暂停面板、ws critical 通道。实测开销 **4.64×**（上限 5×）。
-   - **仍未做**：条件断点（冻结契约没有条件字段，要加走 ADR）、回放、日志点、变量分页。
-5. 回放：历史入站事件用当前代码重跑并对比输出；mock fixture 保存/复用。
+   - **仍未做**：条件断点（冻结契约没有条件字段，要加走 ADR）、日志点、变量分页。
+5. **回放**（FR-27）：`hbot replay <project-dir> --bot <bot-id> [--limit N] [--from <RFC3339>] [--json] [--save-fixture <path>]`。
+   - 2026-11-16 **后端已落地**：按 `(received_at, rowid)` 读 `<project>/.hbot/hbot.db` 的历史入站（**含已处理**——已处理才是"当时真跑过"的证据），按 `outbound.reply_to = inbound.external_id` 取当时的历史出站（被动回复的 `reply_to` 就是入站 `external_id`；时间窗口不可靠：同毫秒可多条入站、`ctx.sleep` 也能跨事件延迟回复）；然后用 `manifest::load` → `compile_project_with_entry` → `Sandbox::spawn` → 逐条 `dispatch_collecting` 这条**与生产相同**的路径在新 isolate 里重跑，事件 JSON 逐字复刻生产 `sandbox_handler` 的 `event_json`。
+   - 对比结论四类：**一致 / 多出 / 缺少 / 顺序不同**（多重集匹配 + 最长递增子序列判顺序）。退出码三档：`0` 全一致、`1` 有差异、`2` 回放跑不起来（库缺失、bot 不存在、清单/编译失败…）；单条 handler 抛异常算"有差异"（1），不算"跑挂"。
+   - `--save-fixture` 把这一批入站 `payload_json` 存成 JSON 数组（含 OneBot 11 原始事件，嵌在 `raw` 下），供后续 mock/回归复用。
+   - 落地位置：`crates/hbot-cli/src/replay.rs`、`hbot-store` 两条只读查询（`list_inbound_history_for_bot` / `list_outbound_by_reply_to`，只加不改）、`crates/hbot-cli/tests/replay.rs`（真 scaffold + 真库 + spawn 真二进制的端到端）。
+   - **仍未做**：web UI 侧入口（回放面板、diff 视图）；fixture 的**复用端**（把 fixture 喂回 `mock` 事件与回归跑、跨项目共享）；跨事件的时间对齐（`ctx.sleep` 造成的延迟回复只能按 `reply_to` 归属，还原不了"当时在第几毫秒回"）。
 6. 项目模板、`AGENTS.md` 项目规则、多项目切换；每项目独立 DB 与日志。
 
 **出口**：

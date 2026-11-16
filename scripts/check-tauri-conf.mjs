@@ -87,14 +87,21 @@ const EXPECTED_PLATFORM_TARGETS = {
   linux: ['deb', 'appimage'],
   macos: ['dmg'],
 }
-// bundle.icon 里必须出现的 5 个文件（缺一个就少一个平台的图标）
+// bundle.icon 里必须出现的图标文件（缺一个就少一个平台的图标）
+// 2026-11-16：补了 icon.icns —— macOS 的 .app/.dmg 只认 ICNS，png 顶不了。
+// icon.icns 由 `cargo tauri icon crates/hbot-desktop/icons/icon-1024.png` 生成
+// （输入图必须 ≥1024x1024，这是 tauri-cli 的硬要求）。
 const REQUIRED_ICONS = [
   'icons/32x32.png',
   'icons/128x128.png',
   'icons/128x128@2x.png',
   'icons/icon.png',
   'icons/icon.ico',
+  'icons/icon.icns',
 ]
+// 生成整套图标的源图（不在 bundle.icon 里，只在仓库里留着以便重新生成）
+const ICON_SOURCE = 'icons/icon-1024.png'
+const ICON_SOURCE_MIN = 1024
 
 // ── 1. 基础文件 ───────────────────────────────────────────────────────────────
 if (!check(existsSync(confPath), 'tauri.conf.json 存在', relative(repoRoot, confPath))) {
@@ -114,9 +121,13 @@ check(typeof conf.productName === 'string' && conf.productName.trim() !== '',
   'productName 是非空字符串', String(conf.productName))
 check(typeof conf.version === 'string' && /^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(conf.version),
   'version 是 semver 字符串', String(conf.version))
-// identifier 已被 AGENTS.md / ADR 冻结，改它等于换应用身份（安装升级会变成两个应用）
-check(conf.identifier === 'com.hbot.app',
-  'identifier 未被改动（冻结值 com.hbot.app）', String(conf.identifier))
+// identifier 在 0.1.0 发布前从 `com.hbot.app` 改成 `com.hbot.desktop`：
+// bundler 对以 `.app` 结尾的 identifier 会告警（与 macOS 的 bundle 扩展名撞车）。
+// 发布之后改它等于换应用身份（安装升级会变成两个应用），所以从这里开始冻结。
+check(conf.identifier === 'com.hbot.desktop',
+  'identifier 未被改动（冻结值 com.hbot.desktop）', String(conf.identifier))
+check(!conf.identifier.endsWith('.app'),
+  'identifier 不以 .app 结尾（避免与 macOS bundle 扩展名撞车）', String(conf.identifier))
 
 // build.frontendDist
 const frontendDist = conf.build?.frontendDist
@@ -209,7 +220,8 @@ const icons = bundle.icon
 if (check(Array.isArray(icons) && icons.length > 0, 'bundle.icon 是非空数组',
   Array.isArray(icons) ? `${icons.length} 项` : String(icons))) {
   const missing = REQUIRED_ICONS.filter(p => !icons.includes(p))
-  check(missing.length === 0, 'bundle.icon 列全 5 个图标文件', missing.length ? `缺: ${missing.join(', ')}` : REQUIRED_ICONS.join(', '))
+  check(missing.length === 0, `bundle.icon 列全 ${REQUIRED_ICONS.length} 个图标文件`,
+    missing.length ? `缺: ${missing.join(', ')}` : REQUIRED_ICONS.join(', '))
 
   for (const iconPath of icons) {
     const abs = resolve(crateDir, iconPath)
@@ -229,8 +241,21 @@ if (check(Array.isArray(icons) && icons.length > 0, 'bundle.icon 是非空数组
 
   // macOS 需要 .icns 才能出 .app / .dmg 图标
   const hasIcns = icons.some(p => p.toLowerCase().endsWith('.icns'))
-  if (hasIcns) ok('macOS .icns 图标就位')
-  else warn('缺少 .icns 图标', 'macOS 打包（app/dmg）需要 icons/icon.icns；生成方式见 docs/spikes/S5-packaging.md')
+  check(hasIcns, 'macOS .icns 图标就位（app/dmg 只认 ICNS）')
+
+  // 源图：整套图标（含 .icns）都是 `cargo tauri icon <源图>` 一次生成的，
+  // 源图低于 1024x1024 时 tauri-cli 直接拒绝，等于以后再也改不出图标。
+  const sourceAbs = resolve(crateDir, ICON_SOURCE)
+  if (check(existsSync(sourceAbs), `图标源图存在（${ICON_SOURCE}）`, relative(crateDir, sourceAbs))) {
+    const src = probeIcon(sourceAbs, ICON_SOURCE)
+    if (src.error) {
+      fail(`图标源图格式（${ICON_SOURCE}）`, src.error)
+    } else {
+      const dims = src.detail.match(/^(\d+)x(\d+)/)
+      const okSize = dims && Number(dims[1]) >= ICON_SOURCE_MIN && dims[1] === dims[2]
+      check(okSize, `图标源图是正方形且 ≥${ICON_SOURCE_MIN}（否则生成不了 .icns）`, src.detail)
+    }
+  }
 }
 
 // ── 3. frontendDist 与前端产物 ───────────────────────────────────────────────
@@ -336,6 +361,15 @@ function probeIcon(abs, iconPath) {
       sizes.push(`${w}x${h}`)
     }
     return { detail: `${count} 张图 [${sizes.join(', ')}], ${buf.length} 字节` }
+  }
+  if (lower.endsWith('.icns')) {
+    // ICNS: magic "icns" + 大端总长度（长度含 8 字节头自身）
+    if (buf.length < 8 || buf.toString('latin1', 0, 4) !== 'icns') {
+      return { error: `${buf.length} 字节，不是 ICNS（magic 不符）` }
+    }
+    const declaredLen = buf.readUInt32BE(4)
+    if (declaredLen !== buf.length) return { error: `头部声明 ${declaredLen} 字节，实际 ${buf.length}` }
+    return { detail: `${buf.length} 字节（ICNS 头一致）` }
   }
   return { detail: `${buf.length} 字节（未校验格式）` }
 }

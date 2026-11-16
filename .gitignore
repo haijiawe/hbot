@@ -12,6 +12,12 @@ Thumbs.db
 *.tsbuildinfo
 /.hbot/
 
+# 用户项目数据：**绝不入库**。
+# `./projects/<name>/bots.json` 里有 `token` / `clientSecret`（QQ 官方与 OneBot 的平台凭据），
+# `./projects/<name>/.hbot/` 有数据库与日志。这是用户数据，不是仓库内容。
+# 新用户的项目默认建在仓库外的任意目录，这里的 `projects/` 只作本机开发夹具。
+/projects/
+
 # 生成物不入库（`cargo xtask gen` 重建，`gen --check` 防漂移）。
 # 注意：`apps/web/src/generated/*.ts` **要入库** —— 它让 UI 能独立 typecheck/构建，
 # 漂移由 CI 的 `cargo xtask gen --check` 拦住。别把它加回忽略列表。

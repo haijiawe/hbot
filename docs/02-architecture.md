@@ -153,7 +153,26 @@ pub trait PlatformAdapter: Send + Sync {
 - **现状（M0 实测，2026-11-16 更新）**：OneBot 11 正向 WebSocket 已实现（心跳看门狗 45s 可注入、`Authorization: Bearer`、串行出站最多 3 次重试、1/2/4…30s ±20% 退避、连接超时 10s）。
   - **TLS 已接**：`ws://` 与 `wss://` 都支持；`wss://` 与 `https://` 共用一份 `ClientConfig`（rustls + `webpki-roots`，**校验始终开启**）。证书不匹配/链到未知 CA → `AdapterError::Tls`（映射 `-32006`），**没有“跳过校验”开关**，也不退化成明文。单测与真 socket 测试见 `crates/hbot-adapters/tests/tls_sockets.rs`（进程内 rcgen 自签 CA、仅回环）。
   - 仍不支持：mTLS（客户端证书）、证书指纹固定、HTTP/1.1 以外的协议、3xx 跟随、gzip、连接池、代理。
-  - **未接线的缺口**：`OneBotClient::probe_connection()` 只是库里的探测入口，rpc 层没调用；所以证书错在当前表现为反复重连的 `warn`，而不是一条明确的“证书不匹配”提示。接线位置应在 `OneBotAdapter::connect` 之前。
+  - **启动前探测（已接线）**：`BotAdapter::subscribe()` 会先跑一次 `OneBotClient::probe_connection()`，失败则 `bot_start` 直接返回 `-32002`（不再表现为后台反复重连）。**已知代价**：一次 `bot_start` 会产生**两条 WS 连接**（一条一次性探测 + 一条真客户端）。除了多一次握手，它会让平台侧看到的「同一 appId 并发连接数」翻倍——OneBot 协议端通常不限制，但这不是可以忽略的常数，若要省掉应改成"探测成功即复用该连接"，那需要把 `probe_connection` 从 `probe → drop` 改成 `probe → handoff`，属于独立改动。
+  - **证书/鉴权错误的表现**：探测阶段就把 401 与证书错误转成 `bot_start` 的显式失败，错误信息里不含 token。
+
+#### 平台不是二选一：OneBot 与 QQ 官方**并列**为一等平台
+
+两个平台的**会话 ID 不是同一个命名空间**，这是产品层面必须先说清的事：
+
+| | OneBot 11（NapCat / LLOneBot / Lagrange） | QQ 官方机器人（QQ 开放平台） |
+|---|---|---|
+| 会话 ID | 群号 / QQ 号本身 | `group_openid` / `user_openid`，**换算不回 QQ 号** |
+| 能收到什么 | 全群消息（取决于协议端配置） | 群聊**只有 @ 机器人**才收到（`GROUP_AT_MESSAGE_CREATE`） |
+| 私聊 | 支持 | C2C 需单独申请且受限 |
+| 主动推送 | 可 | 严格限额，本适配器**不实现** |
+| 合规 | 第三方协议端，违反用户协议、有封号风险 | 官方许可，需主体认证与审核 |
+| 传输 | 本地正向 WebSocket | 官方 WS 网关 + HTTPS OpenAPI |
+
+- 结论：**两个都必须有**。"个人号助手 / 群管理 / 客服"这类要读全群、要主动推的 bot 只能走 OneBot；"合规、可公开分发"的 bot 走官方。把官方当成 OneBot 的替代品是错的——它连群消息都只给 @ 的那一条。
+- 因此 `conversation.external_id` 在不同平台是不同命名空间，落库时必须带 `bot_id` 一起索引（同一产品下两个 bot 各在自己的平台上，会话自然隔离）。
+- 平台差异**只允许**出现在适配器里：归一化后都产出同一个 `NormalizedInbound`（`crates/hbot-adapters/src/normalize.rs`），supervisor/队列/落库/Agent 一行都不分平台。
+- **官方平台的实测事实**（真实凭据、真实端点、真实 WebSocket，2026-11-16）：取 token `POST https://bots.qq.com/app/getAppAccessToken` → 200、`expires_in` 是**剩余**秒数（实测 6627，不是固定 7200）；网关 `GET https://api.sgroup.qq.com/gateway` → `wss://api.sgroup.qq.com/websocket/`；首帧 `op:10` 的 `heartbeat_interval` 实测 **41250ms**（必须用服务端值，不许写死）；`op:2` Identify `{token:"QQBot <t>", intents: 1<<25, shard:[0,1]}` 被接受，随后 `op:0 t=READY` 带回 `session_id`。逐条原始输出与「仍未核实」清单见 [`docs/spikes/S7-qq-official.md`](spikes/S7-qq-official.md)。
 
 ### 4.3 重连与恢复
 
@@ -256,13 +275,35 @@ export default defineBot({
 |---|---|---|---|
 | `name` | string | 必填 | 只用于展示与日志 |
 | `entry` | string | `src/main.ts` | 必须落在项目内（拒绝对路径/`..`/盘符/UNC），文件必须存在 |
-| `platform.kind` | `"onebot11"` | 必填 | 其它值在 M1 报不支持 |
-| `platform.ws` | string | 必填 | `ws://`；`wss://` 走 TLS 后端 |
+| `platform.kind` | string | 必填 | 平台标识，取值与 `bots.json` 的 `platform` 字段一致（`"onebot11"` / `"qq_official"`）。核心**不校验取值**（开放字符串，加平台不改 `hbot-code`）；`hbot check` 对未识别的值只给 warning |
+| `platform.ws` | string | 仅 `onebot11` 必填 | `onebot11`：必填且须 `ws://`/`wss://`（`wss://` 走 TLS 后端）；其它平台不需要（QQ 官方的地址由 `/gateway` 发现），写了不报错，`hbot check` 提示会被忽略 |
 | `permissions.http` | string[] | `[]` | 空 = 全禁；`ctx.http` 尚未实现，字段先占位 |
 | `limits.handlerMs` | number | 2000 | 可调低；超过宿主硬上限直接报错，**不静默 clamp** |
 | `limits.heapMb` | number | 32 | 同上，硬上限 64 |
 
 清单只在**启动/保存**时解析，不在每条消息上解析。
+
+`bots.json`（项目根，`crates/hbot-rpc/src/app/runtime/config.rs`）——**连接凭据在这里，不在 `hbot.json`**：
+
+| 字段（JSON 名） | 类型 | 默认 | 约束 / 说明 |
+|---|---|---|---|
+| `id` | string(UUID) | 必填 | bot 的稳定 id，`bot_start` 用它 |
+| `platform` | string | `onebot11` | `onebot11` / `qq_official`；未知值 → `bot_start` 返回 `-32002` 并列出允许值 |
+| `url` | string | `onebot11` 必填 | OneBot 11 正向 WS 地址；`qq_official` 留空 |
+| `token` | string | — | OneBot access token，按 `Authorization: Bearer` 发送；日志/`Debug` 打码 |
+| `appId` | string | `qq_official` 必填 | QQ 开放平台的 AppID |
+| `clientSecret` | string | `qq_official` 必填 | QQ 开放平台的 AppSecret；`Debug` 打码成 `<redacted>`，**不进日志** |
+| `selfId` | number | — | bot 自己的平台上 id（QQ 号），仅展示 |
+| `name` | string | 项目目录名 | 展示名 |
+| `limits.memoryMb` | number | 32 | 每 isolate 堆上限（Mb） |
+| `limits.handlerTimeoutMs` | number | 2000 | handler 单次执行预算 |
+
+两条必须知道的：
+
+- **不用手工插库**。`bot_start` 的 `start_inner` 先 `get_bot`，有就检查 `enabled`，没有就按 `bots.json` 建行（M0 引导路径）。
+- **凭据只能由用户自己填**。仓库里 `projects/` 已被 `.gitignore` 忽略（`bots.json` 含 `token`/`clientSecret`、`.hbot/` 是数据库），不要把它们放进版本控制；QQ 官方的 AppSecret 也不要写进文档或示例。
+
+真机示例见 `docs/spikes/S9-e2e-qq-official.md`。
 
 **模块规则（硬）**：
 
@@ -305,13 +346,13 @@ export default defineBot({
   | `ctx.send` / `ctx.kv` / `ctx.http` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
   | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage`（`isolate.rs:504-510`）；清单里的 `onSchedule` 字段同样未接 |
 
-- **`onMessage(ctx)` 的 `ctx` 真实形状**（`hbot-rpc/src/app/runtime/sandbox_handler.rs:776-787` 构造，`isolate.rs:600-604` 追加宿主函数）：入站字段**平铺**在 ctx 上，不是嵌套在 `ctx.message` 里。
+- **`onMessage(ctx)` 的 `ctx` 真实形状**（`hbot-rpc/src/app/runtime/sandbox_handler.rs:860-877` 构造，`isolate.rs:924-942` 追加宿主函数）：入站字段**平铺**在 ctx 上，不是嵌套在 `ctx.message` 里。
 
   | 字段 | 类型 | 来源 |
   |---|---|---|
   | `botId` / `conversationId` / `messageId` / `externalId` / `conversationExternalId` | `string` | 本地 ID 与平台外部 ID |
   | `senderId` | `string` | 发送者平台 ID |
-  | `text` | `string` | 已归一化的纯文本（`@`、图片、表情都被替换成占位符） |
+  | `text` | `string` | 已归一化的纯文本（`@`、图片、表情都被替换成占位符）；**没有文本的入站（纯图片/表情）是空串，不是 `null`** |
   | `kind` | `"private"｜"group"｜"channel"` | 会话类型 |
   | `receivedAt` | `number` | unix 毫秒 |
   | `payload` | `unknown` | 原始平台事件（各平台不同，别当契约用） |
@@ -542,6 +583,25 @@ Tauri #[command] ┘        │
 - **事件不落库**：总线是进程内广播（容量 4096），订阅者慢时丢的是自己的那份并记
   `Lagged`；需要持久的历史在 `logs` 表里，事件本身不重放。
 
+### 9.1.2 数据目录（唯一算法）
+
+`hbot_core::paths::data_dir()` 是**唯一**的数据目录算法，桌面上没有第二个入口：
+
+| 平台 | 路径 |
+|---|---|
+| Windows | `%APPDATA%\hbot`（缺失则 `%USERPROFILE%\AppData\Roaming\hbot`） |
+| macOS | `~/Library/Application Support/hbot` |
+| Linux | `$XDG_DATA_HOME/hbot`（缺失则 `~/.local/share/hbot`） |
+| 环境变量全缺 | 当前目录下的 `hbot`（记 `warn`，不 panic） |
+
+- `hbot serve`、`hbot replay`、Tauri 壳、`AppInfo.dataDir` 全部走这一份。
+- **不用 Tauri 的 `app.path().app_data_dir()`**：它按 `identifier` 派生路径，等于把用户数据
+  绑在安装身份上——改 identifier 就静默搬家。现在 identifier 只影响安装/签名身份。
+  桌面壳仅在「连 `HOME`/`APPDATA` 都读不到」的极端环境下退回 `app_data_dir()` 并记 `warn`。
+- 历史教训：修之前这里是三份实现（rpc / cli 各一份 `%APPDATA%\hbot`，桌面 `%APPDATA%\com.hbot.app`），
+  **同一个产品的桌面端与后台端各开一个库**，`hbot replay` 又按另一份找。
+- `hbot.db` 就在这个目录下；`.hbot/` 里的东西属项目，不属应用数据。
+
 ### 9.2 事件
 
 ```text
@@ -555,8 +615,8 @@ project.changed    { path, kind }
 file.search        { searchId, matches }   // 流式
 diagnostics        { path, items }
 agent.diff         { editId, files }       // 待审查的写入
-debug.paused       { sessionId, file, line, scopes, callStack }
-debug.resumed      { sessionId }
+debug.paused       { botId, file, line, scopes, callStack }
+debug.resumed      { botId }
 ```
 
 - 每连接有界发送队列（1024）；`agent.delta` 可合并，`approval.request`/`bot.status` 优先。
@@ -661,18 +721,27 @@ debug.resumed      { sessionId }
 | 档位 | 文件读 | 文件写 | 命令 | 网络（生成代码） |
 |---|---|---|---|---|
 | `read-only` | 项目内 | 拒绝 | 拒绝 | 拒绝 |
-| `workspace-write` | 项目内 | 项目内 | 隔离可用则跑，否则拒绝（**当前全平台拒绝**） | 按 manifest |
+| `workspace-write` | 项目内 | 项目内 | 探测通过才跑，失败拒绝（**Windows 已可用，但只适合脚本级命令**） | 按 manifest |
 | `danger` | 项目内 | 项目内 | 白名单内可跑，每次需显式确认 | 按 manifest |
 
 - 默认 `workspace-write`。
 - 命令隔离分两层（ADR-0003）：`Containment`（进程树可一起杀 + 进程数/内存上限）与 `WriteConfinement`（写不了工作区外）。`read-only` 档直接拒（`SandboxDenied`）；`workspace-write` 要求 `WriteConfinement`；`danger` 要求 `Containment`。端口 `hbot_core::ports::CommandRunner`，实现 `crates/hbot-command`。
-- **当前能力矩阵（2026-11-16，原型）**：
+- **当前能力矩阵（2026-11-16，实测）**：
 
   | 平台 | `Containment` | `WriteConfinement` | 结果 |
   |---|---|---|---|
-  | Windows | 有（Job Object：`KILL_ON_JOB_CLOSE`、`ACTIVE_PROCESS=64`、2 GiB/进程、4 GiB/作业） | 无（受限令牌未接入） | `danger` 可跑；`workspace-write` 拒 |
-  | Linux | 有（`setsid` + `kill(-pgid)`） | 无（Landlock 未接入） | `danger` 可跑；`workspace-write` 拒 |
+  | Windows | 有（Job Object：`KILL_ON_JOB_CLOSE`、`ACTIVE_PROCESS=64`、2 GiB/进程、4 GiB/作业） | **有**（`CreateRestrictedToken(WRITE_RESTRICTED)` + 由工作区路径派生的 write SID + 该目录上的 ACE） | `workspace-write` 可跑，但**受第 1 条限制**；`danger` 可跑 |
+  | Linux | 有（`setsid` + `kill(-pgid)`） | **有（代码已写，从未运行）**（Landlock ABI 探测 + `pre_exec` 装载） | 只交叉编译过；运行期行为未知 |
   | macOS | 无 | 无 | 全拒（`sandbox-exec` 已弃用） |
+
+- **⚠️ Windows 写隔离的真实代价（实测，必须知道）**：`WRITE_RESTRICTED` 不只挡文件写，它让**所有**写类访问检查都只认 restricting SID，而窗口站 / LSA-SSPI / 命名对象这些系统对象的 DACL 里没有我们的 write SID。后果是相当一部分程序在受限令牌下**直接起不来**，退出码 `0xC0000142`：
+  - **能跑**：`cmd.exe` 内建命令、`ping`、`reg`、`ipconfig`、`xcopy`、`icacls`、`findstr`、`hostname`、静态 CRT 的 Rust 二进制。
+  - **起不来**：`node`、`python`、`git`、`cargo`、`rustup`、`pwsh`、`powershell`、`curl`、`tar`、`whoami`、`where`、`net1`、`certutil`、`tasklist`、`robocopy`。
+  - 已逐一排除 cwd（`\\?\`）、环境块、`HANDLE_LIST`、`DETACHED_PROCESS`、restricting SID 集合等因素，二分定位到**旗标本身**。
+  - 结论：`workspace-write` **只适合脚本级命令，跑不了工具链**。要跑 `node`/`cargo`/`git` 得上 `danger`（白名单 + 每次确认），或将来换 AppContainer / 低完整性标签。这是能力边界，不是 bug，**不许为了"能用"去掉写隔离**。
+  - 另两个实测坑：① 受限令牌 + `CREATE_NO_WINDOW` 必然 `0xC0000142`（改用 `DETACHED_PROCESS`）；② `canonicalize()` 得到的 `\\?\` 前缀**不能当子进程 cwd**（`cmd.exe` 会退到 `C:\Windows`，工作区内相对写全失败，看着像权限问题其实不是），必须剥前缀。
+  - 附带副作用：每个工作区会在其目录树上留一条 write SID 的 ACE，**不做清理**（多工作区 = 多条 ACE；目录被移动则 SID 漂移成孤儿）。
+- **探测只证明「隔离装得上」，不证明「程序跑得起来」**：`probe()` 起的是 `cmd.exe /c exit 0`，它恰好属于能跑的那一类。所以"probe=available" 与 "cargo 起不来" 并不矛盾。该结论写在 `crates/hbot-command/src/probe.rs` 的 trait 文档里，别把 probe 当成程序兼容性检测。
 
 - **建不出隔离就拒绝**，不回退名字白名单：不可用时返回 `CommandDenied::IsolationUnavailable{platform, reason}`，`Display` 是一句可操作中文（形如「这台机器上无法建立命令隔离（平台：Linux；原因：内核未启用 landlock…），已拒绝执行。」）。探测在**解析程序之前**执行，避免"程序不存在"掩盖"隔离不可用"。
 - **能力矩阵必须显式**：命令工具在启动时探测隔离是否可用；不可用则工具从 Agent 工具表里移除，UI 说明“本机不支持命令执行”。不要留一个“能点但会失败”的按钮。
@@ -683,7 +752,7 @@ debug.resumed      { sessionId }
   - `HBOT_SANDBOX` / `agent.json` 的 `sandbox`：`read_only`｜`workspace_write`｜`danger`（也接受 `readonly`/`workspace-write`/`DANGER` 这类大小写与连字符变体）。**写错是 `-32002`，不静默退回默认档** —— 静默降档会让用户以为命令能跑却一直被拒。
   - `HBOT_COMMAND_ALLOW` / `agent.json` 的 `allowedPrograms`：逗号分隔的程序名，去空去重保序；**默认空 = 一个程序都不许**。清单只放具体程序，不放 `cmd`/`sh`/`powershell` 这类解释器（ADR-0003 §5：放解释器等于绕过"不经 shell"）。
   - 解析失败（档位拼错、`agent.json` 非法 JSON）= `agent_send` 直接失败，不起回合。
-- **尚未做到**（ADR-0003 §5 有完整清单）：Windows 受限令牌 / 低完整性标签、Linux Landlock、读与网络隔离；Windows 上 `spawn → AssignProcessToJobObject` 之间仍有孙进程逃逸窗口。
+- **尚未做到**（ADR-0003 有完整清单）：Windows 低完整性标签 / AppContainer、Linux 写隔离的**运行验证**（只编译过）、读与网络隔离、注册表 `HKCU` 写不限、临时目录不可写；Windows 上 `spawn → AssignProcessToJobObject` 之间仍有孙进程逃逸窗口。
 
 ### 11.3 密钥
 
@@ -692,6 +761,27 @@ debug.resumed      { sessionId }
 - keychain 不可用：拒绝保存，或用户显式勾选“明文（不推荐）”并写审计。
 - 脱敏字段：`Authorization`、`token`、`apiKey`、`password`、`cookie`、`env`、`headers`。
 
+### 11.4 LLM provider（两个契约，同一条内部流）
+
+支持两种线协议，**产出同形的内部事件**，`loop`/`gateway` 不区分：
+
+| | OpenAI 兼容 | Anthropic Messages |
+|---|---|---|
+| 端点 | `POST {base}/chat/completions`（`base` 自带 `/v1`） | `POST {base}/messages`（`base` 自带 `/v1`） |
+| 认证头 | `Authorization: Bearer <key>` | `x-api-key: <key>` + `anthropic-version: 2023-06-01` |
+| system | 作为一条 `role:"system"` 消息 | 顶层 `system` 字符串（多个 System 用 `\n\n` 拼，空则省略字段） |
+| 工具声明 | `{type:"function", function:{name,description,parameters}}` | `{name, description, input_schema}` |
+| 工具调用（上行） | `delta.tool_calls[]` 分片，`index` 聚合 | `content_block_start{tool_use}` + `input_json_delta.partial_json` 按 `index` 拼接，`content_block_stop` 解析 |
+| 结束标记 | `data: [DONE]` | `message_stop` 事件（**没有** `[DONE]`） |
+| 必发字段 | `stream:true` | `stream:true` + `max_tokens`（默认 4096） |
+| 不发 | — | `tool_choice`（兼容壳收到未知字段可能 400） |
+
+- **只有流式**：两种协议都**不实现非流式**。实测两个兼容端点的非流式 `tool_calls` 都是坏的（返回 `finishReason:"tool_calls"` 但没有工具块），所以「非流式快速路径」是明确的非目标。
+- `message_delta` 的 `usage` 要**后到覆盖**（末帧 `output_tokens` 常为真值而 `message_start` 里是 0）；末帧 `choices` 可能是空数组，解析器必须先取 `usage` 再判 `choices[0]` 是否存在（否则 panic）。
+- `thinking` / `thinking_delta`：计数并 `debug!` 日志，**不进正文、不进 UI**（透传属契约变更，未做）。
+- 选择方式：`HBOT_LLM_PROVIDER` / `agent.json` 的 `provider`，取值 `openai`（缺省）｜`anthropic`。**写错是 `-32002`，不静默退另一个 provider、不自动跨 provider 重试**——静默切换会让用户以为在测 A 实际在测 B。
+- 实测边界（2026-11-16）：`z1rry.cyou` 的 `/v1/messages` 是 **OpenAI 后端的外壳**（响应 `id` 为 `chatcmpl-…`、`usage.billing_usage.source == "oai_chat"`）。所以「Anthropic 契约链路已通」有真机证据，**但原生 `api.anthropic.com` 从未实测**。
+
 ---
 
 ## 12. 失败与恢复
@@ -699,7 +789,7 @@ debug.resumed      { sessionId }
 | 失败 | 行为 |
 |---|---|
 | 平台断线 | 指数退避重连；outbound 继续排队；UI 标 disconnected |
-| 发送失败 | 退避重试（1/2/4…），超限进死信，UI 可见 |
+| 发送失败 | 退避重试（1/2/4…）；**两级预算**：`max_attempts`（本次运行内，默认 3）用完保留 `pending` 等下次启动续发，`max_send_attempts`（跨重启累计，默认 10）到顶才转死信（`state='failed'`，行保留）+ 一条 `error` RunLog，UI 可见 |
 | handler 超时/崩溃 | 中断 isolate，记录；消息进死信；bot degraded；连续 3 次停自动重启 |
 | 编译失败 | 保留旧版本运行；UI 显示错误位置 |
 | SQLite busy | 重试（有界）；仍失败则上报，不静默吞 |
@@ -776,3 +866,54 @@ debug.resumed      { sessionId }
 9. OneBot 11 部分事件没有稳定 `message_id`：去重键如何合成（哈希 + 时间窗），需要实测。
 10. ~~Tauri/WebView2 在 Windows 上的实际空闲内存~~ **已测（S0/S2）**：整机 206 MB private（中位）/ 382 MB WS，Rust 主进程 13.9 MB，其余在 WebView2 子进程。结论见 §1.1 与 ADR-0002 §4；遗留未测项是「Monaco 打开 3 个标签后的增量」与「按键 p95」，需 M3 接 tauri-driver 或 devtools 后再测。
 7. MCP 客户端排期：MVP 后是否需要接第三方工具服务器。
+
+---
+
+## 17. 运行与运维（M5）
+
+> 编号说明：原先规划的「§12 运行与运维」与既有「§12 失败与恢复」冲突，为避免重编号动到 12–16 五个小节的标题，本节作为 §17 追加在文末。落地细节、实测输出与未验证清单见 [spikes/S6-desktop-ops.md](spikes/S6-desktop-ops.md)。
+
+### 17.1 进程形态
+
+- **桌面**：`hbot-desktop`（Tauri 2 壳）。壳里只有窗口 / 托盘 / 单实例 / 偏好 / 崩溃文件；业务全部走 `hbot_rpc::Dispatcher`，不重复实现。
+- **后台**：`hbot serve`（`crates/hbot-cli`）—— 打印一行 ready JSON 到 stdout，等 `SIGTERM`/Ctrl-C 后优雅关闭。桌面壳与 `serve` 是**两条独立入口**，可以同时存在（各用各的数据目录时）。
+- **单实例**：桌面壳用 `tauri-plugin-single-instance` 的命名互斥量 `{identifier}-sim`。第二次启动在**插件 `setup` 阶段**就把 argv 交给已运行实例并 `exit(0)`，此时配置窗口还没创建、`AppState`（SQLite 写者）还没打开 —— 所以不会出现「两个写者」或「两个 WebView」。
+
+### 17.2 关闭语义
+
+| 动作 | 行为 |
+|---|---|
+| 关窗（默认 `closeToTray=true`） | `prevent_close()` + `hide()`：进程留在托盘，机器人继续跑 |
+| 关窗（`closeToTray=false`） | 走优雅关闭：`BotRegistry::stop_all()` → 一次 `AppState::append_log()` 作写屏障 → `exit(0)` |
+| 托盘「退出」 | 同上的优雅关闭；`AtomicBool` 防重入 |
+| 托盘「显示主窗口」/ 第二次启动 | `show` + `unminimize` + `set_focus`（前台是否真的切过去由 Windows 前台锁决定，见 S6 §9） |
+| 任务管理器强杀 | 无处理（OS 行为）；WebView2 用户数据目录可能被占住，立刻重启会在 `setup` panic 并留下崩溃报告 |
+
+**写屏障为什么是 `append_log`**：`Store` 只有一条写线程，`submit()` 阻塞等回执，所以一次成功的写等价于「此前排队的写都已落盘」。`Store` 没有公开 `flush()`/`close()`（`StoreOp::Shutdown` 只由 `Drop` 发）。空库时 `logs.bot_id` 外键无处可插，此时只记日志、不假装排空过。
+
+### 17.3 数据与日志位置
+
+| 内容 | 路径 |
+|---|---|
+| 数据目录（唯一真源 `hbot_core::data_dir()`） | Windows `%APPDATA%\hbot`；Linux `$XDG_DATA_HOME/hbot` 否则 `~/.local/share/hbot`；macOS `~/Library/Application Support/hbot` |
+| 数据库 | `<data_dir>/hbot.db`（SQLite，WAL） |
+| 桌面偏好 | `<data_dir>/desktop.json`（`{"autostart":false,"closeToTray":true}`，无 BOM） |
+| 崩溃报告 | `<data_dir>/logs/crash-<UTC 时间戳>.log`，提示过后改名 `*.reported.log` |
+| 运行日志 | 桌面壳：stderr（由启动方重定向）；`serve`：stdout 一行 ready + stderr；systemd 部署时进 journald |
+
+### 17.4 运维入口
+
+| 场景 | 命令 |
+|---|---|
+| 开/关开机自启（不用开 GUI） | `hbot-desktop --set-autostart on\|off\|toggle` |
+| 看偏好与系统实际自启状态 | `hbot-desktop --print-settings`（JSON：`settings` / `systemAutostart` / `dataDir` / `execPath`） |
+| 后台服务（Linux） | `systemctl enable --now hbot` → `journalctl -u hbot -f`；卸载与 hardening 取舍见 `packaging/README.md` |
+| 崩溃取证 | 让用户把 `<data_dir>/logs/crash-*.log` 发过来；文件里不含环境变量 dump，且过了 `redact_text`（token/密钥/长 hex 会被抹成 `<redacted>`） |
+
+开机自启默认 **off**；首次启动不会自己打开。系统里已有自启项、偏好却是 off 时，壳会**采纳系统状态**（把偏好改成 on），而不是偷偷删用户的注册表项。
+
+### 17.5 可验证性
+
+`scripts/verify-single-instance.ps1` / `verify-tray-close.ps1` / `verify-autostart.ps1` 是真机脚本（起真进程、看真退出码与真日志、读真注册表；自启脚本会备份并还原真实注册表与 `desktop.json`）。**要求 `pwsh` 7**：Windows PowerShell 5.1 的 `Start-Process -RedirectStandardError` 会丢子进程 `.ExitCode`。
+
+已经验过的：单实例退出码 0 且未进 `setup`、关窗隐藏进程不退、第二次启动恢复窗口、`closeToTray=false` 优雅退出 0、注册表写入/幂等/删除、`desktop.json` 字段、崩溃文件落盘与下次启动检测。**没验过的**（Linux systemd/logrotate、macOS 全部、托盘菜单项被点击、崩溃提示出现在界面上、有真实 bot 时的退出）逐条列在 S6 §9 —— 不要把它们当成已验证。

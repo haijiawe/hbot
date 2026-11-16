@@ -90,7 +90,7 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | [`docs/04-implementation-plan.md`](docs/04-implementation-plan.md) | M0–M6、出口标准、parity、风险、切换/回滚 |
 | [`docs/05-quality-gates.md`](docs/05-quality-gates.md) | 一条命令、闸门、测试分层、性能预算、CI |
 | [`docs/06-ide.md`](docs/06-ide.md) | **IDE 设计**：布局、编辑器、Agent Diff、运行/调试、搜索、性能 |
-| [`docs/spikes/`](docs/spikes/) | 实测记录（内存、QuickJS、启动、打包） |
+| [`docs/spikes/`](docs/spikes/) | 实测记录（内存、QuickJS、启动、打包、QQ 官方握手、**QQ 真机端到端**、性能预算） |
 | [`AGENTS.md`](AGENTS.md) | Agent/新人入口：规则、地图、命令、坑 |
 | [`_research/`](_research/) | 旧项目四份只读审查原始证据（不是产品文档） |
 

@@ -2,7 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # 本仓库默认分支是 master（原文件只写 main → push 到 master 时 CI 从不触发，
+    # 这是本轮顺手修掉的一个触发器问题；两个名字都留着，将来改名不用再动）。
+    branches: [main, master]
   pull_request:
 
 concurrency:
@@ -12,6 +14,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # bundle job 靠 ~/.cargo/bin 里的 cargo-tauri 走缓存；tauri-cli 大版本变了就改这个 key
+  TAURI_CLI_SPEC: tauri-cli-v2-2.12
 
 jobs:
   rust:
@@ -29,6 +33,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
+      # Tauri 在 Linux 上**编译期**就要 webkit2gtk / gtk3 / soup3 的 dev 包（build script
+      # 走 pkg-config 探测），而 `cargo clippy --workspace` 与 `cargo test --workspace`
+      # 会把 `crates/hbot-desktop` 一起编译进来。缺这一步时 ubuntu job 会在
+      # `The system library 'webkit2gtk-4.1' required by crate 'webkit2gtk-sys' was not found`
+      # 处红——这是首次 push 就会踩到的，不是偶发。
+      # `libayatana-appindicator3-dev` 供托盘用（`tauri-plugin-*` 的 appindicator 后端）。
+      - name: linux system deps (webkit2gtk / gtk3 / soup3)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            patchelf
+      # crates/hbot-desktop 里的 tauri::generate_context!() 在**编译期**要求
+      # build.frontendDist（../../apps/web/dist）存在，否则 tauri-codegen
+      # (context.rs:187-190) 直接 panic!："The `frontendDist` configuration is set
+      # to `"../../apps/web/dist"` but this path doesn't exist"。
+      # 干净检出里 dist 不存在（.gitignore 忽略它），所以 clippy/test 原本会在这里红。
+      # 这个 job 只验编译与测试，不需要真前端资产：空目录即可（EmbeddedAssets
+      # 对空目录不报错，只是内嵌 0 个资源）。真资产由 web / bundle-* job 构建。
+      - name: frontendDist placeholder
+        shell: bash
+        run: mkdir -p apps/web/dist
       - name: fmt
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
@@ -73,3 +104,166 @@ jobs:
             echo "核心不得启动 node/npm"
             exit 1
           fi
+
+  # ── 打包：Windows 真出 NSIS 安装包并冒烟 ─────────────────────────────
+  # 本仓库的实测口径（docs/spikes/S5-packaging.md）：
+  #   安装包 9,582,147 B / 构建 259s（含 3m47s 编译）/ 装完 25.95 MiB /
+  #   静默安装 2.6s、卸载 1.3s、无残留 —— 这个 job 就是把它在干净 runner 上复跑一遍。
+  # 一台 windows runner 冷启动约 12–18 分钟（cargo install tauri-cli 命中缓存后省 3.5 分钟）。
+  bundle-windows:
+    name: bundle (windows, nsis)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bundle-windows
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: web dist
+        working-directory: apps/web
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: tauri config gate
+        shell: bash
+        run: node scripts/check-tauri-conf.mjs
+      - name: cache tauri-cli
+        id: tauri-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri*
+          key: ${{ runner.os }}-${{ env.TAURI_CLI_SPEC }}
+      - name: install tauri-cli (cache miss only)
+        shell: bash
+        run: |
+          # 缓存命中时 ~/.cargo/bin/cargo-tauri.exe 已在 PATH 上，直接跳过 3.5 分钟的 cargo install
+          if cargo tauri --version >/dev/null 2>&1; then
+            echo "tauri-cli 来自缓存: $(cargo tauri --version)"
+          else
+            cargo install tauri-cli --version "^2" --locked
+          fi
+      - name: bundle (nsis)
+        shell: bash
+        run: cargo tauri build --bundles nsis --ci
+      - name: NSIS smoke (silent install -> launch -> uninstall)
+        shell: pwsh
+        run: |
+          # -SkipWindowCheck：runner 上的桌面会话不一定能拿到 MainWindowHandle，
+          # 窗口与冷启动时间只在真机测（实测 0.9s 出窗口 / 50.9 MiB 工作集）。
+          # 这一档仍然跑完整链路：/S 安装 → 主 exe 起来且进程存活 → 杀掉 → /S 卸载 → 查残留。
+          $setup = Get-ChildItem target/release/bundle/nsis/*.exe | Select-Object -First 1
+          ./scripts/smoke-nsis-install.ps1 -Installer $setup.FullName -SkipWindowCheck
+      - name: 体积与哈希（写进 job summary）
+        shell: pwsh
+        run: |
+          Get-ChildItem target/release/bundle/nsis/*.exe | ForEach-Object {
+            "{0}  {1:N0} bytes  ({2:N2} MiB)  sha256={3}" -f `
+              $_.Name, $_.Length, ($_.Length / 1MB), (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+          } | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hbot-nsis-x64
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── 打包：macOS 出 dmg（未签名/未公证，见 S5 §9） ────────────────────
+  # 这台仓库没有 Mac 本机，dmg 只能在 runner 上验；所以这里是"第一次真正的 dmg 实测"。
+  bundle-macos:
+    name: bundle (macos, dmg)
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bundle-macos
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: web dist
+        working-directory: apps/web
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: tauri config gate
+        shell: bash
+        run: node scripts/check-tauri-conf.mjs
+      - name: cache tauri-cli
+        id: tauri-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri*
+          key: ${{ runner.os }}-${{ env.TAURI_CLI_SPEC }}
+      - name: install tauri-cli (cache miss only)
+        shell: bash
+        run: |
+          if cargo tauri --version >/dev/null 2>&1; then
+            echo "tauri-cli 来自缓存: $(cargo tauri --version)"
+          else
+            cargo install tauri-cli --version "^2" --locked
+          fi
+      - name: bundle (dmg)
+        shell: bash
+        # 没有 APPLE_CERTIFICATE / notarization 凭据：dmg 会产出来，但未签名未公证。
+        # hardenedRuntime=true 在没有签名身份时 bundler 跳过签名步骤。
+        run: cargo tauri build --bundles dmg --ci
+      - name: 体积与哈希（写进 job summary）
+        shell: bash
+        run: |
+          for f in target/release/bundle/dmg/*.dmg; do
+            printf '%s  %s bytes  (%s MiB)  sha256=%s\n' \
+              "$(basename "$f")" "$(stat -f%z "$f")" \
+              "$(echo "scale=2; $(stat -f%z "$f")/1048576" | bc)" \
+              "$(shasum -a 256 "$f" | cut -d' ' -f1)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hbot-dmg
+          path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Ubuntu：只验前端能构建、配置能被 Tauri 解析 ──────────────────────
+  # 刻意**不**跑 `cargo tauri build --bundles deb,appimage`：
+  #   deb/appimage 需要 libwebkit2gtk-4.1-dev / libgtk-3-dev / libayatana-appindicator3-dev
+  #   等系统依赖（apt 装 2–3 分钟），而这两条产物在 Linux 宿主上从未实测过 ——
+  #   与其在 CI 里塞一条没验证过的打包路径，不如先把它留在 S5 §9「未验证」清单里。
+  bundle-linux:
+    name: bundle (ubuntu, frontend + config only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - name: web dist
+        working-directory: apps/web
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: tauri config gate
+        shell: bash
+        run: node scripts/check-tauri-conf.mjs

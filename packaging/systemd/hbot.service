@@ -1,0 +1,47 @@
+[Unit]
+Description=HBot QQ 机器人运行时（headless serve）
+Documentation=file:///usr/share/doc/hbot/README.md
+# hbot serve 自己就要连 adapter/LLM/WebSocket，所以只在有网络时启动。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 注意：`hbot serve` 会往 stdout 打一行 ready JSON（含实际监听地址与 pid），
+# 那是启动成功的信号；Type=simple 不解析它，日志进 journald。
+ExecStart=/usr/local/bin/hbot serve --data-dir /var/lib/hbot
+# 让 Ctrl-C / systemctl stop 走 serve 已有的 SIGTERM 路径（停 bot → handle.shutdown()）。
+KillSignal=SIGTERM
+# 优雅退出最多等 30 秒（每个 bot 最多 5 秒停止宽限，见 hbot-rpc 的 STOP_GRACE）。
+TimeoutStopSec=30
+
+User=hbot
+Group=hbot
+StateDirectory=hbot
+StateDirectoryMode=0750
+
+# 崩溃/重启策略：正常退出（0）不重启，异常退出才重启，间隔 5 秒。
+Restart=on-failure
+RestartSec=5
+
+# ---- 加固（hardening）----
+# 这些选项都是"默认更严"，但**每一条都可能和"让 Agent 跑命令"冲突**，
+# 所以下面每一条都写了取舍。改之前先读 packaging/README.md 的「加固与命令隔离」。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+LockPersonality=true
+# 只允许运行期需要的能力（不额外 AddCapability，serve 不需要 root）。
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
