@@ -21,6 +21,7 @@ import { EditorArea } from '../features/editor/editor-area'
 import { ExplorerView } from '../features/explorer/explorer-view'
 import { openSearch } from '../features/search/open-search'
 import { SettingsView } from '../features/settings/settings-view'
+import { restoreSessionIfSameProject, startSessionPersistence } from '../lib/session-persistence'
 import { useRunStore } from '../stores/run-store'
 import { useDebugStore } from '../stores/debug-store'
 import { useWorkspaceStore } from '../stores/workspace-store'
@@ -80,6 +81,15 @@ export function App() {
   useEffect(() => {
     void loadTree()
   }, [loadTree])
+
+  // 未保存缓冲区 journal：挂载时接上录制（编辑 / 切标签 / 脏标记变化 → 节流写 IndexedDB）
+  // 与 beforeunload 冲刷，随后尝试恢复上次现场。写盘失败进状态栏（不静默吞）。
+  // 卸载时解绑并再尽力 flush 一次；StrictMode 的重复挂载由 journal 单例兜住。
+  useEffect(() => {
+    const stop = startSessionPersistence()
+    void restoreSessionIfSameProject()
+    return stop
+  }, [])
 
   // 启停 bot 会换掉调试目标；断点与暂停现场都由 debugStore 自己处理这次切换。
   useEffect(() => {

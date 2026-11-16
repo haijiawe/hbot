@@ -30,6 +30,15 @@ export interface SessionSnapshot {
   version: 1
   /** 写入时间（毫秒），恢复时只用于展示"上次恢复于…"。 */
   savedAt: number
+  /**
+   * 这份现场属于哪个项目（核心 `project_open` 规范化后的项目根绝对路径）。
+   *
+   * **跨项目污染的唯一判据**：恢复时只有 `snapshot.projectRoot === 当前 projectRoot`
+   * 才允许写回缓冲区。任一方为空 / 不相等一律不恢复 —— 否则会把 A 项目没保存的正文
+   * 写进 B 项目的同名文件（`apps/web/src/lib/session-persistence.ts` 的 `isSameProject`）。
+   * 旧存档没有这个字段（`null`），按"项目身份不明"处理，同样不恢复。
+   */
+  projectRoot: string | null
   activePath: string | null
   tabs: JournalTab[]
 }
@@ -161,7 +170,11 @@ export function sanitizeSnapshot(raw: unknown): SessionSnapshot | null {
   }
   const activePath = typeof raw.activePath === 'string' ? raw.activePath : null
   const savedAt = typeof raw.savedAt === 'number' ? raw.savedAt : 0
-  return { version: 1, savedAt, activePath, tabs }
+  // 旧存档（本字段引入之前写的）没有 projectRoot：读成 null = "项目身份不明"，
+  // 恢复侧因此拒绝写回，而不是猜一个项目往上套。
+  const projectRoot =
+    typeof raw.projectRoot === 'string' && raw.projectRoot.length > 0 ? raw.projectRoot : null
+  return { version: 1, savedAt, projectRoot, activePath, tabs }
 }
 
 /** 测试 / 无 IndexedDB 环境用的内存后端（不写盘，进程内有效）。 */

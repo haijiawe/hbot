@@ -59,6 +59,14 @@ export interface EditorTab {
 
 export interface WorkspaceState {
   rootName: string
+  /**
+   * 当前打开项目的根目录（核心 `project_open` 返回的规范化绝对路径）。
+   *
+   * 它是 journal 快照里的项目身份：恢复未保存缓冲区时只有"快照的项目根 === 这里的值"
+   * 才允许写回（见 `lib/session-persistence.ts` 的 `isSameProject`）。启动时还没有打开
+   * 项目，所以是 `null`——`null` 与任何快照都不匹配，宁可少恢复一次也不能串项目。
+   */
+  projectRoot: string | null
   files: FileNode[]
   treeLoaded: boolean
   /** 打开缓冲区的当前文本，按 path 索引。 */
@@ -85,6 +93,22 @@ export interface WorkspaceState {
   diagnostics: Diagnostic[]
 
   loadTree: () => Promise<void>
+  /** 记下当前项目根（`project_open` 成功后由 `lib/session-persistence.ts` 调用）。 */
+  setProjectRoot: (root: string | null) => void
+  /**
+   * 把一句"该让用户看到"的错误放进状态栏（`error` 字段由 `StatusBar` 渲染）。
+   *
+   * journal 这一层没有自己的 UI：写盘失败、跨项目丢弃恢复都必须走这里，不许只
+   * `console.error` 了事（用户看不到就等于静默丢字）。
+   */
+  reportError: (message: string) => void
+  /**
+   * 清空编辑器会话（标签、缓冲区、脏标记、光标、活动标签），不改文件树与布局。
+   *
+   * 切项目时必须调用：旧项目的标签若留在编辑器里，下一次 `captureSession()` 就会把它们
+   * 记到新项目的身份底下（跨项目污染）。清空是"丢弃旧现场"的唯一正确形状。
+   */
+  resetSession: () => void
   openFile: (path: string) => Promise<void>
   /** 打开文件并把光标跳到 `line`（搜索结果点击用）。 */
   openAt: (path: string, line: number) => Promise<void>
@@ -213,6 +237,7 @@ const initialPrefs = readPrefs()
 
 export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
   rootName: 'hbot-project',
+  projectRoot: null,
   files: [],
   treeLoaded: false,
   contents: {},
@@ -234,6 +259,18 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
     } catch (error) {
       set({ error: `读取文件树失败：${errorMessage(error)}`, treeLoaded: true })
     }
+  },
+
+  setProjectRoot(root) {
+    set({ projectRoot: root })
+  },
+
+  reportError(message) {
+    set({ error: message })
+  },
+
+  resetSession() {
+    set({ tabs: [], contents: {}, saved: {}, cursors: {}, activePath: null })
   },
 
   async openFile(path) {
@@ -499,3 +536,34 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
     set({ error: null })
   },
 }))
+
+/**
+ * 把当前的编辑器现场压成一份 journal 快照（`lib/session-persistence.ts` 的录制数据源）。
+ *
+ * 三条约定，与 `restoreSession` 严格对称：
+ * - `activePath` 就是活动标签（没有活动标签时是 `null`，恢复侧会退回第一个标签）；
+ * - `cursor` 取编辑器上报过的位置，没上报过按 1:1 存（恢复侧直接写回，不用猜）；
+ * - `content` **只有脏标签才有**：干净标签重启后按 path 从磁盘重读，存进 journal 只会
+ *   把昨天的旧文本塞回今天的文件（也会白白占配额）。
+ *
+ * 这里不做节流 / 防抖：调用的频率由订阅方决定，真正的 500ms 合并窗口在 journal 里
+ * （`createBufferJournal`），别在外面再压一层。
+ */
+export function captureSession(): SessionSnapshot {
+  const state = useWorkspaceStore.getState()
+  return {
+    version: 1,
+    savedAt: Date.now(),
+    projectRoot: state.projectRoot,
+    activePath: state.activePath,
+    tabs: state.tabs.map((tab) => {
+      const cursor = state.cursors[tab.path]
+      return {
+        path: tab.path,
+        dirty: tab.dirty,
+        cursor: cursor === undefined ? { line: 1, column: 1 } : { ...cursor },
+        content: tab.dirty ? (state.contents[tab.path] ?? null) : null,
+      }
+    }),
+  }
+}
