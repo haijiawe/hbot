@@ -270,8 +270,8 @@
 | 12 | 审批 always 只作用当前动作 | 旧按大类放行 | 完整键匹配 | 已有：`ApprovalKey` + `canonical_json` 单测 |
 | 13 | 队列满背压不丢 | 旧无队列 | 暂停读取，不丢 | 已有：`parity_13_backpressure_recovers.rs`（`session_capacity=2` 时 `HbotError::Timeout` = -32004、被拒那条已落库；另有反证「B 会话永久卡死时 A 释放必须唤醒」） |
 | 14 | 内存上限可中断 | 旧 `node:vm` 无内存限制 | 32MB 触发 | 已有：`memory_limit_is_enforced`、`infinite_loop_is_interrupted` |
-| 15 | 切项目/退出不丢未保存编辑 | 旧 `persistence.ts:106-110` 防抖 + 退出不 flush | 先 flush 再切/退，失败阻塞 | **缺口**（web 侧；需 vitest + journal 接口） |
-| 16 | Agent 写入不覆盖用户未保存修改 | 旧无 Diff 审查 | 基于缓冲区算 Diff + 冲突拒绝 | **缺口**（编辑提案已有，未保存冲突没有） |
+| 15 | 切项目/退出不丢未保存编辑 | 旧 `persistence.ts:106-110` 防抖 + 退出不 flush | 先 flush 再切/退，失败阻塞 | 已有：`apps/web/src/lib/session-journal.ts` + `session-persistence.ts`（IndexedDB journal、500ms 节流、`runProjectSwitch` 门闩、`beforeunload` 冲刷、跨项目快照丢弃），`session-journal.test.ts` 20 条（含变异验证：去掉 `await journal.flush()` 时 4 条转红）。**缺口**：`lib/ipc.ts` 仍无 `project_open` 命令，切项目 UI 入口未接；光标未上报（`setCursor` 零调用方） |
+| 16 | Agent 写入不覆盖用户未保存修改 | 旧无 Diff 审查 | 基于缓冲区算 Diff + 冲突拒绝 | 已有：`edit-apply.ts` 一律按**缓冲区**校验 hunk（改按磁盘校验时 2 条测试转红），脏但区域对得上照常应用、对不上拒绝并带 `HUMAN_HINT_DIRTY`；纯插入新增 `verifyInsertionAnchor` 防错行；`edit-apply.test.ts` 17 条 + `diff-card.test.tsx` 4 条。**缺口**：`accept-edit.ts` 往返窗口期守卫无单测 |
 
 ### 4.1 为什么单开一个 `crates/hbot-parity`
 
@@ -279,6 +279,27 @@
 - 所以建一个**只含测试**的 crate（`publish = false`、无 `src/lib.rs`，只有 `tests/`），允许它依赖全部实现 crate；它不属于依赖闸门的「实现层」，在 `xtask deps` 里单列一行。
 - 场景断言方式统一为「跑真实组件、只把**外部世界**替换成假货」：假平台适配器（可脚本化投递/断开）、假 LLM provider（回放 SSE）、真 SQLite（临时目录）、真 QuickJS。**禁止 mock 掉被验证的那一层**——否则就是在测试 mock。
 - 每条场景一个测试文件，命名 `parity_NN_<slug>.rs`，与上表编号对齐，报告里可直接说「#7 红」。
+
+### 4.2 出口标准状态（2026-11-16 实测）
+
+口径：**「有证据」= 有自动化测试或真机实测**；写了代码但没跑过的一律算没有证据。复合判据（如「搜索 10k <1s 且 1MB <150ms」）按**最弱的子项**计。
+
+> 下面的 `- [ ]` 复选框是**计划**，不是当前状态；当前状态看这张表。勾选代表该条已有证据，本轮不改复选框，避免"勾了但没证据"。
+
+| 阶段 | 有证据 | 无证据 | 无证据的是哪些 |
+|---|---:|---:|---|
+| M0 地基 | 4 | 1 | CI 三平台编译（仓库无 remote，一次没跑过） |
+| M1 Agent + IDE | 6 | 2 | 关闭再开恢复标签/布局、恢复未保存缓冲区与会话（journal 已接线并测过，但 `lib/ipc.ts` 没有 `project_open`，真机启动时 `projectRoot` 为空 → 不恢复） |
+| M2 真实平台 | 3 | 3 | 同会话 100 条真顺序、重复投递/无 id 重复率、拔网线 30s（都要真 NapCat） |
+| M3 IDE 深度 | 1 | 5 | 改一行 2s 生效、断点真机 E2E、10k 搜索 <1s（中位 731ms、最坏 1588ms）、模板到 mock <3min、20 标签 + 10k 日志 |
+| M4 隔离 + 红队 | 4 | 1 | `run_command` 三平台写不出去（Windows 有；Linux Landlock 只编译未运行；macOS 无） |
+| M5 打包 + 后台 | 0 | 4 | 三平台安装包（只有 Windows NSIS 实测）、systemd 真跑、托盘关窗继续跑（脚本未跑）、headless <800ms（878） |
+| M6 切换 | 0 | 4 | parity 全绿、影子 7 天、回滚演练、用户确认——整段未开始 |
+| **合计** | **18** | **20** | |
+
+**不许把这张表当成绩单**：20 条无证据里，有 6 条是"代码写了、没验证"（Linux Landlock、systemd、托盘脚本、升级路径、真机断点、`accept-edit.ts` 往返守卫），其余 14 条要么缺外部条件（真 NapCat、测试账号、macOS/Linux 机器、git remote），要么确实没做（M6 整段、模板到 mock、20 标签压力、headless 启动）。
+
+**唯一允许缩小这张表的方式**：补上测试或真机证据，并把证据路径写进上表相邻的说明。删条目、改判据、把"未验证"写成"完成"都不允许。
 
 ---
 
