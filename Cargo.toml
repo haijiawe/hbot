@@ -19,6 +19,7 @@ hbot-agent = { path = "crates/hbot-agent", version = "0.1.0" }
 hbot-workspace = { path = "crates/hbot-workspace", version = "0.1.0" }
 hbot-adapters = { path = "crates/hbot-adapters", version = "0.1.0" }
 hbot-command = { path = "crates/hbot-command", version = "0.1.0" }
+hbot-device = { path = "crates/hbot-device", version = "0.1.0" }
 hbot-rpc = { path = "crates/hbot-rpc", version = "0.1.0" }
 
 anyhow = "1"

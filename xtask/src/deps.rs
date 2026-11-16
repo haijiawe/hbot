@@ -25,6 +25,9 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // 项目文件访问、路径守卫、搜索。
     ("hbot-workspace", &["hbot-core"]),
     ("hbot-command", &["hbot-core"]), // 受控命令执行：agent → command → core，不许反向
+    // 设备后端（C6）：Win32 SendInput / 截图 / 前台窗口。只认 core 的
+    // DeviceBackend trait，不认识 bot/agent/rpc（否则闸就会被绕）。
+    ("hbot-device", &["hbot-core"]),
     // 平台协议适配（OneBot / Webhook），不含业务规则。
     ("hbot-adapters", &["hbot-core"]),
     // Bot 运行时：会话队列、outbox、supervisor。handler 由外部注入，
@@ -47,6 +50,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "hbot-bot",
             "hbot-agent",
             "hbot-command",
+            "hbot-device",
         ],
     ),
     // CLI：组合根之一。

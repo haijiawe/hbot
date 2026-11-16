@@ -1,0 +1,40 @@
+[package]
+name = "hbot-device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 内部实现 crate，不发布（只给 hbot-rpc 的组合根用）。
+publish = false
+
+[dependencies]
+# 只依赖 hbot-core（方向是 rpc → device → core），见 docs/09-device-capability.md §5。
+# 契约（`DeviceBackend` / `DeviceError`）全在 hbot-core::device，这里一个类型都不新造。
+hbot-core = { workspace = true }
+tracing = { workspace = true }
+
+# Win32 只在本平台进依赖图。版本与 crates/hbot-command 保持一致（0.59），
+# 免得同一个 workspace 里为同一个 crate 选两份 windows-sys。
+[target.'cfg(windows)'.dependencies]
+# 只开用到的 feature，逐个有理由：
+# - Foundation：HWND/HDC/HANDLE 与 GetLastError/CloseHandle；
+# - Graphics_Gdi：BitBlt + CreateDIBSection（截图的像素来源）；
+# - Storage_Xps：`PrintWindow` 在 windows-sys 里声明在这个模块（不是 GDI）；
+# - System_DataExchange / System_Ole：剪贴板 + `CF_UNICODETEXT`；
+# - System_Memory：`GlobalAlloc/GlobalLock/GlobalUnlock`（CF_UNICODETEXT 的内存）；
+# - System_StationsAndDesktops：`OpenInputDesktop`（锁屏/安全桌面检测）；
+# - System_Threading：`OpenProcess` + `QueryFullProcessImageNameW`（进程映像名）；
+# - UI_Input_KeyboardAndMouse：`SendInput` 与 `INPUT`/虚拟键码；
+# - UI_WindowsAndMessaging：`EnumWindows`/`GetForegroundWindow`/窗口样式。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

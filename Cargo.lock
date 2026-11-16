@@ -1988,6 +1988,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hbot-device"
+version = "0.1.0"
+dependencies = [
+ "hbot-core",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "hbot-parity"
 version = "0.1.0"
 dependencies = [
@@ -2038,6 +2047,7 @@ dependencies = [
  "hbot-code",
  "hbot-command",
  "hbot-core",
+ "hbot-device",
  "hbot-store",
  "hbot-workspace",
  "serde",
