@@ -53,5 +53,5 @@ pub use dispatch::EventFailure;
 pub use error::{CodeError, ErrorLocation, SourcePos};
 pub use hbot_core::debug::{Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, PausedAt};
 pub use limits::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MEMORY_BYTES, Limits};
-pub use manifest::{Manifest, ManifestLimits, PlatformKind, PlatformSpec, ScaffoldReport};
+pub use manifest::{Manifest, ManifestLimits, PlatformSpec, ScaffoldReport};
 pub use runtime::{EventOutcome, HostOutput, MemoryReport, Sandbox};

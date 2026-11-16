@@ -72,33 +72,37 @@ pub struct Manifest {
     pub limits: ManifestLimits,
 }
 
+/// The platform identifier that needs a forward WebSocket address (`ws`).
+///
+/// The manifest does **not** enumerate platforms: `kind` is an open string,
+/// because "which platforms exist" is product knowledge, not core knowledge.
+/// The one exception is this spelling, which the `ws` requirement is keyed on.
+pub const ONE_BOT_KIND: &str = "onebot11";
+
 /// The platform block of the manifest.
+///
+/// `kind` is deliberately a **string, not an enum**: adding a platform must not
+/// require editing `hbot-code` (that would invert the dependency direction —
+/// the sandbox core would have to know every platform product ever ships).
+/// A platform identifier is metadata here, carried through untouched; which
+/// values this build recognises is decided in `hbot check`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformSpec {
-    /// Platform family. Unknown values are a deserialization error, which is how
-    /// "M1 支持 onebot11，其它平台报不支持" is enforced without a second check.
-    pub kind: PlatformKind,
-    /// WebSocket endpoint of the platform, e.g. `ws://127.0.0.1:3001`.
-    pub ws: String,
-}
-
-/// Platform families the M1 runtime can talk to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PlatformKind {
-    /// OneBot 11 over a forward WebSocket.
-    OneBot11,
-}
-
-impl PlatformKind {
-    /// The wire spelling, as used in `hbot.json` and in logs.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OneBot11 => "onebot11",
-        }
-    }
+    /// Platform identifier, spelled the same as `bots.json`'s `platform`
+    /// field: `"onebot11"` / `"qq_official"`.
+    ///
+    /// Not validated here — an unknown value parses fine, and `hbot check`
+    /// reports it as a warning.
+    pub kind: String,
+    /// OneBot 11's forward WebSocket endpoint, e.g. `ws://127.0.0.1:3001`.
+    ///
+    /// **Only `onebot11` needs it.** QQ official has no address to put here:
+    /// its gateway URL is discovered through the `/gateway` API. A `ws` on any
+    /// other platform is tolerated (a hand-written draft must not be refused)
+    /// and `hbot check` says it will be ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws: Option<String>,
 }
 
 /// Capability grants. An absent field means "not granted".
@@ -197,17 +201,29 @@ impl Manifest {
             return Err(invalid(&manifest_path, "`name` 不能为空"));
         }
 
-        if self.platform.ws.trim().is_empty() {
-            return Err(invalid(&manifest_path, "`platform.ws` 不能为空"));
+        // The platform block: `kind` is open metadata (any spelling parses),
+        // but the `ws` contract is keyed on it. Only `onebot11` connects over a
+        // forward WebSocket; every other platform discovers its endpoint (QQ
+        // official does it through `/gateway`), so a `ws` there is a draft
+        // leftover to be ignored, not an error.
+        if self.platform.kind.trim().is_empty() {
+            return Err(invalid(&manifest_path, "`platform.kind` 不能为空"));
         }
-        if !self.platform.ws.starts_with("ws://") && !self.platform.ws.starts_with("wss://") {
-            return Err(invalid(
-                &manifest_path,
-                format!(
-                    "`platform.ws` 必须是 ws:// 或 wss:// 开头，收到 '{}'",
-                    self.platform.ws
-                ),
-            ));
+        if self.platform.kind == ONE_BOT_KIND {
+            let ws = self.platform.ws.as_deref().unwrap_or_default();
+            if ws.trim().is_empty() {
+                return Err(invalid(
+                    &manifest_path,
+                    "`platform.kind` 为 \"onebot11\" 时 `platform.ws` 必填且不能为空\
+                     （OneBot 11 通过正向 WS 连接）",
+                ));
+            }
+            if !ws.starts_with("ws://") && !ws.starts_with("wss://") {
+                return Err(invalid(
+                    &manifest_path,
+                    format!("`platform.ws` 必须是 ws:// 或 wss:// 开头，收到 '{ws}'"),
+                ));
+            }
         }
 
         self.limits.validate(&manifest_path)?;
@@ -358,6 +374,12 @@ pub fn load(dir: &Path) -> Result<Manifest, CodeError> {
 /// worse than a refusal, and "merge into an existing project" is a separate
 /// feature (`hbot new --force` would be an explicit future CLI flag).
 ///
+/// The generated manifest is an **OneBot 11** project (`platform.kind` =
+/// `"onebot11"`, placeholder `ws`) because that is the reasonable default for a
+/// new bot. To make a QQ official project instead, change `platform.kind` to
+/// `"qq_official"` and delete `ws` — the connection settings (`appId` /
+/// `clientSecret`) live in `bots.json`, not in this file.
+///
 /// # Errors
 ///
 /// [`CodeError::Scaffold`] when a target exists or writing fails.
@@ -456,8 +478,8 @@ fn manifest_skeleton(name: &str) -> Result<String, CodeError> {
         name: name.to_owned(),
         entry: default_entry(),
         platform: PlatformSpec {
-            kind: PlatformKind::OneBot11,
-            ws: "ws://127.0.0.1:3001".to_owned(),
+            kind: ONE_BOT_KIND.to_owned(),
+            ws: Some("ws://127.0.0.1:3001".to_owned()),
         },
         permissions: Permissions::default(),
         limits: ManifestLimits::default(),
@@ -560,7 +582,12 @@ mod tests {
         let manifest = load(&scratch.0).expect("应能加载");
         assert_eq!(manifest.name, "demo");
         assert_eq!(manifest.entry_name(), "src/main.ts");
-        assert_eq!(manifest.platform.kind, PlatformKind::OneBot11);
+        assert_eq!(manifest.platform.kind, ONE_BOT_KIND);
+        assert_eq!(
+            manifest.platform.ws.as_deref(),
+            Some("ws://127.0.0.1:3001"),
+            "onebot11 的 ws 要读进来"
+        );
         assert!(manifest.permissions.http.is_empty(), "默认全禁");
         assert_eq!(manifest.limits, ManifestLimits::default());
 
@@ -705,19 +732,90 @@ mod tests {
         );
     }
 
+    /// `qq_official` has no forward WS address: its gateway is discovered
+    /// through the `/gateway` API. A manifest that only says the platform must
+    /// therefore parse — this is the whole point of opening `kind` up.
     #[test]
-    fn unsupported_platforms_are_rejected() {
-        let scratch = Scratch::new("platform");
+    fn qq_official_parses_without_a_websocket_url() {
+        let scratch = Scratch::new("qq-official");
         scratch.write(ENTRY_MODULE, "export default {};\n");
         scratch.write(
             MANIFEST_FILE,
-            r#"{"name":"d","platform":{"kind":"telegram","ws":"ws://h"}}"#,
-        );
-        assert_eq!(
-            load(&scratch.0).expect_err("M1 只支持 onebot11").code(),
-            "HBOT_MANIFEST_INVALID"
+            r#"{"name":"d","platform":{"kind":"qq_official"}}"#,
         );
 
+        let manifest = load(&scratch.0).expect("QQ 官方没有 ws 也必须能解析");
+        assert_eq!(manifest.platform.kind, "qq_official");
+        assert_eq!(manifest.platform.ws, None, "没有 ws 就是 None");
+
+        // A hand-written draft may still carry a `ws`; it is ignored downstream,
+        // not a parse/validate error. `hbot check` is what warns about it.
+        scratch.write(
+            MANIFEST_FILE,
+            r#"{"name":"d","platform":{"kind":"qq_official","ws":"ws://h"}}"#,
+        );
+        let manifest = load(&scratch.0).expect("其它平台带 ws 不报错");
+        assert_eq!(manifest.platform.ws.as_deref(), Some("ws://h"));
+    }
+
+    /// The `ws` requirement is keyed on `onebot11` only, and it is a *validation*
+    /// error (not a deserialization one), so the message has to name `ws`.
+    #[test]
+    fn onebot11_requires_a_websocket_url() {
+        let scratch = Scratch::new("onebot11-no-ws");
+        scratch.write(ENTRY_MODULE, "export default {};\n");
+
+        for manifest_text in [
+            r#"{"name":"d","platform":{"kind":"onebot11"}}"#,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":null}}"#,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":""}}"#,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":"   "}}"#,
+        ] {
+            scratch.write(MANIFEST_FILE, manifest_text);
+            let error = load(&scratch.0).expect_err("onebot11 缺 ws 必须拒绝");
+            assert_eq!(error.code(), "HBOT_MANIFEST_INVALID", "{manifest_text}");
+            assert!(
+                error.to_string().contains("ws"),
+                "报错要点名字段 ws：{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn onebot11_with_a_websocket_url_loads() {
+        let scratch = Scratch::new("onebot11-with-ws");
+        scratch.write(ENTRY_MODULE, "export default {};\n");
+
+        for ws in ["ws://x", "wss://x"] {
+            scratch.write(
+                MANIFEST_FILE,
+                &format!(r#"{{"name":"d","platform":{{"kind":"onebot11","ws":"{ws}"}}}}"#),
+            );
+            let manifest = load(&scratch.0).expect("onebot11 + ws 应通过");
+            assert_eq!(manifest.platform.kind, ONE_BOT_KIND);
+            assert_eq!(manifest.platform.ws.as_deref(), Some(ws));
+        }
+    }
+
+    /// `kind` carries no closed value set: it is metadata for `hbot check`, not
+    /// something the sandbox core validates. Unknown fields are still refused —
+    /// opening the *value* must not loosen the *shape*.
+    #[test]
+    fn unknown_platform_kinds_are_metadata_not_errors() {
+        let scratch = Scratch::new("platform");
+        scratch.write(ENTRY_MODULE, "export default {};\n");
+
+        // `telegram` is not a platform this build knows, but core must parse it.
+        for manifest_text in [
+            r#"{"name":"d","platform":{"kind":"telegram","ws":"ws://h"}}"#,
+            r#"{"name":"d","platform":{"kind":"telegram"}}"#,
+        ] {
+            scratch.write(MANIFEST_FILE, manifest_text);
+            let manifest = load(&scratch.0).expect("取值开放，不认识也应解析");
+            assert_eq!(manifest.platform.kind, "telegram");
+        }
+
+        // The ws scheme is only checked where `ws` means something.
         scratch.write(
             MANIFEST_FILE,
             r#"{"name":"d","platform":{"kind":"onebot11","ws":"http://h"}}"#,
@@ -726,6 +824,26 @@ mod tests {
             load(&scratch.0).expect_err("ws 必须是 websocket").code(),
             "HBOT_MANIFEST_INVALID"
         );
+
+        // An empty platform identifier is still nonsense, not a platform.
+        for manifest_text in [
+            r#"{"name":"d","platform":{"kind":""}}"#,
+            r#"{"name":"d","platform":{"kind":"   "}}"#,
+        ] {
+            scratch.write(MANIFEST_FILE, manifest_text);
+            let error = load(&scratch.0).expect_err("空 kind 要拒绝");
+            assert_eq!(error.code(), "HBOT_MANIFEST_INVALID");
+            assert!(error.to_string().contains("kind"), "{error}");
+        }
+
+        // Unknown *fields* inside `platform` stay refused (deny_unknown_fields).
+        scratch.write(
+            MANIFEST_FILE,
+            r#"{"name":"d","platform":{"kind":"qq_official","extra":1}}"#,
+        );
+        let error = load(&scratch.0).expect_err("未知字段仍要报错");
+        assert_eq!(error.code(), "HBOT_MANIFEST_INVALID");
+        assert!(error.to_string().contains("unknown field"), "{error}");
 
         scratch.write(
             MANIFEST_FILE,
@@ -759,6 +877,17 @@ mod tests {
         let manifest = load(&scratch.0).expect("骨架清单应合法");
         assert_eq!(manifest.name, "demo");
         assert_eq!(manifest.entry_name(), "src/main.ts");
+        // Scaffold still starts a project on OneBot 11, with a placeholder ws.
+        assert_eq!(manifest.platform.kind, ONE_BOT_KIND);
+        assert!(
+            manifest
+                .platform
+                .ws
+                .as_deref()
+                .is_some_and(|ws| ws.starts_with("ws://")),
+            "骨架要带占位 ws，收到 {:?}",
+            manifest.platform.ws
+        );
 
         // ...the generated d.ts must be the current one...
         assert!(dts::is_host_dts_current(&scratch.0).expect("可读"));

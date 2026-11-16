@@ -50,13 +50,22 @@ declare module 'hbot' {
     /** 会话 id；同一会话串行执行。 */
     conversationId: string;
     /** 消息 id，幂等键。注意语义是 **at-least-once**：进程崩溃后启动补偿可能把同一条再执行一次，
-     *  所以有副作用的操作要用它自己判重，不要假设只执行一次。 */
+     *  所以有副作用的操作要用它自己判重，不要假设只执行一次。
+     *  **这不是平台消息 id**（平台消息 id 见 `externalId`）：它是本仓库 `inbound` 表的行主键，
+     *  同一事件重放时取值不变，但拿去问平台"这条是哪条"是不对的。 */
     messageId: string;
-    /** 平台侧消息 id。 */
+    /** 平台侧消息 id。
+     *  **平台没给 `message_id` 时，这里是本地生成的兜底幂等键**（形如
+     *  `"{user_id}-{time}-{fnv1a64:016x}"`，见 `hbot_adapters::platforms::onebot::
+     *  fallback_external_id`），**不是平台消息 id**：别拿它去做平台侧的引用回复
+     *  （OneBot 的 `reply.data.id` 必须是真 `message_id`，否则整条消息发不出去）。
+     *  要判断是不是兜底键，用 `hbot_adapters::platforms::onebot::is_synthetic_external_id`
+     *  （框架内部已经用它决定发不发引用段，业务代码一般不需要再判一次）。 */
     externalId: string;
     /** 发送者平台 id。 */
     senderId: string;
-    /** 已归一化的纯文本，@、图片、表情都换成了占位符。 */
+    /** 已归一化的纯文本，@、图片、表情都换成了占位符。
+     *  没有文本的入站（例如纯图片）是空串 `''`，不会是 `null` 或 `undefined`。 */
     text: string;
     /** 会话类型。 */
     kind: 'private' | 'group' | 'channel';
