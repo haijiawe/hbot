@@ -20,6 +20,7 @@
 use std::fmt;
 use std::path::Path;
 
+use hbot_agent::provider::LlmProvider;
 use hbot_core::{HbotError, SandboxMode};
 
 /// 基础 URL 的环境变量名。
@@ -30,6 +31,8 @@ pub const ENV_API_KEY: &str = "HBOT_LLM_API_KEY";
 pub const ENV_MODEL: &str = "HBOT_LLM_MODEL";
 /// 最大步数的环境变量名。
 pub const ENV_MAX_STEPS: &str = "HBOT_LLM_MAX_STEPS";
+/// 上游协议的环境变量名（`openai` / `anthropic`，缺省 `openai`）。
+pub const ENV_PROVIDER: &str = "HBOT_LLM_PROVIDER";
 
 /// `<data_dir>` 下的配置文件名。
 pub const CONFIG_FILE: &str = "agent.json";
@@ -44,6 +47,7 @@ pub struct ProviderConfig {
     api_key: String,
     model: String,
     max_steps: u32,
+    provider: LlmProvider,
 }
 
 impl ProviderConfig {
@@ -93,12 +97,29 @@ impl ProviderConfig {
             return Err(HbotError::invalid("maxSteps 必须大于 0"));
         }
 
+        // provider 缺省 openai（向后兼容旧配置）；非法值必须报错，不许静默退回。
+        let provider = match pick(get_env, ENV_PROVIDER, file.provider) {
+            Some(raw) => LlmProvider::from_name(&raw).map_err(|raw| {
+                HbotError::invalid(format!(
+                    "provider 只能是 {}，当前是 `{raw}`",
+                    LlmProvider::allowed_names()
+                ))
+            })?,
+            None => LlmProvider::default(),
+        };
+
         Ok(Self {
             base_url,
             api_key,
             model: model.trim().to_string(),
             max_steps,
+            provider,
         })
+    }
+
+    /// 上游协议实现（[`LlmProvider::OpenAi`] / [`LlmProvider::Anthropic`]）。
+    pub fn provider(&self) -> LlmProvider {
+        self.provider
     }
 
     /// 基础 URL（已去掉尾部 `/`，不含 `/chat/completions`）。
@@ -135,19 +156,33 @@ impl fmt::Debug for ProviderConfig {
             .field("api_key", &key)
             .field("model", &self.model)
             .field("max_steps", &self.max_steps)
+            .field("provider", &self.provider.as_str())
             .finish()
     }
 }
 
 impl ProviderConfig {
-    /// 仅供测试与装配方便：不改环境变量构造一份配置。
+    /// 仅供测试与装配方便：不改环境变量构造一份配置（provider 缺省 `openai`）。
     #[cfg(test)]
     pub fn for_test(base_url: &str, api_key: &str, model: &str, max_steps: u32) -> Self {
+        Self::for_test_with_provider(base_url, api_key, model, max_steps, LlmProvider::default())
+    }
+
+    /// 仅供测试与装配方便：显式指定 provider 的版本。
+    #[cfg(test)]
+    pub fn for_test_with_provider(
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        max_steps: u32,
+        provider: LlmProvider,
+    ) -> Self {
         Self {
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             max_steps,
+            provider,
         }
     }
 }
@@ -256,6 +291,25 @@ fn pick(
     }
 }
 
+/// `agent.json` 的已知字段（camelCase，与 [`FileConfig`] 的 serde 名一致）。
+///
+/// 只用来给"你是不是想写 XXX"提建议，**不参与解析**。`agent.json` 是平的（没有嵌套
+/// 对象），所以任何层级的未知键都用这一张表。
+const AGENT_FILE_FIELDS: &[&str] = &[
+    "baseUrl",
+    "apiKey",
+    "model",
+    "maxSteps",
+    "sandbox",
+    "allowedPrograms",
+    "provider",
+];
+
+/// 建议用的字段表：`agent.json` 只有一层，忽略路径。
+fn agent_known_fields(_rendered_path: &str) -> &'static [&'static str] {
+    AGENT_FILE_FIELDS
+}
+
 /// `agent.json` 的字段（全部可选：只配一半也算配置，缺的那半再报缺失）。
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -266,6 +320,8 @@ struct FileConfig {
     max_steps: Option<u32>,
     sandbox: Option<String>,
     allowed_programs: Option<Vec<String>>,
+    /// 上游协议：`openai` / `anthropic`；缺省 `openai`。
+    provider: Option<String>,
 }
 
 /// 读 `<data_dir>/agent.json`；文件不存在等同于"没配"。
@@ -286,7 +342,9 @@ fn read_file_config(data_dir: &Path) -> Result<FileConfig, HbotError> {
     if text.trim().is_empty() {
         return Ok(FileConfig::default());
     }
-    serde_json::from_str(&text)
+    // 未知字段只告警、不失败：手写的 agent.json 里 `_说明` 这类备注键必须能过，
+    // `baseURL` 这类拼写错误则要看得见。机制与判据见 `runtime::config::deserialize_with_warnings`。
+    crate::app::runtime::config::deserialize_with_warnings(&path, &text, agent_known_fields)
         .map_err(|error| HbotError::invalid(format!("`{}` 不是合法 JSON：{error}", path.display())))
 }
 
@@ -409,6 +467,88 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("sk-secret-abcdef"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn provider_defaults_to_openai_when_unset() {
+        // 向后兼容：老配置没有任何 provider 字段，必须还是走 OpenAI 那条。
+        let dir = TempDir::new("agent-config-provider-default");
+        let env = env_of(&[
+            (ENV_BASE_URL, "https://api.example.com/v1"),
+            (ENV_MODEL, "m"),
+        ]);
+        let config = ProviderConfig::resolve_with(dir.path(), &env).expect("默认配置");
+        assert_eq!(config.provider(), LlmProvider::OpenAi);
+    }
+
+    #[test]
+    fn provider_reads_environment_and_file() {
+        let dir = TempDir::new("agent-config-provider-env");
+        let env = env_of(&[
+            (ENV_BASE_URL, "https://z1rry.cyou"),
+            (ENV_MODEL, "deepseek-v4.1-flash-1017"),
+            (ENV_PROVIDER, "anthropic"),
+        ]);
+        let config = ProviderConfig::resolve_with(dir.path(), &env).expect("env 指定 provider");
+        assert_eq!(config.provider(), LlmProvider::Anthropic);
+
+        // 文件里的 provider 在环境变量没给时生效。
+        let dir = TempDir::new("agent-config-provider-file");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"{"baseUrl":"https://z1rry.cyou","model":"m","provider":"anthropic"}"#,
+        )
+        .expect("写配置");
+        let config = ProviderConfig::resolve_with(dir.path(), &empty_env()).expect("文件 provider");
+        assert_eq!(config.provider(), LlmProvider::Anthropic);
+    }
+
+    #[test]
+    fn provider_environment_overrides_file() {
+        let dir = TempDir::new("agent-config-provider-merge");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"{"baseUrl":"https://z1rry.cyou","model":"m","provider":"anthropic"}"#,
+        )
+        .expect("写配置");
+        let env = env_of(&[(ENV_PROVIDER, "openai")]);
+        let config = ProviderConfig::resolve_with(dir.path(), &env).expect("env 覆盖文件");
+        assert_eq!(config.provider(), LlmProvider::OpenAi);
+    }
+
+    #[test]
+    fn invalid_provider_is_rejected_with_allowed_values() {
+        let dir = TempDir::new("agent-config-provider-bad");
+        let env = env_of(&[
+            (ENV_BASE_URL, "https://api.example.com"),
+            (ENV_MODEL, "m"),
+            (ENV_PROVIDER, "gemini"),
+        ]);
+        let error = ProviderConfig::resolve_with(dir.path(), &env).expect_err("非法 provider");
+        assert_eq!(error.code(), -32002, "非法取值必须是 -32002");
+        let message = error.to_string();
+        assert!(
+            message.contains("provider"),
+            "错误要说清是 provider：{message}"
+        );
+        assert!(message.contains("gemini"), "要回显收到的值：{message}");
+        // 必须列出允许值，否则用户不知道该填什么。
+        assert!(message.contains("openai"), "要列出 openai：{message}");
+        assert!(message.contains("anthropic"), "要列出 anthropic：{message}");
+    }
+
+    #[test]
+    fn debug_includes_the_provider_but_not_the_key() {
+        let config = ProviderConfig::for_test_with_provider(
+            "https://z1rry.cyou",
+            "sk-secret-abcdef",
+            "m",
+            5,
+            LlmProvider::Anthropic,
+        );
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("anthropic"), "{rendered}");
+        assert!(!rendered.contains("sk-secret-abcdef"));
     }
 
     #[test]

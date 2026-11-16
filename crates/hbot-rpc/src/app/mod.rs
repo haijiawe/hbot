@@ -17,7 +17,7 @@
 //! | `events` | 所有要推事件的能力 | 进程级（广播，无订阅者时丢弃） |
 //! | `searches` | `search_start` / `search_cancel` | 逐次搜索（登记表里只有正在跑的） |
 //! | `agent` | `agent_send` / `agent_cancel` / `agent_approve` | 进程级（会话表在它内部） |
-//! | `adapter_factory` | `bot_start` | 进程级；测试换成假适配器，生产是 OneBot |
+//! | `adapter_factory` | `bot_start` | 进程级；测试换成假适配器，生产是 `PlatformRouter`（按平台选 OneBot / QQ 官方） |
 //! | `clock` / `ids` | 需要"现在"和关联键的命令 | 进程级，测试可注入固定值 |
 //!
 //! ## 不持有的东西
@@ -49,7 +49,7 @@ pub mod test_support;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use hbot_core::{Clock, HbotError, IdGenerator};
+use hbot_core::{BotId, Clock, HbotError, IdGenerator};
 use hbot_store::Store;
 use hbot_workspace::Workspace;
 
@@ -136,7 +136,8 @@ impl AppState {
             searches: search::SearchRegistry::new(),
             bots: bots::BotRegistry::new(),
             agent,
-            adapter_factory: Arc::new(runtime::onebot::OneBotAdapterFactory),
+            // 生产工厂是路由：按 bots.platform 选 OneBot 或 QQ 官方（见 runtime::PlatformRouter）。
+            adapter_factory: Arc::new(runtime::PlatformRouter),
             clock,
             ids,
         })
@@ -144,7 +145,8 @@ impl AppState {
 
     /// 换掉适配器工厂。
     ///
-    /// 生产装配不调用它（缺省就是真 OneBot）；测试用它注入假适配器，从而在不连真 socket
+    /// 生产装配不调用它（缺省就是 [`runtime::PlatformRouter`]，按平台选 OneBot / QQ 官方）；
+    /// 测试用它注入假适配器，从而在不连真 socket
     /// 的前提下跑通 store → 队列 → 沙箱 → outbox 的**同一条**链路。
     pub fn with_adapter_factory(mut self, factory: Arc<dyn runtime::AdapterFactory>) -> Self {
         self.adapter_factory = factory;
@@ -173,6 +175,36 @@ impl AppState {
     /// 存储层。
     pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// 往 `logs` 表追加一行。
+    ///
+    /// ## 为什么要有这个入口
+    ///
+    /// 桌面壳（`hbot-desktop`）要在下次启动时把「上次异常退出」写进日志表，
+    /// 否则那句话只在文件里躺着、用户永远看不到。它本来可以直接调
+    /// `store.append_log(hbot_store::NewLog { … })` —— 但那样它就得依赖
+    /// `hbot-store` 来构造 `NewLog`，而依赖规则是**壳只许依赖 `hbot-core` + `hbot-rpc`**
+    /// （见 `docs/03-directory.md` 的依赖硬规则与 `xtask deps` 的闸门）。
+    ///
+    /// 把「构造 `NewLog`」这件小事留在本层，壳就只需要说「给这个 bot 记一条 error」。
+    /// 时间是这里取的，调用方不用自己编。
+    ///
+    /// **这是阻塞调用**（`Store::append_log` 走单写线程并等回执），
+    /// 在 async 上下文里必须包 `spawn_blocking`。
+    pub fn append_log(
+        &self,
+        bot_id: BotId,
+        level: &str,
+        line: impl Into<String>,
+    ) -> Result<(), HbotError> {
+        let entry = hbot_store::NewLog {
+            bot_id,
+            level: level.to_string(),
+            line: line.into(),
+            at: self.clock.now().unix_millis(),
+        };
+        self.store.append_log(entry).map_err(store_failed)
     }
 
     /// 事件出口（`EventSink<Event>` 的实现，见 [`EventBus`]）。

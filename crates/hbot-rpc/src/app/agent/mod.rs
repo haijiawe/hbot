@@ -25,12 +25,15 @@
 pub mod approvals;
 pub mod config;
 pub mod edits;
+pub mod log;
 pub mod session;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use hbot_agent::provider::{AnthropicProvider, LlmProvider};
 use hbot_agent::{
     ApprovalStore, AuditEvent, AuditSink, ChatMessage, EditProposer, MAX_TOOL_OUTPUT_BYTES,
     OpenAiProvider, PromptContext, ProposedEdit, Provider, ReqwestTransport, SandboxMode,
@@ -46,6 +49,7 @@ use crate::dto::{DiffHunk, EditFile, Event};
 pub use approvals::ApprovalInbox;
 pub use config::{CONFIG_FILE, MISSING_CONFIG_MESSAGE, ProviderConfig, SandboxConfig};
 pub use edits::{EditRegistry, PendingEdit};
+pub use log::{NullRunLogSink, RunLogSink, StoreRunLogSink};
 pub use session::{SessionRegistry, SessionState};
 
 /// 项目规则文件（拼进 system prompt 的项目内约定）。
@@ -61,14 +65,24 @@ const MAX_TOOL_RESULT_CHARS: usize = 2000;
 pub type ProviderFactory =
     dyn Fn(&ProviderConfig) -> Result<Box<dyn Provider>, HbotError> + Send + Sync;
 
-/// 默认工厂：真实 `reqwest` 传输 + OpenAI 兼容 SSE 客户端。
+/// 默认工厂：真实 `reqwest` 传输 + 按 [`ProviderConfig::provider`] 选的 SSE 客户端。
+///
+/// **不跨 provider 重试**：选了哪条就走哪条，失败如实上报（`AGENTS.md` §0.8 —— 悄悄
+/// 换一个上游会让"已发送"变成谎话，也让排障时看到的是另一个端点的错误）。
 pub fn default_provider_factory(config: &ProviderConfig) -> Result<Box<dyn Provider>, HbotError> {
     let transport = ReqwestTransport::new().map_err(HbotError::from)?;
-    Ok(Box::new(OpenAiProvider::new(
-        config.base_url(),
-        config.api_key(),
-        transport,
-    )))
+    match config.provider() {
+        LlmProvider::OpenAi => Ok(Box::new(OpenAiProvider::new(
+            config.base_url(),
+            config.api_key(),
+            transport,
+        ))),
+        LlmProvider::Anthropic => Ok(Box::new(AnthropicProvider::new(
+            config.base_url(),
+            config.api_key(),
+            transport,
+        ))),
+    }
 }
 
 /// 配置来源（测试可固定为某个配置或缺配置）。
@@ -98,6 +112,9 @@ pub struct AgentManager {
     approval_store: Arc<ApprovalStore>,
     config_source: ConfigSource,
     provider_factory: Box<ProviderFactory>,
+    /// Agent 运行日志的落点（`logs` 表）。默认不写：Agent 会话没有 bot 归属，
+    /// 装配方定下归属后用 [`Self::with_run_log_sink`] 注入。
+    run_log: Arc<dyn RunLogSink>,
 }
 
 impl AgentManager {
@@ -119,7 +136,19 @@ impl AgentManager {
             approval_store: Arc::new(ApprovalStore::new()),
             config_source: ConfigSource::Resolve,
             provider_factory: Box::new(default_provider_factory),
+            run_log: Arc::new(NullRunLogSink),
         }
+    }
+
+    /// 换一个 `RunLog` 落点（见 [`log`] 模块文档：需要 bot 归属才能写 `logs` 表）。
+    pub fn with_run_log_sink(mut self, sink: Arc<dyn RunLogSink>) -> Self {
+        self.run_log = sink;
+        self
+    }
+
+    /// 当前 `RunLog` 落点（测试与诊断用）。
+    pub fn run_log_sink(&self) -> &Arc<dyn RunLogSink> {
+        &self.run_log
     }
 
     /// 测试装配：固定配置 + 假 provider + 记录审批的通道。
@@ -315,6 +344,7 @@ impl AgentManager {
             Arc::clone(&self.events),
             session_id,
             Arc::clone(&self.clock),
+            Arc::clone(&self.run_log),
         );
         let turn_config = TurnConfig::new(config.model()).with_max_steps(config.max_steps());
         let session_id_for_task = session_id;
@@ -433,8 +463,11 @@ async fn run_turn_task(
             };
             if cancelled {
                 tracing::info!(session_id = %session_id, "agent turn cancelled");
+                sink.log_cancel();
             } else {
                 tracing::warn!(session_id = %session_id, error = %error, "agent turn failed");
+                // 失败必须留痕：`logs_tail` 里一行，脱敏见 `log::turn_failure_line`。
+                sink.log_failure(&error.to_string());
             }
             // 失败/取消也要让 UI 看见一句话，不能静默结束。
             sink.emit_delta(&note);
@@ -500,6 +533,11 @@ pub struct EventTurnSink {
     clock: Arc<dyn Clock>,
     /// 本轮已执行的工具调用（`on_tool_call` 记，`on_tool_result` 用）。
     calls: HashMap<String, ToolCallRequest>,
+    /// 每次工具调用**开始**的时刻（`on_tool_result` 用它算耗时）。用 `Instant` 而不是
+    /// `clock.now()`：耗时是进程内的单调读数，不该被墙上时钟跳变污染。
+    started: HashMap<String, Instant>,
+    /// `RunLog` 落点（一步一行，见 [`log`]）。
+    run_log: Arc<dyn RunLogSink>,
     /// 本轮流式文本（失败时写回历史用）。
     text: String,
     /// 是否发过至少一条增量。
@@ -507,12 +545,19 @@ pub struct EventTurnSink {
 }
 
 impl EventTurnSink {
-    fn new(events: Arc<EventBus>, session_id: SessionId, clock: Arc<dyn Clock>) -> Self {
+    fn new(
+        events: Arc<EventBus>,
+        session_id: SessionId,
+        clock: Arc<dyn Clock>,
+        run_log: Arc<dyn RunLogSink>,
+    ) -> Self {
         Self {
             events,
             session_id,
             clock,
             calls: HashMap::new(),
+            started: HashMap::new(),
+            run_log,
             text: String::new(),
             emitted: false,
         }
@@ -549,6 +594,16 @@ impl EventTurnSink {
         }
         vec![ChatMessage::assistant_text(self.text.clone())]
     }
+
+    /// 整轮失败：写一行 `error`（`logs_tail` 里能看见"这一轮为什么没做成"）。
+    fn log_failure(&self, error: &str) {
+        self.run_log.append("error", log::turn_failure_line(error));
+    }
+
+    /// 整轮取消：写一行 `info`（取消不是故障，别用 error 吓人）。
+    fn log_cancel(&self) {
+        self.run_log.append("info", log::turn_cancel_line());
+    }
 }
 
 impl TurnSink for EventTurnSink {
@@ -563,6 +618,7 @@ impl TurnSink for EventTurnSink {
 
     fn on_tool_call(&mut self, call: &ToolCallRequest) {
         // 执行前的状态先记下：执行结果由 `on_tool_result` 补。
+        self.started.insert(call.id.clone(), Instant::now());
         self.calls.insert(call.id.clone(), call.clone());
     }
 
@@ -571,6 +627,14 @@ impl TurnSink for EventTurnSink {
             tracing::warn!(call_id, "工具结果没有对应的调用记录");
             return;
         };
+        // 一步一条：工具名 + 成功/失败 + 耗时（参数与输出都过脱敏，见 `log` 模块）。
+        let elapsed = self
+            .started
+            .remove(call_id)
+            .map_or(Duration::ZERO, |started| started.elapsed());
+        let (level, line) = log::tool_result_line(call, output, elapsed);
+        self.run_log.append(level, line);
+
         let now = self.clock.now();
         let content = truncate_chars(&output.content, MAX_TOOL_RESULT_CHARS);
         let result = serde_json::json!({
@@ -631,6 +695,148 @@ impl AuditSink for TracingAudit {
 mod tests {
     use super::*;
     use crate::app::test_support::TempDir;
+
+    /// 测试用 `RunLog` 收集器：把 Agent 写出的每一行留在内存里供断言。
+    #[derive(Default)]
+    struct CaptureSink {
+        lines: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RunLogSink for CaptureSink {
+        fn append(&self, level: &str, line: String) {
+            self.lines
+                .lock()
+                .expect("日志锁")
+                .push((level.to_owned(), line));
+        }
+    }
+
+    impl CaptureSink {
+        fn lines(&self) -> Vec<(String, String)> {
+            self.lines.lock().expect("日志锁").clone()
+        }
+    }
+
+    fn sink_for(session_id: SessionId) -> (Arc<CaptureSink>, EventTurnSink) {
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn RunLogSink> = capture.clone();
+        let turn = EventTurnSink::new(
+            Arc::new(EventBus::new()),
+            session_id,
+            Arc::new(hbot_adapters::SystemClock),
+            sink,
+        );
+        (capture, turn)
+    }
+
+    fn session() -> SessionId {
+        SessionId::from_uuid(uuid::Uuid::from_u128(0x44))
+    }
+
+    /// 一步一条：一次工具调用正好一行，带工具名 + 成功/失败 + 耗时。
+    ///
+    /// "一步一条"是任务里的硬要求：写三条（开始/结束/摘要）会把 `logs_tail` 刷爆。
+    #[test]
+    fn each_tool_call_writes_exactly_one_run_log_line() {
+        let (capture, mut turn) = sink_for(session());
+
+        turn.on_tool_call(&ToolCallRequest {
+            id: "call-1".to_owned(),
+            name: "fs_read".to_owned(),
+            arguments: serde_json::json!({ "path": "src/main.ts" }),
+        });
+        turn.on_tool_result("call-1", &ToolOutput::text("ok"));
+
+        turn.on_tool_call(&ToolCallRequest {
+            id: "call-2".to_owned(),
+            name: "fs_write".to_owned(),
+            arguments: serde_json::json!({ "path": "src/b.txt" }),
+        });
+        turn.on_tool_result("call-2", &ToolOutput::error("disk full"));
+
+        let lines = capture.lines();
+        assert_eq!(
+            lines.len(),
+            2,
+            "两次工具调用只该有两行（一步一条），实际 {lines:?}"
+        );
+        assert_eq!(lines[0].0, "info");
+        assert!(lines[0].1.contains("fs_read"), "实际 {}", lines[0].1);
+        assert!(lines[0].1.contains("成功"), "实际 {}", lines[0].1);
+        assert_eq!(lines[1].0, "error");
+        assert!(lines[1].1.contains("fs_write"), "实际 {}", lines[1].1);
+        assert!(lines[1].1.contains("失败"), "实际 {}", lines[1].1);
+        assert!(lines[1].1.contains("disk full"), "失败原因要留下");
+        for (_, line) in &lines {
+            assert!(line.contains(" ms）"), "每行都要带耗时：{line}");
+        }
+    }
+
+    /// 工具参数里的密钥**不许**原样进 `logs` 表。
+    ///
+    /// 模型给的参数里经常夹着 `token` 字段与 `Authorization: Bearer ...`；这一层是
+    /// 写库前的最后一道（`logs` 表落库后会被 `logs_tail` 原样推给 UI、也会被导出）。
+    #[test]
+    fn tool_arguments_are_redacted_before_the_log_line() {
+        let (capture, mut turn) = sink_for(session());
+        turn.on_tool_call(&ToolCallRequest {
+            id: "call-1".to_owned(),
+            name: "http_fetch".to_owned(),
+            arguments: serde_json::json!({
+                "url": "https://example.com",
+                "token": "sk-live-SECRET-123",
+                "headers": { "Authorization": "Bearer abcdef123456" },
+                "body": "x".repeat(500),
+            }),
+        });
+        turn.on_tool_result("call-1", &ToolOutput::text("ok"));
+
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0].1;
+        assert!(!line.contains("sk-live-SECRET-123"), "密钥泄漏：{line}");
+        assert!(!line.contains("abcdef123456"), "Bearer 凭据泄漏：{line}");
+        assert!(line.contains(log::REDACTED), "要留下脱敏标记：{line}");
+        assert!(line.contains("example.com"), "普通参数要保留：{line}");
+    }
+
+    /// 整轮失败写一行 `error`；取消写一行 `info`（取消不是故障）。
+    #[test]
+    fn failed_and_cancelled_turns_leave_a_line() {
+        let (capture, turn) = sink_for(session());
+        turn.log_failure("provider 401: key=sk-live-999");
+        turn.log_cancel();
+
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0, "error");
+        assert!(lines[0].1.starts_with("agent 本轮失败："), "{}", lines[0].1);
+        assert!(!lines[0].1.contains("sk-live-999"), "{}", lines[0].1);
+        assert_eq!(lines[1].0, "info");
+        assert!(lines[1].1.contains("已取消"));
+    }
+
+    /// 没有对应调用的结果（乱序/重复回调）不写日志，也不能 panic。
+    #[test]
+    fn orphan_tool_results_are_ignored() {
+        let (capture, mut turn) = sink_for(session());
+        turn.on_tool_result("unknown", &ToolOutput::text("ok"));
+        assert!(capture.lines().is_empty());
+    }
+
+    /// `with_run_log_sink` 真的换掉了落点（`start_turn` 读的就是这个字段）。
+    #[test]
+    fn run_log_sink_can_be_replaced() {
+        let capture: Arc<dyn RunLogSink> = Arc::new(CaptureSink::default());
+        let manager = AgentManager::new(
+            std::env::temp_dir(),
+            Arc::new(EventBus::new()),
+            Arc::new(crate::app::ids::UuidIds),
+            Arc::new(hbot_adapters::SystemClock),
+        )
+        .with_run_log_sink(Arc::clone(&capture));
+        assert!(Arc::ptr_eq(manager.run_log_sink(), &capture));
+    }
 
     fn project_with_rules(label: &str, rules: &str) -> (TempDir, Workspace) {
         let dir = TempDir::new(label);

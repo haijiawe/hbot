@@ -893,3 +893,383 @@ async fn logs_tail_is_newest_limit_in_chronological_order() {
 
     harness.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// 8. 契约：`bot_inject` 的合成消息没有"被动回复"这回事
+// ---------------------------------------------------------------------------
+
+/// `bot_inject` 造出来的消息**不是**平台推来的，所以它没有可引用的平台消息 id。
+///
+/// 契约（`crates/hbot-code/src/dts.rs` 里 `reply` 的说明、`sandbox_handler` 的
+/// `passive_reply_id`）：`reply_to` 只有在"被动回复"时才存在，值是被回复的那条平台
+/// 消息 id。合成消息若把 `inject-<uuid>` 当成平台消息 id 填进去，OneBot 服务端会因为
+/// 引用了一条不存在的消息而拒发（或者发出一条引用了空气的回复），而且这类错误在
+/// 生产里极难复现（只有控制台点"注入"才走这条路径）。
+///
+/// 这里断言的是**整条链路**：`bot_inject` → 沙箱 → `outbound` 落库 → 适配器信封。
+/// 反面（真实事件必须带 reply_to）由同一文件里的
+/// `passive_reply_context_survives_restart` 与 `sandbox_handler` 的单测覆盖；本条用
+/// "先注入、再推一条真事件"的方式把两者放在同一个进程里对照，避免"两边都是 None 却
+/// 因为记录根本没写而蒙对"。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_messages_carry_no_passive_reply_context() {
+    let harness = Harness::new(
+        "inject-no-reply-to",
+        HANDLER_REPLY,
+        Some(&Harness::config_json()),
+        false,
+    )
+    .await;
+    assert_ok(&harness.start().await);
+
+    // ① 合成消息（`bot_inject`）。
+    assert_ok(&harness.inject("ping").await);
+    wait_for("注入的回复已发出", || {
+        !harness.factory.sent_ids().is_empty()
+    })
+    .await;
+
+    let injected_id = harness.factory.sent_ids()[0];
+    assert_eq!(
+        harness.factory.sent_reply_to()[0],
+        None,
+        "合成消息不许带被动回复上下文：inject 的 external_id 不是平台消息 id"
+    );
+    let injected_row = harness
+        .store()
+        .get_outbound(&injected_id)
+        .expect("读 outbound 行")
+        .expect("注入的回复必须落库");
+    assert_eq!(
+        injected_row.reply_to, None,
+        "`outbound.reply_to` 列也不许被写成合成 id"
+    );
+
+    // ② 对照：真实平台事件必须带 reply_to，且就是平台消息 id。
+    let event = PlatformEvent::new(
+        "msg-7001",
+        ConversationRef::new(GROUP_EXTERNAL_ID, ConversationKind::Group),
+        "user-7",
+        serde_json::json!({ "text": "ping" }),
+    );
+    let before = harness.factory.sent_ids().len();
+    wait_for("适配器接受真实事件", || {
+        harness.factory.push(event.clone())
+    })
+    .await;
+    wait_for("真实事件的回复已发出", || {
+        harness.factory.sent_ids().len() > before
+    })
+    .await;
+
+    let real_id = harness.factory.sent_ids()[before];
+    assert_eq!(
+        harness.factory.sent_reply_to()[before].as_deref(),
+        Some("msg-7001"),
+        "真实事件必须带被动回复上下文（证明上面的 None 是刻意的，不是记录没写）"
+    );
+    let real_row = harness
+        .store()
+        .get_outbound(&real_id)
+        .expect("读 outbound 行")
+        .expect("真实事件的回复必须落库");
+    assert_eq!(real_row.reply_to.as_deref(), Some("msg-7001"));
+
+    harness.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 9. 契约：兜底幂等键不许当成 reply_to（出站载荷里连 reply 段都不该有）
+// ---------------------------------------------------------------------------
+
+/// 出站载荷里所有 `reply` 段的 id（没有就是空）。
+///
+/// 走的是真适配器的 `outbound_json`，不是自己拼 JSON：这样断言的是**平台真正收到的东西**
+/// （`{"type":"reply","data":{"id":"…"}}` 是 OneBot 11 的引用语义）。
+fn reply_segment_ids(payload: &serde_json::Value) -> Vec<String> {
+    let Some(segments) = payload.as_array() else {
+        // 纯文本是字符串形式，本来就不含任何段。
+        return Vec::new();
+    };
+    segments
+        .iter()
+        .filter(|segment| segment.get("type").and_then(|kind| kind.as_str()) == Some("reply"))
+        .filter_map(|segment| {
+            segment
+                .get("data")
+                .and_then(|data| data.get("id"))
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// 出站载荷的纯文本正文（字符串形式直接取；段数组里拼 `text` 段）。
+fn outbound_text(payload: &serde_json::Value) -> String {
+    if let Some(text) = payload.as_str() {
+        return text.to_owned();
+    }
+    payload
+        .as_array()
+        .map(|segments| {
+            segments
+                .iter()
+                .filter(|segment| {
+                    segment.get("type").and_then(|kind| kind.as_str()) == Some("text")
+                })
+                .filter_map(|segment| {
+                    segment
+                        .get("data")
+                        .and_then(|data| data.get("text"))
+                        .and_then(|text| text.as_str())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **平台没给 `message_id`** 时，`external_id` 是适配器的兜底幂等键
+/// （`{user_id}-{time}-{fnv1a64:016x}`）。它不是平台消息 id，**不许**当 `reply_to`：
+/// 真网关收到 `{"type":"reply","data":{"id":"111-…"}}` 会判参数非法、整条发不出去，
+/// 用户看到的是"机器人不回我了"，而不是"少了个引用"。
+///
+/// 这条同时钉住反向：真有 `message_id` 时引用段**必须仍在**（别为了修 bug 把被动回复
+/// 整个关掉）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fallback_dedupe_key_never_becomes_a_reply_segment() {
+    let harness = Harness::new(
+        "fallback-reply-to",
+        HANDLER_REPLY,
+        Some(&Harness::config_json()),
+        false,
+    )
+    .await;
+    assert_ok(&harness.start().await);
+
+    // ① 无 message_id 的入站：external_id 是兜底键。
+    //    形状与 `onebot::normalize::fallback_external_id` 一致（111 = user_id）。
+    let fallback_id = "111-1794790031-06032ba7feff3e72";
+    let fallback_event = PlatformEvent::new(
+        fallback_id,
+        ConversationRef::new(GROUP_EXTERNAL_ID, ConversationKind::Group),
+        "user-7",
+        serde_json::json!({ "text": "没有 message_id" }),
+    );
+    wait_for("适配器接受无 message_id 的事件", || {
+        harness.factory.push(fallback_event.clone())
+    })
+    .await;
+    wait_for("无 message_id 的回复发出", || {
+        !harness.factory.sent_ids().is_empty()
+    })
+    .await;
+
+    let fallback_sent = harness.factory.sent_ids()[0];
+    let fallback_row = harness
+        .store()
+        .get_outbound(&fallback_sent)
+        .expect("读 outbox 行")
+        .expect("outbox 行存在");
+    assert_eq!(
+        fallback_row.reply_to, None,
+        "兜底幂等键被写进了 outbound.reply_to：它会变成非法 reply 段"
+    );
+
+    let fallback_payload = hbot_adapters::platforms::onebot::outbound_json(
+        &fallback_row.text,
+        fallback_row.reply_to.as_deref(),
+    );
+    assert!(
+        reply_segment_ids(&fallback_payload).is_empty(),
+        "无 message_id 的回复不许带 reply 段，实际载荷：{fallback_payload}"
+    );
+    assert_eq!(
+        outbound_text(&fallback_payload),
+        "pong",
+        "只该丢掉引用段，正文必须照发（别把回复整条吞了）"
+    );
+
+    // ② 有 message_id 的入站：引用段必须在，且 id 就是平台消息 id。
+    let real_event = PlatformEvent::new(
+        "msg-7001",
+        ConversationRef::new(GROUP_EXTERNAL_ID, ConversationKind::Group),
+        "user-7",
+        serde_json::json!({ "text": "ping", "message_id": 7001 }),
+    );
+    wait_for("适配器接受真实事件", || {
+        harness.factory.push(real_event.clone())
+    })
+    .await;
+    wait_for("真实事件的回复发出", || {
+        harness.factory.sent_ids().len() >= 2
+    })
+    .await;
+
+    let real_sent = harness.factory.sent_ids()[1];
+    let real_row = harness
+        .store()
+        .get_outbound(&real_sent)
+        .expect("读 outbox 行")
+        .expect("outbox 行存在");
+    assert_eq!(
+        real_row.reply_to.as_deref(),
+        Some("msg-7001"),
+        "真有平台消息 id 时必须保留被动回复"
+    );
+    let real_payload = hbot_adapters::platforms::onebot::outbound_json(
+        &real_row.text,
+        real_row.reply_to.as_deref(),
+    );
+    assert_eq!(
+        reply_segment_ids(&real_payload),
+        vec!["msg-7001".to_owned()],
+        "有 message_id 时的 reply 段被修没了：{real_payload}"
+    );
+    assert_eq!(
+        outbound_text(&real_payload),
+        "pong",
+        "引用段的正文也必须是原回复"
+    );
+
+    harness.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 10. 契约：幂等键与平台消息 id 是两个命名空间
+// ---------------------------------------------------------------------------
+
+/// handler 在失败前先把自己的两个 id 打出来，再抛错——这样 inbound 行**留在未处理**，
+/// 测试才能拿到行主键和它逐字比对（处理成功的行会被 `processed_at` 标走）。
+const HANDLER_IDS_THEN_THROW: &str = r#"
+import { defineBot } from 'hbot';
+
+export default defineBot({
+  onMessage(ctx) {
+    ctx.log('ids mid=' + ctx.messageId + ' ext=' + ctx.externalId);
+    throw new Error('故意失败：让 inbound 停在未处理，便于比对行主键');
+  },
+});
+"#;
+
+/// 跨 crate 的幂等契约：`ctx.messageId` 是**落库那一层的行主键**（`inbound.id`），
+/// `ctx.externalId` 才是平台消息 id，两者必须各自逐字对上原始数据。
+///
+/// ## 为什么不是"messageId == externalId"
+///
+/// 任务书写的是"`ctx.messageId` 必须与 `inbound.external_id` 逐字一致"，但那是把两个
+/// 命名空间混成一个了，而且与本仓库**已发布**的契约冲突：
+///
+/// * `crates/hbot-code/src/dts.rs` 的 HOST_DTS 注释：「messageId: 消息 id，**幂等键**。
+///   注意语义是 at-least-once……」，同处「externalId: 平台侧消息 id」；
+/// * `crates/hbot-bot/src/dedupe.rs` 模块文档：「幂等键是 `inbound.id`（生成代码里的
+///   `ctx.messageId`）。重复投递之所以安全，是因为唯一约束在**落库这一层**」；
+/// * `MessageCtx::message_id()` 的实现就是 `self.message.id`。
+///
+/// 如果真按字面把它改成 external_id，`messageId` 就不再是"重放稳定"的键：同一个
+/// external_id 在两次投递里是同一个值，而 inbound 行主键是首次落库时就定下的——把它换成
+/// 平台 id 相当于让幂等键跟着平台漂移，`UNIQUE(bot_id, external_id)` 那层保证就断了。
+///
+/// 所以本条钉住三条**真实的不变量**：
+///
+/// 1. `ctx.messageId` == `inbound.id`（行主键，重放稳定）；
+/// 2. `ctx.externalId` == `inbound.external_id`（平台消息 id，逐字一致）；
+/// 3. 同一个 `external_id` 再投一次，handler **不会**执行第二次（"重复投递只执行一次"）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_id_is_the_stored_inbound_row_key_and_matches_on_replay() {
+    let harness = Harness::new(
+        "idempotency-key",
+        HANDLER_IDS_THEN_THROW,
+        Some(&Harness::config_json()),
+        false,
+    )
+    .await;
+    assert_ok(&harness.start().await);
+
+    let event = PlatformEvent::new(
+        "msg-4242",
+        ConversationRef::new(GROUP_EXTERNAL_ID, ConversationKind::Group),
+        "user-7",
+        serde_json::json!({ "text": "ping" }),
+    );
+    wait_for("适配器接受事件", || {
+        harness.factory.push(event.clone())
+    })
+    .await;
+    wait_for("handler 打出了两个 id", || {
+        harness
+            .logs()
+            .iter()
+            .any(|row| row.line.contains("ids mid="))
+    })
+    .await;
+
+    // 行主键：handler 故意失败，所以这条 inbound 还在"未处理"集合里。
+    let pending = harness
+        .store()
+        .list_unprocessed_inbound(32)
+        .expect("读未处理 inbound");
+    assert_eq!(pending.len(), 1, "应该正好一条未处理入站");
+    let row = &pending[0];
+
+    let line = harness
+        .logs()
+        .into_iter()
+        .find(|row| row.line.contains("ids mid="))
+        .expect("handler 的那行日志")
+        .line;
+    let mid = line
+        .split("mid=")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .expect("日志里有 mid=");
+    let ext = line
+        .split("ext=")
+        .nth(1)
+        .expect("日志里有 ext=")
+        .trim()
+        .to_owned();
+
+    // ① messageId 是落库的行主键，逐字一致（重放时也是这个值）。
+    assert_eq!(
+        mid,
+        row.id.to_string(),
+        "ctx.messageId 必须是 inbound.id（幂等键），实际 {mid} vs 行主键 {}",
+        row.id
+    );
+    // ② externalId 是平台消息 id，逐字一致。
+    assert_eq!(ext, "msg-4242", "ctx.externalId 必须是平台消息 id");
+    assert_eq!(
+        row.external_id, "msg-4242",
+        "落库的 external_id 必须与平台事件逐字一致"
+    );
+    // ③ 两个命名空间不同：谁把 messageId 改成 external_id，这条立刻红。
+    assert_ne!(
+        mid, row.external_id,
+        "messageId 与 external_id 是两个命名空间，不能混用"
+    );
+
+    // ④ 同一 external_id 再投一次：handler 不许执行第二次。
+    let runs_before = harness
+        .logs()
+        .iter()
+        .filter(|row| row.line.contains("ids mid="))
+        .count();
+    assert!(harness.factory.push(event));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let runs_after = harness
+        .logs()
+        .iter()
+        .filter(|row| row.line.contains("ids mid="))
+        .count();
+    assert_eq!(
+        runs_after, runs_before,
+        "同一个 external_id 重复投递必须只执行一次（幂等键落在落库层）"
+    );
+    assert_eq!(
+        harness.unprocessed_inbound(),
+        1,
+        "重复投递不该再多一条 inbound 行"
+    );
+
+    harness.shutdown().await;
+}

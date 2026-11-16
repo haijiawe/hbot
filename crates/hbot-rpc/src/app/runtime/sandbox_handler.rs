@@ -678,10 +678,25 @@ impl SandboxHandler {
 
 /// 这条消息的回复应该挂在哪个平台消息 ID 上。
 ///
-/// 真实入站事件的 `external_id` 就是平台消息 ID；**调试注入**（`bot_inject`）不是平台
-/// 事件，它的 `external_id` 是合成的去重键（`inject-…`），拿去当 `reply_to` 会被平台
-/// 拒发，所以返回 `None`（按主动消息发）。判定依据是注入方写进 payload 的 `injected`
-/// 标记（见 `crate::app::commands::bots::inject`）。
+/// 有平台消息 ID 时才返回 `Some`，否则返回 `None`（降级为**不带引用**的普通回复）。
+/// 两条"`external_id` 不是平台消息 ID"的路：
+///
+/// 1. **调试注入**（`bot_inject`）：不是平台事件，`external_id` 是合成的去重键
+///    （`inject-…`），拿去当 `reply_to` 会被平台拒发。判定依据是注入方写进 payload 的
+///    `injected` 标记（见 `crate::app::commands::bots::inject`），另有 `inject-` 前缀兜底。
+/// 2. **平台没给 `message_id`**：适配器会用兜底幂等键
+///    `"{user_id}-{time}-{fnv1a64:016x}"` 填 `external_id`
+///    （`hbot_adapters::platforms::onebot::normalize`）。那个键**只是本地的去重键**，
+///    不是 OneBot `message_id`；拿它组 `{"type":"reply","data":{"id":"111-…-…"}}`
+///    发给真网关，整条消息会被判参数非法而**发不出去**（"能回"变"回不出去"），
+///    比"少一个引用"糟得多。所以按形状识别出来就降级为主动回复。
+///
+/// 判别采用**兜底键形状**而不是"必须是纯数字"，因为 `external_id` 不只有 OneBot：
+/// QQ 官方适配器的 `external_id` 是 `ROBOT1.0_…`（非纯数字，见
+/// `hbot_adapters::platforms::qq::normalize`），要求纯数字会把 QQ 的被动回复全打死；
+/// 而本仓库既有断言（`replies_carry_the_platform_message_id`）用的也是 `msg-777`
+/// 这种非数字 id。形状识别同时保住三边：OneBot 真 message_id（i64，纯数字）、
+/// QQ 官方 id（`ROBOT1.0_…`）、兜底键（`数字-数字-16 位十六进制`）。
 fn passive_reply_id(ctx: &MessageCtx) -> Option<String> {
     let injected = ctx
         .payload()
@@ -691,7 +706,27 @@ fn passive_reply_id(ctx: &MessageCtx) -> Option<String> {
     if injected {
         return None;
     }
-    Some(ctx.external_id().to_owned())
+    let external_id = ctx.external_id();
+    if is_synthetic_external_id(external_id) {
+        return None;
+    }
+    Some(external_id.to_owned())
+}
+
+/// `external_id` 是不是"本地合成的去重键"（而不是平台侧的消息 id）。
+///
+/// **形状判据只有一份，在适配器里**：`hbot_adapters::platforms::onebot::
+/// is_synthetic_external_id` 与 `fallback_external_id` 的格式串相邻，改一处必须改另一处
+/// （那边有往返测试 `synthetic_id_judgement_round_trips_the_fallback_format` 钉住）。
+/// 这里只补两件**本层**才知道的合成键，不复制形状判断：
+///
+/// 1. `bot_inject` 的 `inject-…`（正常情况下 payload 里的 `injected` 标记已经拦住，
+///    这里按前缀再兜一次，避免"标记丢了但键明显是合成的"时把合成键发回平台）；
+/// 2. 空串——没有引用目标可言。
+fn is_synthetic_external_id(external_id: &str) -> bool {
+    external_id.trim().is_empty()
+        || external_id.starts_with("inject-")
+        || hbot_adapters::platforms::onebot::is_synthetic_external_id(external_id)
 }
 
 /// 把一个（崩溃的）worker 在阻塞线程里释放。
@@ -857,6 +892,20 @@ fn stable_index(key: &str, modulo: usize) -> usize {
 ///
 /// 沙箱会把 `reply` / `log` / `sleep` 三个宿主函数挂到这个对象上，所以这里给的就是
 /// **事件对象本身**的字段（`text`、`kind`、`senderId`……），代码里写 `ctx.text`。
+///
+/// # 这里有一份**复制实现**
+///
+/// `crates/hbot-cli/src/replay.rs` 的 `event_json` 逐字段复刻了本函数（`hbot replay` 要
+/// 用同一形状重建历史事件）。两处必须一起改：字段名集合被
+/// `crates/hbot-code/src/dts.rs` 的漂移测试钉着（`botId/conversationId/messageId/
+/// externalId/senderId/text/kind/conversationExternalId/receivedAt/payload`），少一个
+/// 字段用户代码里读到的就是 `undefined`。
+///
+/// 为什么不直接复用：本函数吃 `&MessageCtx`，而 replay 侧手上只有
+/// `InboundReplayRow`（库行 + 会话列），构造一个 `MessageCtx` 再丢掉一半字段并不比
+/// 直写 JSON 更安全；且本函数在本 crate 内是私有的（`hbot-cli` 只能看到 `pub` 项）。
+/// 要彻底消掉这份复制，正确做法是把「事件对象」提升成 `hbot-bot`/`hbot-code` 里的
+/// 共用 DTO（生产与回放都从它序列化），那是一次跨 crate 改造，不在本次范围内。
 fn event_json(ctx: &MessageCtx) -> Value {
     json!({
         "botId": ctx.bot_id.to_string(),
@@ -864,7 +913,11 @@ fn event_json(ctx: &MessageCtx) -> Value {
         "messageId": ctx.message_id().to_string(),
         "externalId": ctx.external_id(),
         "senderId": ctx.message.sender_id,
-        "text": ctx.text(),
+        // 恒为字符串：`MessageCtx::text()` 是 `Option<&str>`，纯图片/表情入站的 payload
+        // 里没有 `text` 字段，直接落成 JSON 就是 `null`；而 `hbot.d.ts` 声明的是
+        // `text: string`，生成代码写 `ctx.text.length` 会当场抛 TypeError。
+        // 类型声明是对用户的承诺，缺失文本用空串表达（见 docs/02-architecture.md §6.3）。
+        "text": ctx.text().unwrap_or_default(),
         "kind": conversation_kind_str(ctx.conversation_kind()),
         "conversationExternalId": ctx.conversation.external_id,
         "receivedAt": ctx.received_at().unix_millis(),
@@ -1465,6 +1518,76 @@ mod tests {
         );
     }
 
+    /// 平台没给 `message_id` 时，`external_id` 是适配器的兜底去重键，**不能**当引用目标。
+    ///
+    /// 这条是 parity 抓到的真缺陷：出站载荷长成
+    /// `{"type":"reply","data":{"id":"111-1794790031-06032ba7feff3e72"}}`，
+    /// 而 OneBot 的 `reply.data.id` 必须是 `message_id`（数字）。真网关收到这种段会判
+    /// 参数非法、整条消息发不出去——比"少一个引用"严重。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fallback_dedupe_key_is_never_used_as_the_reply_target() {
+        let mut env = Env::new("fallback-reply-to", GOOD_V1);
+        // 形状与 `onebot::normalize::fallback_external_id` 一致：
+        // `{user_id}-{time}-{fnv1a64:016x}`。
+        env.handle(env.ctx("111-1794790031-06032ba7feff3e72", "hi"))
+            .await
+            .expect("无 message_id 的消息照样处理");
+
+        let replies = env.take_replies();
+        assert_eq!(replies.len(), 1, "一条消息一个回复");
+        assert_eq!(
+            replies[0].reply_to, None,
+            "兜底去重键不是平台消息 ID：必须降级成不带引用的回复，否则真网关整条发不出去"
+        );
+        assert_eq!(replies[0].text, "v1", "降级只影响引用段，正文照发");
+    }
+
+    /// 非数字但**确实是**平台消息 ID 的形态（QQ 官方 `ROBOT1.0_…`）仍要走被动回复。
+    ///
+    /// 防止把上一条修成"仅纯数字才算平台 id"——那会打断 QQ 官方适配器的被动回复
+    /// （它的 `external_id` 就是 `d.id`，`ROBOT1.0_…` 形态）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_platform_id_that_is_not_numeric_still_gets_a_passive_reply() {
+        let mut env = Env::new("qq-form-reply-to", GOOD_V1);
+        env.handle(env.ctx("ROBOT1.0_AbCdEf0123456789", "hi"))
+            .await
+            .expect("处理成功");
+
+        let replies = env.take_replies();
+        assert_eq!(
+            replies[0].reply_to.as_deref(),
+            Some("ROBOT1.0_AbCdEf0123456789"),
+            "QQ 官方的消息 id 不是纯数字，但它就是平台消息 ID，必须带引用"
+        );
+    }
+
+    /// 本层的合成键判据：**形状**交给适配器单源判据，`inject-`/空串由本层负责。
+    ///
+    /// 形状本身的往返测试在 `hbot-adapters`
+    /// （`synthetic_id_judgement_round_trips_the_fallback_format`）；这条钉的是
+    /// "本层确实把三者拼在了一起，且没有把 QQ 形态误判成合成键"。
+    #[test]
+    fn synthetic_external_ids_are_recognised_by_shape() {
+        // 兜底键：三段、前两段数字、末段 16 位十六进制 → 合成。
+        assert!(is_synthetic_external_id("111-1794790031-06032ba7feff3e72"));
+        // OneBot 真 message_id（i64）→ 平台 id。
+        assert!(!is_synthetic_external_id("77001"));
+        // QQ 官方消息 id → 平台 id。
+        assert!(!is_synthetic_external_id("ROBOT1.0_AbCdEf0123456789"));
+        // 既有用例用的形态（非数字、两段）→ 平台 id。
+        assert!(!is_synthetic_external_id("msg-777"));
+        // 注入键 → 合成（payload 标记之外的兜底）。
+        assert!(is_synthetic_external_id("inject-abc"));
+        // 空串没有引用目标可言。
+        assert!(is_synthetic_external_id(""));
+        // 形状相近但段数/字符集不符的，不误判成合成。
+        assert!(!is_synthetic_external_id("111-1794790031-06032ba7feff3e7"));
+        assert!(!is_synthetic_external_id("111-abc-06032ba7feff3e72"));
+        assert!(!is_synthetic_external_id(
+            "111-1794790031-06032ba7feff3e722"
+        ));
+    }
+
     /// 超时重映射必须保留 `hbot-code` 的 `HBOT_TIMEOUT` 机器标识。
     ///
     /// 起因（parity 的 P3）：`HbotError::timeout("sandbox.dispatch", ms)` 的 Display 只有
@@ -1567,6 +1690,41 @@ mod tests {
         assert!(
             user_event < error_event,
             "RunLog 流里用户日志必须先于错误行（user_event={user_event}, error_event={error_event}）：{emitted:?}"
+        );
+    }
+
+    /// `hbot.d.ts` 声明 `text: string`，而 `MessageCtx::text()` 是 `Option<&str>`：
+    /// 纯图片、纯表情这类 payload 里没有 `text` 字段。修复前 `event_json` 把
+    /// `Option<&str>` 原样丢给 `json!`，落到 JS 就是 `null`，生成代码写
+    /// `ctx.text.length` 会当场抛 TypeError —— 而 TypeScript 类型检查一个字都不报，
+    /// 因为声明撒谎。
+    ///
+    /// 契约：缺文本时 `ctx.text` 是**空串**（不是 `null`、不是 `undefined`），
+    /// `.length === 0`。
+    const TEXT_LENGTH: &str = "import { defineBot } from 'hbot';\n\
+                               export default defineBot({\n\
+                                 onMessage(ctx) {\n\
+                                   ctx.reply('len=' + ctx.text.length + ' type=' + typeof ctx.text);\n\
+                                 },\n\
+                               });\n";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_message_without_text_still_has_a_string_ctx_text() {
+        let mut env = Env::new("no-text", TEXT_LENGTH);
+        // 纯图片入站：payload 里没有 `text` 字段（OneBot 的图片消息就是这样）。
+        let ctx = env.ctx_with_payload(
+            "evt-image",
+            json!({ "image": "https://example.invalid/a.png", "postType": "message" }),
+        );
+
+        env.handle(ctx)
+            .await
+            .expect("没有 text 字段的消息不该让 handler 失败");
+
+        assert_eq!(
+            env.reply_texts(),
+            vec!["len=0 type=string".to_owned()],
+            "缺文本时 ctx.text 必须是空串：读 .length 不许抛"
         );
     }
 }

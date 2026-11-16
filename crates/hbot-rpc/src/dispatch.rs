@@ -189,36 +189,13 @@ fn unimplemented(command: &Command) -> Response {
     })
 }
 
-/// 数据目录：Windows 用 `%APPDATA%\hbot`，Unix 用 `$XDG_DATA_HOME/hbot`。
+/// 数据目录：算法只有一份，在 [`hbot_core::paths`]。
 ///
-/// 自己算而不引入 `directories` / Tauri path API：这一层必须能被后台模式
-/// （无 Tauri）复用，依赖越少越好。macOS 的 `~/Library/Application Support`
-/// 等真需要时再补，当前落到 Unix 分支。
+/// 这里**不再自己算**。曾经这段逻辑在 `hbot-rpc`、`hbot-cli::serve` 各抄一份，
+/// 而桌面壳走 Tauri 的 `app_data_dir()`（`%APPDATA%\com.hbot.app`）—— 同一个产品
+/// 的桌面端和后台端因此各开一个库，且改 identifier 就等于静默搬家。
 fn default_data_dir() -> PathBuf {
-    if cfg!(windows) {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join("hbot");
-        }
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            return PathBuf::from(profile)
-                .join("AppData")
-                .join("Roaming")
-                .join("hbot");
-        }
-    } else {
-        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(data_home).join("hbot");
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("hbot");
-        }
-    }
-
-    // 环境变量全缺（容器 / 精简服务）：当前目录下的 hbot，至少不 panic。
-    PathBuf::from("hbot")
+    hbot_core::data_dir()
 }
 
 #[cfg(test)]
