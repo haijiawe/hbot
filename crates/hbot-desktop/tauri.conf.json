@@ -2,13 +2,14 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "hbot",
   "version": "0.1.0",
-  "identifier": "com.hbot.app",
+  "identifier": "com.hbot.desktop",
   "build": {
     "frontendDist": "../../apps/web/dist"
   },
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "hbot",
         "width": 1280,
         "height": 820,
@@ -18,6 +19,13 @@
         "fullscreen": false
       }
     ],
+    "trayIcon": {
+      "id": "main",
+      "iconPath": "icons/32x32.png",
+      "iconAsTemplate": false,
+      "showMenuOnLeftClick": false,
+      "tooltip": "hbot（关闭窗口后仍在后台运行）"
+    },
     "security": {
       "csp": null
     }
@@ -29,15 +37,16 @@
     "copyright": "Copyright © 2026 HBot contributors",
     "license": "MIT OR Apache-2.0",
     "category": "DeveloperTool",
-    "shortDescription": "QQ 机器人低代码框架桌面端",
-    "longDescription": "HBot 是 QQ 机器人的低代码开发框架：内置 Monaco 编辑器、Flow 可视化画布与 Agent 面板；业务能力统一经 hbot-rpc 的 dispatch 暴露给前端，数据落在 SQLite（hbot-store）。本安装包只含桌面壳与 Web 资源，不含 Node 运行时。",
+    "shortDescription": "用 Agent 写代码的 QQ 机器人 IDE",
+    "longDescription": "HBot 是一个 Agent-first 的 QQ 机器人 IDE：你用自然语言说需求，Agent 直接改项目里的 TypeScript 代码（每次写入都要你逐块确认 Diff），点运行就在内置沙箱里跑，日志和断点都在同一个窗口里。生成的 bot 是多文件 TS 项目（相对 import、无 npm 依赖），由 QuickJS isolate 按消息执行，平台适配器负责协议。本安装包只含桌面壳与 Web 资源，不含 Node 运行时。",
     "createUpdaterArtifacts": false,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.png",
-      "icons/icon.ico"
+      "icons/icon.ico",
+      "icons/icon.icns"
     ],
     "windows": {
       "nsis": {

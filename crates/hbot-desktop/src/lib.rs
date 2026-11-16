@@ -21,6 +21,12 @@
 //! （`{"type":"agent.delta",…}`）。改名等于协议变更（`docs/02-architecture.md` §9.2），
 //! web 侧（`apps/web/src/lib/ipc-tauri.ts`）的常量必须一起改。
 
+pub mod autostart;
+pub mod cli;
+pub mod crash;
+pub mod settings;
+pub mod shell;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -225,7 +231,7 @@ fn report_fatal(message: &str) {
 
 /// Windows：`MessageBoxW`（无父窗口，阻塞到用户点"确定"）。
 #[cfg(windows)]
-fn show_error_dialog(title: &str, message: &str) {
+pub(crate) fn show_error_dialog(title: &str, message: &str) {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "user32")]
@@ -265,7 +271,7 @@ fn show_error_dialog(title: &str, message: &str) {
 
 /// 非 Windows：没有跨平台对话框，靠 stderr 与日志（终端启动时可见）。
 #[cfg(not(windows))]
-fn show_error_dialog(title: &str, message: &str) {
+pub(crate) fn show_error_dialog(title: &str, message: &str) {
     eprintln!("[{title}] {message}");
 }
 
@@ -285,31 +291,92 @@ fn init_tracing() {
 /// 启动桌面壳，返回进程退出码。
 ///
 /// 只在最外层返回 `i32`；内部的失败都变成可读错误 + 退出码 1，不做 unwrap/panic。
+///
+/// 顺序有三处刻意安排：
+///
+/// 1. **命令行请求先于一切**：`--set-autostart` / `--print-settings` 不建窗口、不开
+///    SQLite，所以第一个实例正跑着时也能安全执行（不会被单实例拦下，也不需要拦）。
+/// 2. **崩溃 hook 在 `Builder` 之前装**：启动期的 panic 也要留报告。
+/// 3. **单实例插件第一个注册**：插件按注册顺序初始化，而插件初始化发生在配置窗口
+///    创建之前（`tauri-2.12.5/src/app.rs`：先 `initialize_plugins` 再
+///    `WebviewWindowBuilder::from_config`）。第二个实例在插件里就把参数交给第一个实例
+///    并以 `0` 退出，**不会**再开一个 WebView、也不会再开一个数据库写入者。
 pub fn run() -> i32 {
+    // 1. 命令行入口（`hbot --set-autostart on` 之类）。
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = cli::run_headless(&args) {
+        return code;
+    }
+
     init_tracing();
 
+    // 2. 崩溃上报：只写本机 `<data_dir>/logs/crash-*.log`，下次启动变成一条 error 日志。
+    //    数据目录算法只有一份（`hbot_core::data_dir`），这里和 `setup` 用的是同一个。
+    let crash_dir = hbot_core::data_dir();
+    crash::install(Some(crash_dir));
+
     let outcome = tauri::Builder::default()
+        // 3. 单实例：第二个进程把 argv/cwd 交给第一个，然后自己 exit(0)。
+        //    回调里"把已有窗口带到前台"就是用户能感知到的全部效果。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tracing::info!("检测到第二次启动，把已有窗口带到前台");
+            shell::show_main_window(app);
+        }))
         .invoke_handler(tauri::generate_handler![dispatch])
+        .on_menu_event(shell::on_menu_event)
+        .on_tray_icon_event(|app, event| shell::on_tray_icon_event(app, &event))
         .setup(|app| {
             let handle = app.handle().clone();
 
-            let data_dir = match handle.path().app_data_dir() {
-                Ok(dir) => dir,
-                Err(error) => {
-                    let message = format!("无法确定应用数据目录：{error}");
-                    report_fatal(&message);
-                    return Err(message.into());
+            // 数据目录必须与 `hbot serve` / `hbot replay` 一致，否则同一个产品
+            // 的桌面端和后台端会各开一个库（`%APPDATA%\hbot` vs
+            // `%APPDATA%\com.hbot.app`）。算法只有一份，在 `hbot_core::paths`。
+            let resolved = hbot_core::data_dir();
+            let data_dir = if resolved.is_absolute() {
+                resolved
+            } else {
+                // 连 HOME/APPDATA 都读不到的极端环境才走 Tauri 的兜底，
+                // 并明确记日志——这不是正常路径。
+                tracing::warn!(
+                    fallback = %resolved.display(),
+                    "环境变量里没有用户目录，改用 Tauri 的应用数据目录"
+                );
+                match handle.path().app_data_dir() {
+                    Ok(dir) => {
+                        tracing::warn!(data_dir = %dir.display(), "已切换到 Tauri 应用数据目录");
+                        dir
+                    }
+                    Err(error) => {
+                        let message = format!("无法确定应用数据目录：{error}");
+                        report_fatal(&message);
+                        return Err(message.into());
+                    }
                 }
             };
             tracing::info!(data_dir = %data_dir.display(), "桌面壳数据目录");
 
-            let host = Arc::new(DesktopHost::new(data_dir));
+            let host = Arc::new(DesktopHost::new(data_dir.clone()));
             app.manage(Arc::clone(&host));
 
+            // 托盘菜单、关窗到托盘、退出按钮。托盘图标本身由 `tauri.conf.json` 的
+            // `app.trayIcon` 在 `Builder::build()` 里建好，这里只挂菜单。
+            let prefs = settings::DesktopSettings::load(&data_dir);
+            reconcile_autostart(&prefs, &data_dir);
+            if let Err(error) = shell::install(&handle, prefs, data_dir.clone()) {
+                // 托盘装不上不该让应用起不来，但这意味着关窗行为可能不对 —— 必须留痕。
+                tracing::error!(%error, "托盘/关窗行为安装失败");
+            }
+
             // 核心装配放后台任务：SQLite 打开 + 迁移不能挡住窗口首帧（§2.1）。
+            let crash_dir = data_dir;
             tauri::async_runtime::spawn(async move {
                 match host.core().await {
-                    Ok(core) => attach_event_pumps(&handle, &core.state),
+                    Ok(core) => {
+                        attach_event_pumps(&handle, &core.state);
+                        // 事件泵起来之后再看上次有没有崩过：`EventBus` 是广播，
+                        // 没有订阅者的事件会被丢掉，所以必须等订阅挂上再说。
+                        crash::report_pending(crash_dir, Arc::clone(&core.state)).await;
+                    }
                     Err(message) => {
                         let message = format!("hbot 启动失败：{message}");
                         // 对话框会阻塞调用线程，放到 blocking 池，别堵住 async worker。
@@ -331,6 +398,45 @@ pub fn run() -> i32 {
             report_fatal(&format!("桌面运行失败：{error}"));
             1
         }
+    }
+}
+
+/// 让"偏好文件"与"系统里的实际自启项"一致。
+///
+/// 两个方向都用**事实**作准，不做单边覆盖：
+///
+/// - 系统里开着、偏好说关 → 把偏好改成开（并落盘）。这是升级/重装后最常见的情况：
+///   注册表项还在，而 `desktop.json` 是新建的默认值。此时**不删系统项** —— 用户
+///   上次明确开过，静默删掉才是更大的意外。
+/// - 偏好说开、系统里没有 → 重新写系统项（用户手工清过注册表或换了安装路径）。
+///   写失败就把偏好改回关，避免"勾选亮着却不起作用"。
+fn reconcile_autostart(prefs: &settings::DesktopSettings, data_dir: &Path) {
+    let system = autostart::current();
+    match (prefs.autostart, system) {
+        (false, autostart::AutostartState::Enabled) => {
+            tracing::info!("系统里已有自启项，偏好文件说关；以系统为准改偏好为开");
+            let adopted = settings::DesktopSettings {
+                autostart: true,
+                ..*prefs
+            };
+            if let Err(error) = adopted.save(data_dir) {
+                tracing::warn!(%error, "把自启偏好改成开失败");
+            }
+        }
+        (true, autostart::AutostartState::Disabled) => {
+            tracing::info!("偏好说开机自启，但系统里没有；重新写入");
+            if let Err(error) = autostart::set_enabled(true) {
+                tracing::warn!(%error, "重写自启项失败，偏好改回关");
+                let disabled = settings::DesktopSettings {
+                    autostart: false,
+                    ..*prefs
+                };
+                if let Err(save_error) = disabled.save(data_dir) {
+                    tracing::warn!(%save_error, "把自启偏好改回关也失败了");
+                }
+            }
+        }
+        _ => {}
     }
 }
 

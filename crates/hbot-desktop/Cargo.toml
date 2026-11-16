@@ -4,17 +4,32 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# PE 的 CompanyName 取自这里；留空会让资源里的公司名为空（卸载列表的 Publisher
+# 来自 tauri.conf.json 的 bundle.publisher，不受影响）。
+authors = ["HBot contributors"]
 description = "Tauri 桌面壳：只做窗口/托盘/单实例/更新，业务在 hbot-rpc 的 dispatch 后面"
 
 [dependencies]
 hbot-core = { path = "../hbot-core" }
 hbot-rpc = { path = "../hbot-rpc" }
+# 壳只许依赖 hbot-core + hbot-rpc（`docs/03-directory.md` 与 `xtask deps` 钉着）。
+# 要往 `logs` 表插一行时走 `hbot_rpc::app::AppState::append_log`，不直接依赖 hbot-store。
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2", features = [] }
+# `tray-icon`：托盘图标与菜单。`tauri.conf.json` 的 `app.trayIcon` 只在编译期嵌图标，
+# 运行时建托盘 + 挂菜单需要这个 feature（否则 `app.tray_by_id` 拿不到东西）。
+tauri = { version = "2", features = ["tray-icon"] }
+# 官方单实例插件：第二个进程在插件初始化阶段就把 argv/cwd 交给第一个实例并 exit(0)，
+# 那时配置窗口还没创建、`AppState` 还没打开 —— 正好满足"不能开第二个 DB 写入者/WebView"。
+tauri-plugin-single-instance = "2.5"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Windows 自启只写 HKCU（不需要管理员）。用官方的 `windows-registry` 而不是 `winreg`：
+# 后者会额外拖进 chrono 一棵树。
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
