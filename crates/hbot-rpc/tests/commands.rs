@@ -1,14 +1,27 @@
-//! 命令契约测试：25 个 `Command` 的 `type` 值与字段名（命令一律 camelCase 字段）。
+//! 命令契约测试：32 个 `Command` 的 `type` 值与字段名（命令一律 camelCase 字段）。
 
 mod support;
 
 use hbot_core::{ApprovalDecision, BotStatus};
+use hbot_rpc::dto::DeviceSettings;
 use hbot_rpc::{AppInfo, BotSummary, Command, DirEntry, FileContent, LogLevel, RunLog, StepKind};
 use serde_json::json;
 use support::{
     APPROVAL_UUID, AT, BOT_UUID, CONVERSATION_UUID, EDIT_UUID, SEARCH_UUID, SESSION_UUID, approval,
     assert_camel_case_keys, assert_command, at, bot, conversation, edit, search, session,
 };
+
+/// 设置命令的样例载荷：字段全给，才能验到每个字段的 wire 名。
+fn settings() -> DeviceSettings {
+    DeviceSettings {
+        enabled: true,
+        capabilities: vec!["screen".to_string()],
+        allowed_apps: vec!["notepad.exe".to_string()],
+        default_minutes: 5,
+        max_minutes: 30,
+        max_actions_per_session: 100,
+    }
+}
 
 #[test]
 fn app_project_and_agent_commands_use_camel_case_fields() {
@@ -278,8 +291,73 @@ fn bot_debug_and_log_commands_use_camel_case_fields() {
 }
 
 #[test]
+fn device_and_settings_commands_use_camel_case_fields() {
+    assert_command(
+        Command::DeviceStatus { bot_id: bot() },
+        json!({ "type": "device_status", "botId": BOT_UUID }),
+    );
+
+    assert_command(
+        Command::DeviceGrant {
+            bot_id: bot(),
+            sub: vec!["screen".to_string(), "ocr".to_string()],
+            allowed_apps: vec!["msedge.exe".to_string()],
+            minutes: Some(10),
+        },
+        json!({
+            "type": "device_grant",
+            "botId": BOT_UUID,
+            "sub": ["screen", "ocr"],
+            "allowedApps": ["msedge.exe"],
+            "minutes": 10,
+        }),
+    );
+
+    assert_command(
+        Command::DeviceRevoke { bot_id: bot() },
+        json!({ "type": "device_revoke", "botId": BOT_UUID }),
+    );
+
+    assert_command(
+        Command::DeviceRequest {
+            bot_id: bot(),
+            sub: vec!["input".to_string()],
+            reason: "帮我点一下同意".to_string(),
+        },
+        json!({
+            "type": "device_request",
+            "botId": BOT_UUID,
+            "sub": ["input"],
+            "reason": "帮我点一下同意",
+        }),
+    );
+
+    // 设置是宿主级对象：`settings` 里的六个字段一个都不能少，且都是 camelCase。
+    assert_command(
+        Command::DeviceSettingsGet,
+        json!({ "type": "device_settings_get" }),
+    );
+    assert_command(
+        Command::DeviceSettingsSet {
+            settings: settings(),
+        },
+        json!({
+            "type": "device_settings_set",
+            "settings": {
+                "enabled": true,
+                "capabilities": ["screen"],
+                "allowedApps": ["notepad.exe"],
+                "defaultMinutes": 5,
+                "maxMinutes": 30,
+                "maxActionsPerSession": 100,
+            },
+        }),
+    );
+}
+
+#[test]
 fn command_fields_never_serialize_as_snake_case() {
-    // 覆盖全部 25 个命令：任何一个字段漏改 camelCase 都会在这里红。
+    // 覆盖全部 32 个命令：任何一个字段漏改 camelCase 都会在这里红。
     // 与上面的形状断言重复构造是有意的——这里只关心"没有 `_` 字段名"。
     let commands = vec![
         Command::AppInfo,
@@ -349,6 +427,24 @@ fn command_fields_never_serialize_as_snake_case() {
             text: "t".to_string(),
         },
         Command::BotList,
+        Command::BotConversations { bot_id: bot() },
+        Command::DeviceStatus { bot_id: bot() },
+        Command::DeviceGrant {
+            bot_id: bot(),
+            sub: vec!["screen".to_string()],
+            allowed_apps: vec!["msedge.exe".to_string()],
+            minutes: Some(10),
+        },
+        Command::DeviceRevoke { bot_id: bot() },
+        Command::DeviceRequest {
+            bot_id: bot(),
+            sub: vec!["input".to_string()],
+            reason: "r".to_string(),
+        },
+        Command::DeviceSettingsGet,
+        Command::DeviceSettingsSet {
+            settings: settings(),
+        },
         Command::DebugSetBreakpoints {
             bot_id: bot(),
             file: "f".to_string(),
@@ -364,7 +460,7 @@ fn command_fields_never_serialize_as_snake_case() {
             limit: 1,
         },
     ];
-    assert_eq!(commands.len(), 25, "命令数量变化时同步这张表");
+    assert_eq!(commands.len(), 32, "命令数量变化时同步这张表");
 
     for command in &commands {
         let value = serde_json::to_value(command).expect("ser");

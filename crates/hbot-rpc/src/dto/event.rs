@@ -178,4 +178,15 @@ pub enum Event {
         /// 请求 ID（用户点"允许"时带回 `device_grant`）。
         request_id: String,
     },
+
+    /// 宿主设备设置变了（`device_settings_set` 写完，或 `device.json` 被外部改动
+    /// 后由 tick 发现）。UI 收到就重画设置页，不用轮询。
+    ///
+    /// `critical = false` 的普通事件：丢一条不影响判断，因为下一次
+    /// `device_settings_get` 一定拿得到真值。
+    #[serde(rename = "device.settings")]
+    DeviceSettings {
+        /// 新的整份设置。
+        settings: super::DeviceSettings,
+    },
 }

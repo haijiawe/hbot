@@ -14,10 +14,10 @@ use ts_rs::{Config, TS};
 
 use super::{GeneratedFile, HEADER, INDEX_FILE, TsGenError};
 use crate::dto::{
-    ApiError, AppInfo, BotSummary, Command, ConversationSummary, DebugScope, DeviceStatus,
-    Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile, Event, FileChangeKind,
-    FileContent, LogLevel, ProjectOpenResult, ProjectSummary, Response, RiskLevel, RunLog,
-    SearchMatch, StackFrame, StepKind,
+    ApiError, AppInfo, BotSummary, Command, ConversationSummary, DebugScope, DeviceSettings,
+    DeviceStatus, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile, Event,
+    FileChangeKind, FileContent, LogLevel, ProjectOpenResult, ProjectSummary, Response, RiskLevel,
+    RunLog, SearchMatch, StackFrame, StepKind,
 };
 
 /// 渲染结果：文件本身 + 它 import 的依赖（供悬空 import 检查）。
@@ -77,6 +77,8 @@ pub fn generated_files() -> Result<Vec<GeneratedFile>, TsGenError> {
         // 代价是前端要自己把未知值当"不认识的能力"忽略，不能 throw。
         DeviceStatus,
     );
+    // 宿主级设备设置（`device_settings_get` / `device_settings_set` 的载荷）。
+    export!(DeviceSettings);
     // 领域类型：事件载荷里出现的枚举 / 结构。
     export!(
         BotStatus,

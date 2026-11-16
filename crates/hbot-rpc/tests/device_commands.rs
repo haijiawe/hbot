@@ -1,12 +1,14 @@
-//! 设备能力四条命令的集成测试（真 `Dispatcher::with_state` + `dispatch`）。
+//! 设备能力六条命令的集成测试（真 `Dispatcher::with_state` + `dispatch`）。
 //!
 //! 走真 `AppState`、真 `Store`（临时目录里的 sqlite）、真 `EventBus`，只有时钟是
 //! [`ManualClock`] —— 到期结算要能"把表拨过去"，等真的一秒会变成 flaky 测试。
 //!
 //! 两个刻意的口径：
 //!
-//! 1. **`device.json` 在 `AppState::open` 之前写进 data_dir**：设置是启动时 load 的，
-//!    事后再改文件不会影响已建好的登记表（那正是"启动读一次"的语义）。
+//! 1. **`device.json` 在 `AppState::open` 之前写进 data_dir**：那是启动时 load 的那份。
+//!    启动之后再改文件也**会**生效，但要等 1 秒的 mtime 轮询（`device_settings_set`
+//!    写完的文件同理）；测试里要"立刻生效"就直接调 `registry.reload_settings_if_changed()`，
+//!    别去 sleep 一秒。
 //! 2. **清单声明来自真项目目录里的 `hbot.json`**：闸门读的是"当前项目"的声明，所以测试
 //!    必须先 `open_project`，否则清单那一闸永远按"没声明"拒。
 
@@ -16,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hbot_core::{BotId, ProjectId, Timestamp};
 use hbot_rpc::app::ids::{ManualClock, UuidIds};
-use hbot_rpc::dto::{ApiError, Command, Event};
+use hbot_rpc::dto::{ApiError, Command, DeviceSettings, Event};
 use hbot_rpc::{AppState, Dispatcher};
 use hbot_store::{Bot, Project};
 use serde_json::{Value, json};
@@ -644,4 +646,345 @@ async fn request_truncates_an_overlong_reason() {
     };
     assert_eq!(reason.chars().count(), 500, "reason 要截到 500 个字符");
     assert!(reason.chars().all(|character| character == '截'));
+}
+
+// ---------------------------------------------------------------------------
+// ⑪ device_settings_get：默认值就是真值（读内存，不顺手落盘）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn settings_get_returns_the_defaults_and_never_writes_a_file() {
+    // 不给 device.json：走 `DeviceSettings::default()`。
+    let fixture = fixture(None, Some(MANIFEST)).await;
+
+    let data = data_of(&fixture.dispatcher, Command::DeviceSettingsGet).await;
+
+    assert!(data.is_object(), "data 必须是对象：{data}");
+    assert_eq!(data["enabled"], json!(false), "默认全关");
+    assert_eq!(
+        data["capabilities"],
+        json!([]),
+        "空清单 = 一个子能力都不放行"
+    );
+    assert_eq!(data["allowedApps"], json!([]), "空白名单 = 不按应用收口");
+    assert_eq!(data["defaultMinutes"], json!(5));
+    assert_eq!(data["maxMinutes"], json!(30));
+    assert_eq!(data["maxActionsPerSession"], json!(10000));
+    assert_eq!(
+        data.as_object().expect("对象").len(),
+        6,
+        "字段就这六个（camelCase），别多加：{data}"
+    );
+    assert!(
+        !fixture
+            .state
+            .device()
+            .data_dir()
+            .join("device.json")
+            .exists(),
+        "get 是纯读：不许顺手把默认值写下去"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ⑫ device_settings_set：全链路（校验 → 落盘 → 换内存 → 广播 → 返回新值）
+// ---------------------------------------------------------------------------
+
+fn settings_command(settings: DeviceSettings) -> Command {
+    Command::DeviceSettingsSet { settings }
+}
+
+/// 一份全合法的基线载荷；各用例只改一处。
+fn valid_settings() -> DeviceSettings {
+    DeviceSettings {
+        enabled: true,
+        capabilities: vec!["screen".to_owned(), "ocr".to_owned()],
+        allowed_apps: vec!["notepad.exe".to_owned()],
+        default_minutes: 5,
+        max_minutes: 20,
+        max_actions_per_session: 100,
+    }
+}
+
+#[tokio::test]
+async fn settings_set_writes_disk_updates_memory_and_broadcasts_one_event() {
+    let fixture = fixture(Some(ENABLED_SETTINGS), Some(MANIFEST)).await;
+    let path = fixture.state.device().data_dir().join("device.json");
+    let before = fixture.state.device().settings();
+    assert!(before.enabled, "夹具起点是全开");
+    let mut events = fixture.state.events().subscribe();
+
+    let data = data_of(
+        &fixture.dispatcher,
+        settings_command(DeviceSettings {
+            enabled: false,
+            // 故意乱序：返回体里的顺序必须按枚举声明序稳定下来。
+            capabilities: vec!["window".to_owned(), "ocr".to_owned()],
+            // 大小写 + 前后空白 + 重复项：归一化后只留一条 `notepad.exe`。
+            allowed_apps: vec!["  Notepad.EXE ".to_owned(), "NOTEPAD.exe".to_owned()],
+            default_minutes: 7,
+            max_minutes: 12,
+            max_actions_per_session: 42,
+        }),
+    )
+    .await;
+
+    // ① 返回体就是写入后的那份（不是"被校验修正过"的静默版本）。
+    assert_eq!(data["enabled"], json!(false));
+    assert_eq!(data["capabilities"], json!(["ocr", "window"]));
+    assert_eq!(data["allowedApps"], json!(["notepad.exe"]));
+    assert_eq!(data["defaultMinutes"], json!(7));
+    assert_eq!(data["maxMinutes"], json!(12));
+    assert_eq!(data["maxActionsPerSession"], json!(42));
+
+    // ② 内存换了。
+    let in_memory = fixture.state.device().settings();
+    assert_ne!(in_memory, before, "内存必须换成新值");
+    assert!(!in_memory.enabled);
+    assert_eq!(in_memory.allowed_apps, vec!["notepad.exe".to_owned()]);
+    assert_eq!(in_memory.default_minutes, 7);
+    assert_eq!(in_memory.max_minutes, 12);
+
+    // ③ 磁盘也换了，而且是 camelCase、没有 .tmp 残留（原子写）。
+    let on_disk: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("设置应已落盘")).expect("合法 JSON");
+    assert_eq!(on_disk["enabled"], json!(false));
+    assert_eq!(on_disk["allowedApps"], json!(["notepad.exe"]));
+    assert_eq!(on_disk["maxMinutes"], json!(12));
+    assert_eq!(on_disk["maxActionsPerSession"], json!(42));
+    assert!(
+        on_disk.get("max_minutes").is_none(),
+        "磁盘上也是 camelCase：{on_disk}"
+    );
+    assert!(
+        !path.with_extension("json.tmp").exists(),
+        "rename 成功后不许留下 device.json.tmp"
+    );
+
+    // ④ `device.settings` 广播了一条，内容是新值。
+    let event = events.try_recv().expect("成功后必须广播 device.settings");
+    let Event::DeviceSettings { settings } = event else {
+        panic!("事件类型不对：{event:?}");
+    };
+    assert!(!settings.enabled);
+    assert_eq!(
+        settings.capabilities,
+        vec!["ocr".to_owned(), "window".to_owned()]
+    );
+    assert_eq!(settings.allowed_apps, vec!["notepad.exe".to_owned()]);
+    assert_eq!(settings.max_actions_per_session, 42);
+
+    // ⑤ get 读的是内存：立刻就能看到同一份。
+    assert_eq!(
+        data_of(&fixture.dispatcher, Command::DeviceSettingsGet).await,
+        data,
+        "get 不该再去读盘（否则写盘刚失败时也会显示成功）"
+    );
+
+    // ⑥ 没有任何多余事件（一次写入只广播一条设置）。
+    assert!(
+        events.try_recv().is_err(),
+        "一次 device_settings_set 只许广播一条 device.settings"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ⑬ 校验：每种非法输入都要 -32002，且**磁盘一个字节都不许变**
+// ---------------------------------------------------------------------------
+
+/// 派发一条应当被 `-32002` 拒掉的设置写入，并钉住四件事：
+/// 错误码、磁盘没变、内存没变、没广播事件（"绝不静默修正"）。
+async fn assert_settings_rejected(
+    fixture: &Fixture,
+    payload: DeviceSettings,
+    hint: &str,
+) -> ApiError {
+    let path = fixture.state.device().data_dir().join("device.json");
+    let disk_before = std::fs::read(&path).expect("夹具应当已写过 device.json");
+    let memory_before = fixture.state.device().settings();
+    let mut events = fixture.state.events().subscribe();
+
+    let error = error_of(&fixture.dispatcher, settings_command(payload)).await;
+
+    assert_eq!(error.code, -32002, "{hint}：{error:?}");
+    assert!(
+        !error.message.trim().is_empty(),
+        "{hint}：错误要带可读文案（用户得知道怎么改）"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("device.json 还在"),
+        disk_before,
+        "{hint}：校验失败绝不许改磁盘 —— 静默修正会让用户以为自己设的就是生效的那份"
+    );
+    assert_eq!(
+        fixture.state.device().settings(),
+        memory_before,
+        "{hint}：内存也不许变"
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "{hint}：失败不许广播 device.settings"
+    );
+    error
+}
+
+#[tokio::test]
+async fn settings_set_rejects_an_unknown_capability_name() {
+    let fixture = fixture(Some(ENABLED_SETTINGS), Some(MANIFEST)).await;
+    let mut payload = valid_settings();
+    payload.capabilities = vec!["screen".to_owned(), "scren".to_owned()];
+
+    let error = assert_settings_rejected(&fixture, payload, "未知子能力").await;
+    assert!(
+        error.message.contains("scren"),
+        "要点出哪个名字：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("clipboard"),
+        "要列出全部允许值：{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn settings_set_rejects_a_max_minutes_over_the_hard_cap() {
+    let fixture = fixture(Some(ENABLED_SETTINGS), Some(MANIFEST)).await;
+    let mut payload = valid_settings();
+    payload.max_minutes = 31;
+
+    let error = assert_settings_rejected(&fixture, payload, "maxMinutes=31").await;
+    assert!(error.message.contains("maxMinutes"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn settings_set_rejects_a_default_minutes_over_the_max() {
+    let fixture = fixture(Some(ENABLED_SETTINGS), Some(MANIFEST)).await;
+    let mut payload = valid_settings();
+    payload.max_minutes = 10;
+    payload.default_minutes = 11;
+
+    let error = assert_settings_rejected(&fixture, payload, "defaultMinutes > maxMinutes").await;
+    assert!(
+        error.message.contains("defaultMinutes"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn settings_set_rejects_an_empty_app_name() {
+    let fixture = fixture(Some(ENABLED_SETTINGS), Some(MANIFEST)).await;
+    let mut payload = valid_settings();
+    payload.allowed_apps = vec!["notepad.exe".to_owned(), "   ".to_owned()];
+
+    let error = assert_settings_rejected(&fixture, payload, "空应用名").await;
+    assert!(
+        error.message.contains("第 2 项"),
+        "要指出第几项：{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn settings_set_rejects_a_zero_action_budget() {
+    let fixture = fixture(Some(ENABLED_SETTINGS), Some(MANIFEST)).await;
+    let mut payload = valid_settings();
+    payload.max_actions_per_session = 0;
+
+    let error = assert_settings_rejected(&fixture, payload, "maxActionsPerSession=0").await;
+    assert!(
+        error.message.contains("maxActionsPerSession"),
+        "{}",
+        error.message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ⑭ 落盘失败不许污染内存（否则"界面显示成功，文件还是旧的"）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_failed_write_leaves_memory_untouched_and_broadcasts_nothing() {
+    let fixture = fixture(Some(ENABLED_SETTINGS), Some(MANIFEST)).await;
+    let data_dir = fixture.state.device().data_dir().to_path_buf();
+    let path = data_dir.join("device.json");
+    let disk_before = std::fs::read(&path).expect("夹具应当已写过 device.json");
+    let memory_before = fixture.state.device().settings();
+    let mut events = fixture.state.events().subscribe();
+
+    // 让**临时文件**写不出来：`device.json.tmp` 先占成一个同名目录。
+    // 这样 `save()` 在 `fs::write(temp)` 那一步就失败（不重试、也不碰真文件），
+    // 与"rename 撞 EPERM"那种临时故障分开测 —— 那种会重试，最后也可能成功。
+    let temp = path.with_extension("json.tmp");
+    std::fs::create_dir(&temp).expect("占住临时文件名");
+
+    let error = error_of(&fixture.dispatcher, settings_command(valid_settings())).await;
+
+    assert_eq!(error.code, -32006, "写盘失败要走 internal：{error:?}");
+    assert!(
+        error.message.contains("写盘失败"),
+        "文案要说清是落盘失败：{}",
+        error.message
+    );
+    assert_eq!(
+        fixture.state.device().settings(),
+        memory_before,
+        "落盘失败绝不许改内存（内存必须晚于磁盘）"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("device.json 还在"),
+        disk_before,
+        "失败后磁盘上还是旧的那份"
+    );
+    assert!(events.try_recv().is_err(), "失败不许广播 device.settings");
+
+    // 收拾掉占位的临时目录（TempDir 的 Drop 也会删，这里只是让断言更明确）。
+    std::fs::remove_dir(&temp).expect("清掉占位目录");
+}
+
+// ---------------------------------------------------------------------------
+// ⑮ 外部改文件（另一个窗口 / 手改）：watcher 重载后 get 立刻看到
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_external_edit_is_reloaded_by_the_watcher_and_shows_up_in_get() {
+    let fixture = fixture(Some(ENABLED_SETTINGS), Some(MANIFEST)).await;
+    // 启动时 load 的那份与磁盘一致：第一次调用只对齐基线，不报变化。
+    assert!(
+        fixture
+            .state
+            .device()
+            .reload_settings_if_changed()
+            .is_none(),
+        "内容没变就不该重载"
+    );
+
+    // 等一拍再写：mtime 是判据，同一时刻内的两次写可能落在同一个时间戳上。
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    std::fs::write(
+        fixture.state.device().data_dir().join("device.json"),
+        APPS_ONLY_SETTINGS,
+    )
+    .expect("外部改设置");
+
+    assert!(
+        fixture
+            .state
+            .device()
+            .reload_settings_if_changed()
+            .is_some(),
+        "mtime 变了就要重载"
+    );
+    let data = data_of(&fixture.dispatcher, Command::DeviceSettingsGet).await;
+    assert_eq!(data["enabled"], json!(false), "外部把开关关了");
+    assert_eq!(data["allowedApps"], json!(["msedge.exe"]));
+    assert!(
+        fixture
+            .state
+            .device()
+            .reload_settings_if_changed()
+            .is_none(),
+        "同一 mtime 只处理一次（坏文件也不许每秒重放事件）"
+    );
 }

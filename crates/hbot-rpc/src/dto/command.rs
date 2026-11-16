@@ -250,6 +250,27 @@ pub enum Command {
         reason: String,
     },
 
+    /// 读宿主级设备设置（`<data_dir>/device.json`）。
+    ///
+    /// `data` 是 [`DeviceSettings`](super::DeviceSettings)。这是**宿主**设置，不是
+    /// 某个 bot 的会话：会话由 [`Command::DeviceGrant`] 开，设置属于这台机器。
+    DeviceSettingsGet,
+
+    /// 写宿主级设备设置。
+    ///
+    /// 校验失败一律 `-32002`（不"就近取一个合法值"）：`capabilities` 里有不认识的
+    /// 名字、`maxMinutes` 超过硬上限 30、`defaultMinutes` 大于 `maxMinutes`、应用名
+    /// 是空串——都当场报错，因为静默修正会让用户以为自己设的就是生效的那份。
+    ///
+    /// 写入后立刻对**下一次**设备调用生效（闸不缓存设置），并且会发一条
+    /// `device.settings` 事件让所有窗口对齐。已经开着的会话：时长与子能力不变
+    /// （那是用户在不同时刻点头的两次决定），但 `allowedApps` 与总开关的收紧会在
+    /// 下一次调用上就生效（`host_ceiling_allows` 每次重查）。
+    DeviceSettingsSet {
+        /// 新的整份设置（不是补丁：少写的字段按默认值算，调用方要传全量）。
+        settings: super::DeviceSettings,
+    },
+
     /// 设置断点（调试构建）。
     ///
     /// 断点是**按 bot 的沙箱**生效的：同一份源码在不同 bot 的 isolate 里可以是不同版本。
@@ -319,6 +340,8 @@ impl Command {
             Self::DeviceGrant { .. } => "device_grant",
             Self::DeviceRevoke { .. } => "device_revoke",
             Self::DeviceRequest { .. } => "device_request",
+            Self::DeviceSettingsGet => "device_settings_get",
+            Self::DeviceSettingsSet { .. } => "device_settings_set",
             Self::DebugSetBreakpoints { .. } => "debug_set_breakpoints",
             Self::DebugResume { .. } => "debug_resume",
             Self::DebugStep { .. } => "debug_step",

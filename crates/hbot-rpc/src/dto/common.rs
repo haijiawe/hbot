@@ -138,6 +138,33 @@ pub struct DeviceStatus {
     pub remaining_ms: Option<i64>,
 }
 
+/// 宿主级设备设置（`device_settings_get` / `device_settings_set` 的 `data`，
+/// 也是 `device.settings` 事件的载荷）。
+///
+/// 这是**这台机器**的设置，不属于某个 bot；某个 bot 能做什么由会话
+/// （[`DeviceStatus`]）与清单 `permissions.device` 再收窄。
+///
+/// `capabilities` 与 `allowedApps` 的空集语义**故意相反**，别"统一"：
+/// - `capabilities` 空 = **全拒**（能力是开一类就整类可用，空集必须最严）；
+/// - `allowedApps` 空 = **不设上限**（应用是在用户已点头那批里再收窄，
+///   若空集也当全拒，用户就得在两处各抄一份名单，最后只会把名单写宽）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSettings {
+    /// 总开关。关掉之后，Agent 与 bot 代码的所有设备调用都拒（`HBOT_DEVICE_NOT_ENABLED`）。
+    pub enabled: bool,
+    /// 允许的子能力（`screen` / `ocr` / `input` / `window` / `clipboard`）；空 = 全拒。
+    pub capabilities: Vec<String>,
+    /// 宿主级应用上限（映像名，小写）；空 = 不设上限。
+    pub allowed_apps: Vec<String>,
+    /// `device_grant` 不传 `minutes` 时的默认时长。
+    pub default_minutes: u32,
+    /// 一次会话最长多少分钟，硬上限 30。
+    pub max_minutes: u32,
+    /// 一次会话最多多少次动作（Agent 与 bot 代码共用一个计数）。
+    pub max_actions_per_session: u32,
+}
+
 /// 一条搜索匹配（`file.search.matches`）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]

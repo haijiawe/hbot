@@ -151,7 +151,9 @@ impl Dispatcher {
             Command::DeviceStatus { .. }
             | Command::DeviceGrant { .. }
             | Command::DeviceRevoke { .. }
-            | Command::DeviceRequest { .. } => {
+            | Command::DeviceRequest { .. }
+            | Command::DeviceSettingsGet
+            | Command::DeviceSettingsSet { .. } => {
                 crate::app::commands::device::handle(state, command).await
             }
         }
@@ -225,7 +227,7 @@ mod tests {
         T::from_str(raw).expect("测试 UUID 必须合法")
     }
 
-    /// 25 条命令各一条样例；与 `Command` 的变体一一对应。
+    /// 32 条命令各一条样例；与 `Command` 的变体一一对应。
     fn sample_commands() -> Vec<Command> {
         vec![
             Command::AppInfo,
@@ -297,6 +299,31 @@ mod tests {
                 text: "ping".to_owned(),
             },
             Command::BotList,
+            Command::BotConversations { bot_id: parse(BOT) },
+            Command::DeviceStatus { bot_id: parse(BOT) },
+            Command::DeviceGrant {
+                bot_id: parse(BOT),
+                sub: vec!["screen".to_owned(), "ocr".to_owned()],
+                allowed_apps: vec!["msedge.exe".to_owned()],
+                minutes: Some(10),
+            },
+            Command::DeviceRevoke { bot_id: parse(BOT) },
+            Command::DeviceRequest {
+                bot_id: parse(BOT),
+                sub: vec!["input".to_owned()],
+                reason: "需要点一下同意按钮".to_owned(),
+            },
+            Command::DeviceSettingsGet,
+            Command::DeviceSettingsSet {
+                settings: crate::dto::DeviceSettings {
+                    enabled: true,
+                    capabilities: vec!["screen".to_owned()],
+                    allowed_apps: vec!["notepad.exe".to_owned()],
+                    default_minutes: 5,
+                    max_minutes: 30,
+                    max_actions_per_session: 100,
+                },
+            },
             Command::DebugSetBreakpoints {
                 bot_id: parse(BOT),
                 file: "src/main.rs".to_owned(),
@@ -319,7 +346,7 @@ mod tests {
         let commands = sample_commands();
         assert_eq!(
             commands.len(),
-            25,
+            32,
             "命令数与 Command 变体数不一致：新增/删除命令时同步这张表"
         );
         for command in commands {

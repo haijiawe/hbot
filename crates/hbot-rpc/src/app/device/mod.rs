@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use hbot_core::device::{
     DeviceActor, DeviceCapability, DeviceError, DeviceGate, DeviceSessionState, DeviceTarget,
@@ -76,8 +76,15 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 pub struct DeviceRegistry {
     /// 数据目录（`device.json` 在它下面）。
     data_dir: PathBuf,
-    /// 当前生效的宿主设置。启动时 [`settings::DeviceSettings::load`] 读一次。
+    /// 当前生效的宿主设置。启动时 [`settings::DeviceSettings::load`] 读一次；之后由
+    /// 1 秒 tick 盯着 `device.json` 的 mtime，外部改动会被重新载入（见
+    /// [`Self::reload_settings_if_changed`]）。
     settings: RwLock<DeviceSettings>,
+    /// `device.json` 上次被观察到的修改时间（`None` = 文件不存在 / 平台不给 mtime）。
+    ///
+    /// 这是 watcher 的**变更判据**：只在 mtime 变化时处理一次。于是坏文件也只会被处理
+    /// 一次（退回默认 + 广播一条 `device.settings`），不会每秒重放一条。
+    settings_mtime: Mutex<Option<SystemTime>>,
     /// 每个 bot 最近一条会话（内存真源）。
     sessions: Mutex<HashMap<BotId, LiveSession>>,
     /// 落库用（`device_sessions` / `device_audit`）。
@@ -115,9 +122,12 @@ impl DeviceRegistry {
         events: Arc<EventBus>,
     ) -> Self {
         let settings = DeviceSettings::load(&data_dir);
+        // 基线 mtime 与"已载入的那份设置"对齐：启动之后才发生的改动才算外部改动。
+        let settings_mtime = Mutex::new(settings_mtime_of(&data_dir));
         Self {
             data_dir,
             settings: RwLock::new(settings),
+            settings_mtime,
             sessions: Mutex::new(HashMap::new()),
             store,
             clock,
@@ -135,6 +145,11 @@ impl DeviceRegistry {
     }
 
     /// 当前设置的快照（改设置不影响已开的会话，见 [`LiveSession::max_actions`]）。
+    ///
+    /// **对已开会话的生效范围**（`device_settings_set` 与 watcher 都是这一条）：会话的
+    /// 时长与子能力不追溯（那是用户在不同时刻点头的两次决定），但 `allowedApps` 与总开关
+    /// 的**收紧会在下一次设备调用上就生效** —— 闸门的 `host_ceiling_allows` /
+    /// `authorize` 每次都重查这份快照。放宽（把名字加回去）不追溯，只影响之后的会话。
     pub fn settings(&self) -> DeviceSettings {
         self.settings_read().clone()
     }
@@ -320,6 +335,10 @@ impl DeviceRegistry {
 
     /// 起 1 秒 tick（`AppState::open` 调用一次）。
     ///
+    /// 每一轮干两件事：把到期会话结算成 `expired`，以及看 `device.json` 的 mtime
+    /// 有没有被外部改动（变了就重载设置并广播 `device.settings`，见
+    /// [`Self::reload_settings_if_changed`]）。两件事共用同一个 1 秒节拍，不另起任务。
+    ///
     /// 持 [`Weak`]：`AppState`/登记表一析构就自然退出，不需要额外的关停协议。
     /// 没有异步运行时（某些同步测试直接 `AppState::open`）时只 `warn` 不 panic ——
     /// 到期结算缺席不影响正确性，闸门自己会拒绝过期会话。
@@ -351,7 +370,19 @@ impl DeviceRegistry {
                 let Some(registry) = registry.upgrade() else {
                     break;
                 };
-                let result = tokio::task::spawn_blocking(move || registry.sweep_expired()).await;
+                // 一次阻塞任务里做完两件事：到期结算 + 看一眼 `device.json` 的 mtime。
+                // 后者是 `device_settings_set` 之外的**另一条生效路径**（用户手改文件、
+                // 或另一个窗口写入）：没有它，内存里的设置会一直停在启动时读到的那份。
+                let result = tokio::task::spawn_blocking(move || {
+                    let swept = registry.sweep_expired();
+                    if let Some(settings) = registry.reload_settings_if_changed() {
+                        registry.events.emit(Event::DeviceSettings {
+                            settings: settings.to_wire(),
+                        });
+                    }
+                    swept
+                })
+                .await;
                 match result {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
@@ -363,6 +394,39 @@ impl DeviceRegistry {
                 }
             }
         });
+    }
+
+    /// 外部改了 `device.json` 就重新载入一份，换掉内存并返回**需要广播的新设置**。
+    ///
+    /// 判据是 mtime 而不是内容：内容比较得先把整个文件读一遍，而 `metadata()` 一次就够。
+    /// 1 秒轮询对"改文件 → 界面刷新"这个场景完全够用，也**不引入 `notify`**
+    /// （新增依赖过不了 `xtask deps` 与体积预算）。文件被删掉 / 改成坏 JSON 都按
+    /// [`DeviceSettings::load`] 的既有口径处理：退回默认（全拒）+ `warn`。
+    ///
+    /// **只在 mtime 变化时处理一次**：mtime 在读文件之前就记账，所以坏文件不会每秒
+    /// 重放一条事件（内存里那时已经是默认值，本来也不该再变）。内容与内存里那份相同时
+    /// 也不广播 —— 自己刚 `save` 过一份一样的设置时，不值得再推一条 `device.settings`。
+    ///
+    /// 同步且会阻塞（读文件）：只该从 `spawn_blocking` 或测试里调用。
+    pub fn reload_settings_if_changed(&self) -> Option<DeviceSettings> {
+        let mtime = settings_mtime_of(&self.data_dir);
+        {
+            let mut last = self
+                .settings_mtime
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if *last == mtime {
+                return None;
+            }
+            // 先记账再读：读失败 / 坏文件也只处理这一次。
+            *last = mtime;
+        }
+        let loaded = DeviceSettings::load(&self.data_dir);
+        if loaded == self.settings() {
+            return None;
+        }
+        self.replace_settings(loaded.clone());
+        Some(loaded)
     }
 
     /// 造一个闸门（`Weak` 指回自己）。
@@ -843,6 +907,16 @@ fn normalize_apps(apps: Vec<String>) -> Vec<String> {
         out.push(app);
     }
     out
+}
+
+/// `device.json` 的修改时间；读不到（文件不存在 / 平台不给 mtime）就是 `None`。
+///
+/// `metadata()` 失败不再区分原因：watcher 的语义是"看着变过就重读一次"，而真正的
+/// 读失败由 [`DeviceSettings::load`] 自己 `warn`（它会把默认值退回并留痕）。
+fn settings_mtime_of(data_dir: &Path) -> Option<SystemTime> {
+    std::fs::metadata(DeviceSettings::path(data_dir))
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 /// `-32002`：参数/前置条件不满足（未启用、清单没声明、交集为空）。
@@ -1818,5 +1892,111 @@ mod tests {
         assert_eq!(last.actor, "agent_tool");
         assert_eq!(last.action, "ocr");
         assert_eq!(last.outcome, "ok");
+    }
+
+    // ---- 设置 watcher（mtime 轮询，不用 `notify`）----
+
+    /// `device.json` 被外部改过：判据是 mtime，**一次改动只处理一次**。
+    #[test]
+    fn reload_settings_if_changed_picks_up_an_external_write_once() {
+        let fixture = Fixture::new("watch-reload", true, &[DeviceCapability::Screen]);
+        // 夹具自己 `save` 过一次，内容与内存里那份一致：第一次调用只对齐 mtime，不报变化。
+        assert!(
+            fixture.registry.reload_settings_if_changed().is_none(),
+            "内容没变就不该报变化"
+        );
+
+        let changed = DeviceSettings {
+            enabled: false,
+            capabilities: BTreeSet::new(),
+            allowed_apps: vec!["notepad.exe".to_owned()],
+            default_minutes: 3,
+            max_minutes: 10,
+            max_actions_per_session: 50,
+        };
+        DeviceSettings::save(fixture.registry.data_dir(), &changed).expect("外部写设置");
+
+        let loaded = fixture
+            .registry
+            .reload_settings_if_changed()
+            .expect("mtime 变了就要处理");
+        assert_eq!(loaded, changed);
+        assert_eq!(fixture.registry.settings(), changed, "内存要跟着换");
+        assert!(
+            fixture.registry.reload_settings_if_changed().is_none(),
+            "同一个 mtime 不许重复处理（否则每秒刷一条事件）"
+        );
+    }
+
+    /// 坏文件：按既有口径退回全拒，但**只处理一次** —— mtime 在处理前就记账了。
+    #[test]
+    fn a_corrupt_external_edit_falls_back_to_deny_all_and_is_processed_once() {
+        let fixture = Fixture::new("watch-corrupt", true, &[DeviceCapability::Screen]);
+        assert!(fixture.registry.reload_settings_if_changed().is_none());
+        assert!(fixture.registry.settings().enabled);
+
+        std::fs::write(
+            fixture.registry.data_dir().join(settings::SETTINGS_FILE),
+            "{ 这不是 JSON",
+        )
+        .expect("写坏文件");
+
+        let loaded = fixture
+            .registry
+            .reload_settings_if_changed()
+            .expect("坏文件也是一种变化，要处理一次");
+        assert_eq!(loaded, DeviceSettings::default(), "坏文件退回全拒的默认值");
+        assert!(!fixture.registry.settings().enabled, "内存也要退回全拒");
+        assert!(
+            fixture.registry.reload_settings_if_changed().is_none(),
+            "坏文件不许每秒重放一条 device.settings"
+        );
+    }
+
+    /// 1 秒 tick 真的会把外部改动广播出去，而且只广播一次。
+    #[tokio::test]
+    async fn the_tick_broadcasts_an_external_settings_change_exactly_once() {
+        let fixture = Fixture::new("watch-tick", true, &[DeviceCapability::Screen]);
+        let mut events = fixture.events.subscribe();
+        fixture.registry.spawn_expiry_tick();
+
+        // 第一轮 tick 只是把 mtime 对齐（内容与内存一致），不会广播；等它跑过一轮。
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+
+        let changed = DeviceSettings {
+            enabled: false,
+            ..DeviceSettings::default()
+        };
+        DeviceSettings::save(fixture.registry.data_dir(), &changed).expect("外部写设置");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let event = loop {
+            if tokio::time::Instant::now() > deadline {
+                panic!("4 秒内没等到 device.settings 事件");
+            }
+            match events.try_recv() {
+                Ok(event) => break event,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("事件通道异常：{error}"),
+            }
+        };
+        match event {
+            Event::DeviceSettings { settings } => {
+                assert!(!settings.enabled, "广播的必须是新值");
+                assert_eq!(settings.allowed_apps, Vec::<String>::new());
+            }
+            other => panic!("期望 device.settings，实际：{other:?}"),
+        }
+
+        // 再等一轮：mtime 没再变、内容也没变，不许再推一条同样的设置。
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, Event::DeviceSettings { .. }),
+                "同一份设置不许重复广播：{event:?}"
+            );
+        }
     }
 }

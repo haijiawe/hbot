@@ -1,17 +1,21 @@
-//! 设备能力的四条命令（`device_status` / `device_grant` / `device_revoke` / `device_request`）。
+//! 设备能力的六条命令（`device_status` / `device_grant` / `device_revoke` /
+//! `device_request` / `device_settings_get` / `device_settings_set`）。
 //!
 //! 契约见 `docs/09-device-capability.md` §8，DTO 在 `crate::dto`（已冻结）。
 //! 这一层只做四件事：**查 bot 是否存在**、**把线上字符串解析成领域枚举**、**把阻塞的
 //! 登记表调用包进 `spawn_blocking`**、**把结果/HbotError 翻译成 [`Response`]**。
 //! 闸门判定与会话状态机都在 [`crate::app::device`] 里 —— 命令层再抄一份判据就是两个真源。
 //!
-//! 两条容易踩的：
+//! 三条容易踩的：
 //!
 //! 1. **`device_request` 绝不改状态**。它是 Agent 说"我想做这件事，用户你批不批"的通道：
 //!    只发一条 `device.request` 事件，等用户点 `device_grant`。在这里顺手开会话等于让模型
 //!    自己给自己授权。
 //! 2. **`device_grant` 是"用户"的命令，不是 Agent 的工具**。所以它没有"审批"这一层：
 //!    调用方能发这条命令就已经是用户在点按钮了（清单闸 + 设置闸仍然在登记表里生效）。
+//! 3. **`device_settings_set` 的 `settings` 是"用户能配置的宿主设置"，不是"会话授权"**。
+//!    两者是不同时刻的两次决定：改设置不追溯已开的会话（时长/子能力），但收紧
+//!    `allowedApps` 与总开关会在下一次设备调用上就生效。
 
 use std::collections::BTreeSet;
 
@@ -20,6 +24,7 @@ use hbot_core::{BotId, EventSink, HbotError};
 use serde_json::Value;
 
 use crate::app::AppState;
+use crate::app::device::DeviceSettings;
 use crate::dto::{Command, Event, Response};
 
 /// `reason` 的字符上限（`device.request` 事件里的理由）。
@@ -28,7 +33,10 @@ use crate::dto::{Command, Event, Response};
 /// （方向是收紧，不丢事件）。
 const REASON_MAX_CHARS: usize = 500;
 
-/// 四条设备命令的统一入口（`Dispatcher` 已经按 `Command` 变体分派到这里）。
+/// 六条设备命令的统一入口（`Dispatcher` 已经按 `Command` 变体分派到这里）。
+///
+/// 前四条是**某个 bot 的会话**（都要 `ensure_bot`），后两条是**宿主设置**（与 bot 无关，
+/// 所以不过 `ensure_bot`：一个还没建 bot 的干净安装也得能读默认设置）。
 pub async fn handle(state: &AppState, command: Command) -> Response {
     // 闸门要从"当前项目"的 hbot.json 读设备声明；`DeviceGate` 拿不到 AppState，
     // 所以每次进命令先把项目根抄给登记表（切换项目时的滞后见 note_project_root 的说明）。
@@ -47,6 +55,8 @@ pub async fn handle(state: &AppState, command: Command) -> Response {
             sub,
             reason,
         } => device_request(state, bot_id, sub, reason).await,
+        Command::DeviceSettingsGet => device_settings_get(state),
+        Command::DeviceSettingsSet { settings } => device_settings_set(state, settings).await,
         other => return super::unimplemented(other.kind()),
     };
     match result {
@@ -120,10 +130,54 @@ async fn device_request(
     Ok(super::done())
 }
 
+/// 读宿主设置。读的是**内存里那份**，不是每次都读盘：磁盘只是持久化，真源是登记表
+/// （启动时载入，外部改动由 1 秒 tick 盯 mtime 重载）。
+fn device_settings_get(state: &AppState) -> Result<Response, HbotError> {
+    let settings = state.device().settings();
+    with_settings(&settings)
+}
+
+/// 全量写宿主设置。五步的顺序是契约的一部分（**内存晚于磁盘**）：
+///
+/// 1. 校验（[`DeviceSettings::from_wire`]）：任何一处不合法 → `-32002`，
+///    **绝不静默修正** —— 静默修正会让用户以为自己设的就是生效的那份；
+/// 2. 原子写 `<data_dir>/device.json`（`save()` 里 tmp + rename + Windows 重试）；
+/// 3. **只有落盘成功才** `replace_settings`：先改内存再落盘的写法一旦写失败，就会出现
+///    "界面显示成功、重启后还是旧策略"这种最难排查的不一致；
+/// 4. 发 `device.settings`（与 `device.status` 同一个 `EventBus`），让所有窗口对齐；
+/// 5. 返回写入后的设置本身（UI 照它重画，不靠猜）。
+///
+/// 对**已开会话**的生效范围：时长与子能力不追溯（那是用户在不同时刻点头的两次决定），
+/// 但 `allowedApps` 与总开关的**收紧在下一次设备调用上就生效**（闸门每次重查设置，
+/// 见 [`crate::app::device::DeviceRegistry::settings`]）；放宽不追溯，只影响之后的会话。
+async fn device_settings_set(
+    state: &AppState,
+    wire: crate::dto::DeviceSettings,
+) -> Result<Response, HbotError> {
+    let settings = DeviceSettings::from_wire(&wire)?;
+    let registry = std::sync::Arc::clone(state.device());
+    let applied = state
+        .blocking(move || {
+            let data_dir = registry.data_dir().to_path_buf();
+            DeviceSettings::save(&data_dir, &settings)
+                .map_err(|error| HbotError::internal(format!("设备设置写盘失败：{error}")))?;
+            registry.replace_settings(settings.clone());
+            Ok(settings)
+        })
+        .await?;
+    state.events().emit(Event::DeviceSettings {
+        settings: applied.to_wire(),
+    });
+    with_settings(&applied)
+}
+
 /// bot 不存在就回 `-32001`。
 ///
-/// 四条命令都先过这一关：一个不存在的 bot 的设备会话本来就不该存在，
+/// 四条会话类命令（`device_status`/`grant`/`revoke`/`request`）都先过这一关：
+/// 一个不存在的 bot 的设备会话本来就不该存在，
 /// 用 `-32001` 让调用方知道"ID 给错了"，而不是让它拿到一份空状态以为"这个 bot 还没开"。
+///
+/// 两条设置类命令**不过这一关**：宿主设置与 bot 无关（干净安装也要能读默认值）。
 async fn ensure_bot(state: &AppState, bot_id: &BotId) -> Result<(), HbotError> {
     let store = std::sync::Arc::clone(state.store());
     let id = *bot_id;
@@ -190,6 +244,13 @@ fn truncate_reason(reason: &str) -> String {
 fn with_status(status: crate::dto::DeviceStatus) -> Result<Response, HbotError> {
     let data: Value = serde_json::to_value(&status)
         .map_err(|error| HbotError::internal(format!("device status 序列化失败：{error}")))?;
+    Ok(Response::with_data(data))
+}
+
+/// `DeviceSettings`（宿主形状 → 线上形状）→ `Response::with_data`。
+fn with_settings(settings: &DeviceSettings) -> Result<Response, HbotError> {
+    let data: Value = serde_json::to_value(settings.to_wire())
+        .map_err(|error| HbotError::internal(format!("device settings 序列化失败：{error}")))?;
     Ok(Response::with_data(data))
 }
 

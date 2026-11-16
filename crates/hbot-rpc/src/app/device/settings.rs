@@ -17,6 +17,14 @@
 //! 这里取 30 并 `warn`，与"静默放宽安全"方向相反 —— 它把用户想要的时长**收紧**到上限，
 //! 不是替用户把闸门开大（那种地方必须拒绝，见 `device_grant` 的空集判定）。
 //!
+//! ## 读路径容错，写路径**拒绝**（口径相反，有意的）
+//!
+//! [`DeviceSettings::load`] 是"文件可能被用户手改"的路径：坏值只能退回默认并 `warn`，
+//! 因为宿主不能因为一个可选能力的配置文件起不来。而 [`DeviceSettings::from_wire`] 是
+//! `device_settings_set` 的路径：调用方就在等一个成功/失败，**静默修正会让用户以为
+//! 自己设的就是生效的那份**（比如把 `maxMinutes=90` 悄悄改成 30，UI 上还显示 90 的选项）。
+//! 所以写路径一律 `-32002` + 一句说清哪条不合法，绝不"就近取一个合法值"。
+//!
 //! ## 为什么写盘要 tmp + rename + 重试
 //!
 //! `AGENTS.md` §5 第 7 条：Windows 上 `rename` 覆盖已存在的目标会撞 `EPERM`（Defender
@@ -29,7 +37,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hbot_core::DeviceCapability;
+use hbot_core::{DeviceCapability, HbotError};
 use serde::{Deserialize, Serialize};
 
 /// 设置文件名（`<data_dir>/device.json`）。
@@ -179,6 +187,96 @@ impl DeviceSettings {
                 let _ = fs::remove_file(&temp);
                 Err(error)
             }
+        }
+    }
+
+    /// 从线上 DTO 转成宿主设置：**校验，不修正**（见模块文档的"写路径拒绝"）。
+    ///
+    /// 与 [`Self::from_raw`] 的分工：那个读的是"用户可能手改过的磁盘文件"，能容错就容错；
+    /// 这个读的是 `device_settings_set` 的入参，调用方就在等一个明确的成败，任何一处不合法
+    /// 都当场 `-32002`。两条路径的共同底线：**没有任何一处修正会把闸门放宽**。
+    ///
+    /// 子能力名走 [`DeviceCapability`] 的 `FromStr`（与 `device_grant` 同一个解析器）：
+    /// 在这里手抄一份 `["screen", "ocr", …]` 就等于给能力名单造第二真源，将来
+    /// `hbot-core` 加一种能力时两处一定不一致。
+    pub(crate) fn from_wire(wire: &crate::dto::DeviceSettings) -> Result<Self, HbotError> {
+        let mut capabilities = BTreeSet::new();
+        let mut unknown = Vec::new();
+        for name in &wire.capabilities {
+            match name.parse::<DeviceCapability>() {
+                Ok(capability) => {
+                    capabilities.insert(capability);
+                }
+                Err(_) => unknown.push(name.clone()),
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(HbotError::invalid(format!(
+                "不认识的设备子能力：{}（允许：{}）",
+                unknown.join(", "),
+                allowed_names()
+            )));
+        }
+
+        if let Some(index) = wire
+            .allowed_apps
+            .iter()
+            .position(|app| app.trim().is_empty())
+        {
+            return Err(HbotError::invalid(format!(
+                "allowedApps 第 {} 项是空应用名（trim 后为空）：要么写映像名，要么整项删掉",
+                index + 1
+            )));
+        }
+        // 归一化只允许有一份实现（`normalize_apps`：trim → 小写 → 去重，保序）。
+        // 传克隆：DTO 是调用方的数据，别就地改。
+        let allowed_apps = super::normalize_apps(wire.allowed_apps.clone());
+
+        if wire.max_minutes == 0 || wire.max_minutes > MAX_SESSION_MINUTES {
+            return Err(HbotError::invalid(format!(
+                "maxMinutes 必须在 1..={MAX_SESSION_MINUTES} 之间（{MAX_SESSION_MINUTES} 是硬上限，\
+                 与 device_grant 的实现一致），实际 {}",
+                wire.max_minutes
+            )));
+        }
+        if wire.default_minutes == 0 || wire.default_minutes > wire.max_minutes {
+            return Err(HbotError::invalid(format!(
+                "defaultMinutes 必须在 1..=maxMinutes（{}）之间，实际 {}",
+                wire.max_minutes, wire.default_minutes
+            )));
+        }
+        if wire.max_actions_per_session == 0 {
+            return Err(HbotError::invalid(
+                "maxActionsPerSession 必须 >= 1（0 会让第一次设备动作就被 HostLimit 拒掉）",
+            ));
+        }
+
+        Ok(Self {
+            enabled: wire.enabled,
+            capabilities,
+            allowed_apps,
+            default_minutes: wire.default_minutes,
+            max_minutes: wire.max_minutes,
+            max_actions_per_session: wire.max_actions_per_session,
+        })
+    }
+
+    /// 转成线上 DTO（`device_settings_get` 的 `data`、`device.settings` 事件的载荷）。
+    ///
+    /// 子能力按 [`DeviceCapability`] 的声明顺序输出（`BTreeSet` 的迭代序就是枚举序），
+    /// 所以同一份设置每次序列化出来的数组顺序都稳定 —— UI 与测试都不必自己排序。
+    pub(crate) fn to_wire(&self) -> crate::dto::DeviceSettings {
+        crate::dto::DeviceSettings {
+            enabled: self.enabled,
+            capabilities: self
+                .capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_owned())
+                .collect(),
+            allowed_apps: self.allowed_apps.clone(),
+            default_minutes: self.default_minutes,
+            max_minutes: self.max_minutes,
+            max_actions_per_session: self.max_actions_per_session,
         }
     }
 
@@ -501,5 +599,137 @@ mod tests {
             !dir.path.join("device.json.tmp").exists(),
             "rename 成功后临时文件必须消失"
         );
+    }
+
+    /// 写路径的样例：一份全部字段都合法、且值都不是默认值的设置。
+    fn wire() -> crate::dto::DeviceSettings {
+        crate::dto::DeviceSettings {
+            enabled: true,
+            capabilities: vec!["window".to_owned(), "screen".to_owned()],
+            allowed_apps: vec!["notepad.exe".to_owned()],
+            default_minutes: 5,
+            max_minutes: 20,
+            max_actions_per_session: 100,
+        }
+    }
+
+    fn invalid_message(error: &HbotError) -> &str {
+        match error {
+            HbotError::Invalid { message } => message,
+            other => panic!("期望 -32002 Invalid，实际：{other:?}"),
+        }
+    }
+
+    /// 合法载荷原样生效（子能力按枚举顺序、应用名归一化），`to_wire` 能转回去。
+    #[test]
+    fn from_wire_accepts_a_valid_payload_and_round_trips() {
+        let settings = DeviceSettings::from_wire(&wire()).expect("合法载荷必须通过");
+        assert!(settings.enabled);
+        assert_eq!(
+            settings.capabilities,
+            [DeviceCapability::Screen, DeviceCapability::Window]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(settings.allowed_apps, vec!["notepad.exe".to_owned()]);
+        assert_eq!(settings.default_minutes, 5);
+        assert_eq!(settings.max_minutes, 20);
+        assert_eq!(settings.max_actions_per_session, 100);
+
+        let back = settings.to_wire();
+        assert_eq!(
+            back.capabilities,
+            vec!["screen".to_owned(), "window".to_owned()],
+            "线上顺序按枚举声明序（screen 在 window 前），稳定可复现"
+        );
+        assert_eq!(
+            DeviceSettings::from_wire(&back).expect("转回来还是合法"),
+            settings
+        );
+    }
+
+    /// 大小写与空白在写路径上也归一化（`"Notepad.EXE"` → `notepad.exe`，重复项去掉）。
+    #[test]
+    fn from_wire_trims_lowercases_and_dedupes_app_names() {
+        let mut payload = wire();
+        payload.allowed_apps = vec![
+            "  Notepad.EXE ".to_owned(),
+            "notepad.exe".to_owned(),
+            "NOTEPAD.EXE".to_owned(),
+        ];
+        let settings = DeviceSettings::from_wire(&payload).expect("归一化后合法");
+        assert_eq!(settings.allowed_apps, vec!["notepad.exe".to_owned()]);
+    }
+
+    /// 不认识的子能力名：`-32002`，且把允许值列出来（用户照提示就能改对）。
+    #[test]
+    fn from_wire_rejects_unknown_capability_names() {
+        let mut payload = wire();
+        payload.capabilities = vec!["screen".to_owned(), "scren".to_owned()];
+        let error = DeviceSettings::from_wire(&payload).expect_err("拼错必须拒绝");
+        assert_eq!(error.code(), -32002);
+        let message = invalid_message(&error);
+        assert!(message.contains("scren"), "要点出是哪个名字：{message}");
+        assert!(message.contains("clipboard"), "要列出允许值：{message}");
+    }
+
+    /// `maxMinutes` 硬上限 30：31 与 0 都拒绝（读路径会截断，写路径不行）。
+    #[test]
+    fn from_wire_rejects_max_minutes_outside_the_hard_range() {
+        let mut payload = wire();
+        payload.max_minutes = 31;
+        let error = DeviceSettings::from_wire(&payload).expect_err("超上限必须拒绝");
+        assert_eq!(error.code(), -32002);
+        assert!(invalid_message(&error).contains("maxMinutes"));
+
+        let mut zero = wire();
+        zero.max_minutes = 0;
+        assert_eq!(
+            DeviceSettings::from_wire(&zero)
+                .expect_err("0 分钟必须拒绝")
+                .code(),
+            -32002
+        );
+    }
+
+    /// `defaultMinutes` 必须在 `1..=maxMinutes`：大于上限与 0 都拒绝。
+    #[test]
+    fn from_wire_rejects_default_minutes_outside_the_max() {
+        let mut payload = wire();
+        payload.max_minutes = 10;
+        payload.default_minutes = 11;
+        let error = DeviceSettings::from_wire(&payload).expect_err("超过 maxMinutes 必须拒绝");
+        assert_eq!(error.code(), -32002);
+        assert!(invalid_message(&error).contains("defaultMinutes"));
+
+        let mut zero = wire();
+        zero.default_minutes = 0;
+        assert_eq!(
+            DeviceSettings::from_wire(&zero)
+                .expect_err("0 分钟必须拒绝")
+                .code(),
+            -32002
+        );
+    }
+
+    /// 空应用名：拒绝并指出第几项（不是静默丢掉 —— 丢掉会让用户以为设上了）。
+    #[test]
+    fn from_wire_rejects_empty_app_names() {
+        let mut payload = wire();
+        payload.allowed_apps = vec!["notepad.exe".to_owned(), "   ".to_owned()];
+        let error = DeviceSettings::from_wire(&payload).expect_err("空应用名必须拒绝");
+        assert_eq!(error.code(), -32002);
+        let message = invalid_message(&error);
+        assert!(message.contains("第 2 项"), "要指出是哪一项：{message}");
+    }
+
+    /// `maxActionsPerSession=0` 会让第一次设备动作就被拒，写路径直接报错。
+    #[test]
+    fn from_wire_rejects_zero_max_actions() {
+        let mut payload = wire();
+        payload.max_actions_per_session = 0;
+        let error = DeviceSettings::from_wire(&payload).expect_err("0 次动作必须拒绝");
+        assert_eq!(error.code(), -32002);
+        assert!(invalid_message(&error).contains("maxActionsPerSession"));
     }
 }
