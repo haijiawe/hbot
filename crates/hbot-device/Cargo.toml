@@ -33,8 +33,30 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    # System_Com：`CoInitializeEx` + `CoIncrementMTAUsage`。WinRT 的对象要求线程先进公寓
+    # （`Windows.Media.Ocr` 的 `RecognizeAsync` 走这条路），Windows 上这就是 COM 公寓；
+    # 刻意不引 `CoUninitialize` —— 见 src/windows.rs 的 `hold_mta_for_process`（拆公寓会让
+    # `windows` crate 的进程级激活工厂缓存悬空，实测直接 0xC0000005）。
+    "Win32_System_Com",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# OCR 走 WinRT 的 `Windows.Media.Ocr`，必须用 `windows`（带类型投影）而不是 `windows-sys`
+# （只有裸 ABI 声明，没有 `OcrEngine`/`SoftwareBitmap` 这些类）。只开用到的 feature：
+# - Foundation：`OcrResult` 的 `BoundingRect`/`TextAngle` 用的是 `Foundation::Rect` /
+#   `Foundation::IReference<f64>`（`windows` 的投影按命名空间拆 feature，用不到不等于不用开）；
+# - Graphics_Imaging：`SoftwareBitmap` + `BitmapPixelFormat`/`BitmapAlphaMode`（OCR 的输入）；
+# - Media_Ocr：`OcrEngine` / `OcrResult` 本体；
+# - Storage_Streams：`DataWriter` 用来把 BGRA 字节变成 `SoftwareBitmap` 需要的 `IBuffer`
+#   （`CreateCopyWithAlphaFromBuffer` 的入参是 `IBuffer`，没有 `&[u8]` 的重载）。
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Foundation",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+]

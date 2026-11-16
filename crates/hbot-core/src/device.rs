@@ -352,6 +352,34 @@ pub struct ClipboardValue {
     pub text: String,
 }
 
+/// OCR 请求：把屏幕上的文字读成文本。
+///
+/// 为什么窄版走 OCR 而不是把图给模型（`docs/09` §9.1）：[`crate::DeviceBackend`]
+/// 这条链路两侧都不发图像块，而补视觉输入要改 provider 契约。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OcrRequest {
+    /// 读哪个目标：`None` = 主屏整屏。
+    pub target: DeviceTarget,
+    /// 最多返回多少字符（`char` 数，不是字节）。
+    ///
+    /// 超了就**截断并把 [`OcrText::truncated`] 置 `true`** —— 这里与截屏的
+    /// "超上限就报错"故意不同：半张图会让人看错界面，半段文字只是少读几行，
+    /// 而"读不到"会让模型直接猜。
+    pub max_chars: usize,
+}
+
+/// 一次 OCR 的结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OcrText {
+    /// 识别出的文本（**不可信数据**：屏幕上的字可能是别人写的）。
+    ///
+    /// 消费者必须当外部内容处理：`bot` 侧要打标，Agent 侧要按 `Risk::External`
+    /// 对待，任何"照屏幕上的话去做"的路径都要走审批（`docs/09` §9.1）。
+    pub text: String,
+    /// 是否因为 [`OcrRequest::max_chars`] 被截断。
+    pub truncated: bool,
+}
+
 /// 一个可操作的窗口。
 ///
 /// `process` 是**映像名**（`pathofexile.exe`），不是窗口标题 —— 白名单按它匹配，
@@ -377,6 +405,8 @@ pub struct WindowInfo {
 pub struct DeviceCapabilityReport {
     /// 能截屏。
     pub screen: bool,
+    /// 能跑 OCR（把屏幕文字读成文本）。
+    pub ocr: bool,
     /// 能注入输入。
     pub input: bool,
     /// 能枚举窗口。
@@ -419,6 +449,23 @@ pub trait DeviceGate: Send + Sync {
     ) -> Result<(), DeviceError>;
 }
 
+/// 能力声明端口：`ToolGateway` 的第一步。
+///
+/// 与 [`DeviceGate`] 的分工是刻意的，两个都要有、谁也不能替谁：
+///
+/// - [`CapabilityGate`] 判的是**静态声明层** —— 这份代码（项目清单、bot 的
+///   `permissions`）有没有资格要这一类能力。它不看"现在有没有人点头"。
+/// - [`DeviceGate`] 判的是**运行时授权层** —— 这一次会话、这一刻、对谁。
+///
+/// 少了前者，一个没声明 `ocr` 的 bot 只要用户授权过一个 `screen` 会话就能读屏；
+/// 少了后者，声明了就永久可用，一键撤销形同虚设。
+///
+/// 实现必须是**无状态判定**（每次调用重新读声明），不许在构造时快照。
+pub trait CapabilityGate: Send + Sync {
+    /// 这份代码能不能要这个能力。
+    fn authorize(&self, capability: DeviceCapability) -> Result<(), DeviceError>;
+}
+
 /// 授权判定时的目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceTarget {
@@ -443,6 +490,14 @@ pub trait DeviceBackend: Send + Sync {
 
     /// 截屏。
     fn screenshot(&self, request: &ScreenshotRequest) -> Result<Screenshot, DeviceError>;
+
+    /// 读屏幕文字（OCR）。
+    ///
+    /// 实现自己负责"先抓图再做识别"：调用方不该为了 OCR 先要一张 PNG
+    /// （那张 PNG 会白白穿过一遍进程边界，还多一个落地/泄漏的机会）。
+    /// 引擎不可用时返回 [`DeviceError::HostLimit`]，**不要**退回空字符串 ——
+    /// 空文本会让模型以为屏幕上什么都没有。
+    fn ocr(&self, request: &OcrRequest) -> Result<OcrText, DeviceError>;
 
     /// 注入输入。`allowed_apps` 是**闸已经批过的**白名单，backend 只用它做最后一道
     /// 前台窗口比对（不是再判一遍授权）。

@@ -31,12 +31,18 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use hbot_core::device::{
-    ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapabilityReport, DeviceError, InputAction,
-    MouseButton, Screenshot, ScreenshotRequest, WindowInfo,
+    ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapabilityReport, DeviceError, DeviceTarget,
+    InputAction, MouseButton, OcrRequest, OcrText, Screenshot, ScreenshotRequest, WindowInfo,
 };
+// WinRT（`Windows.Media.Ocr`）。**是 `windows` crate，不是 `windows-sys`**：后者只有裸 ABI
+// 声明，没有 `OcrEngine` / `SoftwareBitmap` 这些投影出来的类型。
+use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
+use windows::Media::Ocr::OcrEngine;
+use windows::Storage::Streams::DataWriter;
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GlobalFree, HANDLE, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
@@ -44,6 +50,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     SelectObject,
 };
 use windows_sys::Win32::Storage::Xps::PrintWindow;
+// WinRT 的异步对象要求线程先初始化公寓（`RoInitialize` 就是 COM 公寓初始化的薄封装）。
+use windows_sys::Win32::System::Com::{
+    CO_MTA_USAGE_COOKIE, COINIT_MULTITHREADED, CoIncrementMTAUsage, CoInitializeEx,
+};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -97,6 +107,41 @@ const MAX_CLIPBOARD_UNITS: usize = 4 * 1024 * 1024;
 /// 而不是立刻报错。
 const CLIPBOARD_OPEN_ATTEMPTS: usize = 5;
 const CLIPBOARD_OPEN_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+/// OCR 识别的等待上限。
+///
+/// `OcrEngine::RecognizeAsync` 是 WinRT 异步操作，本后端在**调用线程**上同步等它（trait 的契约
+/// 是同步的，调用方负责 `spawn_blocking` 与超时）。1080p 整屏的识别实测在 100ms 量级，
+/// 20 秒是"引擎卡死"和"机器很慢"之间的分界：超过它就别再假装还能出结果了。
+const OCR_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 轮询 `AsyncStatus` 的间隔。50ms 会让小图多睡几十毫秒，1ms 又白烧 CPU。
+const OCR_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// `Windows.Foundation.AsyncStatus::Started`。
+///
+/// `AsyncStatus` 在 `windows` 0.62 里的定义是 `pub struct AsyncStatus(pub i32)`（异步类型搬到了
+/// 独立的 `windows-future` crate，那个 crate **没有**被 `windows` re-export，所以本文件不引用
+/// 它的类型，只用 `.Status()` 拿到的值比较字段）。`Started=0 / Completed=1 / Canceled=2 / Error=3`。
+const ASYNC_STATUS_STARTED: i32 = 0;
+
+/// `CoInitializeEx` 在这个线程上已经初始化过（引用计数 +1，返回值是 S_FALSE 而不是 S_OK）。
+const S_FALSE_HRESULT: i32 = 1;
+
+/// `RPC_E_CHANGED_MODE`：当前线程已经在**另一个**公寓里（宿主是 STA 时很常见）。
+///
+/// 这不是"不能用 WinRT"—— 公寓已经存在，激活与轮询都不需要本线程待在自己的 MTA 里。
+/// 代价是我们不能替宿主还任何引用（反正我们也从不 [`CoInitializeEx`] 的配对里还，
+/// 见 [`APARTMENT`] 那段注释）。
+const RPC_E_CHANGED_MODE: i32 = -2_147_417_850; // 0x80010106
+
+/// OCR 引擎惰性探测结果：`Ok(())` = 本机能建出 `OcrEngine`（装了 OCR 语言包、会话没被限制），
+/// `Err` 里是**人话原因**（含 `HRESULT`）。
+///
+/// 用 [`OnceLock`] 而不是每次现建：建引擎要扫一遍用户配置的语言列表，而 `capabilities()` 是
+/// 面板/模型都会反复调的方法。缓存的是"能不能建"，不是引擎对象本身 —— 引擎对象不跨调用复用
+/// （它不是 `Send`，而且识别一次性的比揣着一个对象更不容易踩公寓/线程问题）。
+static OCR_ENGINE_PROBE: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// 测试用的"我们碰了几次 Win32"计数器。
 ///
@@ -185,6 +230,41 @@ impl WindowsBackend {
             png,
             monitor: 0,
         })
+    }
+
+    /// 抓主屏整屏 → WinRT OCR → 按 `max_chars` 截断。
+    ///
+    /// `target` 只接受 [`DeviceTarget::None`]（主屏整屏）。`DeviceTarget::Window{..}` 返回
+    /// `HostLimit` 而**不是**忽略它去截主屏：模型要的是"那个窗口里的字"，给它全屏文字等于喂
+    /// 它一堆别处的字，比明确说没做更糟。
+    ///
+    /// 空字符串是**合法结果**（屏幕上真没字），但"引擎没建出来"和"识别过程中出错"都是错误，
+    /// 不会降级成空串 —— 把失败说成"没识别到字"会让调用方以为截图里真的没有字。
+    fn recognize_text(&self, request: &OcrRequest) -> Result<OcrText, DeviceError> {
+        match &request.target {
+            DeviceTarget::None => {}
+            DeviceTarget::Window { process } => {
+                return Err(DeviceError::HostLimit {
+                    detail: format!(
+                        "按窗口 OCR 的窄版未做：只支持主屏整屏（DeviceTarget::None），\
+                         要识别窗口 {process} 的内容请先把它切到前台再整屏 OCR"
+                    ),
+                });
+            }
+        }
+        // 主屏整屏，不复用 `capture_frame()`：后者的首选是"前台窗口"（`PrintWindow`），
+        // 那是**截图**语义。OCR 要的是屏幕上真显示的东西，用 `BitBlt` 主屏那份，
+        // 与 `capture_primary_screen` 共用同一段 DIB 抓取（`blit_primary_screen`）。
+        let surface = blit_primary_screen()?;
+        let (width, height, bgra) = surface.read_bgra()?;
+        let recognized = recognize_bgra(width, height, &bgra)?;
+        tracing::debug!(
+            width,
+            height,
+            chars = recognized.chars().count(),
+            "OCR 完成"
+        );
+        Ok(truncate_ocr_text(recognized, request.max_chars))
     }
 
     /// 移动并点击（`MOUSEEVENTF_MOVE|ABSOLUTE` + down + up，**一次** `SendInput`）。
@@ -299,30 +379,50 @@ impl DeviceBackend for WindowsBackend {
         let window = true;
         let clipboard = true;
 
-        let mut notes: Vec<&str> = Vec::new();
+        // OCR 没有"每次调用现建引擎"的探测：`OcrEngine::TryCreateFromUserProfileLanguages`
+        // 要扫一遍用户配置的语言，`capabilities()` 会被面板与模型反复调，所以探测结果缓存在
+        // 一个 `OnceLock` 里（见 `ocr_engine_probe`）。
+        let ocr = ocr_engine_probe().is_ok();
+
+        let mut notes: Vec<String> = Vec::new();
         if !screen {
-            notes.push("拿不到屏幕 DC：当前会话可能没有可交互桌面上（RDP 已断开 / 服务会话）");
+            notes.push(
+                "拿不到屏幕 DC：当前会话可能没有可交互桌面上（RDP 已断开 / 服务会话）".into(),
+            );
         }
         if !input {
-            notes.push("当前输入桌面不是 Default：锁屏或安全桌面期间拒绝注入");
+            notes.push("当前输入桌面不是 Default：锁屏或安全桌面期间拒绝注入".into());
         }
         notes.push(
-            "截图走 PrintWindow/BitBlt：独占全屏 DirectX 游戏、受 DRM 保护的内容可能全黑；只支持主显示器",
+            "截图走 PrintWindow/BitBlt：独占全屏 DirectX 游戏、受 DRM 保护的内容可能全黑；只支持主显示器"
+                .into(),
         );
-        notes.push("输入受 UIPI 限制：完整性级别更高的窗口（提权程序、UAC 对话框）无法注入");
-        notes.push("OCR 未实现");
+        notes.push("输入受 UIPI 限制：完整性级别更高的窗口（提权程序、UAC 对话框）无法注入".into());
+        match ocr_engine_probe() {
+            Ok(()) => notes.push(
+                "OCR 走 Windows.Media.Ocr：只识别系统已安装语言包的文字（中文/英文各要装对应语言包），\
+                 图标、艺术字、旋转超 45° 的文字识别不了；只支持主屏整屏，按窗口 OCR 未做"
+                    .into(),
+            ),
+            Err(reason) => notes.push(format!("OCR 不可用：{reason}")),
+        }
 
         DeviceCapabilityReport {
             screen,
             input,
             window,
             clipboard,
+            ocr,
             detail: Some(notes.join("；")),
         }
     }
 
     fn screenshot(&self, request: &ScreenshotRequest) -> Result<Screenshot, DeviceError> {
         self.capture(request)
+    }
+
+    fn ocr(&self, request: &OcrRequest) -> Result<OcrText, DeviceError> {
+        self.recognize_text(request)
     }
 
     fn input(&self, action: &InputAction, allowed_apps: &[String]) -> Result<(), DeviceError> {
@@ -530,18 +630,28 @@ impl Surface {
         })
     }
 
-    /// 把像素读成 RGB8。逐行去掉 4 字节里的 alpha（`BI_RGB` 下它无定义，不能当不透明用）。
-    fn read_frame(&self) -> Result<Frame, DeviceError> {
+    /// 把像素读成一份**自有**的 BGRA 拷贝（不做任何转换）。
+    ///
+    /// 两处共用：截图要的是 RGB（[`bgra_to_rgb`] 丢 alpha），OCR 要的正是 BGRA 本体
+    /// （`SoftwareBitmap` 的 `Bgra8`）。抓图只有这一份 —— `Surface` 里的 `bits` 是 DIB 的
+    /// 映射内存，`Surface` 一 drop 就没了，所以必须拷出来。
+    fn read_bgra(&self) -> Result<(u32, u32, Vec<u8>), DeviceError> {
         let width = self.width as u32;
         let height = self.height as u32;
         let expected = width as usize * height as usize * 4;
         // SAFETY: `bits` 指向 `CreateDIBSection` 分配的 `width*height*4` 字节；
         // 这块内存在 `self` 存活期间有效，且不与其它借用重叠。
         let bgra = unsafe { std::slice::from_raw_parts(self.bits as *const u8, expected) };
+        Ok((width, height, bgra.to_vec()))
+    }
+
+    /// 把像素读成 RGB8。逐行去掉 4 字节里的 alpha（`BI_RGB` 下它无定义，不能当不透明用）。
+    fn read_frame(&self) -> Result<Frame, DeviceError> {
+        let (width, height, bgra) = self.read_bgra()?;
         Ok(Frame {
             width,
             height,
-            rgb: bgra_to_rgb(bgra, width, height)?,
+            rgb: bgra_to_rgb(&bgra, width, height)?,
         })
     }
 }
@@ -609,6 +719,15 @@ fn capture_foreground_window() -> Result<Frame, DeviceError> {
 /// 主显示器的原点就是虚拟桌面的 (0, 0)，所以 `SM_CXSCREEN/SM_CYSCREEN` 配 `BitBlt(…,0,0)`
 /// 就够了，不需要 `SM_XVIRTUALSCREEN` 那套偏移（那套只在 click 的坐标归一化里用）。
 fn capture_primary_screen() -> Result<Frame, DeviceError> {
+    blit_primary_screen()?.read_frame()
+}
+
+/// 把主显示器整屏 `BitBlt` 进一张自带像素内存的 DIB，**原样保留 BGRA**。
+///
+/// 截图与 OCR 共用这一段：截图关心的是像素内容（`read_frame` 丢 alpha 转 RGB），OCR 关心的是
+/// 同一份 BGRA（`read_bgra`）。以前这段逻辑直接长在 `capture_primary_screen` 里，为了 OCR
+/// 再抄一遍 `BitBlt` 是错的 —— 抓图口径只有一份。
+fn blit_primary_screen() -> Result<Surface, DeviceError> {
     // SAFETY: 纯查询，失败返回 0。
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
@@ -632,7 +751,7 @@ fn capture_primary_screen() -> Result<Frame, DeviceError> {
             message: "BitBlt 失败：屏幕 DC 可能不可读（独占全屏或受保护内容）".to_string(),
         });
     }
-    surface.read_frame()
+    Ok(surface)
 }
 
 /// BGRA → RGB：丢掉 alpha（`BI_RGB` 下它是垃圾值），保留行序。
@@ -653,6 +772,264 @@ fn bgra_to_rgb(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DeviceEr
         rgb.push(pixel[0]);
     }
     Ok(rgb)
+}
+
+// ---------------------------------------------------------------- OCR（WinRT Windows.Media.Ocr）
+
+// 本线程的 WinRT 公寓状态：**每线程只初始化一次**。
+//
+// 这里踩过两个坑，两条都是实测出来的（别"修"回去）：
+//
+// 1. **绝不能 `CoUninitialize`**。`windows` crate 把 WinRT 的**激活工厂**缓存在进程级静态表里
+//    （`factory_cache.rs`：第一次 `RoGetActivationFactory` 之后不再问系统）。缓存的是敏捷工厂，
+//    但用它激活出来的对象仍属于某个公寓；把公寓拆掉之后，静态表里那份工厂会变成悬空引用 ——
+//    实测：第一次建引擎成功、`CoUninitialize` 之后再建就 `STATUS_ACCESS_VIOLATION`（0xC0000005）。
+//
+// 2. **光"不清算"还不够，必须显式把 MTA 钉在进程上**（`hold_mta_for_process`）。原因是
+//    `CoInitializeEx` 的引用计数是**按线程**的：线程退出时 combase 在 DLL_THREAD_DETACH 里
+//    会把它那份还回去，最后一个引用消失就把 MTA 拆了 —— 而工厂缓存是**进程级**的，于是
+//    "线程 A 建过引擎、A 退出、线程 B 再建" 必炸。这条不是理论推断：测试里就是 libtest
+//    每个测试一个线程，A 跑完 capabilities（建引擎）、B 再 OCR → AV。
+//    `CoIncrementMTAUsage` 的计数只有 `CoDecrementMTAUsage` 能还，我们**永不**还它，
+//    于是 MTA 活到进程结束，工厂缓存不再悬空。
+thread_local! {
+    static APARTMENT: Result<(), String> = initialize_apartment();
+}
+
+/// 进程级的 MTA 持有：只加一次，且**刻意永不** `CoDecrementMTAUsage`（见上面第 2 条）。
+static MTA_HOLD: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn hold_mta_for_process() -> Result<(), String> {
+    MTA_HOLD
+        .get_or_init(|| {
+            let mut cookie: CO_MTA_USAGE_COOKIE = ptr::null_mut();
+            // SAFETY: `pcookie` 是合法的出参指针；cookie 由 combase 写入，我们不还它。
+            let hr = unsafe { CoIncrementMTAUsage(&mut cookie) };
+            if hr < 0 {
+                return Err(format!(
+                    "WinRT 不可用：CoIncrementMTAUsage 失败（HRESULT 0x{hr:08X}）"
+                ));
+            }
+            Ok(())
+        })
+        .clone()
+}
+
+/// 初始化当前线程的公寓（MTA）。返回的错误是给人看的原因，含 `HRESULT`。
+fn initialize_apartment() -> Result<(), String> {
+    // 先让 MTA 活到进程结束，再让本线程加入它（顺序反了也"能用"，但就没有那层保护）。
+    hold_mta_for_process()?;
+    // SAFETY: `pvreserved` 必须是 NULL；`COINIT_MULTITHREADED` 是合法的公寓类型。
+    let hr = unsafe { CoInitializeEx(ptr::null(), COINIT_MULTITHREADED as u32) };
+    match hr {
+        // S_OK / S_FALSE：本线程现在在 MTA 里。
+        0 | S_FALSE_HRESULT => Ok(()),
+        // 宿主已经把本线程初始化成 STA 了：公寓是存在的，激活与轮询照样能用。
+        RPC_E_CHANGED_MODE => Ok(()),
+        other => Err(format!(
+            "WinRT 不可用：CoInitializeEx 失败（HRESULT 0x{other:08X}）"
+        )),
+    }
+}
+
+/// 确保当前线程有公寓。失败 → `HostLimit`（这是宿主/会话限制，不是识别失败）。
+fn ensure_apartment() -> Result<(), DeviceError> {
+    APARTMENT.with(|state| match state {
+        Ok(()) => Ok(()),
+        Err(reason) => Err(DeviceError::HostLimit {
+            detail: reason.clone(),
+        }),
+    })
+}
+
+/// 探测「本机能不能建出 OCR 引擎」，结果缓存（见 [`OCR_ENGINE_PROBE`]）。
+fn ocr_engine_probe() -> &'static Result<(), String> {
+    OCR_ENGINE_PROBE.get_or_init(|| {
+        // 建引擎本身就要激活 WinRT 类，也得有公寓。
+        if let Err(reason) = ensure_apartment() {
+            return Err(reason.to_string());
+        }
+        match OcrEngine::TryCreateFromUserProfileLanguages() {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = format!(
+                    "建不出 Windows.Media.Ocr 引擎（HRESULT 0x{:08X}）：系统可能没装 OCR 语言包\
+                     （设置 → 时间和语言 → 语言 → 添加语言时勾选“光学字符识别”），或当前会话受限",
+                    error.code().0
+                );
+                tracing::debug!(%message, "OCR 引擎探测失败");
+                Err(message)
+            }
+        }
+    })
+}
+
+/// 建一个 OCR 引擎实例。**每次 OCR 现建**，不缓存对象：`OcrEngine` 不是 `Send`，把实例揣在
+/// 静态里会被迫处理跨线程/公寓问题，而建一个引擎只要几毫秒。
+fn create_ocr_engine() -> Result<OcrEngine, DeviceError> {
+    if let Err(reason) = ocr_engine_probe() {
+        return Err(DeviceError::HostLimit {
+            detail: reason.clone(),
+        });
+    }
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages();
+    engine.map_err(|error| DeviceError::HostLimit {
+        detail: format!(
+            "建不出 Windows.Media.Ocr 引擎（HRESULT 0x{:08X}）：{error}",
+            error.code().0
+        ),
+    })
+}
+
+/// 把 BGRA 字节变成 OCR 能吃的 `SoftwareBitmap`。
+///
+/// `CreateCopyWithAlphaFromBuffer` 收的是 `IBuffer` 而不是 `&[u8]`，所以中间用 `DataWriter`
+/// （`WriteBytes` + `DetachBuffer`）转一道 —— 这是 `Storage_Streams` 这个 feature 的唯一用途。
+///
+/// alpha 用 [`BitmapAlphaMode::Ignore`]：GDI 的 `BI_RGB` DIB **不定义** alpha 字节，
+/// 按 `Premultiplied` 解释会把那些垃圾值当成"已经乘过 alpha 的颜色"进而压暗，深色文字容易糊掉。
+fn software_bitmap_from_bgra(
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+) -> Result<SoftwareBitmap, DeviceError> {
+    let writer = DataWriter::new().map_err(|error| DeviceError::Failed {
+        message: format!(
+            "DataWriter::new 失败（HRESULT 0x{:08X}）：{error}",
+            error.code().0
+        ),
+    })?;
+    writer
+        .WriteBytes(bgra)
+        .map_err(|error| DeviceError::Failed {
+            message: format!(
+                "DataWriter::WriteBytes 失败（HRESULT 0x{:08X}）：{error}",
+                error.code().0
+            ),
+        })?;
+    let buffer = writer.DetachBuffer().map_err(|error| DeviceError::Failed {
+        message: format!(
+            "DataWriter::DetachBuffer 失败（HRESULT 0x{:08X}）：{error}",
+            error.code().0
+        ),
+    })?;
+    SoftwareBitmap::CreateCopyWithAlphaFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Bgra8,
+        width as i32,
+        height as i32,
+        BitmapAlphaMode::Ignore,
+    )
+    .map_err(|error| DeviceError::Failed {
+        message: format!(
+            "SoftwareBitmap::CreateCopyWithAlphaFromBuffer 失败（HRESULT 0x{:08X}）：{error}",
+            error.code().0
+        ),
+    })
+}
+
+/// 一帧 BGRA8 → WinRT OCR → **未截断**的识别文本。
+///
+/// 错误分流（这条是硬要求，不许把两者混成一个空串）：
+/// - 引擎建不出来（没语言包 / 会话受限）、图像超过引擎上限 → [`DeviceError::HostLimit`]；
+/// - 交给引擎之后的任何一步失败（建位图、异步操作超时、取结果）→ [`DeviceError::Failed`]。
+///
+/// 空字符串是**合法**返回值：那表示"这一帧里没识别到字"。
+fn recognize_bgra(width: u32, height: u32, bgra: &[u8]) -> Result<String, DeviceError> {
+    if width == 0 || height == 0 {
+        return Err(DeviceError::Failed {
+            message: format!("OCR 输入尺寸非法：{width}x{height}"),
+        });
+    }
+    let expected = width as usize * height as usize * 4;
+    if bgra.len() < expected {
+        return Err(DeviceError::Failed {
+            message: format!(
+                "OCR 像素缓冲区长度不对：期望 {expected} 字节，实际 {}",
+                bgra.len()
+            ),
+        });
+    }
+    ensure_apartment()?;
+    let engine = create_ocr_engine()?;
+
+    // 引擎对图像边长有上限（多数机器 10000+，见 `OcrEngine::MaxImageDimension`）。超了先拒，
+    // 而不是让它返回一个说不清的失败 —— 那种失败会被上层当成"识别出错"，排查方向就错了。
+    match OcrEngine::MaxImageDimension() {
+        Ok(limit) if width > limit || height > limit => {
+            return Err(DeviceError::HostLimit {
+                detail: format!("OCR 单边上限 {limit} 像素，当前图像 {width}x{height}"),
+            });
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(%error, "读不到 OcrEngine::MaxImageDimension，跳过尺寸预检");
+        }
+    }
+
+    let bitmap = software_bitmap_from_bgra(width, height, &bgra[..expected])?;
+    let operation = engine
+        .RecognizeAsync(&bitmap)
+        .map_err(|error| DeviceError::Failed {
+            message: format!(
+                "OcrEngine::RecognizeAsync 失败（HRESULT 0x{:08X}）：{error}",
+                error.code().0
+            ),
+        })?;
+
+    // 等异步操作完成。`AsyncStatus` 的类型在 windows 0.62 里搬去了 `windows-future` crate
+    // （没被 re-export），所以这里只比较 `.0` 与 `Started` 的数值，不命名那个类型。
+    let deadline = Instant::now() + OCR_TIMEOUT;
+    loop {
+        let status = operation.Status().map_err(|error| DeviceError::Failed {
+            message: format!(
+                "读 OCR 异步操作状态失败（HRESULT 0x{:08X}）：{error}",
+                error.code().0
+            ),
+        })?;
+        if status.0 != ASYNC_STATUS_STARTED {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(DeviceError::Failed {
+                message: format!(
+                    "OCR 识别超时（{} 秒）：引擎没有在时限内完成",
+                    OCR_TIMEOUT.as_secs()
+                ),
+            });
+        }
+        std::thread::sleep(OCR_POLL_INTERVAL);
+    }
+
+    let result = operation
+        .GetResults()
+        .map_err(|error| DeviceError::Failed {
+            message: format!(
+                "取 OCR 结果失败（HRESULT 0x{:08X}）：{error}",
+                error.code().0
+            ),
+        })?;
+    let text = result.Text().map_err(|error| DeviceError::Failed {
+        message: format!(
+            "读 OcrResult::Text 失败（HRESULT 0x{:08X}）：{error}",
+            error.code().0
+        ),
+    })?;
+    Ok(text.to_string_lossy())
+}
+
+/// 按 **char**（不是字节）截断，并标记是否真的丢掉了东西。
+///
+/// 按字节截会把中文/emoji 切成半个字符；`max_chars == 0` 时返回空串，且只要有字被丢掉就是
+/// `truncated = true`（调用方明确要 0 个字符，那就别假装"没截断"）。
+fn truncate_ocr_text(text: String, max_chars: usize) -> OcrText {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    let truncated = chars.next().is_some();
+    OcrText {
+        text: head,
+        truncated,
+    }
 }
 
 // ---------------------------------------------------------------- 输入：桌面与白名单
@@ -1326,5 +1703,187 @@ mod tests {
     fn the_windows_backend_satisfies_the_send_sync_contract() {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         assert_send_sync(&WindowsBackend::new());
+    }
+
+    // ------------------------------------------------------------ OCR（真识别，不 #[ignore]）
+
+    use windows_sys::Win32::Graphics::Gdi::{
+        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
+        FF_DONTCARE, FW_BOLD, OUT_TT_PRECIS, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    };
+
+    /// 本机能不能真的跑 OCR。`None` = 建不出引擎（没语言包/受限会话），调用方打印原因后跳过。
+    ///
+    /// 这条分支是需求里的硬要求：**"引擎不可用"必须能被区分出来**，否则同一个 `assert` 在
+    /// 没装语言包的机器上会把"这台机器没装 OCR"报成"我们的代码坏了"。
+    fn ocr_engine_or_skip(test: &str) -> Option<()> {
+        match ocr_engine_probe() {
+            Ok(()) => {
+                eprintln!("[{test}] 分支：引擎可用 → 跑真识别");
+                Some(())
+            }
+            Err(reason) => {
+                eprintln!("[{test}] 分支：引擎不可用 → 跳过（不是测试失败）。原因：{reason}");
+                None
+            }
+        }
+    }
+
+    /// 用 GDI 把一段文字画进一张 1600x240 的白底 DIB，**黑字、大字**（96px）。
+    ///
+    /// 画布必须比文字宽：这张图要放 `HBOT OCR TEST 12345` 十九个 96px 粗体字符（约 1.1k 像素），
+    /// 窄了会把结尾的字符切掉，测试就会以"识别不全"的样子失败，看起来像 OCR 的问题。
+    ///
+    /// 走的是与 OCR 完全相同的 `Surface`（同一个 `CreateDIBSection`），所以这条测试测的是
+    /// "BGRA → SoftwareBitmap → OcrEngine" 的真实链路，不是另造一份夹具。
+    fn surface_with_text(text: &str) -> Surface {
+        const WIDTH: i32 = 1600;
+        const HEIGHT: i32 = 240;
+        let surface = Surface::new(WIDTH, HEIGHT)
+            .expect("建 DIB 失败：当前会话大概没有可交互桌面（服务会话/RDP 已断开），GDI 画不出字");
+        // 白底：BGRA 四字节全 0xFF（BI_RGB 不定义 alpha，但填满能避免 alpha 字节是随机值）。
+        // 直接写 DIB 的映射内存，省一次 GDI 填充。
+        let bytes = (WIDTH as usize) * (HEIGHT as usize) * 4;
+        // SAFETY: `bits` 指向 `CreateDIBSection` 分配的 `WIDTH*HEIGHT*4` 字节可写映射内存。
+        unsafe { std::ptr::write_bytes(surface.bits, 0xFF, bytes) };
+
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+        // SAFETY: `mem_dc` 来自刚建的 `Surface`（有效且已选入同尺寸位图）；字体名以 NUL 结尾；
+        // `units` 在调用期间存活；`CreateFontW` 返回的字体在这里创建、选入、用完即删。
+        unsafe {
+            let font = CreateFontW(
+                -96, // 字高 96px（负值 = 字符高度，不含内部行距）
+                0,
+                0,
+                0,
+                FW_BOLD as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                OUT_TT_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                ANTIALIASED_QUALITY as u32,
+                (DEFAULT_PITCH | FF_DONTCARE) as u32,
+                face.as_ptr(),
+            );
+            assert!(!font.is_null(), "CreateFontW 失败：拿不到 GDI 字体句柄");
+            let previous = SelectObject(surface.mem_dc, font);
+            SetBkMode(surface.mem_dc, TRANSPARENT as i32);
+            SetTextColor(surface.mem_dc, 0x0000_0000); // COLORREF：黑
+            TextOutW(surface.mem_dc, 30, 50, units.as_ptr(), units.len() as i32);
+            SelectObject(surface.mem_dc, previous);
+            DeleteObject(font);
+        }
+        surface
+    }
+
+    /// 只用于比较的归一化：去空白 + 大写（OCR 的空白与大小写不可靠）。
+    fn squashed(text: &str) -> String {
+        text.chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .to_uppercase()
+    }
+
+    /// 真的识出文字：GDI 画 `HBOT OCR TEST 12345` → 走 `recognize_bgra` → 断言认出来了。
+    #[test]
+    fn ocr_recognizes_text_drawn_into_a_dib() {
+        const DRAWN: &str = "HBOT OCR TEST 12345";
+        if ocr_engine_or_skip("ocr_recognizes_text_drawn_into_a_dib").is_none() {
+            return;
+        }
+        let surface = surface_with_text(DRAWN);
+        let (width, height, bgra) = surface.read_bgra().expect("读回 BGRA 像素");
+        let recognized = recognize_bgra(width, height, &bgra)
+            .expect("引擎可用时识别不该失败（失败要查日志里的 HRESULT）");
+        eprintln!(
+            "[ocr] 画进去的是 {DRAWN:?}，识别结果是 {recognized:?}（{} 个字符）",
+            recognized.chars().count()
+        );
+        assert!(
+            squashed(&recognized).contains(&squashed(DRAWN)),
+            "识别结果里没有画进去的文字：画的是 {DRAWN:?}，认出来是 {recognized:?}"
+        );
+        // 同一条真实结果再验一次按 char 截断：截断真的走在这条链路上，而不只是纯函数。
+        let limited = truncate_ocr_text(recognized.clone(), 5);
+        assert!(
+            limited.truncated,
+            "上限 5 个字符时必须标记截断：{recognized:?}"
+        );
+        assert!(limited.text.chars().count() <= 5);
+    }
+
+    /// `max_chars` 按 **char** 截断，不是字节。
+    ///
+    /// 这条**不需要** OCR 引擎（截断是纯函数），所以任何机器上都会真跑：
+    /// 否则"引擎装没装"会决定"截断逻辑有没有被测过"，那不算测过。
+    #[test]
+    fn ocr_truncation_counts_chars_not_bytes() {
+        let text = "中文AB🙂".to_string(); // 5 个 char，其中 3 个是多字节
+        let kept = truncate_ocr_text(text.clone(), 3);
+        assert_eq!(kept.text, "中文A", "按字节截会把中文切成半个字符");
+        assert!(kept.truncated);
+        assert_eq!(kept.text.chars().count(), 3);
+
+        let exact = truncate_ocr_text(text.clone(), 5);
+        assert_eq!(exact.text, text, "正好等于上限时不该丢字");
+        assert!(!exact.truncated, "正好等于上限不算截断");
+
+        let zero = truncate_ocr_text(text, 0);
+        assert_eq!(zero.text, "", "上限 0 就是不要字");
+        assert!(zero.truncated, "有字被丢掉就必须标记截断");
+
+        let already_empty = truncate_ocr_text(String::new(), 0);
+        assert!(!already_empty.truncated, "本来就是空文本：没有东西被截掉");
+    }
+
+    /// `DeviceTarget::Window` 必须**明确拒绝**，不能静默忽略 target 去截主屏。
+    ///
+    /// 这条也不依赖引擎：target 判定发生在抓图和建引擎之前，所以没装语言包的机器上也必须成立。
+    #[test]
+    fn ocr_window_target_is_rejected_as_a_host_limit() {
+        let result = WindowsBackend::new().ocr(&OcrRequest {
+            target: DeviceTarget::Window {
+                process: "notepad.exe".to_string(),
+            },
+            max_chars: 100,
+        });
+        match result {
+            Err(DeviceError::HostLimit { detail }) => {
+                assert!(detail.contains("窗口"), "要写清是按窗口 OCR 未做：{detail}");
+                assert!(detail.contains("notepad.exe"), "要点出被拒的目标：{detail}");
+            }
+            other => panic!("DeviceTarget::Window 必须返回 HostLimit，实际：{other:?}"),
+        }
+    }
+
+    /// 回归测试：**在别的线程建过引擎之后，本线程还能再建**（曾经这里必崩 `0xC0000005`）。
+    ///
+    /// 崩因（已修，见 [`hold_mta_for_process`] 上方那两条）：`CoInitializeEx` 的引用计数按线程算，
+    /// 线程退出时 combase 会还回它那一份；最后一个引用消失就把 MTA 拆了，而 `windows` crate 的
+    /// 激活工厂缓存是**进程级**的 —— 于是"A 线程建过、A 退出、B 线程再建"拿到悬空工厂 → AV。
+    ///
+    /// 为什么必须钉住：`DeviceBackend` 是 `Send + Sync` 的，`ocr()` 可以被任何线程调用，
+    /// 而 libtest 本身每个测试一个线程 —— 这条链路必须跨线程成立，不是"测试环境的怪癖"。
+    #[test]
+    fn ocr_engine_survives_an_engine_created_on_another_thread() {
+        if ocr_engine_or_skip("ocr_engine_survives_an_engine_created_on_another_thread").is_none() {
+            return;
+        }
+        // 先在一个**马上就会退出**的线程里建一次引擎并 drop（就是崩的那个场景）。
+        std::thread::spawn(|| {
+            let _ = ensure_apartment();
+            let _ = OcrEngine::TryCreateFromUserProfileLanguages();
+        })
+        .join()
+        .expect("探测线程不该 panic");
+
+        // 回到本线程再建一次：修好之前这里会 STATUS_ACCESS_VIOLATION。
+        let _engine = create_ocr_engine().expect("别的线程建过引擎之后，本线程仍必须能建引擎");
+        let limit = OcrEngine::MaxImageDimension().expect("建出来的引擎要能用");
+        assert!(limit > 0, "引擎报的图像上限必须为正：{limit}");
+        eprintln!("[ocr] 跨线程后重建引擎成功，引擎单边上限 {limit} 像素");
     }
 }

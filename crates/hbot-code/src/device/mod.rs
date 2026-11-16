@@ -336,12 +336,22 @@ mod tests {
         struct Nothing;
         impl DeviceBackend for Nothing {
             fn capabilities(&self) -> hbot_core::DeviceCapabilityReport {
+                // 全 `false`：这个夹具就是"什么都不支持"的那一档，
+                // 包括 `ocr` —— 与 `ocr()` 返回 `Failed` 的语义一致。
                 hbot_core::DeviceCapabilityReport::default()
             }
             fn screenshot(
                 &self,
                 _request: &hbot_core::ScreenshotRequest,
             ) -> Result<Screenshot, DeviceError> {
+                Err(DeviceError::Failed {
+                    message: "no".to_owned(),
+                })
+            }
+            fn ocr(
+                &self,
+                _request: &hbot_core::OcrRequest,
+            ) -> Result<hbot_core::OcrText, DeviceError> {
                 Err(DeviceError::Failed {
                     message: "no".to_owned(),
                 })

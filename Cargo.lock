@@ -1993,6 +1993,7 @@ version = "0.1.0"
 dependencies = [
  "hbot-core",
  "tracing",
+ "windows",
  "windows-sys 0.59.0",
 ]
 

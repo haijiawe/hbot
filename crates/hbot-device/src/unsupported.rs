@@ -13,7 +13,7 @@
 
 use hbot_core::device::{
     ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapabilityReport, DeviceError, InputAction,
-    Screenshot, ScreenshotRequest, WindowInfo,
+    OcrRequest, OcrText, Screenshot, ScreenshotRequest, WindowInfo,
 };
 
 /// 每条拒绝共用的说明文字（`capabilities().detail` 与每个方法的错误都是它，避免两处漂移）。
@@ -44,6 +44,7 @@ impl DeviceBackend for UnsupportedBackend {
     fn capabilities(&self) -> DeviceCapabilityReport {
         DeviceCapabilityReport {
             screen: false,
+            ocr: false,
             input: false,
             window: false,
             clipboard: false,
@@ -52,6 +53,10 @@ impl DeviceBackend for UnsupportedBackend {
     }
 
     fn screenshot(&self, _request: &ScreenshotRequest) -> Result<Screenshot, DeviceError> {
+        Self::refuse()
+    }
+
+    fn ocr(&self, _request: &OcrRequest) -> Result<OcrText, DeviceError> {
         Self::refuse()
     }
 

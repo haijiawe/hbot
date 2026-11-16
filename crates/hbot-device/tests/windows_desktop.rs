@@ -2,20 +2,24 @@
 //!
 //! CI 里绝不移动鼠标、绝不截整屏 —— 那会让正在用机器的人莫名其妙。所以这里只做：
 //!
-//! - 能力报告（只 `GetDC` 一下、查一次输入桌面名）；
+//! - 能力报告（只 `GetDC` 一下、查一次输入桌面名，外加一次惰性的 OCR 引擎探测）；
 //! - 窗口枚举（只读）；
 //! - 空白名单拒绝（在碰 `SendInput` 之前就返回了）；
 //! - 剪贴板**读**（空剪贴板也是合法的成功）；
-//! - 指定了未实现的显示器索引 → 明确 `HostLimit`（连截图都不开始）。
+//! - 指定了未实现的显示器索引 → 明确 `HostLimit`（连截图都不开始）；
+//! - 按窗口 OCR → 明确 `HostLimit`（连抓图都不开始，不静默截全屏）。
 //!
 //! 真截屏、真写剪贴板的两条被 `#[ignore]` 关掉，手动跑：
 //! `cargo test -p hbot-device -- --ignored`。
+//!
+//! **真 OCR**（画字进 DIB 再识别）在 `src/windows.rs` 的单测里，那里能直接拿到 `Surface`
+//! 与内部识别函数；这里不截整屏做 OCR —— 那会把用户桌面上的字喂进日志。
 
 #![cfg(windows)]
 
 use hbot_device::{
-    ClipboardOp, DeviceBackend, DeviceError, InputAction, MouseButton, ScreenshotRequest,
-    WindowsBackend, process_name,
+    ClipboardOp, DeviceBackend, DeviceError, DeviceTarget, InputAction, MouseButton, OcrRequest,
+    ScreenshotRequest, WindowsBackend, process_name,
 };
 
 #[test]
@@ -34,8 +38,40 @@ fn capabilities_report_the_four_implemented_sub_capabilities() {
     );
     assert!(
         detail.contains("OCR"),
-        "能力报告要写明 OCR 未实现：{detail}"
+        "能力报告要写明 OCR 的边界（不是「没做」，是「只认已安装语言 + 只支持主屏整屏」）：{detail}"
     );
+    // `ocr` 字段按"引擎能不能建出来"填（没装 OCR 语言包的机器上是 false），说明必须与它一致：
+    // 说支持就得写清"只认已安装语言"，说不支持就得写清原因 —— 两者不许打架。
+    if report.ocr {
+        assert!(
+            detail.contains("语言包"),
+            "报告说 OCR 可用，就必须写明它只认系统已安装的语言包：{detail}"
+        );
+    } else {
+        assert!(
+            detail.contains("OCR 不可用"),
+            "报告说 OCR 不可用，就必须写明原因（本机大概率没装 OCR 语言包）：{detail}"
+        );
+    }
+}
+
+#[test]
+fn ocr_rejects_a_window_target_as_a_host_limit() {
+    // 只走 trait 的公开入口，而且 target 判定发生在抓图与建引擎**之前** —— 所以这条在
+    // 任何机器上都成立（没装语言包的机器也一样），也不会去读屏幕、不打扰正在用机器的人。
+    let result = WindowsBackend::new().ocr(&OcrRequest {
+        target: DeviceTarget::Window {
+            process: "notepad.exe".to_string(),
+        },
+        max_chars: 100,
+    });
+    match result {
+        Err(DeviceError::HostLimit { detail }) => {
+            assert!(detail.contains("窗口"), "要写清按窗口 OCR 未做：{detail}");
+            assert!(detail.contains("notepad.exe"), "要点出被拒的目标：{detail}");
+        }
+        other => panic!("DeviceTarget::Window 必须返回 HostLimit（不静默截全屏），实际：{other:?}"),
+    }
 }
 
 #[test]

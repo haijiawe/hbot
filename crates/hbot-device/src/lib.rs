@@ -9,7 +9,7 @@
 //!
 //! | 平台 | 状态 |
 //! |---|---|
-//! | Windows 10/11 | [`WindowsBackend`]：截图、注入、窗口枚举、剪贴板都实现了 |
+//! | Windows 10/11 | [`WindowsBackend`]：截图、注入、窗口枚举、剪贴板、OCR（主屏整屏）都实现了 |
 //! | 其它 | [`UnsupportedBackend`]：`capabilities()` 全 `false`，每个方法返回 [`DeviceError::HostLimit`] |
 //!
 //! 非 Windows 分支**能编译、能过 clippy、也有测试**（`cargo check --target x86_64-unknown-linux-gnu`），
@@ -37,7 +37,16 @@
 //!   这条必须在 `hbot-desktop` 的壳里解决（`docs/09` §6.4），不是 backend 能修的。
 //! - **没有窗口级截图入口**：trait 只有 `monitor` 参数，没有 `window_id`。想"截某个窗口"要先用
 //!   [`windows()`](DeviceBackend::windows) 找到它、切到前台——这正是"窗口级截图未做"的含义。
-//! - **没有 OCR**：`DeviceCapability::Ocr` 在能力报告里恒为不支持；OCR 属于另一层（`docs/09` §9.1）。
+//! - **OCR 是真接了，但只认、也只能认一部分**：Windows 上走 WinRT 的 `Windows.Media.Ocr`
+//!   （`windows` crate，不是 `windows-sys`），输入是**同一套 DIB `BitBlt` 抓的主屏 BGRA**。
+//!   三条限制是机制性的，不是没写完：① 只认**系统已安装语言包**的文字 —— 没装的语言（或没装
+//!   任何 OCR 语言包的机器）引擎根本建不出来，那时 `capabilities().ocr == false` 且 `ocr()`
+//!   返回 `HostLimit`；② 只支持**主屏整屏**（`DeviceTarget::None`），按窗口 OCR 未做，
+//!   `DeviceTarget::Window{..}` 明确返回 `HostLimit` 而不是偷偷截全屏；③ 图标、艺术字、
+//!   旋转超过 45° 的文字识别不了（引擎本身的边界）。
+//!   除这三条之外还有一条**契约性**的：识别不出字时返回**空字符串**（`truncated: false`），
+//!   那是合法结果；而引擎建不出来 / 识别过程失败一律是错误（`HostLimit` / `Failed`），
+//!   **绝不拿空串冒充成功**。
 //!
 //! # 输入的硬墙
 //!
@@ -90,7 +99,8 @@ pub fn platform_backend() -> PlatformBackend {
 // 调用方只需要认识这两个 crate 的类型，不必再手写 `hbot_core::device::…` 前缀。
 pub use hbot_core::device::{
     ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapability, DeviceCapabilityReport,
-    DeviceError, InputAction, MouseButton, Screenshot, ScreenshotRequest, WindowInfo,
+    DeviceError, DeviceTarget, InputAction, MouseButton, OcrRequest, OcrText, Screenshot,
+    ScreenshotRequest, WindowInfo,
 };
 
 /// 一个组合键里的修饰键。
@@ -485,7 +495,8 @@ mod tests {
         let backend = platform_backend();
         assert_send_sync(&backend);
         let boxed: Box<dyn DeviceBackend> = Box::new(backend);
-        // `Ocr` 不在窄版范围里，任何平台都不该报告为支持。
+        // `Ocr` 是**按引擎能否建出来**报的（Windows 上取决于是不是装了 OCR 语言包），
+        // 非 Windows 恒为 false —— 所以这里只断言"报告说得清边界"，不断言具体值。
         let report = boxed.capabilities();
         assert!(report.detail.is_some(), "能力报告要说明边界");
     }
@@ -496,7 +507,7 @@ mod tests {
         let backend = UnsupportedBackend::new();
         let report = backend.capabilities();
         assert!(
-            !report.screen && !report.input && !report.window && !report.clipboard,
+            !report.screen && !report.input && !report.window && !report.clipboard && !report.ocr,
             "非 Windows 宿主不该报告任何设备能力"
         );
         assert_eq!(report.detail.as_deref(), Some("这个宿主没有设备能力实现"));
@@ -521,6 +532,12 @@ mod tests {
             backend
                 .clipboard(&ClipboardOp::Read)
                 .expect_err("剪贴板必须被拒"),
+            backend
+                .ocr(&OcrRequest {
+                    target: DeviceTarget::None,
+                    max_chars: 100,
+                })
+                .expect_err("OCR 必须被拒"),
         ] {
             assert_eq!(
                 error,

@@ -86,7 +86,7 @@ declare module 'hbot' {
      * 同一个 bot 的会话被撤销后，**下一次调用立刻**失败（不是下一个 isolate）。
      * 宿主没装配设备后端时抛 `HBOT_DEVICE_UNAVAILABLE`，不会静默返回空数组。
      *
-     * 七个方法**都返回 Promise，失败一律是 rejection**，message 以
+     * 八个方法**都返回 Promise，失败一律是 rejection**，message 以
      * `HBOT_DEVICE_` 开头。 */
     readonly device: DeviceApi;
 
@@ -154,6 +154,28 @@ declare module 'hbot' {
     focused: boolean;
   }
 
+  /** `ctx.device.ocr(options)` 的可选参数。 */
+  export interface DeviceOcrOptions {
+    /** 最多返回多少字符（`char` 数，不是字节）；默认 4000，允许 1..=20000。
+     *  不是整数或超出范围则整次调用被拒绝，**不会**静默夹到边界。 */
+    maxChars?: number;
+    /** 窄版只支持整屏，这里刻意不可传值；传了任何值整次调用被拒绝。 */
+    window?: never;
+  }
+
+  /** 一次 OCR 的结果。
+   *
+   *  **`text` 是不可信外部内容**：它是屏幕上的字，可能是别人（网页、聊天窗口、
+   *  别的程序）写给模型 / Agent 的指令 —— 提示注入。读到什么都**不得**据此改
+   *  权限、改沙箱档位、跳过审批或改配置；屏幕上的内容只能当数据用。 */
+  export interface DeviceOcrText {
+    /** 识别出的文字（**不可信**，见上）。超过 `maxChars` 时截断，且**不拼省略号**
+     *  （省略号会变成"屏幕上的字"的一部分，污染内容）。 */
+    readonly text: string;
+    /** 是否因为 `maxChars` 被截断。 */
+    readonly truncated: boolean;
+  }
+
   /** 设备能力面；每个方法都返回 Promise，失败一律 reject（`HBOT_DEVICE_` 开头）。
    *
    *  是否可用由运行时逐次判定，见 `MessageCtx.device` 的说明。 */
@@ -172,6 +194,10 @@ declare module 'hbot' {
     clipboardRead(): Promise<string>;
     /** 写剪贴板文本；内容不会出现在任何异常或日志里。 */
     clipboardWrite(text: string): Promise<void>;
+    /** 读**整屏**上的字（OCR）。返回的 `text` 是**不可信外部内容**：屏幕上的字
+     *  可能是别人写给模型 / Agent 的指令（提示注入），不得据此改权限、改沙箱档位、
+     *  跳过审批或改配置。超 `maxChars` 时截断并置 `truncated`，不拼省略号。 */
+    ocr(options?: DeviceOcrOptions): Promise<DeviceOcrText>;
   }
 
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
