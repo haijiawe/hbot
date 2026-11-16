@@ -11,12 +11,20 @@ const STATUS_LABEL: Record<PendingEdit['status'], string> = {
 
 interface DiffCardProps {
   edit: PendingEdit
+  /**
+   * 这些路径在编辑器里**有未保存改动**（缓冲区 ≠ 磁盘）。
+   *
+   * 不是拒绝理由，是提示理由：文档 §06-ide「未保存缓冲区默认参与 Diff 并标注」
+   * —— 用户必须知道"我手上还有没存的字"，否则接受之后会以为自己刚才的编辑丢了。
+   */
+  dirtyPaths: readonly string[]
   onAccept: () => void
   onReject: () => void
 }
 
-export function DiffCard({ edit, onAccept, onReject }: DiffCardProps) {
+export function DiffCard({ edit, dirtyPaths, onAccept, onReject }: DiffCardProps) {
   const pending = edit.status === 'pending'
+  const dirty = new Set(dirtyPaths)
   const stats = editStats(edit.files)
   const title = edit.files.map((file) => file.path).join('、') || '（空编辑）'
 
@@ -35,6 +43,11 @@ export function DiffCard({ edit, onAccept, onReject }: DiffCardProps) {
             <span className="diff-card__path" title={file.path}>
               {file.path}
             </span>
+            {dirty.has(file.path) ? (
+              <span className="diff-card__dirty" role="note">
+                有未保存改动
+              </span>
+            ) : null}
             <span className="diff-card__file-hunks">{file.hunks.length} 块</span>
           </li>
         ))}
@@ -67,7 +80,9 @@ export function DiffCard({ edit, onAccept, onReject }: DiffCardProps) {
       </div>
 
       <p className="diff-card__note">
-        接受后由核心按块落盘（`edit_apply`，哈希过期会拒绝并保留这张卡片）；拒绝则丢弃这次编辑。
+        {dirty.size > 0
+          ? '标了「有未保存改动」的文件：接受时会先按你手上的缓冲区校验，冲突的块会被拒并留在这张卡片上，不会覆盖你没存的字。'
+          : '接受后由核心按块落盘（`edit_apply`，哈希过期会拒绝并保留这张卡片）；拒绝则丢弃这次编辑。'}
       </p>
     </article>
   )

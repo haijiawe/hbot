@@ -30,7 +30,17 @@ interface ApprovalCardProps {
 }
 
 export function ApprovalCard({ approval, onAnswer }: ApprovalCardProps) {
-  const [always, setAlways] = useState(false)
+  /**
+   * 「以后都按这次的动作放行」只属于**当前这个审批**（approvalId）。
+   *
+   * 存成 `{ id, value }` 而不是裸 `boolean`：父组件换了下一条审批时可能复用同一个组件
+   * 实例（`agent-panel.tsx` 没给 key），裸布尔会让上一条的勾选态漏到下一条 ——
+   * 用户以为只是批准这一条，实际发了 `always: true` 去放行**另一个工具的完整动作**，
+   * 与 docs/06-ide.md §5.1「总是允许只对当前完整动作生效」相悖。
+   * 这里按 id 比对，跨审批的残留值**读不到**，也就不会画出一帧错误的勾选态。
+   */
+  const [alwaysFor, setAlwaysFor] = useState<{ id: string; value: boolean } | null>(null)
+  const always = alwaysFor !== null && alwaysFor.id === approval.approvalId ? alwaysFor.value : false
   const busy = approval.busy
 
   return (
@@ -51,7 +61,9 @@ export function ApprovalCard({ approval, onAnswer }: ApprovalCardProps) {
           type="checkbox"
           checked={always}
           disabled={busy}
-          onChange={(event) => setAlways(event.target.checked)}
+          onChange={(event) =>
+            setAlwaysFor({ id: approval.approvalId, value: event.target.checked })
+          }
         />
         以后都按这次的动作放行
       </label>

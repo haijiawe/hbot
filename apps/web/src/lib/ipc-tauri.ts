@@ -21,12 +21,15 @@
  * - `search.start` / `search.cancel` → `search_start` / `search_cancel`，两者都只回
  *   `data: null`：命中由 `file.search` 事件推来（`searchId` 也只随事件到达，命令不回传），
  *   所以这里**不能**编一个结果对象，也不许把 `data: null` 当成错误（用 `callWireVoid`）。
+ * - `diagnostics` → `diagnostics`（同名）：`data` 是 `Diagnostic[]`，核心同时再推一条
+ *   `diagnostics` 事件；条目为空数组是**合法结果**，不能走 `callWireVoid`。
  */
 
 import type {
   ApiError,
   BotSummary,
   Command as WireCommand,
+  Diagnostic,
   DirEntry,
   Event as CoreEvent,
   FileContent,
@@ -383,6 +386,12 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
       return callWireVoid('search_cancel', {
         type: 'search_cancel',
         searchId: command.searchId,
+      })
+    case 'diagnostics':
+      // 返回 `Diagnostic[]`（核心 `ok_data(&items)`）；条目为空是合法结果，不是错误。
+      return callWire<Diagnostic[]>('diagnostics', {
+        type: 'diagnostics',
+        path: command.path,
       })
     case 'bot.list':
       return callWire<BotSummary[]>('bot_list', { type: 'bot_list' })

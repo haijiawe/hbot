@@ -31,13 +31,20 @@ const TAB_ID: Record<BottomPanelTab, string> = {
 }
 
 /** 页签上的计数（`null` = 不显示徽标）。 */
-function tabCount(tab: BottomPanelTab, logCount: number, searchCount: number): number | null {
+function tabCount(
+  tab: BottomPanelTab,
+  logCount: number,
+  searchCount: number,
+  problemCount: number,
+): number | null {
   switch (tab) {
     case 'logs':
       return logCount
     case 'search':
       return searchCount
     case 'problems':
+      // 诊断条数是"有几条问题"的唯一可见指标，别让它只活在面板里。
+      return problemCount
     case 'debug':
       return null
     default: {
@@ -77,6 +84,7 @@ export default function BottomPanel() {
   const logCount = useRunStore((state) => state.logs.length)
   const clearLogs = useRunStore((state) => state.clearLogs)
   const searchCount = useSearchStore((state) => state.totalMatches)
+  const problemCount = useWorkspaceStore((state) => state.diagnostics.length)
   // 暂停时页签上挂一个点点提示（不改变计数语义，只是让"别的页签里有暂停"看得见）。
   const paused = useDebugStore((state) => state.paused !== null)
 
@@ -85,7 +93,7 @@ export default function BottomPanel() {
       <header className="bottom-panel__header">
         <div className="bottom-panel__tabs" role="tablist" aria-label="底部面板页签">
           {TABS.map((item) => {
-            const count = tabCount(item, logCount, searchCount)
+            const count = tabCount(item, logCount, searchCount, problemCount)
             return (
               <button
                 key={item}

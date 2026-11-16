@@ -518,6 +518,81 @@ body.is-resizing {
   padding-bottom: 8px;
 }
 
+.problems__list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 4px 8px 0;
+  list-style: none;
+}
+
+.problem {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 6px;
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.problem:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.problem:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.problem__severity {
+  flex: 0 0 auto;
+  min-width: 30px;
+  font-weight: 600;
+}
+
+.problem__severity--error {
+  color: var(--danger);
+}
+
+.problem__severity--warning {
+  color: var(--warn);
+}
+
+.problem__severity--info {
+  color: var(--accent);
+}
+
+.problem__severity--hint {
+  color: var(--fg-dim);
+}
+
+.problem__message {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.problem__location {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+}
+
+.problem__code {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+}
+
 /* ---------- 运行日志 ---------- */
 
 .logs {

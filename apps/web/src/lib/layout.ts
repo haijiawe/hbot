@@ -43,6 +43,17 @@ export const RESIZE_STEP_LARGE = 32
  */
 export const DEBUG_STACK_WIDTH = 240
 
+/**
+ * 侧栏当前显示哪个视图。
+ *
+ * 放在 layout.ts 而不是 store 里：它和布局一起被持久化（见 `lib/layout-prefs.ts`），
+ * 而且组件只从这里取类型，避免"布局真源"和"页签类型"分成两处分头维护。
+ */
+export type SidebarView = 'explorer' | 'settings'
+
+/** 底部面板当前页签（同样随布局一起持久化）。 */
+export type BottomPanelTab = 'logs' | 'problems' | 'search' | 'debug'
+
 /** 可持久化的布局状态（只存"用户意图"，不存像素级派生值）。 */
 export interface LayoutState {
   sidebarWidth: number

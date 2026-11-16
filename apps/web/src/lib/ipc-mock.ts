@@ -313,6 +313,17 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
       cancelledSearches.add(command.searchId)
       return null
 
+    case 'diagnostics': {
+      // mock 没有 TS 编译器（真机由 `hbot_code::compile_project` 出诊断），所以这里恒回
+      // 空集；但**照核心的契约补推一条 `diagnostics` 事件**（`files.rs` 的 `diagnostics`
+      // 无论 items 是否为空都会推），否则问题面板在浏览器里永远等不到"刷新完成"。
+      const eventPath = command.path ?? ''
+      queueMicrotask(() => {
+        emitMockEvent({ type: 'diagnostics', path: eventPath, items: [] })
+      })
+      return []
+    }
+
     // 真机上是 `bot_list`：行来自 hbot-store 的 bot 表 + 本进程的 supervisor 状态。
     case 'bot.list':
       return [mockBotSummary()]

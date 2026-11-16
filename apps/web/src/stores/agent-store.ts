@@ -13,6 +13,7 @@
 
 import { create } from 'zustand'
 import type { EditFile, RiskLevel, ToolCall } from '../generated'
+import type { EditApplyHooks } from '../lib/edit-apply'
 import { errorMessage } from '../lib/format'
 import type { CoreEvent } from '../lib/ipc'
 import { dispatch } from '../lib/ipc'
@@ -69,7 +70,7 @@ export interface AgentState {
   send: (text: string) => Promise<void>
   ingestEvent: (event: CoreEvent) => void
   answerApproval: (decision: ApprovalDecisionInput, always: boolean) => Promise<void>
-  acceptEdit: () => Promise<void>
+  acceptEdit: (hooks?: EditApplyHooks) => Promise<void>
   rejectEdit: () => Promise<void>
   dismissError: () => void
 }
@@ -214,20 +215,51 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     }
   },
 
-  async acceptEdit() {
+  async acceptEdit(hooks) {
     const edit = get().edit
     if (!edit || edit.status !== 'pending') return
+
+    // 落盘前先按**缓冲区**校验（用户有未保存改动时，hunk 必须以屏幕上的文本为准）。
+    // precheck 只返回"仍然要接受的块"：对不上缓冲区的文件整份剔掉，其余照常落盘。
+    let acceptHunks = allHunkIndices(edit.files)
+    if (hooks?.precheck) {
+      const planned = hooks.precheck({
+        editId: edit.editId,
+        files: edit.files,
+        acceptHunks,
+      })
+      acceptHunks = planned.acceptHunks
+    }
+
+    if (acceptHunks.length === 0) {
+      // 一块都没剩下（全部对不上缓冲区）：**不要**派发空 accept_hunks ——
+      // 核心对空数组的语义是"丢弃这次编辑"，那样用户保存后连重试的机会都没有了。
+      // 具体原因已经由 precheck 报进问题面板，这里只把卡片留在 pending。
+      set({ error: '这次改动没有任何一块能安全落到当前缓冲区，见问题面板。' })
+      return
+    }
 
     try {
       await dispatch({
         type: 'edit.apply',
         editId: edit.editId,
-        acceptHunks: allHunkIndices(edit.files),
+        acceptHunks,
       })
-      set({ edit: { ...edit, status: 'accepted' } })
+      set({ edit: { ...edit, status: 'accepted' }, error: null })
     } catch (error) {
       // 核心拒绝（哈希过期 / 文件已被创建）时保留卡片：重新发起一次编辑即可。
       set({ error: `应用改动失败：${errorMessage(error)}` })
+      return
+    }
+
+    // 落盘成功后才碰编辑器：一次应用 = 每个受影响的模型一个 undo 组
+    // （具体分组在 `applyEditsAsOneUndoGroup`，本 store 不 import monaco）。
+    if (hooks?.afterApply) {
+      try {
+        await hooks.afterApply({ editId: edit.editId, files: edit.files, acceptHunks })
+      } catch (error) {
+        set({ error: `改动已落盘，但同步到编辑器失败：${errorMessage(error)}` })
+      }
     }
   },
 

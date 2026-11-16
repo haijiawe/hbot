@@ -4,7 +4,8 @@
  * 为什么在这里而不是 store 内部：AGENTS.md §0.11 禁止 store 互相 import，
  * 所以"谁收哪些事件"由外壳决定 —— run-store 收 `bot.status` / `run.log`，
  * agent-store 收 `agent.*` / `approval.request`，search-store 收 `file.search`，
- * debug-store 收 `debug.paused` / `debug.resumed`，各自忽略不认识的事件。
+ * debug-store 收 `debug.paused` / `debug.resumed`，workspace-store 收 `diagnostics`
+ * （问题面板的数据），各自忽略不认识的事件。
  *
  * `debug.paused` 还顺带把底部面板展开并切到"调试"页签：暂停是**阻塞**状态
  * （核心在等继续 / 单步），不让用户自己去翻页签。
@@ -32,6 +33,7 @@ export function useCoreEvents(): void {
       useAgentStore.getState().ingestEvent(event)
       useSearchStore.getState().ingestEvent(event)
       useDebugStore.getState().ingestEvent(event)
+      useWorkspaceStore.getState().ingestEvent(event)
       if (event.type === 'debug.paused') {
         const debug = useDebugStore.getState()
         // 只在这条暂停真的落到本 store 上时才抢页签（别的 bot 的事件被过滤掉了）。

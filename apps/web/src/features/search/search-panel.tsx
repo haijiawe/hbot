@@ -15,7 +15,9 @@ import { SearchForm } from './search-form'
 import { SearchResults } from './search-results'
 
 export function SearchPanel() {
-  const query = useSearchStore((state) => state.query)
+  // `query` 是输入框的当前值（用户可能正在改），文案里要用**已提交**的那个串：
+  // 否则用户还没按回车，上一次搜索的结论就被改写成新词了。
+  const submittedQuery = useSearchStore((state) => state.submittedQuery)
   const running = useSearchStore((state) => state.running)
   const searchId = useSearchStore((state) => state.searchId)
   const totalMatches = useSearchStore((state) => state.totalMatches)
@@ -26,7 +28,7 @@ export function SearchPanel() {
       ? running
         ? '正在搜索…'
         : '输入关键词后按回车开始搜索。'
-      : `没有匹配「${query}」。`
+      : `没有匹配「${submittedQuery}」。`
 
   return (
     <section className="search" aria-label="全局搜索">

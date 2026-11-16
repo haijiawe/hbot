@@ -40,8 +40,16 @@ export interface SearchParams {
 }
 
 export interface SearchState {
-  /** 当前提交的查询串（输入框直接绑它，切页签不丢）。 */
+  /** 输入框里的查询串（用户可能正在改，**不代表**当前结果属于它）。 */
   query: string
+  /**
+   * 最近一次**真的提交给核心**的查询串。
+   *
+   * 与 `query` 分开的理由：`query` 随每次按键变，而"当前这批结果"只属于上一次提交。
+   * 空结果时面板要说「没有匹配「X」」，X 必须是**提交过**的那个串 —— 拿 `query`
+   * 会在用户还没按回车时就把上一次搜索的结论改写成新词（界面撒谎）。
+   */
+  submittedQuery: string
   regex: boolean
   /** glob 的原始输入文本（逗号 / 空白分隔），提交时经 `parseGlobs` 拆成数组。 */
   globs: string
@@ -95,6 +103,7 @@ function rememberId(ids: readonly string[], id: string | null): string[] {
 /** 初始状态（测试与"新开一次搜索"共用，避免两份字面量）。 */
 export const INITIAL_SEARCH_STATE = {
   query: '',
+  submittedQuery: '',
   regex: false,
   globs: '',
   running: false,
@@ -108,6 +117,7 @@ export const INITIAL_SEARCH_STATE = {
 } satisfies Pick<
   SearchState,
   | 'query'
+  | 'submittedQuery'
   | 'regex'
   | 'globs'
   | 'running'
@@ -146,6 +156,7 @@ export const useSearchStore = create<SearchState>()((set, get) => ({
     const previous = get()
     set({
       query,
+      submittedQuery: query,
       regex: params.regex,
       globs: formatGlobs(params.globs),
       running: true,

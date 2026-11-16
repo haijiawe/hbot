@@ -190,6 +190,12 @@ export function CommandPalette({ mode: initialMode, onClose, onNotice }: Command
     return source.filter((item) => fuzzyMatch(item.title, query))
   }, [commands, fileItems, mode, query])
 
+  // 换模式就清空查询：命令的查询串（"快速打开"）在文件列表里一个都匹配不上，
+  // 不清的话用户切过去看到的是「没有匹配项」，还得自己删一串字——看起来就像快速打开坏了。
+  useEffect(() => {
+    setQuery('')
+  }, [mode])
+
   useEffect(() => {
     setIndex(0)
   }, [mode, query])

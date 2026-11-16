@@ -9,6 +9,7 @@ import { useEffect, useRef } from 'react'
 import { formatClock } from '../../lib/format'
 import { useAgentStore } from '../../stores/agent-store'
 import { useWorkspaceStore } from '../../stores/workspace-store'
+import { acceptEditInEditor } from './accept-edit'
 import { ApprovalCard } from './approval-card'
 import { DiffCard } from './diff-card'
 
@@ -25,10 +26,17 @@ export function AgentPanel() {
   const setDraft = useAgentStore((state) => state.setDraft)
   const send = useAgentStore((state) => state.send)
   const answerApproval = useAgentStore((state) => state.answerApproval)
-  const acceptEdit = useAgentStore((state) => state.acceptEdit)
   const rejectEdit = useAgentStore((state) => state.rejectEdit)
   const dismissError = useAgentStore((state) => state.dismissError)
   const toggleAgent = useWorkspaceStore((state) => state.toggleAgent)
+  const tabs = useWorkspaceStore((state) => state.tabs)
+
+  /** Diff 里要标"未保存"的文件：目标文件在编辑器里有未保存改动。 */
+  const dirtyPaths = edit
+    ? edit.files
+        .map((file) => file.path)
+        .filter((path) => tabs.find((tab) => tab.path === path)?.dirty === true)
+    : []
 
   const listRef = useRef<HTMLDivElement | null>(null)
 
@@ -99,7 +107,12 @@ export function AgentPanel() {
       {approval ? <ApprovalCard approval={approval} onAnswer={(decision, always) => void answerApproval(decision, always)} /> : null}
 
       {edit ? (
-        <DiffCard edit={edit} onAccept={() => void acceptEdit()} onReject={() => void rejectEdit()} />
+        <DiffCard
+          edit={edit}
+          dirtyPaths={dirtyPaths}
+          onAccept={() => void acceptEditInEditor()}
+          onReject={() => void rejectEdit()}
+        />
       ) : null}
 
       {step > 0 || tool ? (

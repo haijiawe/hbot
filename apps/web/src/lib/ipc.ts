@@ -18,6 +18,7 @@
 import type {
   BotStatus as BotStatusDto,
   BotSummary as BotSummaryDto,
+  Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
   StepKind as StepKindDto,
 } from '../generated'
@@ -68,6 +69,22 @@ export interface LogLine {
 export type BotSummary = BotSummaryDto
 
 /**
+ * 一条诊断（问题面板的一行）。
+ *
+ * `path` 为空串表示项目级诊断（没有具体文件），这类条目**不能跳转**；`line` 为 0
+ * 表示核心不知道位置（见 `crates/hbot-rpc/src/app/commands/files.rs` 的 `diagnostics`）。
+ */
+export type Diagnostic = DiagnosticDto
+
+/** 诊断的严重级；顺序即问题面板的排序优先级（越靠前越严重）。 */
+export const DIAGNOSTIC_SEVERITY_ORDER: readonly DiagnosticDto['severity'][] = [
+  'error',
+  'warning',
+  'info',
+  'hint',
+]
+
+/**
  * bot 运行状态。
  *
  * 直接复用生成的枚举（`stopped | starting | running | stopping | degraded`）：
@@ -103,6 +120,15 @@ export interface CommandInputs {
   'search.start': { query: string; regex: boolean; globs: string[] }
   /** 取消一次搜索（best-effort；核心随即停止推事件，不会补一条"结果"）。 */
   'search.cancel': { searchId: string }
+  /**
+   * 请求诊断（问题面板的数据来源）。
+   *
+   * `path: null` = 整个项目；核心随后**必定**推一条 `diagnostics` 事件
+   * （`items` 为空也推），`data` 里则是同一批条目。UI 以事件为准
+   * （`stores/workspace-store.ts` 的 `ingestEvent`），命令的返回值只用于
+   * 首帧兜底，避免"命令成功但事件丢了"时面板永远空着。
+   */
+  diagnostics: { path: string | null }
   /** 列出当前项目的 bot（无字段；`data` 是 `BotSummary[]`）。 */
   'bot.list': Record<never, never>
   'bot.start': { botId: string }
@@ -146,6 +172,8 @@ export interface CommandOutputs {
   /** 搜"启停"只回 `data: null`；命中见 `file.search` 事件（上面的说明）。 */
   'search.start': null
   'search.cancel': null
+  /** 诊断条目；条目为空表示"没有诊断"，与"命令失败"是两件事（失败会抛 `IpcError`）。 */
+  diagnostics: Diagnostic[]
   'bot.list': BotSummary[]
   /** 启停只回"命令已接受"（`data: null`）；状态看 `bot.status` 事件。 */
   'bot.start': null
