@@ -16,18 +16,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hbot_core::{CommandRunner, HbotError, SandboxMode, SessionId};
+use hbot_core::{
+    CommandRunner, DeviceBackend, DeviceCapability, HbotError, SandboxMode, SessionId,
+};
 use hbot_workspace::Workspace;
 use serde_json::Value;
 
 use crate::cancel::CancellationToken;
 use crate::provider::ToolSpec;
 
+pub mod device;
 pub mod fs;
 pub mod http;
 pub mod search;
 pub mod shell;
 
+pub use device::ReadScreenTool;
 pub use fs::{CreateDirTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use http::HttpFetchTool;
 pub use search::SearchTool;
@@ -137,6 +141,12 @@ pub struct ToolCtx<'a> {
     /// "没有装配命令执行器"——不是"平台不支持"：前者该由组合根修，后者换机器才有用，
     /// 混成一句话就没法定位。
     pub command: Option<Arc<dyn CommandRunner>>,
+    /// 设备执行端口（截屏 / OCR / 输入 / 窗口 / 剪贴板）。
+    ///
+    /// 只给**执行**能力，不给判据：要不要做由网关的 `Capability` 步与
+    /// `DeviceGate` 决定。`None` 时 [`ReadScreenTool`] 诚实拒绝——同样的理由
+    /// 和 `command` 一样，装配缺失要能被表达。
+    pub device: Option<Arc<dyn DeviceBackend>>,
 }
 
 /// 一个可被模型调用的工具。
@@ -184,6 +194,19 @@ pub trait Tool: Send + Sync {
     /// 单次执行超时。
     fn timeout(&self) -> Duration {
         DEFAULT_TOOL_TIMEOUT
+    }
+
+    /// 这个工具要求项目声明哪些设备能力（网关的第一步就判它）。
+    ///
+    /// 默认空 = 不需要任何能力：绝大多数工具（读写文件、搜索、跑命令）与设备
+    /// 无关。**新增工具必须显式想一次**"它要不要能力"，而不是继承一个宽松默认
+    /// 就了事——所以这里的默认值只在"新工具确实无关"时才成立，登记表
+    /// （[`ToolRegistry::with_defaults`]）会为每个工具写一行注释。
+    ///
+    /// 判的是**声明层**（项目清单有没有写 `permissions.device.sub`），不是
+    /// 运行时授权：后者由设备闸每次调用时判。
+    fn required_capabilities(&self) -> &'static [DeviceCapability] {
+        &[]
     }
 
     /// 执行（不做权限/审批/审计）。
@@ -274,6 +297,11 @@ impl ToolRegistry {
         registry.register(Arc::new(SearchTool));
         registry.register(Arc::new(RunCommandTool::new()));
         registry.register(Arc::new(HttpFetchTool));
+        // 第 9 个工具，也是唯一一个需要设备能力的：它要项目清单声明 `ocr`
+        // （网关的 `Capability` 步判），并且每次调用都要审批（`Risk::External`）。
+        // 前 8 个工具都不需要能力，登记时不必写 `required_capabilities`——
+        // 但新增工具时请先想一次"它要不要能力"，别默认按"不要"处理。
+        registry.register(Arc::new(ReadScreenTool));
         registry
     }
 

@@ -3,7 +3,7 @@
 //! 顺序（不可换、不可跳过）：
 //!
 //! ```text
-//! 参数校验 → 工具存在 → 沙箱档 → 路径 realpath → 审批 → 执行 → 审计
+//! 能力声明 → 参数校验 → 工具存在 → 沙箱档 → 路径 realpath → 审批 → 执行 → 审计
 //! ```
 //!
 //! 每条调用都留下 [`GatewayStep`] 轨迹，测试断言"拒绝发生在哪一步"，
@@ -19,7 +19,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use hbot_core::{ApprovalDecision, CommandRunner, HbotError, SandboxMode, SessionId};
+use hbot_core::{
+    ApprovalDecision, CapabilityGate, CommandRunner, DeviceBackend, HbotError, SandboxMode,
+    SessionId,
+};
 use hbot_workspace::Workspace;
 use serde_json::Value;
 
@@ -37,6 +40,8 @@ use crate::tools::{
 /// 新增步骤必须插在正确位置并同步 [`GatewayStep::ALL`]。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GatewayStep {
+    /// 能力声明（项目清单有没有声明这个工具要的设备能力）。
+    Capability,
     /// 参数校验（必填 / 类型）。
     ValidateArgs,
     /// 工具存在。
@@ -55,7 +60,8 @@ pub enum GatewayStep {
 
 impl GatewayStep {
     /// 全部步骤，按执行顺序。
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::Capability,
         Self::ValidateArgs,
         Self::ToolExists,
         Self::SandboxMode,
@@ -68,6 +74,7 @@ impl GatewayStep {
     /// 稳定的字符串形式（日志/审计/UI）。
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Capability => "capability",
             Self::ValidateArgs => "validate_args",
             Self::ToolExists => "tool_exists",
             Self::SandboxMode => "sandbox_mode",
@@ -251,6 +258,8 @@ pub struct ToolGateway {
     audit: Arc<dyn AuditSink>,
     edits: Option<Arc<dyn EditProposer>>,
     command: Option<Arc<dyn CommandRunner>>,
+    capabilities: Option<Arc<dyn CapabilityGate>>,
+    device: Option<Arc<dyn DeviceBackend>>,
 }
 
 impl ToolGateway {
@@ -270,6 +279,8 @@ impl ToolGateway {
             audit,
             edits: None,
             command: None,
+            capabilities: None,
+            device: None,
         }
     }
 
@@ -291,6 +302,28 @@ impl ToolGateway {
     #[must_use]
     pub fn with_edit_proposer(mut self, proposer: Arc<dyn EditProposer>) -> Self {
         self.edits = Some(proposer);
+        self
+    }
+
+    /// 装配能力声明端口：网关第一步（`Capability`）用它判断"项目清单有没有
+    /// 声明这个工具要的设备能力"。
+    ///
+    /// 不装配时的行为是**按需拒绝**，不是全拒：不需要能力的工具（今天除
+    /// `read_screen` 以外的全部）照常执行；需要能力的工具会以"没有装配能力
+    /// 声明端口"拒绝。这样旧调用方（网关自测、非 Agent 场景）不会因为多了
+    /// 一步就全体失灵，而真正要能力的那条路仍然 fail-closed。
+    #[must_use]
+    pub fn with_capability_gate(mut self, gate: Arc<dyn CapabilityGate>) -> Self {
+        self.capabilities = Some(gate);
+        self
+    }
+
+    /// 装配设备执行端口：`read_screen` 从"没有装配设备后端"变成真能读屏。
+    ///
+    /// 只给执行，不给判据：能不能读由 `Capability` 步与设备闸决定。
+    #[must_use]
+    pub fn with_device(mut self, backend: Arc<dyn DeviceBackend>) -> Self {
+        self.device = Some(backend);
         self
     }
 
@@ -390,7 +423,38 @@ impl ToolGateway {
         approver: &dyn Approver,
         trace: &mut CallTrace,
     ) -> Result<ToolOutput, HbotError> {
-        // 1) 参数：先做结构判定（参数不是对象连工具都查不了），
+        // 1) 能力声明：工具要求的设备能力必须在项目清单里声明过。
+        //
+        //    放在最前面（早于参数校验）：这一步不看参数，只判"这份代码有没有
+        //    资格要这类能力"。用工具名查一次即可；查不到工具时**放过**，
+        //    让下一步 `ToolExists` 报那个更准确的错。
+        //
+        //    与 `PathRealpath` / `Approval` 同一约定：**只在适用时才进轨迹**。
+        //    不要求能力的工具（今天除 `read_screen` 以外的全部）不会凭空多出
+        //    一步，既有测试与审计读法都不用改。
+        if let Some(tool) = self.registry.get(&call.name) {
+            let required = tool.required_capabilities();
+            if !required.is_empty() {
+                trace.steps.push(GatewayStep::Capability);
+                let gate = self.capabilities.as_ref().ok_or_else(|| {
+                    HbotError::denied(format!(
+                        "工具 `{}` 需要设备能力，但没有装配能力声明端口",
+                        call.name
+                    ))
+                })?;
+                for capability in required {
+                    gate.authorize(*capability).map_err(|error| {
+                        HbotError::denied(format!(
+                            "项目没有声明能力 `{}`：{}",
+                            capability.as_str(),
+                            error
+                        ))
+                    })?;
+                }
+            }
+        }
+
+        // 2) 参数：先做结构判定（参数不是对象连工具都查不了），
         //    工具存在时再按它的 schema 校验必填/类型。
         trace.steps.push(GatewayStep::ValidateArgs);
         if !call.arguments.is_object() {
@@ -404,12 +468,12 @@ impl ToolGateway {
             validate_args(&call.name, &tool.schema(), &call.arguments)?;
         }
 
-        // 2) 工具存在。
+        // 3) 工具存在。
         trace.steps.push(GatewayStep::ToolExists);
         let tool = looked_up.ok_or_else(|| HbotError::not_found("tool", call.name.clone()))?;
         trace.risk = Some(tool.risk());
 
-        // 3) 沙箱档：低于工具要求直接拒，**不进审批**。
+        // 4) 沙箱档：低于工具要求直接拒，**不进审批**。
         trace.steps.push(GatewayStep::SandboxMode);
         let required = tool.min_sandbox();
         if sandbox_rank(self.level) < sandbox_rank(required) {
@@ -421,7 +485,7 @@ impl ToolGateway {
             )));
         }
 
-        // 4) 路径 realpath：真正解析在 workspace 里，网关只判结果并把
+        // 5) 路径 realpath：真正解析在 workspace 里，网关只判结果并把
         //    规范化后的相对路径写回参数，审批键因此稳定。
         let mut args = call.arguments.clone();
         if let Some(arg) = tool.path_arg()
@@ -434,7 +498,7 @@ impl ToolGateway {
             }
         }
 
-        // 5) 审批：免审批的工具（只读）整步跳过——不是"批准后跳过"。
+        // 6) 审批：免审批的工具（只读）整步跳过——不是"批准后跳过"。
         if tool.requires_approval(self.level, &args) {
             trace.steps.push(GatewayStep::Approval);
             let key = ApprovalKey::new(tool.name(), &args, self.level);
@@ -476,7 +540,7 @@ impl ToolGateway {
             cancel.check()?;
         }
 
-        // 6) 执行。
+        // 7) 执行。
         trace.steps.push(GatewayStep::Execute);
         cancel.check()?;
         let ctx = ToolCtx {
@@ -487,6 +551,7 @@ impl ToolGateway {
             call_id: &call.id,
             edits: self.edits.as_deref(),
             command: self.command.clone(),
+            device: self.device.clone(),
         };
         let timeout = tool.timeout();
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
@@ -580,6 +645,7 @@ mod tests {
     #[test]
     fn steps_are_declared_in_fixed_order() {
         let expected = [
+            GatewayStep::Capability,
             GatewayStep::ValidateArgs,
             GatewayStep::ToolExists,
             GatewayStep::SandboxMode,
@@ -1230,5 +1296,137 @@ mod tests {
             error.error
         );
         assert_eq!(error.failed_at(), Some(GatewayStep::Execute));
+    }
+    /// 只答"允不允许"的能力声明端口。
+    struct FakeCapabilities {
+        allow: bool,
+        calls: std::sync::Mutex<Vec<hbot_core::DeviceCapability>>,
+    }
+
+    impl FakeCapabilities {
+        fn allowing(allow: bool) -> Arc<Self> {
+            Arc::new(Self {
+                allow,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<hbot_core::DeviceCapability> {
+            self.calls
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl CapabilityGate for FakeCapabilities {
+        fn authorize(
+            &self,
+            capability: hbot_core::DeviceCapability,
+        ) -> Result<(), hbot_core::DeviceError> {
+            if let Ok(mut guard) = self.calls.lock() {
+                guard.push(capability);
+            }
+            if self.allow {
+                Ok(())
+            } else {
+                Err(hbot_core::DeviceError::NotDeclared { capability })
+            }
+        }
+    }
+
+    fn capability_fixture(
+        gate: Option<Arc<dyn CapabilityGate>>,
+    ) -> (ToolGateway, Arc<RecordingTool>) {
+        let dir = TestDir::new("gateway-capability");
+        let workspace = dir.workspace();
+        let tool = Arc::new(
+            RecordingTool::new("needs_ocr")
+                .requiring_capabilities(&[hbot_core::DeviceCapability::Ocr]),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(tool.clone());
+        let mut gateway = ToolGateway::new(
+            Arc::new(registry),
+            workspace,
+            SandboxMode::ReadOnly,
+            Arc::new(ApprovalStore::new()),
+            Arc::new(RecordingAudit::new()),
+        );
+        if let Some(gate) = gate {
+            gateway = gateway.with_capability_gate(gate);
+        }
+        (gateway, tool)
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_needs_a_capability_is_refused_when_the_project_has_not_declared_it() {
+        let gate = FakeCapabilities::allowing(false);
+        let (gateway, tool) = capability_fixture(Some(gate.clone()));
+        let approver = RecordingApprover::approving_always();
+        let cancel = CancellationToken::new();
+        let error = gateway
+            .call(
+                session_id(),
+                call("needs_ocr", json!({})),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect_err("没声明能力必须拒绝");
+
+        assert_eq!(
+            error.failed_at(),
+            Some(GatewayStep::Capability),
+            "必须在能力步就停，实际：{:?}",
+            error.steps
+        );
+        assert!(matches!(error.error, HbotError::Denied { .. }));
+        assert!(error.error.to_string().contains("ocr"));
+        assert_eq!(gate.calls(), vec![hbot_core::DeviceCapability::Ocr]);
+        assert!(tool.calls().is_empty(), "拒绝后工具不得执行");
+        assert_eq!(approver.count(), 0, "能力步在审批之前：不该问用户");
+    }
+
+    #[tokio::test]
+    async fn a_declared_capability_lets_the_call_reach_the_tool() {
+        let gate = FakeCapabilities::allowing(true);
+        let (gateway, tool) = capability_fixture(Some(gate.clone()));
+        let approver = RecordingApprover::approving_always();
+        let cancel = CancellationToken::new();
+        // `RecordingTool` 的 schema 要求 `path`：能力步放行之后必须能继续走到参数校验。
+        let outcome = gateway
+            .call(
+                session_id(),
+                call("needs_ocr", json!({ "path": "a.txt" })),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect("声明了就应放行");
+
+        assert_eq!(outcome.steps.first(), Some(&GatewayStep::Capability));
+        assert_eq!(gate.calls(), vec![hbot_core::DeviceCapability::Ocr]);
+        assert_eq!(tool.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_needs_a_capability_fails_closed_without_a_gate() {
+        let (gateway, tool) = capability_fixture(None);
+        let approver = RecordingApprover::approving_always();
+        let cancel = CancellationToken::new();
+        let error = gateway
+            .call(
+                session_id(),
+                call("needs_ocr", json!({})),
+                &cancel,
+                &approver,
+            )
+            .await
+            .expect_err("没装配端口时，要能力的工具必须拒绝");
+
+        assert_eq!(error.failed_at(), Some(GatewayStep::Capability));
+        assert!(error.error.to_string().contains("能力声明端口"));
+        assert!(tool.calls().is_empty());
     }
 }

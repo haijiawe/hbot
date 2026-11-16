@@ -481,6 +481,7 @@ mod tests {
             call_id: "call",
             edits: None,
             command: runner,
+            device: None,
         };
         tool.run(args, &ctx).await
     }

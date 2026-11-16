@@ -175,6 +175,7 @@ pub struct RecordingTool {
     needs_approval: bool,
     path_arg: Option<&'static str>,
     may_create: bool,
+    capabilities: &'static [hbot_core::DeviceCapability],
     failure: Option<String>,
     calls: Arc<Mutex<Vec<serde_json::Value>>>,
 }
@@ -188,6 +189,7 @@ impl RecordingTool {
             needs_approval: false,
             path_arg: None,
             may_create: false,
+            capabilities: &[],
             failure: None,
             calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -214,6 +216,15 @@ impl RecordingTool {
     /// 允许路径不存在（新建）。
     pub fn creating_paths(mut self) -> Self {
         self.may_create = true;
+        self
+    }
+
+    /// 声明这个工具需要哪些设备能力（网关第一步会判）。
+    pub fn requiring_capabilities(
+        mut self,
+        capabilities: &'static [hbot_core::DeviceCapability],
+    ) -> Self {
+        self.capabilities = capabilities;
         self
     }
 
@@ -259,6 +270,10 @@ impl Tool for RecordingTool {
 
     fn path_arg(&self) -> Option<&'static str> {
         self.path_arg
+    }
+
+    fn required_capabilities(&self) -> &'static [hbot_core::DeviceCapability] {
+        self.capabilities
     }
 
     fn may_create_path(&self) -> bool {

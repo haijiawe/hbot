@@ -93,6 +93,7 @@ mod tests {
             call_id: "call",
             edits: None,
             command: None,
+            device: None,
         };
         let error = HttpFetchTool
             .run(json!({ "url": "https://example.com" }), &ctx)

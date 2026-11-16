@@ -504,6 +504,7 @@ mod tests {
             call_id: "call_test",
             edits: None,
             command: None,
+            device: None,
         }
     }
 
