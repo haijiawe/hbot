@@ -41,9 +41,9 @@ pub use command::{
 pub use debug::{Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, PausedAt};
 pub use device::{
     CapabilityGate, ClipboardOp, ClipboardValue, DeviceActor, DeviceAuditEntry, DeviceBackend,
-    DeviceCapability, DeviceCapabilityReport, DeviceError, DeviceGate, DeviceSessionState,
-    DeviceTarget, InputAction, MouseButton, OcrRequest, OcrText, Screenshot, ScreenshotRequest,
-    WindowInfo,
+    DeviceCapability, DeviceCapabilityReport, DeviceError, DeviceGate, DeviceRateLimits,
+    DeviceRateWindow, DeviceSessionState, DeviceTarget, InputAction, MouseButton, OcrRequest,
+    OcrText, Screenshot, ScreenshotRequest, WindowInfo,
 };
 pub use domain::{
     ApprovalDecision, Bot, BotStatus, Conversation, ConversationKind, InboundMessage,

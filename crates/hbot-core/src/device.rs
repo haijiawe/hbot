@@ -21,6 +21,8 @@
 //! 只能有一份（`AGENTS.md` 坑 48）。
 
 use std::fmt;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +68,15 @@ impl DeviceCapability {
             Self::Window,
             Self::Clipboard,
         ]
+    }
+
+    /// 这个子能力是不是"抓一整帧"（要抓整张位图、可能还要跑识别）。
+    ///
+    /// 限速用它把截屏与 OCR 单独收紧到 [`DeviceRateLimits::frames_per_second`]：
+    /// 抓一帧的代价是点一下鼠标的几百倍，两者不该共用同一个配额。
+    #[must_use]
+    pub fn is_frame(self) -> bool {
+        matches!(self, Self::Screen | Self::Ocr)
     }
 }
 
@@ -190,6 +201,25 @@ pub enum DeviceError {
         /// 人话解释。
         message: String,
     },
+    /// 调得太频繁（[`DeviceRateWindow`] 的判据）。
+    ///
+    /// **与 [`Self::HostLimit`] 必须是两个变体**：那一个是"这台机器做不到"，
+    /// 这一个是"这台机器做得到、但你先歇一下"。混成一个码，用户看到"不支持设备能力"
+    /// 会去查系统设置，而真正的处置是少调几次。
+    RateLimited {
+        /// 被限住的子能力。
+        capability: DeviceCapability,
+        /// 多久之后可以再试（毫秒）。UI 可以直接拿它做倒计时。
+        retry_after_ms: u64,
+    },
+    /// 后端没在预算内返回。
+    ///
+    /// 同样**不能报成 [`Self::HostLimit`]**（`docs/09` §13 问 8）：宿主明明支持，
+    /// 只是这次慢了。用户看到 `HOST_LIMIT` 会去查"我的系统为什么不支持截屏"。
+    Timeout {
+        /// 本次调用的预算（毫秒）。
+        ms: u64,
+    },
 }
 
 impl DeviceError {
@@ -206,6 +236,8 @@ impl DeviceError {
             Self::TooLarge { .. } => "HBOT_DEVICE_TOO_LARGE",
             Self::UnknownCapability { .. } => "HBOT_DEVICE_UNKNOWN_CAPABILITY",
             Self::Failed { .. } => "HBOT_DEVICE_FAILED",
+            Self::RateLimited { .. } => "HBOT_DEVICE_RATE_LIMITED",
+            Self::Timeout { .. } => "HBOT_DEVICE_TIMEOUT",
         }
     }
 
@@ -243,6 +275,15 @@ impl fmt::Display for DeviceError {
             }
             Self::UnknownCapability { name } => write!(f, ": 不认识的子能力 `{name}`"),
             Self::Failed { message } => write!(f, ": {message}"),
+            Self::RateLimited {
+                capability,
+                retry_after_ms,
+            } => write!(
+                f,
+                ": `{capability}` 调得太频繁，{} 毫秒后再试",
+                retry_after_ms
+            ),
+            Self::Timeout { ms } => write!(f, ": 设备后端在 {ms} 毫秒内没有返回"),
         }
     }
 }
@@ -433,6 +474,177 @@ pub struct DeviceAuditEntry {
     pub outcome: String,
 }
 
+/// 设备调用的频率上限（`docs/09` §13 问 7 的数字）。
+///
+/// 两个上限分开是为了对准两种伤害：
+///
+/// - **总调用数**（`calls_per_second`）拦"循环里狂点"—— 按钮会被点成双击、
+///   组合键会自己拼出系统快捷键。改的是**别人的桌面状态**。
+/// - **帧数**（`frames_per_second`）比总数更严：抓屏与 OCR 各自要抓一整张位图、
+///   OCR 还要跑识别，代价是点一下鼠标的几百倍。8 次/秒的截屏能把一个 4 核机器
+///   的 CPU 吃满，而 20 次/秒的点击不会。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceRateLimits {
+    /// 一秒内允许的设备调用总数。
+    pub calls_per_second: u32,
+    /// 一秒内允许的"帧"调用数（`screen` 与 `ocr` 各算一帧）。
+    pub frames_per_second: u32,
+}
+
+impl Default for DeviceRateLimits {
+    fn default() -> Self {
+        Self {
+            calls_per_second: 20,
+            frames_per_second: 2,
+        }
+    }
+}
+
+/// 一秒的滑动窗口，拦"调得太频繁"。
+///
+/// **为什么是滑动窗口而不是令牌桶**：令牌桶允许突发（攒满 20 个令牌后一口气用掉），
+/// 而这里的伤害正是突发 —— 一秒内 20 次点击等于把 20 个动作在几十毫秒内砸进别人的
+/// 界面。滑动窗口把"任意 1 秒内不超过 N 次"变成硬约束。
+///
+/// 时间由调用方传入（[`Instant`]），不在这里读时钟：测试要能一秒一秒地推。
+///
+/// # 每份实现管一棵窗口
+///
+/// 窗口是**按被授权方**分的：bot 代码那条路每个 `Sandbox` 一个槽（一个槽就是一个
+/// bot 的 isolate），Agent 那条路每个会话后端一个。判定代码只有这一份，窗口实例
+/// 按调用方分 —— 与 [`DeviceGate`] 的关系一样（一个实现、几处装配）。
+pub struct DeviceRateWindow {
+    limits: DeviceRateLimits,
+    state: Mutex<WindowState>,
+}
+
+/// 窗口里留的两次调用的时刻。`VecDeque` 从前面淘汰过期的。
+struct WindowState {
+    calls: std::collections::VecDeque<Instant>,
+    frames: std::collections::VecDeque<Instant>,
+}
+
+/// 窗口长度：固定 1 秒（`*_per_second` 的"per second"就是这个意思）。
+const WINDOW: Duration = Duration::from_secs(1);
+
+impl Default for DeviceRateWindow {
+    /// 文档里的默认上限（20 次/秒、2 帧/秒）。装配方不特别指定时用它。
+    fn default() -> Self {
+        Self::new(DeviceRateLimits::default())
+    }
+}
+
+impl DeviceRateWindow {
+    /// 用给定的上限建一棵空窗口。
+    #[must_use]
+    pub fn new(limits: DeviceRateLimits) -> Self {
+        Self {
+            limits,
+            state: Mutex::new(WindowState {
+                calls: std::collections::VecDeque::new(),
+                frames: std::collections::VecDeque::new(),
+            }),
+        }
+    }
+
+    /// 上限（UI 与文档都要能查，别让数字只活在代码里）。
+    #[must_use]
+    pub fn limits(&self) -> DeviceRateLimits {
+        self.limits
+    }
+
+    /// 现在允许再一次 `capability` 调用吗？
+    ///
+    /// 允许就把这次调用记进窗口（**先判后记**：拒绝的那次不占配额，否则一个
+    /// 被限住的循环会让窗口永远排满，用户的"等一秒"变成"等一辈子"）。
+    ///
+    /// # Errors
+    ///
+    /// [`DeviceError::RateLimited`]，带 `retry_after_ms`（最早那次调用滑出窗口的
+    /// 剩余时间）。`0` 是不可能的 —— 判据成立时窗口里必有一条更早的记录。
+    pub fn admit(&self, capability: DeviceCapability, now: Instant) -> Result<(), DeviceError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        prune(&mut state.calls, now);
+        prune(&mut state.frames, now);
+
+        // 先看更严的那条：帧超了即使总数没超也要拒。
+        if capability.is_frame() {
+            if let Some(retry_after_ms) = wait_ms(&state.frames, self.limits.frames_per_second, now)
+            {
+                return Err(DeviceError::RateLimited {
+                    capability,
+                    retry_after_ms,
+                });
+            }
+        }
+        if let Some(retry_after_ms) = wait_ms(&state.calls, self.limits.calls_per_second, now) {
+            return Err(DeviceError::RateLimited {
+                capability,
+                retry_after_ms,
+            });
+        }
+
+        state.calls.push_back(now);
+        if capability.is_frame() {
+            state.frames.push_back(now);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DeviceRateWindow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceRateWindow")
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 淘汰滑出窗口的记录。`>=` 与 `admit` 里的判据一致：正好 1 秒整就算过期。
+fn prune(queue: &mut std::collections::VecDeque<Instant>, now: Instant) {
+    while let Some(oldest) = queue.front() {
+        match now.checked_duration_since(*oldest) {
+            Some(age) if age >= WINDOW => {
+                queue.pop_front();
+            }
+            // `None` = 记录的时刻在 `now` 之后（测试里时钟被推回去）。
+            // 保守起见当成"还没过期"，不淘汰 —— 宁可少放行一次。
+            _ => break,
+        }
+    }
+}
+
+/// 还差多少毫秒才能再来一次；`None` = 现在就可以。
+fn wait_ms(queue: &std::collections::VecDeque<Instant>, limit: u32, now: Instant) -> Option<u64> {
+    // 上限 0 = 永远拒。这一支必须写在"空窗口"之前：空窗口的 `front()` 是
+    // `None`，若靠 `?` 短路就会把"零配额"解释成"随便用"（这正是第一版测试
+    // 抓到的 bug）。
+    if limit == 0 {
+        return Some(one_window_ms());
+    }
+    if u32::try_from(queue.len()).unwrap_or(u32::MAX) < limit {
+        return None;
+    }
+    let oldest = queue.front()?;
+    let left = match now.checked_duration_since(*oldest) {
+        Some(age) => WINDOW.saturating_sub(age),
+        // 时钟倒退（测试推进了 `Instant` 或系统时间跳变）：当成整窗都没过，
+        // 宁可少放行一次，也不许凭一次倒退凭空多出配额。
+        None => WINDOW,
+    };
+    Some(u64::try_from(left.as_millis()).unwrap_or(0).max(1))
+}
+
+/// 一个窗口长度的毫秒数（`u64`，至少 1 —— 0 会让 UI 画出"立刻可重试"）。
+fn one_window_ms() -> u64 {
+    u64::try_from(WINDOW.as_millis()).unwrap_or(1_000).max(1)
+}
+
 /// 授权端口：**判据的唯一入口**。
 ///
 /// 实现必须每次调用都查当前授权（`docs/09` §4.3），不许在构造时快照 —— 否则
@@ -570,5 +782,177 @@ mod tests {
         assert_eq!(DeviceSessionState::Active.as_str(), "active");
         assert_eq!(DeviceActor::BotCode.as_str(), "bot_code");
         assert_eq!(DeviceActor::AgentTool.as_str(), "agent_tool");
+    }
+
+    /// 只有截屏与 OCR 算"抓一帧"。
+    #[test]
+    fn only_screen_and_ocr_count_as_frames() {
+        assert!(DeviceCapability::Screen.is_frame());
+        assert!(DeviceCapability::Ocr.is_frame());
+        for capability in [
+            DeviceCapability::Input,
+            DeviceCapability::Window,
+            DeviceCapability::Clipboard,
+        ] {
+            assert!(!capability.is_frame(), "{capability} 不该算帧");
+        }
+    }
+
+    /// 默认上限是 `docs/09` §13 问 7 定的 20 次/秒、2 帧/秒。
+    #[test]
+    fn the_default_limits_are_the_documented_ones() {
+        let limits = DeviceRateLimits::default();
+        assert_eq!(limits.calls_per_second, 20);
+        assert_eq!(limits.frames_per_second, 2);
+    }
+
+    /// 第 21 次点击被拒，且被拒的那次**不占配额**。
+    #[test]
+    fn the_twenty_first_call_in_a_second_is_refused() {
+        let window = DeviceRateWindow::new(DeviceRateLimits::default());
+        let start = Instant::now();
+        for index in 0..20 {
+            let now = start + Duration::from_millis(index);
+            assert!(
+                window.admit(DeviceCapability::Input, now).is_ok(),
+                "第 {} 次不该被拒",
+                index + 1
+            );
+        }
+
+        let refused = window
+            .admit(DeviceCapability::Input, start + Duration::from_millis(20))
+            .expect_err("第 21 次必须被拒");
+        match refused {
+            DeviceError::RateLimited {
+                capability,
+                retry_after_ms,
+            } => {
+                assert_eq!(capability, DeviceCapability::Input);
+                // 最早那次在 t=0，refused 在 t=20ms：还要 ~980ms 才滑出去。
+                assert!(
+                    retry_after_ms > 900 && retry_after_ms <= 1000,
+                    "retry_after_ms = {retry_after_ms}"
+                );
+            }
+            other => panic!("期望 RateLimited，得到 {other:?}"),
+        }
+
+        // 拒绝不占配额：等一秒后一次成功，且窗口里只有这两条。
+        assert!(
+            window
+                .admit(
+                    DeviceCapability::Input,
+                    start + Duration::from_millis(1_100)
+                )
+                .is_ok()
+        );
+    }
+
+    /// 帧比总数更严：总数还剩 18 个名额，第 3 张截图仍然被拒。
+    #[test]
+    fn the_third_frame_in_a_second_is_refused_while_calls_are_still_plentiful() {
+        let window = DeviceRateWindow::new(DeviceRateLimits::default());
+        let start = Instant::now();
+        assert!(window.admit(DeviceCapability::Screen, start).is_ok());
+        assert!(
+            window
+                .admit(DeviceCapability::Ocr, start + Duration::from_millis(10))
+                .is_ok()
+        );
+        // 两者共用帧配额：一张截图 + 一次 OCR 已经用满了 2 帧。
+        match window
+            .admit(DeviceCapability::Screen, start + Duration::from_millis(20))
+            .expect_err("第 3 帧必须被拒")
+        {
+            DeviceError::RateLimited {
+                capability,
+                retry_after_ms,
+            } => {
+                assert_eq!(capability, DeviceCapability::Screen);
+                assert!(retry_after_ms > 900, "retry_after_ms = {retry_after_ms}");
+            }
+            other => panic!("期望 RateLimited，得到 {other:?}"),
+        }
+        // 同时刻的点击不受帧配额影响（它不吃帧）。
+        assert!(
+            window
+                .admit(DeviceCapability::Input, start + Duration::from_millis(20))
+                .is_ok()
+        );
+    }
+
+    /// 一秒之后配额自动回来（滑动窗口，不是"每秒钟清零一次"）。
+    #[test]
+    fn the_window_slides_instead_of_resetting() {
+        let window = DeviceRateWindow::new(DeviceRateLimits::default());
+        let start = Instant::now();
+        for _ in 0..20 {
+            window
+                .admit(DeviceCapability::Input, start)
+                .expect("前 20 次都该放行");
+        }
+        assert!(
+            window.admit(DeviceCapability::Input, start).is_err(),
+            "同一时刻的第 21 次必须被拒"
+        );
+        // 差 1 毫秒还不够（`>=` WINDOW 才算过期）。
+        assert!(
+            window
+                .admit(DeviceCapability::Input, start + Duration::from_millis(999))
+                .is_err(),
+            "999ms 时最早那条还没滑出去"
+        );
+        assert!(
+            window
+                .admit(DeviceCapability::Input, start + WINDOW)
+                .is_ok(),
+            "正好 1 秒整应当放行"
+        );
+    }
+
+    /// 上限是 0 时永远拒，且 `retry_after_ms` 不许给 0（否则 UI 会画
+    /// "立刻可重试"然后立刻再被拒）。
+    #[test]
+    fn a_zero_limit_never_admits_and_never_promises_zero_wait() {
+        let window = DeviceRateWindow::new(DeviceRateLimits {
+            calls_per_second: 0,
+            frames_per_second: 0,
+        });
+        let start = Instant::now();
+        for capability in [DeviceCapability::Input, DeviceCapability::Screen] {
+            match window
+                .admit(capability, start)
+                .expect_err("零配额必须一次都不放行")
+            {
+                DeviceError::RateLimited {
+                    capability: refused,
+                    retry_after_ms,
+                } => {
+                    assert_eq!(refused, capability);
+                    // 关键：空窗口也要给一个正的等待时间。
+                    assert_eq!(retry_after_ms, 1_000);
+                }
+                other => panic!("期望 RateLimited，得到 {other:?}"),
+            }
+        }
+    }
+
+    /// 时钟倒退（测试或系统时间跳变）时不 panic、不误放行一堆。
+    #[test]
+    fn a_backwards_clock_does_not_panic_or_flood_the_window() {
+        let window = DeviceRateWindow::new(DeviceRateLimits {
+            calls_per_second: 1,
+            frames_per_second: 1,
+        });
+        let start = Instant::now();
+        assert!(window.admit(DeviceCapability::Input, start).is_ok());
+        // 比记录更早的时刻：`checked_duration_since` 给 None ⇒ 当成没过期。
+        assert!(
+            window
+                .admit(DeviceCapability::Input, start - Duration::from_millis(500))
+                .is_err(),
+            "时钟倒退不该凭空多出配额"
+        );
     }
 }
