@@ -56,32 +56,55 @@
 
 ### 3.1 `device_sessions`
 
+**已落地**（`crates/hbot-store/src/migrations/0004_device.sql`，2026-11-17）。下表是实际列，不是设想：
+
 | 列 | 类型 | 说明 |
 |---|---|---|
-| `id` | TEXT PK | UUIDv4 |
-| `bot_id` | TEXT | 归属 bot（**一个 bot 同时最多一个活跃会话**，见 07 §13 问 7） |
-| `state` | TEXT | `requested` / `active` / `expired` / `revoked` / `denied` |
-| `subcapabilities` | TEXT | 逗号分隔：`screen,input`（**不含**未授权的） |
-| `allowed_apps` | TEXT | JSON 数组；空数组 = 全拒 |
-| `granted_at` | INTEGER | unix 毫秒 |
-| `deadline` | INTEGER | unix 毫秒；默认 5 min，上限 30 min |
-| `ended_at` | INTEGER NULL | 结束时刻 |
-| `ended_reason` | TEXT NULL | `timeout` / `revoked` / `bot_stop` / `shutdown` |
+| `id` | TEXT PK | UUIDv4（调用方生成，存储层不造 ID） |
+| `bot_id` | TEXT NOT NULL | 归属 bot，`REFERENCES bots(id) ON DELETE CASCADE`（删项目→级联删会话，不留孤儿授权） |
+| `state` | TEXT NOT NULL | `requested` / `active` / `expired` / `revoked` / `denied`（`none` 不落行——"没有行"就是 none） |
+| `sub_json` | TEXT NOT NULL | JSON 数组：`["screen","input"]`（**不含**未授权的；`[]` = 一个都没有） |
+| `allowed_apps_json` | TEXT NOT NULL | JSON 数组；`[]` = 全拒 |
+| `granted_at` | INTEGER NULL | unix 毫秒（`requested` 态可能还没批） |
+| `deadline` | INTEGER NULL | unix 毫秒；默认 5 min，上限 30 min |
+| `ended_at` | INTEGER NULL | 结束时刻；`NULL` = 还没结束 |
+| `created_at` | INTEGER NOT NULL | unix 毫秒，**由调用方注入**（存储层不读时钟） |
 
-索引：`(bot_id, state)`。
+索引：`idx_device_sessions_bot_created ON device_sessions (bot_id, created_at DESC)`。
+`latest_device_session` 的读法是 `WHERE bot_id=?1 ORDER BY created_at DESC, id DESC LIMIT 1` ——
+`id DESC` 只在同毫秒时做**确定性定序**，不是时间序（UUIDv4 不含时间）。
+
+> **与初稿的两处差异（实现时定的，已改文档而不是改代码）**：
+> 初稿写 `subcapabilities` 逗号分隔 + `allowed_apps` + `ended_reason`，索引 `(bot_id, state)`。
+> 落地改成 JSON 两列（解析失败即坏数据，不用猜分隔符）、去掉 `ended_reason`（状态本身已经
+> 表达了"为什么结束"）、索引改 `created_at DESC`（服务 `latest` 查询）。**0004 已发布，不可再改**，
+> 要调就开 0005。
 
 **为什么落库而不是只在内存**：① 崩溃/重启后必须能判定"上次那个会话已经不算数"，不能靠内存为空来"默认安全"（万一某天有人改成从库里恢复）；② 审计要能回看"上周二那个会话是谁开的、开了多久"。
+
+**已知缺口（如实记下，未修）**：
+
+- **没有部分唯一索引**保证"每 bot 至多一条 `active`"。当前靠上层语义（`device_grant` 先 `end_live_device_sessions` 再插）维持；`latest_device_session` 只取一条，所以真出现第二条 active 就会"活着但没人看得见"。加索引要先改上层，故留给 M10 收口时一起做。
+- `state` **没有 CHECK 约束**，存储层也不校验：上层若写入 `"Active"`（大写），这行永远匹配不上 `WHERE state='active'`，撤销/到期都撤不掉它。当前用测试 `active_state_literal_matches_the_core_contract` 钉住"存储层常量 == 核心字面量"，但钉不住"上层传进来的就是它"。
+- 排序键是调用方注入的 `created_at` 毫秒：系统时钟回拨 / NTP 跳跃会让"最新"不新。
 
 ### 3.2 `device_audit`
 
 | 列 | 说明 |
 |---|---|
-| `id`、`session_id`、`at` | 自增/时间 |
+| `id` | INTEGER 自增 |
+| `at` | unix 毫秒（调用方注入的时钟） |
+| `bot_id` | TEXT NOT NULL，`REFERENCES bots(id) ON DELETE CASCADE` |
+| `actor` | `bot_code` / `agent_tool`（`hbot_core::DeviceActor::as_str()`）——**会话的两个消费者都记** |
 | `action` | `screenshot` / `click` / `key` / `move` / `focus` / `clipboard_read` / `clipboard_write` |
-| `target` | 窗口标题或坐标，**不含像素、不含剪贴板内容、不含 OCR 文本** |
+| `target` | **只允许**进程名 / 窗口 id / 子能力名，**不含像素、不含剪贴板内容、不含 OCR 文本** |
 | `outcome` | `ok` / `denied` / `failed` |
 
-**审计不记内容**（07 §9.3 第 5 条）：记了内容，日志本身就成了新的泄漏面 —— 密码框的像素、剪贴板里的 token 都会躺在 `logs` 里。
+索引：`idx_device_audit_bot_at ON device_audit (bot_id, at DESC)`。
+
+**审计不记内容**（07 §9.3 第 5 条）：记了内容，日志本身就成了新的泄漏面 —— 密码框的像素、剪贴板里的 token 都会一直躺在库里，被导出、被 UI 展示、被喂进模型上下文。列清单由 `device_audit_rejects_content_columns`（`PRAGMA table_info` + 禁用子串表）钉死，**以后不许加** `content`/`text`/`png`/`image`/`ocr`/`clipboard`/`payload`/`bytes`/`pixel`/`blob`/`data` 之类的列。
+
+> **已知缺口**：初稿有 `session_id` 外键，落地没有（只留 `bot_id`）。后果是"这次点击属于哪个授权"只能靠 `at` 时间窗猜。要按会话回放得开 0005 加列 —— 现在不需要，但**别在 UI 上承诺"按会话查审计"**。
 
 保留策略：随项目 DB，不做单独裁剪（与现有 `logs` 一致）；量级是每会话最多 10000 条（07 §9.3 的 `maxActionsPerSession`）。
 
@@ -91,7 +114,16 @@
 
 ### 4.1 第一层：清单声明（Agent 写、你看得见）
 
-`crates/hbot-code/src/manifest.rs:111` 的 `Permissions` 现在只有 `http: Vec<String>`。加：
+**已落地**（2026-11-17）：`crates/hbot-code/src/manifest.rs` 的 `Permissions` 原有 `http: Vec<String>`，现在多了 `device: Option<DevicePermissions>`：
+
+```rust
+pub struct DevicePermissions {
+    pub sub: Vec<DeviceCapability>,  // 已解析成领域枚举，不是裸字符串
+    pub apps: Vec<String>,
+}
+```
+
+清单写法：
 
 ```json
 {
@@ -246,17 +278,19 @@ pub trait DeviceBackend: Send + Sync {
 
 | `type` | 入参 | 成功 data | 失败 |
 |---|---|---|---|
-| `device_status` | `{ botId }` | `DeviceStatus`；无会话时为 `null` | `-32001` bot 不存在 |
-| `device_grant` | `{ botId, sub, allowedApps?, minutes? }` | `DeviceStatus` | `-32002` 子能力非法/`minutes` 超 30；`-32005` 设置未开 |
+| `device_status` | `{ botId }` | `DeviceStatus`（**从不返回 `null`**；无会话时是 `state:"none"` 的快照，见 8.4） | `-32001` bot 不存在 |
+| `device_grant` | `{ botId, sub, allowedApps?, minutes? }` | `DeviceStatus` | `-32002` 子能力非法/生效集合为空/`minutes` 超 30；`-32005` 设置未开 |
 | `device_revoke` | `{ botId }` | `null` | `-32001`；无活跃会话时**成功**（幂等） |
 | `device_request` | `{ botId, sub, reason }` | `null`（请求已投递给 UI） | `-32002`、`-32005` 清单没声明 |
 
-`DeviceStatus`（`dto/common.rs` 新增）：
+`DeviceStatus`（`dto/common.rs`，字段全 camelCase）：
 
 ```
-{ sessionId, botId, state, sub: [String], allowedApps: [String],
+{ botId, sessionId, state, sub: [String], allowedApps: [String],
   grantedAt, deadline, remainingMs }
 ```
+
+`state` / `sub` / `allowedApps` 是**开放字符串**，不是枚举（与 `ConversationSummary.kind` 同一个理由：设备能力是产品面最容易继续长的一处）。前端遇到不认识的 `state` 必须原样显示、不认识的 `sub` 必须忽略而不是 throw。
 
 ### 8.2 事件（`dto/event.rs`，现有 12 个 → 14 个）
 
@@ -271,17 +305,33 @@ pub trait DeviceBackend: Send + Sync {
 
 ```ts
 interface DeviceApi {
-  screen(): Promise<{ width: number; height: number; png: Uint8Array; monitor: number }>;
-  windows(): Promise<Array<{ id: number; title: string; process: string; focused: boolean }>>;
-  click(x: number, y: number, button?: 'left' | 'right'): Promise<void>;
-  key(text: string): Promise<void>;                         // 文本注入
-  keyCombo(keys: string[]): Promise<void>;                  // "ctrl+c"
+  /** 截主屏。pngBase64 是 base64 字符串（JS 侧没有 Node Buffer）。 */
+  screen(options?: { monitor?: number; maxBytes?: number }):
+    Promise<{ width: number; height: number; pngBase64: string; monitor: number }>;
+  windows(): Promise<Array<{ id: string; title: string; process: string; focused: boolean }>>;
+  click(x: number, y: number, button?: 'left' | 'right' | 'middle'): Promise<void>;
+  key(text: string): Promise<void>;        // 文本注入（不是剪贴板粘贴）
+  keyCombo(keys: string[]): Promise<void>; // ["ctrl","c"]；键名大小写不敏感
   clipboardRead(): Promise<string>;
   clipboardWrite(text: string): Promise<void>;
 }
 ```
 
-**没在清单里声明的子能力，这个对象上就不出现对应方法**（V1：生成 d.ts 后断言不含该符号）。`dts.rs:388` 的 `host_bindings_match_the_module_and_the_dts` 四向防漂移测试必须扩到 `device`，否则 d.ts 会承诺运行时不存在的符号。
+两处与初稿不同（实现时定的，已按实现改文档）：
+
+- `png` 是 **`pngBase64: string`** 而不是 `Uint8Array`：QuickJS 里没有 Node 的 `Buffer`，宿主把像素编成 PNG 后以 base64 交给 JS，JS 侧要发出去就放进 `http` 请求体。
+- `windows()` 的 `id` 是 **string**（`hbot_core::WindowInfo.id` 就是 `String`，Windows 上是 `HWND` 的十进制文本）：不要为了"看起来像数字"在 DTO 里换类型，那会让 64 位句柄在 JS 的 double 里丢精度。
+
+**没在清单里声明的子能力，这个对象上就不出现对应方法**（V1：生成 d.ts 后断言不含该符号）。`dts.rs` 的 `host_bindings_match_the_module_and_the_dts` 四向防漂移测试必须扩到 `device`，否则 d.ts 会承诺运行时不存在的符号。
+
+### 8.4 写 UI 时被问出来的六件事（口径在此，别再各自猜）
+
+1. **`device_status` 永远不会 `data: null`**（初稿写错过，已改）。UI 无条件按对象处理：`state:"none"` 就是"从没有过会话"，此时 `sessionId`/`grantedAt`/`deadline`/`remainingMs` 为 `null`，但 `sub`/`allowedApps` 是数组（设置页要拿它画当前配置）。
+2. **没有 `device_deny` 命令，而且不需要**：`device_request` 只发一条事件、**不创建任何服务端状态**（`device-cmd` 的实现约束）。所以 UI 的「拒绝」= 清掉本地 `pending`，服务端无事可做。副作用是 `DeviceSessionState::Requested` 这个变体今天**没有任何代码会写**——它是为 M7「请求也要落库、可跨重启恢复」预留的，别在别处假装它有用。
+3. **UI 拿不到 bot 列表**（真缺口）：四条命令都要 `botId`，界面只能取当前运行中的那一个。要支持多 bot 授权得让 UI 用现成的 `bot_list` 命令（它早就有），并在 `ipc.ts` 补上——不在本轮范围，记在 §11.1 的待办里。
+4. **`-32005` 的 `data.toggle` 被前端丢掉了**：`IpcError` 只保留 `message`，所以「设置没开」无法给"去打开设置"的跳转按钮，只能显示一行错误。要修得让 `IpcError` 保留 `data`（跨所有命令的改动），不在本轮。
+5. **`allowedApps` 的大小写口径**：**比较前双方都 `trim` + 转小写**（`device-win` 取前台进程的映像名后也转小写），UI 侧**原样显示用户写的东西**，不回写、不归一化。这样 `PathOfExile.exe` 与 `pathofexile.exe` 都能匹配，而用户看到的还是自己写的。
+6. **`device.status` 不带 `requestId`**：因为请求不落状态（见第 2 条），"这条状态是否消化了那个待处理请求"由前端在 `device_grant` 成功时自己清 `pending`。不要试图从事件里反推。
 
 ---
 
@@ -338,7 +388,7 @@ interface DeviceApi {
 
 ---
 
-## 11. 顺序：与 M7 的关系（待用户拍板）
+## 11. 顺序：与 M7 的关系（用户已选 B，2026-11-17）
 
 `M10` 的最小前置链：
 
@@ -346,14 +396,30 @@ interface DeviceApi {
 2. **设置文件读取**（`device.json`）—— 已有 `DesktopSettings` 的写法可抄。
 3. **`Capability` 闸的位置** —— `ToolGateway` 第一步现在不存在，要先加空壳（只判定"清单声明"这一层）并把现有 8 个工具全部登记为"无能力要求"。
 
-所以有两个选择：
-
 | 选择 | 何时能跑 | 风险 |
 |---|---|---|
-| **A. 等 M7**（推荐） | M7 之后 | 晚，但骨架长在正地方 |
-| **B. 现在做窄版** | 10–12 天后有 demo | 定时器与 Capability 闸会被设备需求"推着长"，可能与 M7 的设计打架，届时返工 |
+| A. 等 M7 | M7 之后 | 晚，但骨架长在正地方 |
+| **B. 现在做窄版（已选）** | 10–12 天后有 demo | 定时器与 Capability 闸会被设备需求"推着长"，可能与 M7 的设计打架，届时返工 |
 
-如果选 B，**把第 1、3 项写成"临时实现 + 明确 TODO 迁移点"**，不要假装它们是 M7 的最终形态。
+用户 2026-11-17 说「开始吧」，按 **B** 开工。本轮的处置原则（写下来是为了将来不返工时能一眼看出当时怎么想的）：
+
+- **不写"临时实现"**。需求被拆成两部分：本次做"形式正确、范围窄"的实现；M7 的 `C1.timer` / `Capability` 闸到 M7 时**替换实现而不是替换形状**。
+- 具体地：到期结算用 `AppState` 里一个 1 秒 tick（`docs/09` §7 已定"由定时器结算，不 lazy 检查"）；M7 的 timer 落地后，这个 tick 应变成"往统一调度器注册一个任务"，而不是删掉——**所以 tick 的入口必须是一个可被替换的 `fn sweep_expired(&self)`**，不是内联在 `AppState::open` 里。
+- `ToolGateway` 的 `Capability` 第一步**本次不做**（设备能力有两个消费者，bot 代码路径根本不经过 gateway，先做 gateway 那一步不会让任何一条路径更安全）。但 `DeviceGate` trait 的形状已经是那一步要用的形状——将来加 `Capability` 闸时是"多一个实现者"，不是"改一个 trait"。
+
+### 11.1 落地状态（2026-11-17）
+
+| 层 | 状态 | 落点 |
+|---|---|---|
+| 契约（DTO/事件/错误码/trait） | **已冻结并提交**（`da97da6`） | `crates/hbot-core/src/device.rs`、`crates/hbot-rpc/src/dto/{common,command,event}.rs` |
+| 存储（两表 + 6 方法） | **已完成** | `crates/hbot-store/src/migrations/0004_device.sql`、`src/repositories/device.rs` |
+| 宿主闸 + `ctx.device.*` | 并行单元中 | `crates/hbot-code/src/device/`、`src/runtime/device_api.rs` |
+| 设置 + 四条命令 + 到期 tick | 并行单元中 | `crates/hbot-rpc/src/app/device/`、`src/app/commands/device.rs` |
+| Windows 后端 | 并行单元中 | `crates/hbot-device/` |
+| IDE 面板 + 授权弹窗 | 并行单元中 | `apps/web/src/features/device/`、`src/stores/device-store.ts` |
+| 注入沙箱（我的集成步） | 待做 | `crates/hbot-rpc/src/app/runtime/sandbox_handler.rs` 里 `set_device` |
+| OCR | **未开始** | §9.1 的窄版路径 |
+| `ToolGateway` 的 Capability 闸 | **明确不做**（M7） | 见上 |
 
 ---
 
