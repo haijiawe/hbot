@@ -104,8 +104,10 @@ struct TempDir {
 impl TempDir {
     fn new(label: &str) -> Self {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("hbot-hotreload-{label}-{}-{seq}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "hbot-hotreload-{label}-{}-{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).expect("创建临时目录");
         Self { path }
     }
@@ -153,9 +155,7 @@ fn handler_source(marker: &str) -> String {
 
 /// 回复文本 → 版本标记（回复形如 `v2········：m17`）。
 fn marker_of(reply: &str) -> &str {
-    reply
-        .rsplit_once('：')
-        .map_or(reply, |(head, _rest)| head)
+    reply.rsplit_once('：').map_or(reply, |(head, _rest)| head)
 }
 
 // ---------------------------------------------------------------------------
@@ -189,9 +189,7 @@ impl Harness {
         // scaffold 不写 bots.json（部署配置，不是项目源码）：本地试跑自己补一份。
         std::fs::write(
             project.join("bots.json"),
-            format!(
-                r#"{{"bots":[{{"id":"{BOT_UUID}","platform":"local","name":"热重载"}}]}}"#
-            ),
+            format!(r#"{{"bots":[{{"id":"{BOT_UUID}","platform":"local","name":"热重载"}}]}}"#),
         )
         .expect("写 bots.json");
 
@@ -366,7 +364,10 @@ impl Harness {
 
 fn assert_ok(response: &Response, what: &str) {
     if let Response::Error { error } = response {
-        panic!("{what} 期望成功，实际失败 {}：{}", error.code, error.message);
+        panic!(
+            "{what} 期望成功，实际失败 {}：{}",
+            error.code, error.message
+        );
     }
 }
 
@@ -428,13 +429,19 @@ async fn hot_reload_latency_after_saving_main_ts() {
         );
 
         // 一直注入，直到某条消息拿到新版本。期间每条回复都必须是上一版。
+        // 顺便记每条消息的"派发→看到回复"回程：切换那一条的回程里含着
+        // 去抖等待 + 编译，缓存命中的那些只有一次 dispatch —— 这是把 2s 归因到
+        // 元数据 TTL、把多出来的几百毫秒归因到去抖窗口的实测依据。
         let mut stale = 0usize;
-        let mut switched: Option<(Instant, String)> = None;
+        let mut stale_round_trips: Vec<Duration> = Vec::new();
+        let mut switched: Option<(Instant, String, Duration)> = None;
         while written.elapsed() < HANG_GUARD {
             let text = harness.next_text();
+            let msg_started = Instant::now();
             let reply = harness.inject_and_wait(&text).await;
+            let round_trip = msg_started.elapsed();
             if marker_of(&reply) == marker(next) {
-                switched = Some((Instant::now(), reply));
+                switched = Some((Instant::now(), reply, round_trip));
                 break;
             }
             assert_eq!(
@@ -443,15 +450,18 @@ async fn hot_reload_latency_after_saving_main_ts() {
                 "新版本生效之前只应看到 {previous} 版（缓存命中或 last-good），实际 {reply:?}"
             );
             stale += 1;
+            stale_round_trips.push(round_trip);
         }
-        let (seen_at, reply) = switched.unwrap_or_else(|| {
+        let (seen_at, reply, switch_round_trip) = switched.unwrap_or_else(|| {
             panic!("挂死守卫 {HANG_GUARD:?}：写完 src/main.ts 后 {TRIALS} 轮内没看到新版本")
         });
         let latency = seen_at.duration_since(written);
         println!(
             "  trial {trial}: 生效 {:.1} ms（stale 注入 {stale} 条，warm {warm_turnaround:?}，\
-             新文案 {reply:?}）",
-            latency.as_secs_f64() * 1000.0
+             新文案 {reply:?}；切换那条回程 {switch_round_trip:?}，\
+             stale 回程中位 {:.1} ms）",
+            latency.as_secs_f64() * 1000.0,
+            median_ms(&stale_round_trips[..stale_round_trips.len().min(64)])
         );
 
         // 下界推导（见文件头）：新版本需要一次 stat，那次 stat 距上次 stat ≥ TTL，
@@ -529,9 +539,11 @@ async fn compile_error_keeps_serving_last_good_then_recovers() {
 
     // 2) 一直注入，直到日志里出现编译错误行；期间每条回复都必须是上一版。
     let mut served_while_broken: Vec<String> = Vec::new();
-    let error_seen_at = loop {
+    let (error_seen_at, detecting_round_trip) = loop {
         let text = harness.next_text();
+        let msg_started = Instant::now();
         let reply = harness.inject_and_wait(&text).await;
+        let round_trip = msg_started.elapsed();
         assert_eq!(
             marker_of(&reply),
             marker(1),
@@ -543,7 +555,7 @@ async fn compile_error_keeps_serving_last_good_then_recovers() {
         );
         served_while_broken.push(reply);
         if !harness.error_lines("生成代码编译失败").is_empty() {
-            break Instant::now();
+            break (Instant::now(), round_trip);
         }
         assert!(
             broken_at.elapsed() < HANG_GUARD,
@@ -551,7 +563,8 @@ async fn compile_error_keeps_serving_last_good_then_recovers() {
         );
     };
     println!(
-        "编译失败被看见：{:?}（写完成 → 错误行落库），期间 {} 条消息全部由 v1 服务",
+        "编译失败被看见：{:?}（写完成 → 错误行落库），期间 {} 条消息全部由 v1 服务，\
+         触发编译的那条回程 {detecting_round_trip:?}（含去抖等待 + 一次失败的编译）",
         error_seen_at.duration_since(broken_at),
         served_while_broken.len()
     );
@@ -645,7 +658,9 @@ async fn first_message_right_after_save_is_served_by_the_cached_version() {
     // 写 v2，然后**立刻**注入一条（模拟"保存后马上在试跑框里发一条"）。
     let written = harness.write_version(2);
     let text = harness.next_text();
+    let first_started = Instant::now();
     let reply = harness.inject_and_wait(&text).await;
+    let first_round_trip = first_started.elapsed();
     let elapsed = written.elapsed();
 
     assert!(
@@ -663,25 +678,30 @@ async fn first_message_right_after_save_is_served_by_the_cached_version() {
          （fingerprint_cache.rs:147-153）。"
     );
     println!(
-        "保存后 {elapsed:?}（< TTL {DEFAULT_METADATA_TTL:?}）注入：仍然 {reply:?} —— 陈旧窗口成立"
+        "保存后 {elapsed:?}（< TTL {DEFAULT_METADATA_TTL:?}）注入：仍然 {reply:?} \
+         —— 陈旧窗口成立（这条消息回程只有 {first_round_trip:?}，没有编译、没有去抖等待：\
+         走的是 `current_at` 的缓存返回分支）"
     );
 
     // 但"晚一点"必须生效，否则就成了"永远不生效"。
     let mut switched = None;
     while written.elapsed() < HANG_GUARD {
         let text = harness.next_text();
+        let msg_started = Instant::now();
         let r = harness.inject_and_wait(&text).await;
+        let round_trip = msg_started.elapsed();
         if marker_of(&r) == marker(2) {
-            switched = Some((Instant::now(), r));
+            switched = Some((Instant::now(), r, round_trip));
             break;
         }
         assert_eq!(marker_of(&r), marker(1), "过渡期内只该看到 v1，实际 {r:?}");
     }
-    let (seen_at, r) = switched.unwrap_or_else(|| {
+    let (seen_at, r, switch_round_trip) = switched.unwrap_or_else(|| {
         panic!("挂死守卫 {HANG_GUARD:?}：保存后一直没切到 v2，陈旧窗口变成了永不过期")
     });
     println!(
-        "同一进程内稍后注入：{:.1} ms 后切到 {r:?}（总耗时含 {elapsed:?} 的那一条）",
+        "同一进程内稍后注入：{:.1} ms 后切到 {r:?}（切换那条回程 {switch_round_trip:?}，\
+         含去抖等待 + 一次编译）",
         seen_at.duration_since(written).as_secs_f64() * 1000.0
     );
     harness.stop_ok().await;
