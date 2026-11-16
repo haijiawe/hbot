@@ -10,6 +10,7 @@
 //! | `reply(text)` | `(unknown) => void` | [`HostOutput::replies`] |
 //! | `sleep(ms)` | `(number) => Promise<void>` | `tokio::time::sleep` |
 //! | `http.get(url, options?)` | `(string, object?) => Promise<{status, body, headers}>` | [`crate::http::HttpConfig`] |
+//! | `device.*` | seven methods, all `Promise`-returning | [`crate::device`] |
 //!
 //! `sleep` and `http.get` are the important ones: they resolve (or reject) a
 //! JavaScript promise from a Rust async task. The task is spawned onto the
@@ -35,6 +36,7 @@ use std::time::Duration;
 use rquickjs::prelude::Async;
 use rquickjs::{Ctx, Exception, Function, IntoJs, Object, Value};
 
+use crate::device::DeviceSlot;
 use crate::error::CodeError;
 use crate::http::{GetOptions, HttpConfig, HttpResponse};
 use crate::limits::Deadline;
@@ -44,7 +46,7 @@ use crate::limits::Deadline;
 /// This is data, not prose: `crate::dts`'s drift tests compare it with the
 /// exports of [`HOST_MODULE_SOURCE`] and with the declarations in `hbot.d.ts`,
 /// so a binding added here without its two declarations is a test failure.
-pub(crate) const HOST_BINDING_KEYS: &[&str] = &["log", "reply", "sleep", "http"];
+pub(crate) const HOST_BINDING_KEYS: &[&str] = &["log", "reply", "sleep", "http", "device"];
 
 /// Upper bound on captured `log`/`reply` entries per event.
 ///
@@ -124,12 +126,17 @@ fn truncate(message: String) -> String {
     truncated
 }
 
-/// Install `globalThis.__hbot` (`log`, `reply`, `sleep`, `http.get`) into `ctx`.
+/// Install `globalThis.__hbot` (`log`, `reply`, `sleep`, `http.get`, `device`) into `ctx`.
+///
+/// `device` is the **replaceable** slot, not a snapshot: every `ctx.device.*` call
+/// re-reads it, so a revoked session takes effect on the very next call rather
+/// than on the next isolate (`docs/09` §4.2).
 pub(crate) fn install<'js>(
     ctx: &Ctx<'js>,
     output: Arc<Mutex<HostOutput>>,
     deadline: Arc<Deadline>,
     http: Arc<HttpConfig>,
+    device: Arc<DeviceSlot>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -213,10 +220,13 @@ pub(crate) fn install<'js>(
         http_object
     };
 
+    let device_object = super::device_api::install(ctx, &device, &http, &deadline)?;
+
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
     host.set("sleep", sleep).map_err(super::js_error)?;
     host.set("http", http_object).map_err(super::js_error)?;
+    host.set("device", device_object).map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
             .filter_map(Result::ok)
@@ -367,7 +377,43 @@ export const http = {
   },
 };
 
-export default { defineBot, log, reply, sleep, http };
+/**
+ * Device surface. **Every method returns a Promise and every failure is a
+ * rejection** whose message starts with `HBOT_DEVICE_*`.
+ *
+ * Presence is not authorization: whether a call is allowed is decided at call
+ * time from the manifest's `permissions.device`, the host settings and a live
+ * device session. Nothing here is cached, so a revoked session fails the very
+ * next call; a sandbox in `read-only` mode refuses without touching the OS.
+ *
+ * `screen()` resolves `{ width, height, pngBase64, monitor }` — PNG bytes as
+ * base64 text, because the isolate has no `Buffer`/`Uint8Array` helper.
+ */
+export const device = {
+  screen(options) {
+    return host.device.screen(options);
+  },
+  windows() {
+    return host.device.windows();
+  },
+  click(x, y, button) {
+    return host.device.click(x, y, button);
+  },
+  key(text) {
+    return host.device.key(text);
+  },
+  keyCombo(keys) {
+    return host.device.keyCombo(keys);
+  },
+  clipboardRead() {
+    return host.device.clipboardRead();
+  },
+  clipboardWrite(text) {
+    return host.device.clipboardWrite(text);
+  },
+};
+
+export default { defineBot, log, reply, sleep, http, device };
 "#;
 
 #[cfg(test)]

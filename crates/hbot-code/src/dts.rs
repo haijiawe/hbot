@@ -76,6 +76,20 @@ declare module 'hbot' {
     /** 原始平台事件；形状随平台变化，别当契约用。 */
     payload: unknown;
 
+    /* 设备能力面。
+     *
+     * **存在不等于被授权。** 这一层能不能用，由运行时在**每次调用**时决定：
+     * ① 沙箱是 `read-only` 档 → 一律拒绝，且不碰 OS；② `hbot.json` 的
+     * `permissions.device.sub` 没声明这项 → `HBOT_DEVICE_NOT_DECLARED`；
+     * ③ 用户设置或设备会话没放行 → `HBOT_DEVICE_NOT_GRANTED` /
+     * `HBOT_DEVICE_NOT_ENABLED` / `HBOT_DEVICE_EXPIRED` / `HBOT_DEVICE_REVOKED`。
+     * 同一个 bot 的会话被撤销后，**下一次调用立刻**失败（不是下一个 isolate）。
+     * 宿主没装配设备后端时抛 `HBOT_DEVICE_UNAVAILABLE`，不会静默返回空数组。
+     *
+     * 七个方法**都返回 Promise，失败一律是 rejection**，message 以
+     * `HBOT_DEVICE_` 开头。 */
+    readonly device: DeviceApi;
+
     /** 回复这条消息，绑定 reply_to。 */
     reply(text: string): void;
     /** 写一条运行日志，进 RunLog，不进聊天。 */
@@ -108,6 +122,58 @@ declare module 'hbot' {
     headers: Record<string, string>;
   }
 
+  /** `ctx.device.screen(options)` 的可选参数。 */
+  export interface DeviceScreenOptions {
+    /** 显示器序号；省略取主屏。超范围或不是非负整数则整次调用被拒绝。 */
+    monitor?: number;
+    /** 本帧字节上限（PNG 原始字节，不是 base64 长度）；默认 4 MiB，超过按 4 MiB 算。 */
+    maxBytes?: number;
+  }
+
+  /** 一帧截图。 */
+  export interface DeviceScreen {
+    /** 物理像素宽。 */
+    width: number;
+    /** 物理像素高。 */
+    height: number;
+    /** PNG 字节的 base64 文本（不是 `Uint8Array`，隔离区没有 Buffer）。 */
+    pngBase64: string;
+    /** 这帧来自哪块屏（`monitor` 参数的解析结果）。 */
+    monitor: number;
+  }
+
+  /** 一块可见窗口。 */
+  export interface DeviceWindow {
+    /** 平台窗口句柄。 */
+    id: number;
+    /** 标题。 */
+    title: string;
+    /** 进程名；输入闸按它比白名单。 */
+    process: string;
+    /** 是否是当前前台窗口。 */
+    focused: boolean;
+  }
+
+  /** 设备能力面；每个方法都返回 Promise，失败一律 reject（`HBOT_DEVICE_` 开头）。
+   *
+   *  是否可用由运行时逐次判定，见 `MessageCtx.device` 的说明。 */
+  export interface DeviceApi {
+    /** 截一帧；`pngBase64` 超上限时整次失败，不会给半帧。 */
+    screen(options?: DeviceScreenOptions): Promise<DeviceScreen>;
+    /** 列出可见窗口。 */
+    windows(): Promise<DeviceWindow[]>;
+    /** 在物理像素坐标点一下；坐标可以是负数（多屏主屏左侧）。 */
+    click(x: number, y: number, button?: 'left' | 'right' | 'middle'): Promise<void>;
+    /** 输入一段文本。 */
+    key(text: string): Promise<void>;
+    /** 按一个组合键，例如 `['ctrl', 'c']`。 */
+    keyCombo(keys: string[]): Promise<void>;
+    /** 读剪贴板文本。 */
+    clipboardRead(): Promise<string>;
+    /** 写剪贴板文本；内容不会出现在任何异常或日志里。 */
+    clipboardWrite(text: string): Promise<void>;
+  }
+
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */
@@ -121,6 +187,9 @@ declare module 'hbot' {
     /** 发一个 GET；失败时 reject，message 以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 开头。 */
     get(url: string, options?: HttpGetOptions): Promise<HttpResponse>;
   };
+  /** 设备能力，与 `ctx.device` 是同一份实现，等价于在事件外调用。
+   *  声明了不等于被授权：能不能用由运行时逐次判定，见 `MessageCtx.device`。 */
+  export const device: DeviceApi;
 }
 "#;
 
@@ -204,6 +273,7 @@ mod drift {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::runtime::device_api::DEVICE_BINDING_KEYS;
     use crate::runtime::host_api::{HOST_BINDING_KEYS, HOST_MODULE_SOURCE};
 
     /// `export function <name>` declarations in a piece of source.
@@ -358,6 +428,99 @@ mod drift {
             .collect()
     }
 
+    /// The object-valued host surfaces `MessageCtx` declares (`readonly device:
+    /// DeviceApi;`), as opposed to the inbound platform fields.
+    ///
+    /// The split is the declaration convention: a property whose declared type
+    /// starts with an uppercase letter is a host API object, one with a lowercase
+    /// type (`string`, `number`, `unknown`) is inbound data. [`message_ctx_functions`]
+    /// covers the callable half, so both are needed to describe what
+    /// `build_event` puts on `ctx`.
+    fn message_ctx_namespaces() -> BTreeSet<String> {
+        let start = HOST_DTS
+            .find("export interface MessageCtx {")
+            .expect("hbot.d.ts 应有 MessageCtx");
+        let block = &HOST_DTS[start..];
+        let end = block.find("\n  }").expect("MessageCtx 应有收尾 `}`");
+        block[..end]
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("    ")?;
+                if rest.contains('(') {
+                    return None;
+                }
+                let (name, after) = rest.split_once(':')?;
+                if !after.trim_end().ends_with(';') {
+                    return None;
+                }
+                let ty = after.trim().trim_end_matches(';').trim();
+                let is_namespace = ty.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+                // `readonly` is part of the declaration, not the name.
+                let name = name.trim().strip_prefix("readonly").unwrap_or(name.trim());
+                let name = name.trim();
+                let is_name = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+                (is_namespace && is_name).then(|| name.to_owned())
+            })
+            .collect()
+    }
+
+    /// The keys `runtime/device_api.rs` installs on the `ctx.device` object, read
+    /// from the real source.
+    ///
+    /// The scan targets that function's `entries` literal — the one place a key is
+    /// paired with its host function — rather than the `object.set(..)` calls,
+    /// because rustfmt wraps the long ones and a line-oriented scan would silently
+    /// lose them.
+    fn installed_device_keys() -> BTreeSet<String> {
+        let source = include_str!("runtime/device_api.rs");
+        let start = source
+            .find("let entries: [(&str, Function<'js>);")
+            .expect("device_api.rs 应有 entries 表");
+        let block = &source[start..];
+        let end = block.find("\n    ]").expect("entries 表应有收尾 `]`");
+        block[..end]
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("(\""))
+            .filter_map(|rest| rest.split_once('"').map(|(name, _)| name.to_owned()))
+            .collect()
+    }
+
+    /// Method declarations inside `export interface DeviceApi {`.
+    fn dts_device_methods() -> BTreeSet<String> {
+        let start = HOST_DTS
+            .find("export interface DeviceApi {")
+            .expect("hbot.d.ts 应有 DeviceApi");
+        let block = &HOST_DTS[start..];
+        let end = block.find("\n  }").expect("DeviceApi 应有收尾 `}`");
+        block[..end].lines().filter_map(method_name).collect()
+    }
+
+    /// Method keys of `export const device = { … }` in the runtime module.
+    fn module_device_methods() -> BTreeSet<String> {
+        let start = HOST_MODULE_SOURCE
+            .find("export const device = {")
+            .expect("HOST_MODULE_SOURCE 应有 device 命名空间");
+        let block = &HOST_MODULE_SOURCE[start..];
+        let end = block
+            .find("\n};")
+            .expect("HOST_MODULE_SOURCE 的 device 对象应有收尾 `};`");
+        block[..end].lines().filter_map(method_name).collect()
+    }
+
+    /// A `name(...)` line's name, when it is a plain identifier.
+    fn method_name(line: &str) -> Option<String> {
+        let (name, _) = line.trim().split_once('(')?;
+        let name = name.trim();
+        let is_method = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        is_method.then(|| name.to_owned())
+    }
+
     #[test]
     fn hbot_dts_exports_match_the_runtime_module() {
         let runtime = exported_names(HOST_MODULE_SOURCE);
@@ -433,7 +596,11 @@ mod drift {
     #[test]
     fn message_ctx_functions_match_the_event_object() {
         let ctx = ctx_function_keys();
-        let declared = message_ctx_functions();
+        // `ctx.device` is a namespace object, not a method, so the callable half of
+        // `MessageCtx` is `message_ctx_functions()` plus the namespace properties.
+        // Its members get their own four-way check below.
+        let mut declared = message_ctx_functions();
+        declared.extend(message_ctx_namespaces());
 
         assert!(
             !ctx.is_empty(),
@@ -443,6 +610,64 @@ mod drift {
             ctx, declared,
             "ctx 上挂的宿主函数与 MessageCtx 声明不一致：运行时 {ctx:?}，类型 {declared:?}"
         );
+    }
+
+    #[test]
+    fn device_surface_matches_the_runtime_object_and_the_module() {
+        // The four-way drift check `docs/09` §8.3 asks for: what
+        // `runtime/device_api.rs` puts on `ctx.device`, what the `hbot` module's
+        // `device` namespace forwards to, what hbot.d.ts declares, and the
+        // hand-kept key list. Nothing here is copied by hand except
+        // `DEVICE_BINDING_KEYS`, which is itself checked against the source.
+        let installed = installed_device_keys();
+        assert!(
+            !installed.is_empty(),
+            "device_api.rs 里没解析到 `object.set(\"...\")`，扫描逻辑失效了"
+        );
+        assert_eq!(
+            installed,
+            DEVICE_BINDING_KEYS
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect::<BTreeSet<String>>(),
+            "DEVICE_BINDING_KEYS 与 device_api.rs 实际注入的键不一致"
+        );
+
+        let module = module_device_methods();
+        assert_eq!(
+            installed, module,
+            "`ctx.device` 的方法与 `hbot` 模块转发的方法不一致：运行时 {installed:?}，模块 {module:?}"
+        );
+
+        let declared = dts_device_methods();
+        assert_eq!(
+            installed, declared,
+            "`ctx.device` 的方法与 hbot.d.ts 的 DeviceApi 不一致：运行时 {installed:?}，类型 {declared:?}"
+        );
+    }
+
+    #[test]
+    fn the_device_surface_is_declared_but_not_promised() {
+        // §8.3: `ctx.device` 存在不代表被授权 —— 这句话必须在 d.ts 里写清楚，
+        // 否则照着类型写代码的人会以为拿到类型就等于拿到权限。
+        assert!(
+            HOST_DTS.contains("readonly device: DeviceApi;"),
+            "MessageCtx 应声明 readonly device"
+        );
+        assert!(
+            HOST_DTS.contains("export const device: DeviceApi;"),
+            "hbot 模块应声明 device"
+        );
+        for hint in [
+            "HBOT_DEVICE_UNAVAILABLE",
+            "HBOT_DEVICE_NOT_DECLARED",
+            "read-only",
+        ] {
+            assert!(
+                HOST_DTS.contains(hint),
+                "hbot.d.ts 没有说明设备能力的失败面，缺少 `{hint}`"
+            );
+        }
     }
 
     #[test]

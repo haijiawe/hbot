@@ -102,6 +102,15 @@
 
 索引：`idx_device_audit_bot_at ON device_audit (bot_id, at DESC)`。
 
+**落地现状（2026-11-17，与初稿的两处差异）**：
+
+1. **审计只在放行时写**，`outcome` 今天恒为 `"ok"`；`denied` 那一列还没有写入点。要记拒绝就得在
+   `authorize` 的每条 `Err` 前补一行写库，代价是"拒绝放大写库"（Agent 反复试错的路径会灌满表）。
+   取舍未定，**别在 UI 上承诺"能看到被拒绝的操作"**。
+2. **`action` 写的是能力名**（`screen`/`input`/`window`/`clipboard`），不是动作名（`screenshot`/`click`…）：
+   `hbot_core::DeviceGate` 的签名只带"能力 + 目标"，拿不到"具体是点击还是输入文本"。动作级审计要等
+   闸的签名扩出 `action` 字段（契约变更），或者由后端在 `DeviceBackend::input` 里补一行。
+
 **审计不记内容**（07 §9.3 第 5 条）：记了内容，日志本身就成了新的泄漏面 —— 密码框的像素、剪贴板里的 token 都会一直躺在库里，被导出、被 UI 展示、被喂进模型上下文。列清单由 `device_audit_rejects_content_columns`（`PRAGMA table_info` + 禁用子串表）钉死，**以后不许加** `content`/`text`/`png`/`image`/`ocr`/`clipboard`/`payload`/`bytes`/`pixel`/`blob`/`data` 之类的列。
 
 > **已知缺口**：初稿有 `session_id` 外键，落地没有（只留 `bot_id`）。后果是"这次点击属于哪个授权"只能靠 `at` 时间窗猜。要按会话回放得开 0005 加列 —— 现在不需要，但**别在 UI 上承诺"按会话查审计"**。
@@ -153,22 +162,30 @@ pub struct DevicePermissions {
 
 这就是"闸必须在核心"的具体体现：**桌面壳可以写这个文件，但不能是唯一读者。**
 
-形状：
+形状（**已落地，扁平、不是嵌套在 `device` 键下**；字段名就是 `DeviceSettings` 的 `camelCase`）：
 
 ```json
 {
-  "device": {
-    "enabled": true,
-    "sub": ["screen", "input"],
-    "apps": ["PathOfExile.exe", "Notepad.exe"],
-    "maxSessionMinutes": 5
-  }
+  "enabled": true,
+  "capabilities": ["screen", "input"],
+  "allowedApps": ["PathOfExile.exe", "Notepad.exe"],
+  "defaultMinutes": 5,
+  "maxMinutes": 30,
+  "maxActionsPerSession": 10000
 }
 ```
 
 - `enabled` 默认 `false`（与 `DesktopSettings.autostart` 同款产品决策：首次启动不许偷偷开）。
-- `apps` 空 = 全拒（**不是**全放）。
+- `capabilities` 空 = **全拒**（不是全放）。
+- `allowedApps` 空 = **没有设上限**（**不是**全拒）—— 语义与 `capabilities` 故意相反，理由：
+  能力是"开不开这一类"，开了一类就整类可用，所以空集必须全拒；应用是在"用户已经点头的那批"
+  里再收窄的一层上限，若空集也当全拒，用户就得在 `device.json` 与授权对话框里各抄一遍同一份
+  名单才能用一次输入，最后只会把名单写宽。真正的白名单是会话那一份（`device_grant` 的
+  `allowedApps`，必填、非空）。
 - 读不到/坏 JSON → 退回默认（全关）并 warn，启动不许失败（沿用 `DesktopSettings::load` 的容错口径）。
+- 未知字段忽略；未知能力名只丢那一条（不整份作废）；`maxMinutes` 硬上限 30，写 999 取 30 并 warn。
+- **写入入口还没有**：`DeviceSettings::save()` 与 `DeviceRegistry::replace_settings()` 都实现了，
+  但今天没有任何命令调它们，"设置页改设备设置"要另开一条命令；也没有 watcher，改完文件要重启。
 
 ### 4.3 第三层：运行时会话（撤销要立刻生效）
 
@@ -178,15 +195,24 @@ pub struct DevicePermissions {
 
 ### 4.4 判定表（缺一层就拒）
 
-| 清单 | 设置 | 会话 | 结果 | 错误码 | `data.toggle` |
+**落地口径（2026-11-17，`crates/hbot-rpc/src/app/device/mod.rs` 的 `authorize`）**：闸门的四步顺序是
+宿主总开关 → 清单声明 → 宿主点名的子能力 → 会话；**全部回 `-32002 invalid`**，不是 `-32005 denied`。
+理由：这些不是"用户拒绝了这次操作"，而是"当前配置下这个能力根本不成立"，UI 要据此提示去改哪一处配置。
+
+| 清单 | 设置 | 会话 | 结果 | 错误码 | `DeviceError` |
 |---|---|---|---|---|---|
-| 没声明 | — | — | 拒 | `-32005 denied` | 无（**不提示开关**：代码本来就不该有这个能力） |
-| 声明了 | 关 | — | 拒 | `-32005 denied` + `HOST_LIMIT` | `device.enabled` |
-| 声明了 | 开但子能力缺 | — | 拒 | 同上 | `device.sub.screen` |
-| 声明了 | 开 | 无会话/已过期 | 拒 | `-32005` | `start a device session` |
+| 没声明 | — | — | 拒 | `-32002` | `NotDeclared{capability}` |
+| 声明了 | 关 | — | 拒 | `-32002` | `NotEnabled{toggle:"device.enabled"}` |
+| 声明了 | 开但子能力缺 | — | 拒 | `-32002` | `NotEnabled{toggle:"device.capabilities"}` |
+| 声明了 | 开 | 无会话/已过期 | 拒 | `-32002` | `NotGranted{capability}` / `Expired` |
 | 声明了 | 开 | 活跃 | 放行 | — | — |
 
-**关键差别**：清单没声明时**连开关都不提示**（V12 要求 approver 调用次数 = 0）；声明了但设置没开时才告诉用户"去打开哪个开关"（V13 要求 `data.toggle` 存在）。两者混同会让用户以为"关掉开关能拦住任意代码"。
+**应用白名单是三层求交，落点在 `grant`**：`请求 ∩ 清单 permissions.device.apps ∩ 宿主 allowedApps`
+（宿主没写上限则不参与求交），交集为空直接 `-32002` 并列出三边。`authorize` 每次调用还会
+**再查一遍宿主上限**（`host_ceiling_allows`）——因为设置可能在会话中途被改窄，旧会话必须跟着收紧。
+
+**关键差别**：清单没声明时错误文案里**没有** `toggle`（V12 要求 approver 调用次数 = 0）；声明了但设置
+没开时才带上"去打开哪个开关"（V13 要求 `data.toggle` 存在）。两者混同会让用户以为"关掉开关能拦住任意代码"。
 
 ---
 
@@ -279,9 +305,11 @@ pub trait DeviceBackend: Send + Sync {
 | `type` | 入参 | 成功 data | 失败 |
 |---|---|---|---|
 | `device_status` | `{ botId }` | `DeviceStatus`（**从不返回 `null`**；无会话时是 `state:"none"` 的快照，见 8.4） | `-32001` bot 不存在 |
-| `device_grant` | `{ botId, sub, allowedApps?, minutes? }` | `DeviceStatus` | `-32002` 子能力非法/生效集合为空/`minutes` 超 30；`-32005` 设置未开 |
+| `device_grant` | `{ botId, sub, allowedApps?, minutes? }` | `DeviceStatus` | `-32001` bot 不存在；`-32002` 子能力非法 / 三边交集为空 / 设置未开（**设置未开也是 `-32002`，不是 `-32005`**，见 4.4） |
 | `device_revoke` | `{ botId }` | `null` | `-32001`；无活跃会话时**成功**（幂等） |
-| `device_request` | `{ botId, sub, reason }` | `null`（请求已投递给 UI） | `-32002`、`-32005` 清单没声明 |
+| `device_request` | `{ botId, sub, reason }` | `null`（请求已投递给 UI） | `-32001`；`-32002` 子能力非法 / 清单没声明 |
+
+`minutes` 超上限**不报错**：截到 `maxMinutes` 并 warn（善意超限，收紧而不是拒绝；见 `effective_minutes`）。`reason` 超 500 字符按字符截断。
 
 `DeviceStatus`（`dto/common.rs`，字段全 camelCase）：
 
@@ -308,7 +336,7 @@ interface DeviceApi {
   /** 截主屏。pngBase64 是 base64 字符串（JS 侧没有 Node Buffer）。 */
   screen(options?: { monitor?: number; maxBytes?: number }):
     Promise<{ width: number; height: number; pngBase64: string; monitor: number }>;
-  windows(): Promise<Array<{ id: string; title: string; process: string; focused: boolean }>>;
+  windows(): Promise<Array<{ id: number; title: string; process: string; focused: boolean }>>;
   click(x: number, y: number, button?: 'left' | 'right' | 'middle'): Promise<void>;
   key(text: string): Promise<void>;        // 文本注入（不是剪贴板粘贴）
   keyCombo(keys: string[]): Promise<void>; // ["ctrl","c"]；键名大小写不敏感
@@ -320,7 +348,11 @@ interface DeviceApi {
 两处与初稿不同（实现时定的，已按实现改文档）：
 
 - `png` 是 **`pngBase64: string`** 而不是 `Uint8Array`：QuickJS 里没有 Node 的 `Buffer`，宿主把像素编成 PNG 后以 base64 交给 JS，JS 侧要发出去就放进 `http` 请求体。
-- `windows()` 的 `id` 是 **string**（`hbot_core::WindowInfo.id` 就是 `String`，Windows 上是 `HWND` 的十进制文本）：不要为了"看起来像数字"在 DTO 里换类型，那会让 64 位句柄在 JS 的 double 里丢精度。
+- `windows()` 的 `id` 是 **number**（`hbot_core::WindowInfo.id` 是 `u64`，Windows 上是 `HWND as usize as u64`）。实测 HWND 远小于 2^53，JSON number 不会丢精度；**不要**为了"看起来更安全"改成字符串，那会让 `device-win` 的实现和契约打架。
+
+> **隐性契约（实现时撞出来的，2026-11-17）**：`MessageCtx` 里新增**对象属性**（`readonly device: DeviceApi;`）会被两个独立扫描器当成"入站事件字段"——`crates/hbot-code/src/dts.rs` 的 `message_ctx_properties()` 和 `crates/hbot-rpc/tests/event_shape_dts.rs` 的同名函数（后者直接与 `hbot_bot::event_json` 的键集合 `assert_eq!`）。两边都跳过"名字里含空格"的行，所以这里必须保持 `readonly device: DeviceApi;` 这种写法。**把它"规范化"成 `device: DeviceApi;` 会同时红两个 crate，而报错信息完全看不出原因。**
+>
+> 同一条精神也适用于防漂移闸门本身：`installed_device_keys()` 扫的是 `let entries: [(&str, Function<'js>); N]` 这张**结构化表**，不是 `object.set("...")` 的行首字面量——后者会被 rustfmt 的 `chain_width` 折行，静默漏掉键（第一版就这么漏了 `clipboardRead`/`clipboardWrite`）。
 
 **没在清单里声明的子能力，这个对象上就不出现对应方法**（V1：生成 d.ts 后断言不含该符号）。`dts.rs` 的 `host_bindings_match_the_module_and_the_dts` 四向防漂移测试必须扩到 `device`，否则 d.ts 会承诺运行时不存在的符号。
 
@@ -415,11 +447,25 @@ interface DeviceApi {
 | 存储（两表 + 6 方法） | **已完成** | `crates/hbot-store/src/migrations/0004_device.sql`、`src/repositories/device.rs` |
 | 宿主闸 + `ctx.device.*` | 并行单元中 | `crates/hbot-code/src/device/`、`src/runtime/device_api.rs` |
 | 设置 + 四条命令 + 到期 tick | 并行单元中 | `crates/hbot-rpc/src/app/device/`、`src/app/commands/device.rs` |
-| Windows 后端 | 并行单元中 | `crates/hbot-device/` |
-| IDE 面板 + 授权弹窗 | 并行单元中 | `apps/web/src/features/device/`、`src/stores/device-store.ts` |
-| 注入沙箱（我的集成步） | 待做 | `crates/hbot-rpc/src/app/runtime/sandbox_handler.rs` 里 `set_device` |
+| Windows 后端 | **已完成**（34 passed / 2 ignored，clippy 0） | `crates/hbot-device/` |
+| IDE 面板 + 授权弹窗 | **已完成**（web 30 文件 / 230 用例） | `apps/web/src/features/device/`、`src/stores/device-store.ts` |
+| 注入沙箱（装配） | **已完成**（2026-11-17） | `SandboxHandler::with_device(gate, backend)`，在 `crates/hbot-rpc/src/app/commands/bots.rs` 的 `start_bot` 里调；每次新建 isolate 时 `set_device` + `set_device_apps(device_apps(project_root))` |
+| 切项目时刷新清单 | **已完成** | `AppState::open_project` 末尾 `self.device.note_project_root(Some(root))` |
+| 限速（20 次/秒、2 帧/秒） | **窄版未做** | 应在闸层；今天 `HBOT_DEVICE_HOST_LIMIT` 只在超时时出现（见 §13 问 8） |
 | OCR | **未开始** | §9.1 的窄版路径 |
 | `ToolGateway` 的 Capability 闸 | **明确不做**（M7） | 见上 |
+
+**装配方必须调两个方法，少一个就是静默失败（`hbot-code` 实测出来的，2026-11-17）**：
+
+| 方法 | 不调的后果 | 为什么签名分成两个 |
+|---|---|---|
+| `Sandbox::set_device(gate, backend)` | 每次设备调用都报 `HBOT_DEVICE_UNAVAILABLE: 设备能力尚未装配` | 闸与后端都是 `Arc<dyn …>`，与 `Sandbox::spawn*` 的签名解耦（`spawn` 签名冻结不动，`hbot-rpc`/`hbot-bench` 在调） |
+| `Sandbox::set_device_apps(apps)` | 设备能力装好了，但 `input` 永远被拒（`HBOT_DEVICE_APP_NOT_ALLOWED`）——**安全方向对，但是静默的** | `Sandbox` 没有 manifest、`CompiledProject` 没有项目根，白名单只能由装配方喂 |
+
+另外两条由实现定下来的事实：
+
+- **设备授权的 bot 身份来自事件 payload 的 `botId`**（`build_event` 里取 `payload.botId`）。手写 payload 的测试/基准里设备能力会报 `HBOT_DEVICE_FAILED: 本次事件没有 botId`。这也是为什么"能构造事件交给 `dispatch` 的路径"等于"能决定对哪个 bot 的会话做授权"。
+- **`read-only` 档连闸都不问**（`authorize` 在第一步就返回 `HBOT_DEVICE_NOT_GRANTED`，假 gate 的 `authorize` 调用计数为 0）：因为 `DeviceGate::authorize` 的实现方自己要读 `device.json`、查会话表，那些也是"碰外部资源"。这比"后端没被调"更强。
 
 ---
 
@@ -446,7 +492,9 @@ interface DeviceApi {
 4. **`device_request` 与现有 `ApprovalRequest` 是否合并**：两者都是"Agent 请用户点一下"，但语义不同（一个是单次动作、一个是限时会话）。倾向不合并 —— 合并会让审批 UI 长出两种完全不同的卡片。但用同一个 critical 通道。
 5. **多显示器时的坐标系**：`screen()` 返回"当前主屏"还是"虚拟桌面全图"？注入坐标是绝对还是相对某屏？倾向：默认主屏 + 显式 `monitor` 参数，绝对坐标。
 6. **无头模式下谁批准设备会话**：`hbot serve` 没有 UI。是拒绝（最安全）、还是从 `device.json` 里预置一个"永久允许"（危险）？倾向**拒绝**：无头模式没有人在场，设备能力应该返回 `HOST_LIMIT` 并说明"需要桌面端批准"。
-7. **`ctx.device` 的调用是否要限速在 gate 层还是 backend 层**（07 §9.3 给了 20 次/秒、2 帧/秒的数字）：倾向 gate 层，因为 back 层可能被绕过（未来加第二个 backend 时）。
+7. **`ctx.device` 的调用是否要限速在 gate 层还是 backend 层**（07 §9.3 给了 20 次/秒、2 帧/秒的数字）：倾向 gate 层，因为 back 层可能被绕过（未来加第二个 backend 时）。**窄版没做限速**（见 §11.1）。
+8. **`HBOT_DEVICE_HOST_LIMIT` 目前一词两义（第 11 节的实现事实，2026-11-17）**：它既表示"宿主做不到 / 不支持"，也覆盖"后端调用超时"（`crates/hbot-code/src/device/gate.rs` 的 `DEFAULT_TIMEOUT = 10s`，实际被 handler 的 2s 预算压到 2s）。窄版按现状保留（限速还没做，今天这个码基本只会在超时时出现）；等 §11.1 的限速落地时，超时应拆成独立的 `HBOT_DEVICE_TIMEOUT`，否则用户看到 `HOST_LIMIT` 会以为"这台机器不支持设备能力"。
+9. **`clipboardWrite` 的"不回显"只管住了闸这一侧（第 11 节）**：`crates/hbot-code/src/runtime/device_api.rs` 从不把写入内容放进异常与日志（有测试钉住），但它对后端返回的 `DeviceError::Failed { message }` 是**原样透传**的。所以 `DeviceBackend` 的实现方也不许把剪贴板内容/截图字节塞进 `message` —— 这条约束同时属于 V16 的两侧（闸 + 后端），不只管闸。
 
 ---
 

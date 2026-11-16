@@ -5,11 +5,15 @@
 //!
 //! * [`isolate`] — thread + `LocalSet` + `AsyncContext`, the command loop, the
 //!   ES module loader and per-event invocation;
-//! * [`host_api`] — `log`/`reply`/`sleep` bindings and the virtual `hbot` module.
+//! * [`host_api`] — `log`/`reply`/`sleep`/`http.get`/`device.*` bindings and the
+//!   virtual `hbot` module;
+//! * [`device_api`] — the `ctx.device` methods themselves (parsing, the gate call,
+//!   `spawn_blocking` around the backend).
 //!
 //! Limits live in [`crate::limits`]; compile-time work in [`crate::compile`].
 
 pub(crate) mod debug_host;
+pub(crate) mod device_api;
 pub(crate) mod host_api;
 mod isolate;
 

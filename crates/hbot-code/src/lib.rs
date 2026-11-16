@@ -38,6 +38,7 @@
 //! implements — nothing more (`docs/02-architecture.md` §6.1 status table).
 
 pub mod compile;
+pub mod device;
 mod dispatch;
 pub mod dts;
 pub mod error;
@@ -53,6 +54,10 @@ pub use compile::{
     BuildMode, CompileStats, CompiledModule, CompiledProject, Compiler, DebugInfo, ENTRY_MODULE,
     LineMapping, compile_project, compile_project_debug, compile_project_with_entry,
     compile_project_with_entry_debug,
+};
+pub use device::{
+    DeviceFailure, DeviceHandles, MAX_CLIPBOARD_BYTES, MAX_INPUT_TEXT_BYTES, MAX_SCREEN_BYTES,
+    ScreenFrame,
 };
 pub use dispatch::EventFailure;
 pub use error::{CodeError, ErrorLocation, SourcePos};

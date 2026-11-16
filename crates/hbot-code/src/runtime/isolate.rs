@@ -31,6 +31,7 @@ use rquickjs::{
 };
 
 use crate::compile::CompiledProject;
+use crate::device::DeviceSlot;
 use crate::dispatch::EventFailure;
 use crate::error::CodeError;
 use crate::http::HttpConfig;
@@ -38,6 +39,7 @@ use crate::instrument;
 use crate::limits::{Deadline, Limits};
 use crate::modules;
 use hbot_core::debug::{Breakpoints, DebugSink};
+use hbot_core::{DeviceBackend, DeviceGate};
 
 use super::debug_host::{DebugControl, DebugRuntime};
 use super::host_api::{self, HostOutput};
@@ -107,6 +109,14 @@ pub struct Sandbox {
     /// atomics and must not take the `DebugState` mutex, and because the sink is
     /// only meaningful for the duration of one [`Sandbox::dispatch_with_debug`].
     control: Arc<DebugControl>,
+    /// The device slot: gate + backend, replaceable at any time.
+    ///
+    /// Deliberately **not** copied into the isolate at spawn: every
+    /// `ctx.device.*` call re-reads it, so revoking a device session takes effect
+    /// on the next call rather than on the next isolate (`docs/09` §4.2). Kept as
+    /// an `Arc` so [`Sandbox::set_device`] needs no command round-trip and cannot
+    /// be blocked by a wedged worker.
+    device: Arc<DeviceSlot>,
 }
 
 /// Mutable debug state shared with the worker thread.
@@ -163,9 +173,11 @@ impl Sandbox {
         // still evaluating.
         let debug = Arc::new(Mutex::new(DebugState::default()));
         let control = Arc::new(DebugControl::new());
+        let device = Arc::new(DeviceSlot::new());
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
         let worker_http = Arc::clone(&http);
+        let worker_device = Arc::clone(&device);
         let worker = std::thread::Builder::new()
             .name("hbot-isolate".to_owned())
             .spawn(move || {
@@ -176,6 +188,7 @@ impl Sandbox {
                     worker_debug,
                     worker_control,
                     worker_http,
+                    worker_device,
                     &started_tx,
                     &finished_tx,
                 )
@@ -191,6 +204,7 @@ impl Sandbox {
             limits,
             debug,
             control,
+            device,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -202,6 +216,41 @@ impl Sandbox {
                 message: "isolate did not finish loading the entry module in time".to_owned(),
             }),
         }
+    }
+
+    /// Assemble device capability into this sandbox (or replace the assembly).
+    ///
+    /// The gate and the backend are **ports** (`hbot_core::device`); the host owns
+    /// the implementations. Nothing is judged here: a handler that calls
+    /// `ctx.device.screen()` still goes through the one gate on every call, and an
+    /// all-allowing gate is the only way a call reaches `backend`.
+    ///
+    /// Safe to call at any time, including between two dispatches: the isolate
+    /// reads the slot per call, never a spawn-time snapshot (`docs/09` §4.2), so
+    /// replacing a gate with a denying one makes the *next* call fail.
+    ///
+    /// Because the spawn signatures are frozen (`hbot-rpc` and the S1 bench call
+    /// them), this is the only way in: a sandbox without it answers
+    /// `HBOT_DEVICE_UNAVAILABLE` and never fabricates an empty result.
+    pub fn set_device(&self, gate: Arc<dyn DeviceGate>, backend: Arc<dyn DeviceBackend>) {
+        self.device.set_device(gate, backend);
+    }
+
+    /// Set the application allow-list handed to [`DeviceBackend::input`].
+    ///
+    /// The whitelist is the intersection the *host* already approved
+    /// (`hbot.json`'s `permissions.device.apps` ∩ the user's setting); the backend
+    /// only uses it as the last foreground check, it does not judge again.
+    /// Empty (the default) means "no application may receive input": a sandbox
+    /// that never sets this cannot type into anything, which is the fail-closed
+    /// direction.
+    pub fn set_device_apps(&self, apps: Vec<String>) {
+        self.device.set_apps(apps);
+    }
+
+    /// Whether [`Sandbox::set_device`] has been called on this sandbox.
+    pub fn is_device_assembled(&self) -> bool {
+        self.device.is_assembled()
     }
 
     /// Run `onMessage` for one JSON event.
@@ -607,10 +656,13 @@ fn worker(
     debug: Arc<Mutex<DebugState>>,
     control: Arc<DebugControl>,
     http: Arc<HttpConfig>,
+    device: Arc<DeviceSlot>,
     started: &Sender<Result<(), CodeError>>,
     finished: &Sender<()>,
 ) {
-    if let Err(error) = serve(inbox, project, limits, debug, control, http, started) {
+    if let Err(error) = serve(
+        inbox, project, limits, debug, control, http, device, started,
+    ) {
         tracing::error!(
             code = error.code(),
             error = %error,
@@ -671,6 +723,7 @@ fn serve(
     debug: Arc<Mutex<DebugState>>,
     control: Arc<DebugControl>,
     http: Arc<HttpConfig>,
+    device: Arc<DeviceSlot>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -724,11 +777,13 @@ fn serve(
         let debug = &debug;
         let control = &control;
         let http = &http;
+        let device = &device;
         local.block_on(&runtime, async move {
             context
                 .async_with(async |ctx| {
                     bootstrap(
-                        &ctx, &entry, output, deadline, project, debug, control, http, limits,
+                        &ctx, &entry, output, deadline, project, debug, control, http, device,
+                        limits,
                     )
                     .await
                 })
@@ -759,6 +814,7 @@ fn serve(
                     let deadline = &deadline;
                     let project = &project;
                     let control = &control;
+                    let device = &device;
                     local.block_on(&runtime, async move {
                         context
                             .async_with(async |ctx| {
@@ -770,6 +826,7 @@ fn serve(
                                     deadline,
                                     project,
                                     control,
+                                    device,
                                     instrumented,
                                     limits,
                                 )
@@ -810,6 +867,7 @@ async fn bootstrap<'js>(
     debug: &Arc<Mutex<DebugState>>,
     control: &Arc<DebugControl>,
     http: &Arc<HttpConfig>,
+    device: &Arc<DeviceSlot>,
     limits: Limits,
 ) -> Result<Persistent<Function<'static>>, CodeError> {
     deadline.reset();
@@ -821,6 +879,7 @@ async fn bootstrap<'js>(
             Arc::clone(output),
             Arc::clone(deadline),
             Arc::clone(http),
+            Arc::clone(device),
         )?;
         // The probe functions exist in both builds so the loader never has to
         // care, but `__hbot_dbg` starts `false`: a release build never emits a
@@ -886,6 +945,7 @@ async fn run_event<'js>(
     deadline: &Arc<Deadline>,
     project: &CompiledProject,
     control: &Arc<DebugControl>,
+    device: &Arc<DeviceSlot>,
     instrumented: bool,
     limits: Limits,
 ) -> RawEvent {
@@ -903,7 +963,7 @@ async fn run_event<'js>(
     let _ = ctx.globals().set(instrument::DEBUG_FLAG, instrumented);
 
     let started = Instant::now();
-    let result = invoke(ctx, payload, handler, project).await;
+    let result = invoke(ctx, payload, handler, project, device).await;
     let duration = started.elapsed();
 
     control.end_event();
@@ -927,8 +987,9 @@ async fn invoke<'js>(
     payload: &str,
     handler: &Persistent<Function<'static>>,
     project: &CompiledProject,
+    device: &DeviceSlot,
 ) -> Result<(), CodeError> {
-    match invoke_inner(ctx, payload, handler).await {
+    match invoke_inner(ctx, payload, handler, device).await {
         Ok(()) => Ok(()),
         Err(error) => Err(describe(ctx, error, project)),
     }
@@ -938,8 +999,9 @@ async fn invoke_inner<'js>(
     ctx: &Ctx<'js>,
     payload: &str,
     handler: &Persistent<Function<'static>>,
+    device: &DeviceSlot,
 ) -> rquickjs::Result<()> {
-    let event = build_event(ctx, payload)?;
+    let event = build_event(ctx, payload, device)?;
     let function = handler.clone().restore(ctx)?;
     // `MaybePromise` accepts both `onMessage(ctx) {}` and
     // `async onMessage(ctx) {}`; awaiting it is also what drives any
@@ -952,8 +1014,20 @@ async fn invoke_inner<'js>(
 
 /// Turn the JSON payload into the object handed to `onMessage`, plus the host
 /// functions under the names `docs/02-architecture.md` §6.1 documents
-/// (`ctx.reply`, `ctx.log`, `ctx.sleep`).
-fn build_event<'js>(ctx: &Ctx<'js>, payload: &str) -> rquickjs::Result<Object<'js>> {
+/// (`ctx.reply`, `ctx.log`, `ctx.sleep`) and the device surface (`ctx.device`).
+///
+/// The payload is also where the device gate learns *whose* session to check:
+/// the isolate itself has no bot identity (a [`CompiledProject`] does not carry
+/// one and the spawn signature is frozen), so `botId` from the event JSON is
+/// remembered on the slot for the duration of the call. A payload without it
+/// clears the identity, which makes every device call fail closed with
+/// `HBOT_DEVICE_FAILED: ...没有 botId...` instead of inheriting the previous
+/// event's bot.
+fn build_event<'js>(
+    ctx: &Ctx<'js>,
+    payload: &str,
+    device: &DeviceSlot,
+) -> rquickjs::Result<Object<'js>> {
     let parsed: Value<'js> = ctx.json_parse(payload.to_owned())?;
     let event = match Object::from_value(parsed.clone()) {
         Ok(object) => object,
@@ -966,11 +1040,26 @@ fn build_event<'js>(ctx: &Ctx<'js>, payload: &str) -> rquickjs::Result<Object<'j
         }
     };
 
+    device.set_current_bot(bot_id_of(payload));
+
     let host: Object<'js> = ctx.globals().get("__hbot")?;
     event.set("reply", host.get::<_, Function<'js>>("reply")?)?;
     event.set("log", host.get::<_, Function<'js>>("log")?)?;
     event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
+    event.set("device", host.get::<_, Object<'js>>("device")?)?;
     Ok(event)
+}
+
+/// The `botId` the event JSON carries, if it can be read as a [`BotId`].
+///
+/// Deliberately lenient about *shape* and strict about *content*: a missing,
+/// non-string or unparsable value yields `None`, and the gate turns `None` into a
+/// refusal (`crates::device::gate::DeviceFailure::NoBotIdentity`) rather than a
+/// default session.
+fn bot_id_of(payload: &str) -> Option<hbot_core::BotId> {
+    let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let raw = parsed.get("botId")?.as_str()?;
+    raw.parse().ok()
 }
 
 /// Describe a failed JavaScript call, preferring the thrown object over the
