@@ -83,6 +83,100 @@ fn migrations_are_idempotent_across_restarts() {
     assert_eq!(user_version, i64::from(migrations::latest_version()));
 }
 
+/// 启动路径只允许开 1 条写连接 + [`crate::db`] 的 `READ_CONNECTIONS` 条只读连接。
+///
+/// 这是**结构不变量**，不是时长断言：多开一条连接只会让 ready 晚几毫秒，功能测试不会红，
+/// 所以 ADR-0002 §4 的启动预算只能靠这种断言兜住。计数记在测试线程本地（见
+/// `crate::db::connection_opens_on_this_thread`），并行测试互不污染。
+#[test]
+fn startup_opens_only_the_writer_and_read_connections() {
+    use crate::db::{
+        READ_CONNECTIONS, connection_opens_on_this_thread, reset_connection_opens_on_this_thread,
+    };
+
+    let dir = TempDir::new("startup-conns");
+    reset_connection_opens_on_this_thread();
+    let store = Store::open(dir.db_path()).expect("open store");
+
+    assert_eq!(
+        connection_opens_on_this_thread(),
+        1 + READ_CONNECTIONS,
+        "Store::open 只该开 1 条写连接 + READ_CONNECTIONS 条只读连接；多开的就是启动路径上的浪费"
+    );
+    drop(store);
+}
+
+/// 读出 `schema_migrations` 的 (version, name, applied_at)，升序。
+fn schema_migrations_rows(dir: &TempDir) -> Vec<(i64, String, i64)> {
+    let conn = raw(dir);
+    let mut statement = conn
+        .prepare("SELECT version, name, applied_at FROM schema_migrations ORDER BY version")
+        .expect("prepare schema_migrations");
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query schema_migrations");
+    rows.map(|row| row.expect("schema_migrations row"))
+        .collect()
+}
+
+/// 第二次打开**不重跑**迁移：`schema_migrations` 必须逐行不变。
+///
+/// 比 `migrations_are_idempotent_across_restarts` 更强：那条只看行数，而"每次启动重放一遍
+/// 迁移、用 `INSERT OR REPLACE` 覆盖记账"同样能保持行数。这里先把 `applied_at` 改成哨兵值
+/// （42，远小于任何真实的 `now_unix_ms()`），重开一次后再比：迁移只要重放，时间戳就会变。
+#[test]
+fn reopening_does_not_rerun_migrations() {
+    const SENTINEL: i64 = 42;
+
+    let dir = TempDir::new("no-rerun");
+    drop(Store::open(dir.db_path()).expect("first open"));
+
+    raw(&dir)
+        .execute("UPDATE schema_migrations SET applied_at = ?1", [SENTINEL])
+        .expect("stamp applied_at");
+    let before = schema_migrations_rows(&dir);
+    assert_eq!(
+        before.len(),
+        usize::try_from(migrations::latest_version()).expect("latest version fits usize"),
+        "首次打开应当把每条迁移各记一行"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|(_, _, applied_at)| *applied_at == SENTINEL),
+        "哨兵值没写进去，后面的重放断言就失去意义"
+    );
+
+    drop(Store::open(dir.db_path()).expect("second open"));
+
+    assert_eq!(
+        schema_migrations_rows(&dir),
+        before,
+        "第二次打开改了 schema_migrations：迁移被重放了（启动预算会随库增长变差）"
+    );
+}
+
+/// 启动路径不许出现全库扫描/整理语句（`integrity_check` / `quick_check` / `VACUUM`）。
+///
+/// 这三样都是 O(库大小) 的，会随用户数据增长拖慢 ready——ADR-0002 §4 那条预算最怕的回归。
+/// 崩溃安全由 WAL 自己保证，启动时不需要全库校验。真要在启动路径里加，请先改这个测试，
+/// 并在 `docs/spikes/S11-headless-startup.md` 写清"什么情况下会漏检"。
+#[test]
+fn startup_path_has_no_full_database_scan() {
+    for (name, source) in [
+        ("db.rs", include_str!("db.rs")),
+        ("migrations.rs", include_str!("migrations.rs")),
+    ] {
+        let lowered = source.to_ascii_lowercase();
+        for forbidden in ["integrity_check", "quick_check", "vacuum"] {
+            assert!(
+                !lowered.contains(forbidden),
+                "{name} 的启动路径里出现了 {forbidden}（全库扫描/整理），会随库增长拖慢 ready"
+            );
+        }
+    }
+}
+
 /// 同一 `(bot_id, external_id)` 插两次：第一次 `Some`，第二次 `None`，库里只有一行。
 #[test]
 fn duplicate_inbound_is_inserted_only_once() {

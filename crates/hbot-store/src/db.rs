@@ -50,7 +50,10 @@ use crate::startup_trace;
 pub const BUSY_TIMEOUT_MS: u32 = 5_000;
 
 /// 只读连接数量（`docs/02-architecture.md` §7 建议 2–4）。
-const READ_CONNECTIONS: usize = 2;
+///
+/// `pub(crate)`：启动路径的回归闸门要按它断言"只开 1 条写连接 + 这么多条只读连接"
+/// （`crate::tests::startup_opens_only_the_writer_and_read_connections`）。
+pub(crate) const READ_CONNECTIONS: usize = 2;
 
 /// 写队列容量。满载时 `send` 阻塞，形成背压（`AGENTS.md` §5：通道一律有界）。
 const WRITE_QUEUE_CAPACITY: usize = 1_024;
@@ -897,12 +900,45 @@ fn reply_send<T>(reply: Reply<T>, result: Result<T>) {
     }
 }
 
+// 当前测试线程上打开过的连接数（仅 `cfg(test)` 编译）。
+//
+// 为什么需要这个探针：ADR-0002 §4 的启动预算靠"ready 之前只开必要连接"兜住，
+// 而多开几条连接没有任何可观察的输出——功能测试照样全绿，只是 ready 晚几毫秒。
+// 用它把"顺手加个预热连接/连接池"挡在启动路径外面（`crate::tests` 里断言）。
+//
+// 计到**线程本地**而不是全局 `AtomicUsize`：store 的单元测试是并行跑的，
+// 别的测试同时 `Store::open` 会把全局计数抬高，断言就变成 flaky 的。
+#[cfg(test)]
+thread_local! {
+    static CONNECTION_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 记一次连接打开（仅测试）。在 [`open_connection`] 里 `Connection::open` 成功之后调用。
+#[cfg(test)]
+fn note_connection_open() {
+    CONNECTION_OPENS.with(|count| count.set(count.get() + 1));
+}
+
+/// 当前线程已打开的连接数（仅测试）。
+#[cfg(test)]
+pub(crate) fn connection_opens_on_this_thread() -> usize {
+    CONNECTION_OPENS.with(|count| count.get())
+}
+
+/// 清零当前线程的连接计数（仅测试，断言前调用）。
+#[cfg(test)]
+pub(crate) fn reset_connection_opens_on_this_thread() {
+    CONNECTION_OPENS.with(|count| count.set(0));
+}
+
 /// 打开一个连接并施加本层的 PRAGMA 契约。
 ///
 /// `role` 只用于启动计时（`role=writer` / `role=read0` / `role=read1`），不参与逻辑。
 fn open_connection(path: &Path, role: &'static str) -> Result<Connection> {
     let phase = startup_trace::Phase::start("store_conn_open");
     let connection = Connection::open(path)?;
+    #[cfg(test)]
+    note_connection_open();
     phase.done_with(role);
 
     // 先给忙等窗口，再切 WAL：切 journal_mode 需要短暂排他，否则并发启动会直接 SQLITE_BUSY。

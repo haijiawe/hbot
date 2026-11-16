@@ -103,7 +103,7 @@ Linux 后台：
 | 桌面整机（Rust 主进程 + WebView2 子进程求和） | < 260 MB | **190–223 MB**，四次中位 206 MB | 达标（余量 ~20%） |
 | 每多一个 bot（连接态） | < 6 MB | **0.10 MB**（首个 bot +1.1 MB） | 达标，余量 60× |
 | 每个 QuickJS isolate | < 8 MB（堆上限 32 MB） | **0.30 MB**（32 个共 +9.5 MB） | 达标，余量 27× |
-| 冷启动到核心可用 | < 800 ms | `hbot serve` **878 ms 中位 / 1264 ms p95**；桌面 **966 ms 中位 / 1330 ms p95**（2026-11-16 分段复测，n=7） | **未达标**，见 §4.2 |
+| 冷启动到核心可用 | < 800 ms | headless `hbot serve` 到 ready **24 ms 中位 / 28 ms p95**（首次建库 32–52 / 41–70）；桌面到核心可用 **966 ms 中位 / 1330 ms p95**（2026-11-16 headless 分段实测 n=7；桌面条目沿用 §4.2） | headless **达标**（余量 ~21×）；桌面未达标，见 §4.2 / §4.3 |
 | 二进制 | < 60 MB | **`hbot.exe` 16.2 MB / `hbot-desktop.exe` 33.0 MB** | 达标（SWC 链没有把体积撑爆） |
 | 安装包 | < 70 MB | 未测（`bundle.active=false`，M5 才出安装器） | 待 M5 |
 
@@ -136,11 +136,23 @@ Linux 后台：
 
 处置（按顺序，不许静默放宽）：
 
-1. **把预算拆成两个口径**：headless `hbot serve` 到 ready < 800 ms（当前 878 ms，需继续查首次迁移与进程初始化）；桌面到 IPC 首次可用 < 1500 ms（当前 1049 ms，达标）。两句话都写进性能表，不再用一个数字同时代表两种形态。
+1. **把预算拆成两个口径**：headless `hbot serve` 到 ready < 800 ms（当前 **24–38 ms，已达标**；原记的 878 ms 是桌面数字误抄，见 §4.3）；桌面到 IPC 首次可用 < 1500 ms（当前 1049 ms，达标）。两句话都写进性能表，不再用一个数字同时代表两种形态。
 2. **桌面端再压 800 ms 之前先证明能压**：需要把「核心启动」从 Tauri `setup` 里挪到 `setup` 之前（例如在 `run()` 开头先 `spawn` 核心初始化，窗口与核心并行）并实测；只改 SQLite 无效。
 3. 若第 2 步做完仍 > 1000 ms，就把桌面目标正式改为 1000 ms，并在此处写明「因为 WebView2 初始化不可控」，同时保留「到可编辑」单独计量。
 
 「到可编辑」没有客观信号（Monaco ready 不可外部观测），1049 ms 是「到 IPC 首次可用」的下界，不作为验收线。首次建库/首次装 WebView2 的路径单独测量，不与已有数据混在一起。
+
+### 4.3 headless 口径更正（2026-11-16）
+
+上面那个「`hbot serve` 878 ms」**从来不是 headless 的测量值**，是 §4.2 桌面包「进程启动 → 核心可用（966/1330 那一行）」里的另一个采样窗口数，被误标成了 `hbot serve`：`docs/spikes/S2-tauri.md:73,86-87` 里 878/1264 明确标为桌面，且 headless 路径里根本没有 Tauri/WebView2 那 900 ms。
+
+本次用 `scripts/headless-startup-probe.ps1` 第一次真正量 headless（release，`HBOT_STARTUP_TRACE=1` 分段，n=7）：
+
+- 非首次建库：**24 ms 中位 / 28 ms p95**（同机被构建压满时 38 / 48；最终构建复测 29 / 35）
+- 首次建库（每次前删库）：**32–52 ms 中位 / 41–70 ms p95**
+- 分段归因：14–25 ms 是进程启动本身（不可由本仓代码优化）、6.4–7.2 ms 是写连接第一次触碰库文件时 `PRAGMA journal_mode = WAL` 付的 WAL 索引恢复、1.0–1.4 ms 是 `TcpListener::bind`，其余各段 ≤ 0.6 ms。迁移早已按 `schema_migrations` 短路（常规启动 0.1 ms），启动路径里没有 `integrity_check` / `quick_check` / `VACUUM`。
+
+⇒ headless 预算**达标，余量约 21×**，不需要再优化；桌面口径不受影响，仍按 §4.2 处置。完整分段表、被否掉的优化与各自实测收益、防回归闸门见 `docs/spikes/S11-headless-startup.md`。
 
 ---
 

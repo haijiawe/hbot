@@ -124,7 +124,16 @@ pub fn ready_line(addr: SocketAddr, pid: u32) -> String {
 }
 
 /// 执行 `hbot serve`。
+///
+/// 启动分段（`HBOT_STARTUP_TRACE=1`，默认零开销）：本函数打 `serve_enter` /
+/// `plan_ready` / `serve_dispatcher` / `serve_ws_bind` / `serve_ready_write` /
+/// `ready_written` 六个点，配合 `AppState::open` 与 `Store::open` 里已有的埋点，
+/// 就能把「进程创建 → ready 行」拆到每一段。`scripts/headless-startup-probe.ps1`
+/// 按这个格式解析。
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
+    use hbot_store::startup_trace::{Phase, point};
+
+    point("serve_enter", "");
     let plan = ServePlan::from_args(args);
     let pid = std::process::id();
 
@@ -137,6 +146,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         Some(path) => path,
         None => default_data_dir(),
     };
+    point("plan_ready", "");
     let state = hbot_rpc::AppState::open(
         &data_dir,
         Arc::new(hbot_adapters::SystemClock),
@@ -144,11 +154,16 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     )
     .context("打开应用状态失败")?;
 
+    let phase = Phase::start("serve_dispatcher");
     let dispatcher = Arc::new(Dispatcher::new().with_state(Arc::new(state)));
+    phase.done();
+
+    let phase = Phase::start("serve_ws_bind");
     let handle = server
         .bind(dispatcher)
         .await
         .context("启动 WebSocket 服务失败")?;
+    phase.done();
 
     info!(
         addr = %handle.addr(),
@@ -161,7 +176,13 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             .unwrap_or_else(|| "<default>".to_owned()),
         "hbot serve 已就绪"
     );
+    point("serve_log_ready", "");
+
+    // 就绪契约 = 这一行的字节进了 stdout（`write_line` 内部 flush）。
+    let phase = Phase::start("serve_ready_write");
     crate::write_line(&ready_line(handle.addr(), pid))?;
+    phase.done();
+    point("ready_written", "");
 
     wait_for_shutdown().await;
     info!("收到关闭信号，开始收尾");

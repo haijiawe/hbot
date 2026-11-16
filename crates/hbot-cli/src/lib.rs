@@ -75,6 +75,7 @@ pub fn write_line(line: &str) -> anyhow::Result<()> {
 
 /// 顶层分发。
 pub async fn run(cli: Cli) -> anyhow::Result<Outcome> {
+    hbot_store::startup_trace::point("run_enter", "");
     match cli.command {
         Command::Version => {
             write_line(&version_text())?;
