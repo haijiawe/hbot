@@ -63,10 +63,12 @@
 | `compute.jobs` | ✅ 10 min | ✅ 10 min | ⚠️ 30 s 量级 | 见 §4.3 |
 | `compute.wasm` | ✅ | ✅ | ⚠️ | 内存更紧 |
 | `ai` | ✅ | ✅ | ✅ | 走网络，注意流量与费用 |
-| `device`（截图/键鼠） | ✅ 需确认 | ❌ | ❌ | 见 `docs/07` §9 |
+| `device`（截图/键鼠） | ✅ 逐项授权 | ❌ | ⚠️ 仅 Android 且只能侧载 | 见 `docs/07` §9；云端 ❌；iOS ❌；Wayland 走 portal |
 | Agent 的 `run_command` | ✅ | ✅ | ❌ | 手机不能起子进程（§5） |
 
 **这张表就是 `hbot.d.ts` 的生成输入**（`docs/07` §7.2）：手机上 `run_command` 不出现在 d.ts 里，Agent 就不会写它。⚠️ 项出现在 d.ts 但带 `@host-limited` 注释，运行时返回 `HOST_LIMIT` 而不是静默降级。
+
+**运行位置也要乘进这张表**（§9）：同一份项目在云端跑时 `device` 从 ✅ 变 ❌；在局域网另一台机器跑时 `device` 指的是**那台机器**的屏幕与键鼠，不是你的——UI 必须说清"控制的是哪台机器的鼠标"。
 
 ---
 
@@ -150,6 +152,31 @@
 
 **未核实**（不要当结论用）：`beginBackgroundTask` 的具体延长秒数（官方只写「extra time」）；`BGTaskScheduler` 的具体时限；iOS 回环 `127.0.0.1` 是否触发本地网络授权（TN3179 未点名 loopback，按"非广播接口"定义推断不触发）；Android 明文策略对 `127.0.0.1` 是否豁免；Android 16 起的 local network permission 具体范围。
 
+### 4.6 设备能力在手机上的两个硬结论
+
+用户 2026-11-17 决定把设备能力（`C6`）纳入范围（见 `07` §9 与 `ADR-0005`）。查完官方政策后，手机端有两条结论必须写死：
+
+**① Android：Agent 驱动的设备自动化上不了 Google Play。**
+Play 的 AccessibilityService 政策原文禁的是「an app to **autonomously initiate, plan, and execute** actions or decisions」，只允许「deterministic, rule-based automation ... a static, human-defined script」。本项目恰恰是让 Agent 自己决定点哪里、下一步做什么——它允许的"固定规则脚本"是我们正要替代的东西。
+
+所以 Android 的设备 bot 只能**侧载**（用户自己装 APK），或另做一个"规则模式"去迎合政策（不建议：等于把产品拆成两个，且规则模式不是我们要做的）。
+
+**② iOS：设备能力等于没有。** 三重挡，不是"以后会开放"：没有第三方可用的输入注入 API、读不到别的 App 的界面结构、录全屏必须用户手动起 broadcast extension（`RPSystemBroadcastPickerView`）。所以 iOS 宿主只做"跑 bot + 看日志 + 审批"。
+
+**对产品文案的要求**：应用商店描述里不许写"能帮你操作手机上的其它 App"（Android 侧的设备功能只对侧载用户可见，且需在首次使用时讲明风险）。
+
+**出处**：
+- Play 无障碍政策（含"autonomously initiate, plan, and execute"禁令与"deterministic, rule-based automation"豁免）：<https://support.google.com/googleplay/android-developer/answer/10964491>
+- Android 无障碍服务能力：<https://developer.android.com/guide/topics/ui/accessibility/service>、<https://developer.android.com/reference/android/accessibilityservice/AccessibilityService>
+- MediaProjection 每次会话同意与 token 单次有效：<https://developer.android.com/media/grow/media-projection>
+- `FLAG_SECURE` 截屏为黑屏：<https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE>
+- iOS `RPScreenRecorder` 只录自家 App：<https://developer.apple.com/documentation/replaykit/rpscreenrecorder>
+- iOS 全屏录制需 Broadcast Upload Extension：<https://developer.apple.com/documentation/replaykit/rpsystembroadcastpickerview>
+- iOS `XCUIAutomation` 仅用于测试自家 App：<https://developer.apple.com/documentation/xcuiautomation>
+- iOS 2.5.14 录屏须显式同意与可见提示：<https://developer.apple.com/app-store/review/guidelines/>
+
+**未核实**：Android 各厂商 ROM 对无障碍服务的额外限制；Android 13+ 侧载应用的"受限设置"在无障碍服务上的具体表现。
+
 ---
 
 ## 5. 生态：手机上没有 Node，怎么用 npm
@@ -211,19 +238,80 @@
 
 ---
 
-## 9. 里程碑（接在 `docs/04` 的 M6 之后）
+## 9. 运行位置：本机 / 局域网 / 云端
+
+"宿主"回答的是**跑在哪类设备**（桌面/无头/手机）。"运行位置"是另一个正交维度：**这台设备是你的还是别人的**。用户已定：**两者都要，可在设置里选，本地或云端**。
+
+关键结论先说：**这不是一次架构分叉**。核心是一个二进制，IDE 始终走同一份 JSON-RPC（`02` §9）。"跑在云端"= 把 `hbot serve` 部署到一台服务器，IDE 远程连上去——代码路径现在就有，缺的是传输安全、认证、部署物与运维。
+
+### 9.1 四档位置
+
+| 档 | 形态 | 机器人连接 | 现状 |
+|---|---|---|---|
+| **L0 桌面同进程** | Tauri 壳直接链接核心 | 本机进程内 | ✅ 已实现（默认） |
+| **L1 本机无头** | `hbot serve`，IDE 连 loopback | 本机进程 | ✅ 已实现（`36.4 ms` 到 ready） |
+| **L2 局域网另一台机器** | 同上，但绑非 loopback | 那台机器 | ⚠️ 代码可用，**缺 TLS 与认证强化** |
+| **L3 云端服务器** | 同上，公网可达 | 云主机 | ❌ 未做（见 §9.4） |
+
+`L2`/`L3` 与 `L0`/`L1` 的差别只在**传输与部署**，不在运行时行为。这条性质是刻意保留的：`ADR-0004` 的"一份契约"如果因为要上云而分裂，手机端就没有意义了。
+
+### 9.2 单一写者原则（上云也不能破）
+
+一个项目在同一时刻**只能有一个核心在写**它的 `hbot.db`：
+
+- 远程 IDE 是**客户端**，不是第二个写者。所有写操作走同一套 `Command`，由那一个核心串行化（`02` §5）。
+- 不允许"桌面跑一份、云端跑一份、共享同一个项目目录"——那是分布式一致性问题，不是这个产品要解决的问题。
+- 要换位置，就是**搬家**：`bot_stop` → 导出项目（git 或 zip）→ 在目标机 `project_open` → `bot_start`。**不做热迁移**（会让"消息不丢"这条不变量失效）。
+
+### 9.3 上云要补的四件事（缺一不可）
+
+| 缺口 | 为什么必须补 | 做法 |
+|---|---|---|
+| **传输加密** | 现在 `ws://` 只在 loopback 上安全，公网明文等于把 token 和全部消息内容广播出去 | `wss://`（`tokio-rustls` 或反向代理终止）+ 强制 `wss` 才允许非 loopback 绑定 |
+| **认证与授权** | 单 token 足够本机，不够公网（泄露即全权） | 每个客户端一枚 token（可独立吊销）+ 登录审计 + 失败退避 |
+| **非 loopback 绑定的显式确认** | 默认只绑 `127.0.0.1` 是**安全默认**，不能被配置"顺手"改掉 | 绑非回环地址时必须显式 flag + 启动横幅警告 + 文档同步 |
+| **运维物** | 云上进程会挂、盘会满、日志会撑爆 | systemd 单元 + 重启策略 + 日志轮转 + 备份脚本 + 健康检查端点 |
+
+**已实现的与未实现的要分清**：RPC 的 token 校验、Origin 白名单、首帧 auth 5s 超时、1 MiB 帧上限、32 in-flight 都已实现并有测试；**TLS 终止、多客户端 token、审计、绑定确认、健康检查、备份**都还没做。
+
+### 9.4 云端特有的取舍
+
+| 项 | 本机 | 云端 |
+|---|---|---|
+| `C6.device` | 可用（见 `07` §9） | **不可用**（没有显示器与输入设备） |
+| `run_command` | 可用（受沙箱档约束） | 可用，但**沙箱语义仍是"限制在项目目录"**，不是容器隔离——多人共用一台云主机时这不够，见下 |
+| 密钥 | OS keychain（`03` 已定） | 无 keychain 时退化为加密文件 + 启动时解密，或环境变量（**明确记录哪种**，不能静默） |
+| 长期在线 | 受用户关机影响 | 真正的 24h，但要自己承担运维 |
+| 延迟 | 本机 | 编辑器每次保存/读取都过一次公网（Monaco 输入是本地，只有落盘往返，可接受；1 MB 文件读取明显变慢） |
+| 数据归属 | 自己的盘 | **用户的 QQ/平台凭据落在别人的服务器上** —— 这是产品承诺问题，不是技术问题 |
+
+**多人共用一台云主机的边界**（明确不做，别让人误以为做了）：当前的 `workspace-write` 命令沙箱是"限制在项目目录"，不是"一个用户的进程看不到另一个用户的项目"。真正的多租户需要容器/独立系统用户，属于另一个产品形态。文档与 UI 都要写明：**一台云主机 = 一个用户**。
+
+### 9.5 与 IDE 的关系
+
+- 编辑器永远是本地的（Monaco 在 IDE 里），远程只是"文件读写与运行动作在网络另一头"。
+- 断线不应丢内容：未保存缓冲区走本地 journal（`06` §… 已实现），重连后按 `baseHash` 冲突检测，不静默覆盖。
+- 远程项目在文件树里要**显式标注来源**（本机 / `wss://host:port`），否则用户会以为自己改的是本机文件。
+
+---
+
+## 10. 里程碑（接在 `docs/04` 的 M6 之后）
 
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
 | **M7 能力底座** | `docs/07` §11 的 1–5 步：kv / history / ai / timer / jobs / session | 四类 bot 的示例项目各一个，全部能在桌面跑通；V1–V11 验收全绿 |
 | **M8 Android 宿主** | 拆 `hbot-mobile` crate；vendor rquickjs bindings；APK 能装能跑；前台服务与常驻通知；能力矩阵裁剪 | 真机装上、`local` bot 能跑、`onebot11` 能连局域网协议端、`bot_inject` 有回复；体积 ≤ 25 MB |
-| **M9 iOS 宿主**（可选） | macOS + Xcode 构建；IPA；`WKWebView` 控制台；仅前台运行 | 真机 TestFlight 可装、前台跑通同一条链路；审核按 4.7 准备材料 |
+| **M9 云端执行宿主** | `wss` + 多客户端 token + 绑定确认 + 健康检查 + systemd/备份；`L2/L3` 落地 | 一台真云主机跑满 24h 不断线；桌面 IDE 远程连上能编辑、能 `bot_start`、能看日志；断网重连不丢未保存内容 |
+| **M10 设备能力（C6）** | 桌面三平台 `screen`/`input`/`window`/`clipboard`/`ocr`；三道闸 + 限时会话 + 一键撤销 + 审计 | `07` §9 的 V12–V16 全绿；真机手动跑一个"看屏幕并点按钮"的 bot |
+| **M11 iOS 宿主**（可选） | macOS + Xcode 构建；IPA；`WKWebView` 控制台；仅前台运行 | 真机 TestFlight 可装、前台跑通同一条链路；审核按 4.7 准备材料 |
 
 **顺序理由**（`docs/adr/0004` §6）：手机端 90% 的工作量是"宿主移植"，10% 是"能力裁剪"。能力底座没做就移植，等于把四种半成品复制到三个平台。
 
+`M9`（云端）排在手机前：它补的是**认证与部署**这两件"所有远程场景都要用"的基础，手机端的局域网直连也吃这套。`M10`（设备）单独排在最后：实现量最大、且只有一类 bot 需要，但它**不再可省略**（用户已定纳入范围）。
+
 ---
 
-## 10. 验收标准
+## 11. 验收标准
 
 | # | 验收 | 怎么测 |
 |---|---|---|
@@ -234,10 +322,13 @@
 | H5 | Android 前台服务停止后通知消失、服务不留残 | 真机停服务，查通知栏与进程 |
 | H6 | 三端 RPC 契约一致（同 `gen --check` 产物） | CI 比对三端生成物哈希 |
 | H7 | 手机导出的项目 zip 在桌面能直接打开并跑 | 真机导出 → 桌面 `project_open` |
+| H8 | 绑非 loopback 且未配 TLS 时**拒绝启动**（不是警告） | 启动断言退出码与错误信息 |
+| H9 | 云端断开网络 30s 后重连，未保存缓冲区不丢、不覆盖远端更新的文件 | 断网 → 改本地 → 远端改 → 重连断言冲突提示 |
+| H10 | 同一项目两个核心同时写被拒（第二个 `project_open` 报冲突） | 两进程指同一目录，断言第二个失败 |
 
 ---
 
-## 11. 未决问题
+## 12. 未决问题
 
 1. 移动壳是**新 crate**（`hbot-mobile`）还是 `hbot-desktop` 里 `cfg` 门控？（倾向新 crate：托盘/单实例/更新这些桌面专属逻辑不该和移动共处一个文件）
 2. rquickjs bindings 是**开 bindgen**（CI 装 libclang）还是**vendor 两份**（体积换来确定性）？（倾向 vendor）
@@ -245,3 +336,7 @@
 4. 手机端要不要做"本地通知"能力（`egress.notify` 在手机上是系统通知，语义与桌面托盘通知不同）。
 5. 手机端 `hbot.db` 的 WAL 在 iOS 沙盒里是否有已知问题？（未核实）
 6. M8 要不要同时支持 Android 平板/横屏（IDE 在小屏上用不了，但平板可能能用）。
+7. 云端多客户端 token 的发放方式：手工 `hbot token issue` 子命令，还是走一个最小的管理界面？（倾向子命令，界面留到有远程用户再说）
+8. 云端的"项目搬家"要不要做成一条命令（`hbot export` / `hbot import`），还是只靠 git？（倾向做出命令：git 对非技术用户不友好）
+9. 云端密钥：没有 keychain 的 Linux 服务器上，是加密文件（口令从哪来？）还是环境变量 + 明文告警？（见 `ADR-0006` §风险）
+10. "同一台云主机只服务一个用户"这条边界要不要在协议层强制（例如单 token 只能绑一个项目）？还是只写在文档里？

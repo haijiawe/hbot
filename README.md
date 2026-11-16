@@ -91,9 +91,11 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | [`docs/04-implementation-plan.md`](docs/04-implementation-plan.md) | M0–M6、出口标准、parity、风险、切换/回滚 |
 | [`docs/05-quality-gates.md`](docs/05-quality-gates.md) | 一条命令、闸门、测试分层、性能预算、CI |
 | [`docs/06-ide.md`](docs/06-ide.md) | **IDE 设计**：布局、编辑器、Agent Diff、运行/调试、搜索、性能 |
-| [`docs/07-bot-runtime-blueprint.md`](docs/07-bot-runtime-blueprint.md) | **起 bot 的架构蓝图**：三层分离、6 组能力、四类 bot 缺什么、状态/定时/作业、网关顺序 |
-| [`docs/08-multi-host.md`](docs/08-multi-host.md) | **多宿主与手机端**：桌面/无头/手机能力矩阵、iOS/Android 后台真相、npm 打包、移动端风险 |
+| [`docs/07-bot-runtime-blueprint.md`](docs/07-bot-runtime-blueprint.md) | **起 bot 的架构蓝图**：三层分离、6 组能力、四类 bot 缺什么、状态/定时/作业、设备能力（C6）三道闸、网关顺序 |
+| [`docs/08-multi-host.md`](docs/08-multi-host.md) | **多宿主与运行位置**：桌面/无头/手机能力矩阵、iOS/Android 后台真相、本机/局域网/云端四档、npm 打包、移动端风险 |
 | [`docs/adr/0004-one-core-three-hosts.md`](docs/adr/0004-one-core-three-hosts.md) | 决策：一个核心三宿主、手机不做完整 IDE、为什么 QuickJS 对 iOS 也成立 |
+| [`docs/adr/0005-capability-ceiling-and-device-grant.md`](docs/adr/0005-capability-ceiling-and-device-grant.md) | 决策：能力上限不砍、默认全关、逐项授权（含键鼠注入的三层闸） |
+| [`docs/adr/0006-execution-backend.md`](docs/adr/0006-execution-backend.md) | 决策：运行位置可选（本机/局域网/云端）、单一写者、换位置靠搬家不靠热迁移 |
 | [`docs/spikes/`](docs/spikes/) | 实测记录（内存、QuickJS、启动、打包、QQ 官方握手、**QQ 真机端到端**、性能预算） |
 | [`AGENTS.md`](AGENTS.md) | Agent/新人入口：规则、地图、命令、坑 |
 | [`_research/`](_research/) | 旧项目四份只读审查原始证据（不是产品文档） |
@@ -107,7 +109,7 @@ crates/            Rust workspace：core / store / agent / code / bot / workspac
                    rpc / cli / desktop / command / parity / redteam / bench（+ xtask）
 apps/web/          React IDE（generated/ 由 Rust 生成）
 docs/              设计与决策（00 体检、01 需求、ADR、02 架构、03 目录、04 计划、05 闸门、
-                   06 IDE、07 bot 能力蓝图、08 多宿主与手机端、spikes 实测、security 红队）
+                   06 IDE、07 bot 能力蓝图、08 多宿主与运行位置、spikes 实测、security 红队）
 scripts/           闸门、打包、真机验证脚本
 packaging/         systemd / logrotate 部署物
 AGENTS.md          Agent 入口
