@@ -147,4 +147,35 @@ pub enum Event {
         /// Bot ID。
         bot_id: BotId,
     },
+
+    /// 设备会话状态变了（开了 / 到期 / 被撤销 / 被拒）。
+    ///
+    /// **critical 通道**（`crates/hbot-rpc/src/ws.rs` 的 `classify`）：这条丢了，
+    /// UI 会显示"没有会话在跑"，而鼠标可能正在被控制。宁可丢 `agent.delta`
+    /// 也不能丢它。
+    ///
+    /// `state` 为 `none` 的载荷也会发一次（用于"会话结束、干净了"），UI 只需
+    /// 按 `state` 渲染，不必自己推断。
+    #[serde(rename = "device.status")]
+    DeviceStatus {
+        /// 会话快照（`state == "none"` 时只有 `botId` 与 `state` 有意义）。
+        status: super::DeviceStatus,
+    },
+
+    /// Agent 请求一次设备授权，等用户点。
+    ///
+    /// 与 `approval.request` 分开的两个理由（`docs/09` §13 问 4）：一次动作 vs
+    /// 一段时间的会话，语义不同；合并会让审批卡片长出两种完全不同的交互。
+    /// 但**走同一个 critical 通道**。
+    #[serde(rename = "device.request")]
+    DeviceRequest {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 请求的子能力。
+        sub: Vec<String>,
+        /// Agent 给的理由（**不可信数据**：可能含提示注入，UI 只展示）。
+        reason: String,
+        /// 请求 ID（用户点"允许"时带回 `device_grant`）。
+        request_id: String,
+    },
 }

@@ -198,6 +198,58 @@ pub enum Command {
         bot_id: BotId,
     },
 
+    /// 查某个 bot 的设备会话状态。
+    ///
+    /// `data` 是 [`DeviceStatus`](super::DeviceStatus)；从没有过会话时 `state` 为
+    /// `none`、其余字段为 `null`（**不是** `data: null` —— UI 需要 `sub`/`allowedApps`
+    /// 这两条空数组来画设置页）。
+    DeviceStatus {
+        /// Bot ID。
+        bot_id: BotId,
+    },
+
+    /// 开一个限时设备会话（**用户拍板**的那一层闸）。
+    ///
+    /// `sub` 是请求的子能力，最终生效的是**清单声明 ∩ 宿主设置 ∩ 本次请求**三者交集
+    /// （交出来是空集就回 `-32002`，不"就近给一个"）。`minutes` 缺省按设置里的
+    /// 默认值，硬上限 30 分钟。
+    ///
+    /// 用户可能从来没见过这条命令 —— 它由设置页/托盘/快捷键走，Agent 不能自己调
+    /// （Agent 只能发 [`Command::DeviceRequest`]）。
+    DeviceGrant {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 请求的子能力（`screen` / `ocr` / `input` / `window` / `clipboard`）。
+        sub: Vec<String>,
+        /// 允许的应用（映像名）；空数组 = 全拒。
+        allowed_apps: Vec<String>,
+        /// 会话时长（分钟）；`None` = 用设置的默认值。
+        minutes: Option<u32>,
+    },
+
+    /// 立刻结束设备会话。**幂等**：没有活跃会话时也成功。
+    ///
+    /// 这是"一键全局撤销"的入口，四个触发点（设置页按钮、托盘菜单、快捷键、
+    /// `device_revoke` 命令）都走它，不各写一份。
+    DeviceRevoke {
+        /// Bot ID。
+        bot_id: BotId,
+    },
+
+    /// Agent 请求一次设备授权（**不是**授权本身）。
+    ///
+    /// `data` 是 `null`；结果经 `device.status`（若用户批准）或 `device.status`
+    /// 的 `denied` 状态回来。存在的理由：Agent 不能用 [`Command::DeviceGrant`]
+    /// 给自己开权限，否则"用户拍板"这一层就没有了。
+    DeviceRequest {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 请求的子能力。
+        sub: Vec<String>,
+        /// 给用户看的理由（Agent 自己写，**不可信数据**，UI 只展示不执行）。
+        reason: String,
+    },
+
     /// 设置断点（调试构建）。
     ///
     /// 断点是**按 bot 的沙箱**生效的：同一份源码在不同 bot 的 isolate 里可以是不同版本。
@@ -263,6 +315,10 @@ impl Command {
             Self::BotInject { .. } => "bot_inject",
             Self::BotList => "bot_list",
             Self::BotConversations { .. } => "bot_conversations",
+            Self::DeviceStatus { .. } => "device_status",
+            Self::DeviceGrant { .. } => "device_grant",
+            Self::DeviceRevoke { .. } => "device_revoke",
+            Self::DeviceRequest { .. } => "device_request",
             Self::DebugSetBreakpoints { .. } => "debug_set_breakpoints",
             Self::DebugResume { .. } => "debug_resume",
             Self::DebugStep { .. } => "debug_step",

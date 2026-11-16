@@ -12,6 +12,7 @@ export type { ConversationId } from "./ConversationId";
 export type { ConversationKind } from "./ConversationKind";
 export type { ConversationSummary } from "./ConversationSummary";
 export type { DebugScope } from "./DebugScope";
+export type { DeviceStatus } from "./DeviceStatus";
 export type { Diagnostic } from "./Diagnostic";
 export type { DiagnosticSeverity } from "./DiagnosticSeverity";
 export type { DiffHunk } from "./DiffHunk";

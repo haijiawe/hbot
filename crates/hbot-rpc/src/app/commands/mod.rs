@@ -13,6 +13,7 @@
 pub mod agent;
 pub mod bots;
 pub mod debug;
+pub mod device;
 pub mod files;
 pub mod system;
 

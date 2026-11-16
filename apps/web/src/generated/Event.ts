@@ -8,6 +8,7 @@ import type { ApprovalId } from "./ApprovalId";
 import type { BotId } from "./BotId";
 import type { BotStatus } from "./BotStatus";
 import type { DebugScope } from "./DebugScope";
+import type { DeviceStatus } from "./DeviceStatus";
 import type { Diagnostic } from "./Diagnostic";
 import type { EditFile } from "./EditFile";
 import type { EditId } from "./EditId";
@@ -145,4 +146,24 @@ callStack: Array<StackFrame>, } | { "type": "debug.resumed",
 /**
  * Bot ID。
  */
-botId: BotId, };
+botId: BotId, } | { "type": "device.status", 
+/**
+ * 会话快照（`state == "none"` 时只有 `botId` 与 `state` 有意义）。
+ */
+status: DeviceStatus, } | { "type": "device.request", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 请求的子能力。
+ */
+sub: Array<string>, 
+/**
+ * Agent 给的理由（**不可信数据**：可能含提示注入，UI 只展示）。
+ */
+reason: string, 
+/**
+ * 请求 ID（用户点"允许"时带回 `device_grant`）。
+ */
+requestId: string, };

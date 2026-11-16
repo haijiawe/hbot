@@ -148,6 +148,12 @@ impl Dispatcher {
             | Command::DebugStep { .. } => {
                 crate::app::commands::debug::handle(state, command).await
             }
+            Command::DeviceStatus { .. }
+            | Command::DeviceGrant { .. }
+            | Command::DeviceRevoke { .. }
+            | Command::DeviceRequest { .. } => {
+                crate::app::commands::device::handle(state, command).await
+            }
         }
     }
 }

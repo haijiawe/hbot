@@ -14,10 +14,10 @@ use ts_rs::{Config, TS};
 
 use super::{GeneratedFile, HEADER, INDEX_FILE, TsGenError};
 use crate::dto::{
-    ApiError, AppInfo, BotSummary, Command, ConversationSummary, DebugScope, Diagnostic,
-    DiagnosticSeverity, DiffHunk, DirEntry, EditFile, Event, FileChangeKind, FileContent, LogLevel,
-    ProjectOpenResult, ProjectSummary, Response, RiskLevel, RunLog, SearchMatch, StackFrame,
-    StepKind,
+    ApiError, AppInfo, BotSummary, Command, ConversationSummary, DebugScope, DeviceStatus,
+    Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile, Event, FileChangeKind,
+    FileContent, LogLevel, ProjectOpenResult, ProjectSummary, Response, RiskLevel, RunLog,
+    SearchMatch, StackFrame, StepKind,
 };
 
 /// 渲染结果：文件本身 + 它 import 的依赖（供悬空 import 检查）。
@@ -70,6 +70,12 @@ pub fn generated_files() -> Result<Vec<GeneratedFile>, TsGenError> {
         ProjectOpenResult,
         // `bot_conversations` 的行：`bot_inject` 要的 conversationId 由这里给。
         ConversationSummary,
+        // `device_status` / `device_grant` 的快照，也是 `device.status` 的载荷。
+        //
+        // 字段全是开放字符串（`state` / `sub` / `allowedApps` 不是枚举）：设备能力是
+        // 产品面最容易继续长的一处，加一种子能力不该逼着 UI 重新生成一遍枚举。
+        // 代价是前端要自己把未知值当"不认识的能力"忽略，不能 throw。
+        DeviceStatus,
     );
     // 领域类型：事件载荷里出现的枚举 / 结构。
     export!(

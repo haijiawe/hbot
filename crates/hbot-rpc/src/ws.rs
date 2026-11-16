@@ -279,7 +279,8 @@ struct ConnHandle {
 /// 事件通道分类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventClass {
-    /// 不可丢：`approval.request` / `agent.diff` / `debug.paused` / `debug.resumed`。
+    /// 不可丢：`approval.request` / `agent.diff` / `debug.paused` / `debug.resumed` /
+    /// `device.status` / `device.request`。
     Critical,
     /// 可丢弃（记录并计数）：状态类与可合并增量。
     Bulk,
@@ -291,12 +292,18 @@ impl EventClass {
     /// `debug.paused` / `debug.resumed` 必须走 critical：暂停事件丢了，UI 就再也
     /// 不知道 bot 正卡在断点上（表现为「点了运行但没反应」），而它本身是低频事件，
     /// 占不住 64 格 critical 队列。
+    ///
+    /// `device.status` / `device.request` 同理且更严重：设备状态丢了，UI 会显示
+    /// "没有会话在跑"，而鼠标/键盘可能正被生成代码控制（`docs/09` §4.1）。这两条
+    /// 也是低频（只在开/关/到期/请求时发），不会挤占 critical 队列。
     fn classify(event: &Event) -> Self {
         match event {
             Event::ApprovalRequest { .. }
             | Event::AgentDiff { .. }
             | Event::DebugPaused { .. }
-            | Event::DebugResumed { .. } => Self::Critical,
+            | Event::DebugResumed { .. }
+            | Event::DeviceStatus { .. }
+            | Event::DeviceRequest { .. } => Self::Critical,
             _ => Self::Bulk,
         }
     }
@@ -1296,6 +1303,41 @@ mod tests {
             EventClass::classify(&resumed),
             EventClass::Critical,
             "debug.resumed 不可丢：丢了 UI 会一直显示暂停中"
+        );
+
+        // 设备事件同理：状态条丢了，用户会以为鼠标没被控制。
+        let device_status = Event::DeviceStatus {
+            status: crate::dto::DeviceStatus {
+                bot_id: "22222222-2222-4222-8222-222222222222"
+                    .parse()
+                    .expect("测试 UUID"),
+                session_id: Some("session".to_owned()),
+                state: "active".to_owned(),
+                sub: vec!["screen".to_owned()],
+                allowed_apps: vec!["game.exe".to_owned()],
+                granted_at: Some(hbot_core::Timestamp::from_unix_millis(1_700_000_000_000)),
+                deadline: Some(hbot_core::Timestamp::from_unix_millis(1_700_000_300_000)),
+                remaining_ms: Some(300_000),
+            },
+        };
+        assert_eq!(
+            EventClass::classify(&device_status),
+            EventClass::Critical,
+            "device.status 不可丢：丢了 UI 不显示会话，而鼠标可能正被控制"
+        );
+
+        let device_request = Event::DeviceRequest {
+            bot_id: "22222222-2222-4222-8222-222222222222"
+                .parse()
+                .expect("测试 UUID"),
+            sub: vec!["screen".to_owned(), "input".to_owned()],
+            reason: "想看看你的游戏画面".to_owned(),
+            request_id: "req-1".to_owned(),
+        };
+        assert_eq!(
+            EventClass::classify(&device_request),
+            EventClass::Critical,
+            "device.request 不可丢：丢了用户永远等不到授权弹窗"
         );
     }
 

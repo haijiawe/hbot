@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use hbot_core::DeviceCapability;
+
 use crate::compile::ENTRY_MODULE;
 use crate::dts;
 use crate::error::CodeError;
@@ -117,6 +119,34 @@ pub struct Permissions {
     /// [`crate::permissions`].
     #[serde(default)]
     pub http: Vec<String>,
+
+    /// 设备能力（C6）。`None` = 没有任何设备能力，`ctx.device` 上不会长出符号。
+    ///
+    /// **这只是第一层闸**：清单声明 ≠ 被允许。真正的放行还要宿主设置
+    /// （`<data_dir>/device.json`）与一个限时设备会话，三层缺一层就拒。
+    /// 见 `docs/09-device-capability.md` §4。
+    #[serde(default)]
+    pub device: Option<DevicePermissions>,
+}
+
+/// 清单里的设备授权声明（第一层闸）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevicePermissions {
+    /// 声明的子能力（`screen` / `ocr` / `input` / `window` / `clipboard`）。
+    ///
+    /// 空数组 = 声明了 `device` 块但没要任何子能力 —— 与 `None` 等价，但保留它
+    /// 是为了让"我以后要加"有地方写，也为了让 `deny_unknown_fields` 能抓拼写错。
+    /// 不认识的名字在这里就报错，不留到运行时。
+    #[serde(default)]
+    pub sub: Vec<DeviceCapability>,
+
+    /// 请求的应用白名单（进程映像名，大小写不敏感）。
+    ///
+    /// 这是**提议**：宿主设置里也会有一份，两者的交集才生效
+    /// （Agent 不能靠改清单给自己加应用）。
+    #[serde(default)]
+    pub apps: Vec<String>,
 }
 
 /// The `limits` block.

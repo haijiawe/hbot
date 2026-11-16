@@ -59,6 +59,8 @@ pub use error::{CodeError, ErrorLocation, SourcePos};
 pub use hbot_core::debug::{Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, PausedAt};
 pub use http::{HttpConfig, HttpRequest, HttpResponse, HttpTransport, TransportError};
 pub use limits::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MEMORY_BYTES, Limits};
-pub use manifest::{Manifest, ManifestLimits, PlatformSpec, ScaffoldReport};
+pub use manifest::{
+    DevicePermissions, Manifest, ManifestLimits, Permissions, PlatformSpec, ScaffoldReport,
+};
 pub use permissions::{PermissionError, authorize};
 pub use runtime::{EventOutcome, HostOutput, MemoryReport, Sandbox};

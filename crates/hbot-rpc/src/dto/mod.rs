@@ -61,6 +61,10 @@
 //! | `DebugSetBreakpoints` | `null` |
 //! | `DebugResume` | `null`（结果经 `debug.resumed` / `debug.paused`） |
 //! | `DebugStep` | `null`（同上） |
+//! | `DeviceStatus` | [`DeviceStatus`]（**从不返回 `null`**：没会话时是 `state: "none"` 的快照，UI 直接用 `sub`/`allowedApps` 画设置页） |
+//! | `DeviceGrant` | [`DeviceStatus`]（新会话的快照；状态变更另发 `device.status`） |
+//! | `DeviceRevoke` | `null`（幂等；状态变更经 `device.status`） |
+//! | `DeviceRequest` | `null`（**不是授权**：只是把请求抛给用户，结果经 `device.status`） |
 //! | `LogsTail` | `Vec<`[`RunLog`]`>` |
 //!
 //! 只有"一次性快照"类命令返回 `data`；所有流式/异步结果都走事件，避免同一条
@@ -72,8 +76,9 @@ pub mod event;
 
 pub use command::Command;
 pub use common::{
-    ApiError, AppInfo, BotSummary, ConversationSummary, DebugScope, Diagnostic, DiagnosticSeverity,
-    DiffHunk, DirEntry, EditFile, FileChangeKind, FileContent, LogLevel, ProjectOpenResult,
-    ProjectSummary, Response, RiskLevel, RunLog, SearchMatch, StackFrame, StepKind,
+    ApiError, AppInfo, BotSummary, ConversationSummary, DebugScope, DeviceStatus, Diagnostic,
+    DiagnosticSeverity, DiffHunk, DirEntry, EditFile, FileChangeKind, FileContent, LogLevel,
+    ProjectOpenResult, ProjectSummary, Response, RiskLevel, RunLog, SearchMatch, StackFrame,
+    StepKind,
 };
 pub use event::Event;

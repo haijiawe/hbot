@@ -108,6 +108,36 @@ pub struct ConversationSummary {
     pub kind: String,
 }
 
+/// 某个 bot 的设备会话快照（`device_status` / `device_grant` 的 `data`，也是
+/// `device.status` 事件的载荷）。
+///
+/// **字段用开放字符串而不是 Rust 枚举**，与 [`ConversationSummary::kind`] 同一个理由：
+/// 设备能力是产品面最容易继续长的一处（将来加 `audio` 之类），不该为它先改 DTO。
+/// 合法值见 `hbot_core::DeviceCapability::as_str` 与 `DeviceSessionState::as_str`。
+///
+/// `state` 为 `none` 表示"从来没有过会话"，此时 `sessionId` / `grantedAt` / `deadline`
+/// 都是 `null` —— 这一条是给 UI 画状态条用的，别拿它当"过期的会话"。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceStatus {
+    /// Bot ID。
+    pub bot_id: BotId,
+    /// 会话 ID；无会话为 `null`。
+    pub session_id: Option<String>,
+    /// `none` / `requested` / `active` / `expired` / `revoked` / `denied`。
+    pub state: String,
+    /// 这个会话**生效的**子能力（清单∩设置∩会话，取交集）。
+    pub sub: Vec<String>,
+    /// 这个会话允许的应用（映像名，小写）。
+    pub allowed_apps: Vec<String>,
+    /// 会话开始时间（毫秒）；无会话为 `null`。
+    pub granted_at: Option<Timestamp>,
+    /// 到期时间（毫秒）；无会话为 `null`。
+    pub deadline: Option<Timestamp>,
+    /// 剩余毫秒；无会话或已结束时为 `null`（UI 不该自己拿 deadline 减本机时钟）。
+    pub remaining_ms: Option<i64>,
+}
+
 /// 一条搜索匹配（`file.search.matches`）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]

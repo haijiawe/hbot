@@ -19,11 +19,15 @@
 //!   `SystemClock` 放这里是因为读系统时间不是平台适配；放适配器层会逼着组合根
 //!   （如 `hbot-desktop`）为了一个时钟依赖整个 `hbot-adapters`，那是错误的依赖方向。
 //! - [`paths`]：应用数据目录的唯一算法（桌面端与后台端必须落到同一个库）。
+//! - [`device`]：设备能力（C6）的契约类型与两个端口（[`device::DeviceGate`] 判据、
+//!   [`device::DeviceBackend`] 执行）。实现分别在 `hbot-rpc` 与 `hbot-device`，
+//!   设计见 `docs/09-device-capability.md`。
 
 #![warn(missing_docs)]
 
 pub mod command;
 pub mod debug;
+pub mod device;
 pub mod domain;
 pub mod errors;
 pub mod ids;
@@ -35,6 +39,11 @@ pub use command::{
     CommandDenied, CommandOutput, CommandSpec, CommandStatus, OutputStream, Platform,
 };
 pub use debug::{Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, PausedAt};
+pub use device::{
+    ClipboardOp, ClipboardValue, DeviceActor, DeviceAuditEntry, DeviceBackend, DeviceCapability,
+    DeviceCapabilityReport, DeviceError, DeviceGate, DeviceSessionState, DeviceTarget, InputAction,
+    MouseButton, Screenshot, ScreenshotRequest, WindowInfo,
+};
 pub use domain::{
     ApprovalDecision, Bot, BotStatus, Conversation, ConversationKind, InboundMessage,
     OutboundMessage, OutboundState, Project, SandboxMode, Timestamp, ToolCall, ToolCallStatus,

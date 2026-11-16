@@ -152,7 +152,43 @@ text: string, } | { "type": "bot_list" } | { "type": "bot_conversations",
 /**
  * Bot ID。
  */
-botId: BotId, } | { "type": "debug_set_breakpoints", 
+botId: BotId, } | { "type": "device_status", 
+/**
+ * Bot ID。
+ */
+botId: BotId, } | { "type": "device_grant", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 请求的子能力（`screen` / `ocr` / `input` / `window` / `clipboard`）。
+ */
+sub: Array<string>, 
+/**
+ * 允许的应用（映像名）；空数组 = 全拒。
+ */
+allowedApps: Array<string>, 
+/**
+ * 会话时长（分钟）；`None` = 用设置的默认值。
+ */
+minutes: number | null, } | { "type": "device_revoke", 
+/**
+ * Bot ID。
+ */
+botId: BotId, } | { "type": "device_request", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 请求的子能力。
+ */
+sub: Array<string>, 
+/**
+ * 给用户看的理由（Agent 自己写，**不可信数据**，UI 只展示不执行）。
+ */
+reason: string, } | { "type": "debug_set_breakpoints", 
 /**
  * Bot ID。
  */
