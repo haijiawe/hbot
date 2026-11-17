@@ -10,6 +10,7 @@ export type KeybindingId =
   | 'global-search'
   | 'save'
   | 'save-all'
+  | 'inline-edit'
   | 'run-bot'
   | 'stop-bot'
   | 'toggle-agent'
@@ -47,6 +48,8 @@ export const KEYBINDINGS: readonly Keybinding[] = [
   { id: 'global-search', title: '全局搜索', category: '导航', chord: { key: 'f', primary: true, shift: true } },
   { id: 'save', title: '保存', category: '文件', chord: { key: 's', primary: true } },
   { id: 'save-all', title: '全部保存', category: '文件', chord: { key: 's', primary: true, alt: true } },
+  // 行内编辑（docs/06-ide.md §3.2 / §5.3）：选中一段代码（或光标所在行）让 Agent 改写。
+  { id: 'inline-edit', title: '行内编辑（让 Agent 改选中的代码）', category: '文件', chord: { key: 'k', primary: true } },
   { id: 'run-bot', title: '运行 bot', category: '运行', chord: { key: 'Enter', primary: true } },
   { id: 'stop-bot', title: '停止 bot', category: '运行', chord: { key: '.', primary: true } },
   { id: 'toggle-agent', title: '切换 Agent 栏', category: '查看', chord: { key: 'a', primary: true, shift: true } },

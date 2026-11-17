@@ -13,6 +13,11 @@ export interface ShortcutActions {
   openQuickOpen: () => void
   save: () => void
   saveAll: () => void
+  /**
+   * 行内编辑（docs/06-ide.md §3.2）：让编辑器打开就地浮层。没有可编辑的选区时由
+   * 调用方自己给可见反馈（状态栏 toast），这里不假设一定成功。
+   */
+  inlineEdit: () => void
   run: () => void
   stop: () => void
   toggleAgent: () => void
@@ -56,6 +61,9 @@ export function useGlobalKeybindings(actions: ShortcutActions): void {
           break
         case 'save-all':
           current.saveAll()
+          break
+        case 'inline-edit':
+          current.inlineEdit()
           break
         case 'run-bot':
           current.run()

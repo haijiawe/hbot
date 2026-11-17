@@ -9,6 +9,11 @@
  * `window.prompt`：prompt 是阻塞式的，会把整条事件循环按住（这个窗口里还有正在跑的
  * bot 事件与日志流），而且样式不可控。断点点由这里打装饰；暂停行另有一层整行高亮。
  * 调试面板本身在底部面板的"调试"页签里，这里只管"让断点与当前执行行在代码上看得见"。
+ *
+ * 行内编辑（docs/06-ide.md §3.2）：Cmd/Ctrl+K 把当前选区（空选区 = 光标所在行）连同
+ * 一句自然语言指令发给 Agent，回来仍是既有的 diff-card 逐块审阅 —— 这里只负责"取选区、
+ * 摆浮层、发请求"，不碰应用修改的逻辑。选区是**一次性快照**：Monaco 的 editor 实例仍是
+ * 光标/选区的唯一真源，store 里不存第二份。
  */
 
 import * as monaco from 'monaco-editor'
@@ -18,14 +23,34 @@ import { languageForPath } from '../../lib/paths'
 import { setupMonaco } from '../../lib/monaco/setup'
 import {
   MAX_CONDITION_CHARS,
+  MAX_LOG_CHARS,
   conditionAt,
   hasBreakpointAt,
+  hasLogpointAt,
+  logpointAt,
   useDebugStore,
 } from '../../stores/debug-store'
 import { breakpointGlyphs } from './breakpoint-decorations'
+import { gutterMenuItems, type GutterMenuAction } from './breakpoint-menu'
 import { useWorkspaceStore } from '../../stores/workspace-store'
+import { useAgentStore } from '../../stores/agent-store'
+import { inlineEditPrompt } from '../../lib/agent-requests'
+import {
+  registerInlineEditOpener,
+  selectionSnapshot,
+  type InlineEditSelection,
+} from '../../lib/inline-edit'
+import { InlineEditPopover } from './inline-edit-popover'
 
 const MODEL_SCHEME = 'hbot'
+
+/** 浮层按"最坏情况"预留的尺寸，只用于把位置夹进容器（真实尺寸由 CSS 决定）。 */
+const INLINE_EDIT_WIDTH = 360
+const INLINE_EDIT_HEIGHT = 160
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
+}
 
 function modelUri(path: string): monaco.Uri {
   return monaco.Uri.from({ scheme: MODEL_SCHEME, path: `/${path}` })
@@ -57,8 +82,17 @@ interface GutterMenu {
   /** 相对 `.editor-surface` 的左上角（像素）。 */
   left: number
   top: number
-  /** `menu` = 显示三个动作；`edit` = 显示条件输入框。 */
-  mode: 'menu' | 'edit'
+  /** `menu` = 动作列表；`edit` = 断点条件输入框；`log` = 日志点模板输入框。 */
+  mode: 'menu' | 'edit' | 'log'
+}
+
+/** 行内编辑浮层的现场：选区快照 + 脏标记 + 位置。关闭即丢弃（不进 store）。 */
+interface InlineEditState {
+  selection: InlineEditSelection
+  /** 打开浮层那一刻该文件是否有未保存改动（给用户看的，也是请求里的提示）。 */
+  dirty: boolean
+  left: number
+  top: number
 }
 
 export default function EditorSurface() {
@@ -78,6 +112,11 @@ export default function EditorSurface() {
   const [draft, setDraft] = useState('')
   const menuRef = useRef<GutterMenu | null>(null)
   menuRef.current = menu
+  const [inlineEdit, setInlineEdit] = useState<InlineEditState | null>(null)
+  const [inlineError, setInlineError] = useState<string | null>(null)
+  const [inlineBusy, setInlineBusy] = useState(false)
+  const inlineEditRef = useRef<InlineEditState | null>(null)
+  inlineEditRef.current = inlineEdit
 
   // 只创建一次编辑器实例；真正的 model 在下一个 effect 里挂载。
   useEffect(() => {
@@ -115,16 +154,16 @@ export default function EditorSurface() {
       useDebugStore.getState().toggleBreakpoint(path, line)
     })
 
-    // 行槽位右键 = 该行断点的菜单（只在已有断点时出现：没有断点时右键的意图不明确，
-    // 而"加断点"本来左键一下就够了）。
+    // 行槽位右键 = 该行断点/日志点的菜单（只在已有断点或日志点时出现：两样都没有时
+    // 右键的意图不明确，而"加断点"本来左键一下就够了）。
     const gutterMenu = editor.onContextMenu((event) => {
       if (event.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return
       const line = event.target.position?.lineNumber
       const path = useWorkspaceStore.getState().activePath
       if (line === undefined || path === null) return
       const entries = useDebugStore.getState().breakpoints[path]
-      if (!hasBreakpointAt(entries, line)) return
-      // 拦掉 Monaco 自己的右键菜单：这一行的上下文就是断点，不是编辑器命令。
+      if (!hasBreakpointAt(entries, line) && !hasLogpointAt(entries, line)) return
+      // 拦掉 Monaco 自己的右键菜单：这一行的上下文就是断点/日志点，不是编辑器命令。
       event.event.preventDefault()
       event.event.stopPropagation()
       const rect = container.getBoundingClientRect()
@@ -158,6 +197,9 @@ export default function EditorSurface() {
     const editor = editorRef.current
     if (!editor) return
     setMenu(null)
+    // 换文件时浮层必须关掉：它记着上一个文件的选区，继续留着会发错请求。
+    setInlineEdit(null)
+    setInlineError(null)
     if (!activePath) {
       editor.setModel(null)
       return
@@ -212,6 +254,18 @@ export default function EditorSurface() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [menu])
 
+  // 行内编辑浮层的 Esc：焦点可能已经落回编辑器（浮层不是模态的），所以也在 window 上兜一层。
+  useEffect(() => {
+    if (inlineEdit === null) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      setInlineEdit(null)
+      setInlineError(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [inlineEdit])
+
   // 关闭 tab：回收对应 model 与监听。
   useEffect(() => {
     const stillOpen = new Set(openKey.split('\n').filter((path) => path.length > 0))
@@ -258,6 +312,148 @@ export default function EditorSurface() {
     setMenu(null)
   }
 
+  /**
+   * 提交日志点模板。留空 = 删日志点（`setLogpoint` 那边把空串归一成 `null`），
+   * 与"清空条件"一致：输入框清空是明确的删除动作，不该报错。
+   */
+  const submitLogpoint = () => {
+    const target = menuRef.current
+    if (target === null) return
+    useDebugStore.getState().setLogpoint(target.file, target.line, draft)
+    setMenu(null)
+  }
+
+  /** 菜单项 → 动作（`edit-*` 切成输入框，其余直接落到 store 并关菜单）。 */
+  const runMenuAction = (action: GutterMenuAction): void => {
+    const target = menuRef.current
+    if (target === null) return
+    const entries = useDebugStore.getState().breakpoints[target.file]
+    switch (action) {
+      case 'edit-condition':
+        setDraft(conditionAt(entries, target.line) ?? '')
+        setMenu({ ...target, mode: 'edit' })
+        return
+      case 'edit-logpoint':
+        setDraft(logpointAt(entries, target.line) ?? '')
+        setMenu({ ...target, mode: 'log' })
+        return
+      case 'add-logpoint':
+        // 新日志点的模板默认给一个能直接用的示例？不给：用户要的是自己那行的变量，
+        // 预填反而要先删掉。空输入框 + 占位符说明比预填好。
+        setDraft('')
+        setMenu({ ...target, mode: 'log' })
+        return
+      case 'clear-condition':
+        useDebugStore.getState().setBreakpointCondition(target.file, target.line, null)
+        break
+      case 'remove-breakpoint':
+        useDebugStore.getState().removeBreakpoint(target.file, target.line)
+        break
+      case 'remove-logpoint':
+        useDebugStore.getState().removeLogpoint(target.file, target.line)
+        break
+    }
+    setMenu(null)
+  }
+
+  /**
+   * 打开行内编辑浮层：取当前选区（空选区 = 光标所在行）做成一次性快照。
+   *
+   * 返回 `false` = 这里没有可编辑的东西（编辑器未挂载 / 没开文件 / 选区取不到），
+   * 由 App 走状态栏 toast 说明原因 —— 按了快捷键什么都不发生是最糟的反馈。
+   */
+  const openInlineEdit = (): boolean => {
+    const editor = editorRef.current
+    const container = containerRef.current
+    const model = editor?.getModel() ?? null
+    const path = useWorkspaceStore.getState().activePath
+    if (!editor || !container || !model || path === null) return false
+
+    const selection = editor.getSelection()
+    const position = editor.getPosition()
+    const anchor = selection?.positionLineNumber ?? position?.lineNumber
+    if (anchor === undefined) return false
+    const lines = Array.from({ length: model.getLineCount() }, (_, index) =>
+      model.getLineContent(index + 1),
+    )
+    const snapshot = selectionSnapshot(
+      path,
+      lines,
+      selection?.startLineNumber ?? anchor,
+      selection?.endLineNumber ?? anchor,
+    )
+    if (snapshot === null) return false
+
+    const state = useWorkspaceStore.getState()
+    const dirty = state.tabs.some((tab) => tab.path === path && tab.dirty)
+    const rect = container.getBoundingClientRect()
+    const visible = editor.getScrolledVisiblePosition({ lineNumber: snapshot.startLine, column: 1 })
+    const width = Math.min(INLINE_EDIT_WIDTH, Math.max(rect.width - 16, 200))
+    const height = Math.min(INLINE_EDIT_HEIGHT, Math.max(rect.height - 16, 120))
+    // 夹进容器：选区在最后几行时浮层不能掉到可视区外面去。
+    const left = clamp(
+      (visible?.left ?? 0) + 16,
+      8,
+      Math.max(8, rect.width - width - 8),
+    )
+    const top = clamp(
+      (visible?.top ?? 0) + (visible?.height ?? 20) + 6,
+      8,
+      Math.max(8, rect.height - height - 8),
+    )
+
+    setInlineError(null)
+    setInlineEdit({ selection: snapshot, dirty, left, top })
+    return true
+  }
+
+  const openInlineEditRef = useRef(openInlineEdit)
+  openInlineEditRef.current = openInlineEdit
+
+  // 注册给全局快捷键（`app/use-global-keybindings.ts` 拿不到编辑器实例）。
+  useEffect(() => registerInlineEditOpener(() => openInlineEditRef.current()), [])
+
+  const cancelInlineEdit = (): void => {
+    setInlineEdit(null)
+    setInlineError(null)
+  }
+
+  /**
+   * 提交：只发请求，不改任何文件。
+   *
+   * 失败**不关浮层**：关掉等于让用户以为请求已经发出去了。请求载荷里带
+   * 「选区原文 + 文件相对路径 + 行范围 + 指令」，有未保存改动时再附一句提示
+   * （docs/06-ide.md §5.2：Diff 以磁盘为基准）。
+   */
+  const submitInlineEdit = async (instruction: string): Promise<void> => {
+    const target = inlineEditRef.current
+    if (target === null) return
+    const agent = useAgentStore.getState()
+    // `send` 在 sending 为 true 时直接 return（不发也不报错），所以必须自己先拦。
+    if (agent.sending) {
+      setInlineError('Agent 正在处理上一条消息，等它回来再发。')
+      return
+    }
+    if (agent.error !== null) agent.dismissError()
+    setInlineError(null)
+    setInlineBusy(true)
+    try {
+      await agent.send(
+        inlineEditPrompt({ ...target.selection, instruction, dirty: target.dirty }),
+      )
+      const after = useAgentStore.getState()
+      if (after.error !== null) {
+        setInlineError(after.error)
+        return
+      }
+      setInlineEdit(null)
+      // 展开 Agent 栏：Diff 卡片回来时用户第一眼就能看到（docs/06-ide.md §5.2）。
+      useWorkspaceStore.getState().toggleAgent(false)
+    } finally {
+      setInlineBusy(false)
+    }
+  }
+
   return (
     <div className="editor-surface" ref={containerRef}>
       {menu !== null && (
@@ -272,46 +468,26 @@ export default function EditorSurface() {
             className="breakpoint-menu"
             style={{ left: `${menu.left}px`, top: `${menu.top}px` }}
             role="menu"
-            aria-label={`第 ${menu.line} 行的断点`}
+            aria-label={`第 ${menu.line} 行的断点与日志点`}
           >
             {menu.mode === 'menu' ? (
-              <>
+              gutterMenuItems({
+                hasBreakpoint: hasBreakpointAt(breakpoints[menu.file], menu.line),
+                condition: conditionAt(breakpoints[menu.file], menu.line),
+                logpoint: logpointAt(breakpoints[menu.file], menu.line),
+              }).map((item) => (
                 <button
+                  key={item.action}
                   type="button"
                   role="menuitem"
                   className="breakpoint-menu__item"
-                  onClick={() => {
-                    setDraft(conditionAt(breakpoints[menu.file], menu.line) ?? '')
-                    setMenu({ ...menu, mode: 'edit' })
-                  }}
+                  disabled={item.disabled}
+                  onClick={() => runMenuAction(item.action)}
                 >
-                  编辑条件…
+                  {item.label}
                 </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="breakpoint-menu__item"
-                  disabled={conditionAt(breakpoints[menu.file], menu.line) === null}
-                  onClick={() => {
-                    useDebugStore.getState().setBreakpointCondition(menu.file, menu.line, null)
-                    setMenu(null)
-                  }}
-                >
-                  清除条件
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="breakpoint-menu__item"
-                  onClick={() => {
-                    useDebugStore.getState().removeBreakpoint(menu.file, menu.line)
-                    setMenu(null)
-                  }}
-                >
-                  删除断点
-                </button>
-              </>
-            ) : (
+              ))
+            ) : menu.mode === 'edit' ? (
               <form
                 className="breakpoint-menu__form"
                 onSubmit={(event) => {
@@ -351,9 +527,61 @@ export default function EditorSurface() {
                   不支持 await。
                 </p>
               </form>
+            ) : (
+              <form
+                className="breakpoint-menu__form"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  submitLogpoint()
+                }}
+              >
+                <label className="breakpoint-menu__label" htmlFor="logpoint-template">
+                  第 {menu.line} 行的日志点模板（{'{表达式}'} 在命中时展开，留空 = 删除日志点）
+                </label>
+                <input
+                  id="logpoint-template"
+                  className="breakpoint-menu__input"
+                  autoFocus
+                  value={draft}
+                  maxLength={MAX_LOG_CHARS}
+                  placeholder="例如 count={count}"
+                  onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape') {
+                      event.preventDefault()
+                      setMenu(null)
+                    }
+                  }}
+                />
+                <div className="breakpoint-menu__actions">
+                  <button type="submit" className="button button--primary">
+                    保存
+                  </button>
+                  <button type="button" className="button" onClick={() => setMenu(null)}>
+                    取消
+                  </button>
+                </div>
+                <p className="breakpoint-menu__hint">
+                  日志点不暂停：命中时进调试面板的日志列表，然后照常往下跑。
+                  {'{表达式}'} 在 isolate 里求值，抛错就填 &lt;错误&gt;（每行只提示一次），
+                  不支持嵌套花括号与 await。
+                </p>
+              </form>
             )}
           </div>
         </>
+      )}
+      {inlineEdit !== null && (
+        <InlineEditPopover
+          selection={inlineEdit.selection}
+          dirty={inlineEdit.dirty}
+          error={inlineError}
+          busy={inlineBusy}
+          left={inlineEdit.left}
+          top={inlineEdit.top}
+          onSubmit={(instruction) => void submitInlineEdit(instruction)}
+          onCancel={cancelInlineEdit}
+        />
       )}
     </div>
   )

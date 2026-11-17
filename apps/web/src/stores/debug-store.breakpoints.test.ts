@@ -54,7 +54,7 @@ describe('断点：乐观写入 + 防抖', () => {
 
     // 同一个 tick：UI 读到的状态已经是"这一行有断点"。
     expect(useDebugStore.getState().breakpoints).toEqual({
-      'src/main.ts': [{ line: 5, condition: null }],
+      'src/main.ts': [{ line: 5, condition: null, log: null }],
     })
     expect(sentCommands()).toEqual([])
 
@@ -68,7 +68,7 @@ describe('断点：乐观写入 + 防抖', () => {
         type: 'debug.set-breakpoints',
         botId: 'bot-1',
         file: 'src/main.ts',
-        breakpoints: [{ line: 5, condition: null }],
+        breakpoints: [{ line: 5, condition: null, log: null }],
       },
     ])
   })
@@ -78,7 +78,7 @@ describe('断点：乐观写入 + 防抖', () => {
 
     toggleBreakpoint('src/main.ts', 5)
     expect(useDebugStore.getState().breakpoints).toEqual({
-      'src/main.ts': [{ line: 5, condition: null }],
+      'src/main.ts': [{ line: 5, condition: null, log: null }],
     })
 
     toggleBreakpoint('src/main.ts', 5)
@@ -94,10 +94,10 @@ describe('断点：乐观写入 + 防抖', () => {
     useDebugStore.setState({
       breakpoints: {
         'src/a.ts': [
-          { line: 1, condition: null },
-          { line: 4, condition: 'count > 2' },
+          { line: 1, condition: null, log: null },
+          { line: 4, condition: 'count > 2', log: null },
         ],
-        'src/b.ts': [{ line: 9, condition: null }],
+        'src/b.ts': [{ line: 9, condition: null, log: null }],
       },
     })
 
@@ -116,8 +116,8 @@ describe('断点：乐观写入 + 防抖', () => {
       botId: 'bot-1',
       breakpoints: {
         'src/a.ts': [
-          { line: 2, condition: null },
-          { line: 6, condition: 'state.ready' },
+          { line: 2, condition: null, log: null },
+          { line: 6, condition: 'state.ready', log: null },
         ],
       },
     })
@@ -131,8 +131,8 @@ describe('断点：乐观写入 + 防抖', () => {
         botId: 'bot-2',
         file: 'src/a.ts',
         breakpoints: [
-          { line: 2, condition: null },
-          { line: 6, condition: 'state.ready' },
+          { line: 2, condition: null, log: null },
+          { line: 6, condition: 'state.ready', log: null },
         ],
       },
     ])
@@ -150,12 +150,12 @@ describe('断点：乐观写入 + 防抖', () => {
     expect(useDebugStore.getState().error).toContain('还没有可调试的 bot')
     // 断点本身保留：等 bot 起来（setBotId）再同步，不能让用户白点。
     expect(useDebugStore.getState().breakpoints).toEqual({
-      'src/main.ts': [{ line: 5, condition: null }],
+      'src/main.ts': [{ line: 5, condition: null, log: null }],
     })
   })
 
   it('停止调试时本来就没暂停：只清断点，不凭空发 resume', async () => {
-    useDebugStore.setState({ breakpoints: { 'src/main.ts': [{ line: 5, condition: null }] } })
+    useDebugStore.setState({ breakpoints: { 'src/main.ts': [{ line: 5, condition: null, log: null }] } })
 
     await useDebugStore.getState().stopDebugging()
 

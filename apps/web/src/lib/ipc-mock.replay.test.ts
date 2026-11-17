@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import type { ReplayReport } from '../generated'
+import type { FixtureRunReport, ReplayReport, SavedFixture } from '../generated'
 import { mockDispatch } from './ipc-mock'
 
 const BOT_ID = 'demo-bot'
@@ -72,5 +72,68 @@ describe('mockDispatch：replay_run', () => {
     await expect(
       mockDispatch({ type: 'replay_run', botId: 'nobody', from: null, limit: null }),
     ).rejects.toThrow('未知 bot')
+  })
+})
+
+/** 夹具命令的包装：mock 的返回类型是全命令联合，这里按用例收窄。 */
+async function saveFixture(path: string, limit: number | null = null): Promise<SavedFixture> {
+  return (await mockDispatch({
+    type: 'replaySaveFixture',
+    botId: BOT_ID,
+    from: null,
+    limit,
+    path,
+  })) as SavedFixture
+}
+
+async function runFixture(botId: string, path: string): Promise<FixtureRunReport> {
+  return (await mockDispatch({ type: 'fixtureRun', botId, path })) as FixtureRunReport
+}
+
+describe('mockDispatch：夹具的保存与重跑', () => {
+  it('存进去再跑：条目与回放同一批，回复可预测，出错那条仍然出错', async () => {
+    const saved = await saveFixture('.hbot/fixtures/mock-roundtrip.json')
+    // 事件数与 `replay_run` 的全量报告一致（mock 没有库，两处必须是同一批历史）。
+    expect(saved.path).toBe('.hbot/fixtures/mock-roundtrip.json')
+    expect(saved.events).toBe(3)
+
+    const report = await runFixture(BOT_ID, saved.path)
+
+    expect(report.path).toBe('.hbot/fixtures/mock-roundtrip.json')
+    expect(report.events).toBe(3)
+    expect(report.entries.map((entry) => entry.index)).toEqual([0, 1, 2])
+    expect(report.entries[0]?.replies).toEqual(['pong:在的，有什么可以帮你'])
+    // 第 3 条是历史里就没有回复的那条：重跑时 handler 抛错，一条出错不影响其余。
+    expect(report.entries[2]?.error).toContain('handler 抛错')
+    expect(report.replies).toBe(2)
+    expect(report.errors).toBe(1)
+  })
+
+  it('路径守卫：跳出项目、不是 .json 都拒绝', async () => {
+    // 复用 mock 已有的"项目内"判据（它自己带文案，不重复 -32002 前缀）。
+    await expect(saveFixture('../escape.json')).rejects.toThrow('路径必须位于项目内')
+    await expect(saveFixture('.hbot/fixtures/not-json.txt')).rejects.toThrow('.json')
+    // 允许 `.hbot/`：夹具的默认位置就在那儿（与 `assertWritable` 的"不写 .hbot"不同）。
+    await expect(saveFixture('.hbot/fixtures/allowed.json')).resolves.toBeTruthy()
+  })
+
+  it('`limit` 截断与 `0` 的拒绝与核心一致', async () => {
+    const saved = await saveFixture('.hbot/fixtures/mock-limit.json', 2)
+    expect(saved.events).toBe(2)
+    await expect(saveFixture('.hbot/fixtures/mock-zero.json', 0)).rejects.toThrow('-32002')
+  })
+
+  it('读不到的那份夹具直接报错，不静默造一份假的', async () => {
+    await expect(runFixture(BOT_ID, '.hbot/fixtures/never-saved.json')).rejects.toThrow(
+      '读不了夹具文件',
+    )
+  })
+
+  it('重跑不查库：库里没有的 bot 也能跑（`botId` 只当归属）', async () => {
+    const saved = await saveFixture('.hbot/fixtures/mock-other-bot.json')
+    const report = await runFixture('nobody', saved.path)
+
+    expect(report.events).toBe(saved.events)
+    expect(report.entries[0]?.replies.length).toBeGreaterThan(0)
   })
 })

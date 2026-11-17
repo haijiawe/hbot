@@ -33,6 +33,10 @@
  *   `project.create` → `project_create`：`data` 才是 `ProjectSummary`。
  * - `replay_run` → `replay_run`（同名）：`data` 是整份 `ReplayReport`（含逐条 `entries`）。
  *   回放不写库、不联网，核心用新 isolate 重跑后把对账结果一次回传，所以这里没有事件可等。
+ * - `replaySaveFixture` → `replay_save_fixture`：`data` 是 `SavedFixture{path, events}`；
+ *   它**只写那一个文件**（原子写），成功才有 data，路径越界 / 没有历史都是 `IpcError`。
+ * - `fixtureRun` → `fixture_run`：`data` 是整份 `FixtureRunReport`。这条**不查库**，
+ *   所以库里没有那个 bot 也照跑；`botId` 只当日志归属，仍要原样过 wire。
  */
 
 import type {
@@ -46,10 +50,12 @@ import type {
   DirEntry,
   Event as CoreEvent,
   FileContent,
+  FixtureRunReport,
   ProjectSummary,
   ReplayReport,
   Response,
   RunLog,
+  SavedFixture,
 } from '../generated'
 import type { Command, FileNode, ProjectOpenResult, ReadFileResult, WriteFileResult } from './ipc'
 
@@ -551,6 +557,23 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
         botId: command.botId,
         from: command.from,
         limit: command.limit,
+      })
+    case 'replaySaveFixture':
+      // 写一个文件 + 回一条 `SavedFixture`：没有事件可等，`data: null` 说明壳层与契约
+      // 对不上（核心成功时一定回它），所以走 `callWire` 而不是 void 变体。
+      return callWire<SavedFixture>('replay_save_fixture', {
+        type: 'replay_save_fixture',
+        botId: command.botId,
+        from: command.from,
+        limit: command.limit,
+        path: command.path,
+      })
+    case 'fixtureRun':
+      // 与 `replay_run` 同形：报告一次性回传，`entries` 与计数都在同一个 data 里。
+      return callWire<FixtureRunReport>('fixture_run', {
+        type: 'fixture_run',
+        botId: command.botId,
+        path: command.path,
       })
     case 'project.open':
       // `project_open` 成功时 data 是 `ProjectOpenResult{path}`（兼容旧的裸字符串）；

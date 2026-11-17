@@ -77,6 +77,8 @@ beforeEach(() => {
   useDebugStore.setState({
     botId: BOT_ID,
     breakpoints: {},
+    logs: [],
+    logSeq: 0,
     paused: null,
     selectedFrame: 0,
     busy: false,
@@ -225,8 +227,8 @@ describe('DebugPanel', () => {
     useDebugStore.setState({
       breakpoints: {
         'src/main.ts': [
-          { line: 3, condition: null },
-          { line: 12, condition: 'count > 3' },
+          { line: 3, condition: null, log: null },
+          { line: 12, condition: 'count > 3', log: null },
         ],
       },
     })
@@ -242,7 +244,7 @@ describe('DebugPanel', () => {
 
   it('点断点清单里的一行：编辑器跳到那个文件行', async () => {
     const user = userEvent.setup()
-    useDebugStore.setState({ breakpoints: { 'src/main.ts': [{ line: 12, condition: null }] } })
+    useDebugStore.setState({ breakpoints: { 'src/main.ts': [{ line: 12, condition: null, log: null }] } })
     render(<DebugPanel />)
 
     await user.click(screen.getByText('第 12 行').closest('button') as HTMLButtonElement)
@@ -252,5 +254,48 @@ describe('DebugPanel', () => {
       expect(workspace.activePath).toBe('src/main.ts')
       expect(workspace.reveal).toMatchObject({ path: 'src/main.ts', line: 12 })
     })
+  })
+})
+
+describe('DebugPanel 日志点输出', () => {
+  it('debug.log 进缓冲后在面板里按 file:line message 展示', () => {
+    ingest({ type: 'debug.log', botId: BOT_ID, file: 'src/main.ts', line: 7, message: '3 items' })
+    render(<DebugPanel />)
+
+    const section = screen.getByRole('region', { name: '日志点输出' })
+    expect(section.textContent).toContain('src/main.ts:7')
+    expect(section.textContent).toContain('3 items')
+  })
+
+  it('点一条日志：跳到那条日志的文件行（日志是读到就地看代码的入口）', async () => {
+    const user = userEvent.setup()
+    ingest({ type: 'debug.log', botId: BOT_ID, file: 'src/main.ts', line: 7, message: '3 items' })
+    render(<DebugPanel />)
+
+    await user.click(screen.getByText('3 items').closest('button') as HTMLButtonElement)
+
+    await waitFor(() => {
+      const workspace = useWorkspaceStore.getState()
+      expect(workspace.activePath).toBe('src/main.ts')
+      expect(workspace.reveal).toMatchObject({ path: 'src/main.ts', line: 7 })
+    })
+  })
+
+  it('日志点条目在清单里标着「日志点」（它不会停下来，别和断点混同）', () => {
+    useDebugStore.setState({
+      breakpoints: {
+        'src/main.ts': [
+          { line: 3, condition: null, log: null },
+          { line: 7, condition: null, log: 'count={count}' },
+        ],
+      },
+    })
+    render(<DebugPanel />)
+
+    const list = screen.getByRole('region', { name: '断点' })
+    expect(list.textContent).toContain('第 7 行')
+    expect(list.textContent).toContain('日志点 count={count}')
+    // 同一行的断点仍显示为断点（两样可以在同一行）。
+    expect(list.textContent).toContain('无条件')
   })
 })

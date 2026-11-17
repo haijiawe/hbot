@@ -20,6 +20,8 @@ import { AgentPanel } from '../features/agent/agent-panel'
 import { EditorArea } from '../features/editor/editor-area'
 import { ExplorerView } from '../features/explorer/explorer-view'
 import { openSearch } from '../features/search/open-search'
+// 行内编辑的桥：编辑器挂载时注册，快捷键这边只问一句"现在能不能开浮层"。
+import { requestInlineEdit } from '../lib/inline-edit'
 import { SettingsView } from '../features/settings/settings-view'
 import { restoreSessionIfSameProject, startSessionPersistence } from '../lib/session-persistence'
 import { useRunStore } from '../stores/run-store'
@@ -120,6 +122,11 @@ export function App() {
     openQuickOpen: () => setPaletteMode('files'),
     save: () => void saveActive(),
     saveAll: () => void saveAll(),
+    // 没有打开的编辑器（主编辑区懒加载未完成 / 没开文件）时快捷键按下去必须有回音，
+    // 否则用户以为快捷键坏了。这就是取消/失败的那条可见反馈。
+    inlineEdit: () => {
+      if (!requestInlineEdit()) notify('没有可编辑的选区：先打开一个文件，把光标放到要改的那一行。')
+    },
     run: () => void start(),
     stop: () => void stop(),
     toggleAgent: () => toggleAgent(),

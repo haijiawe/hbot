@@ -71,9 +71,9 @@ describe('debugStore 断点同步', () => {
         botId: 'bot-1',
         file: 'src/main.ts',
         breakpoints: [
-          { line: 1, condition: null },
-          { line: 2, condition: null },
-          { line: 3, condition: null },
+          { line: 1, condition: null, log: null },
+          { line: 2, condition: null, log: null },
+          { line: 3, condition: null, log: null },
         ],
       },
     ])
@@ -94,7 +94,7 @@ describe('debugStore 断点同步', () => {
         type: 'debug.set-breakpoints',
         botId: 'bot-1',
         file: 'src/main.ts',
-        breakpoints: [{ line: 9, condition: null }],
+        breakpoints: [{ line: 9, condition: null, log: null }],
       },
     ])
   })
@@ -115,15 +115,15 @@ describe('debugStore 断点同步', () => {
         botId: 'bot-1',
         file: 'src/a.ts',
         breakpoints: [
-          { line: 2, condition: null },
-          { line: 4, condition: null },
+          { line: 2, condition: null, log: null },
+          { line: 4, condition: null, log: null },
         ],
       },
       {
         type: 'debug.set-breakpoints',
         botId: 'bot-1',
         file: 'src/b.ts',
-        breakpoints: [{ line: 7, condition: null }],
+        breakpoints: [{ line: 7, condition: null, log: null }],
       },
     ])
   })
@@ -136,7 +136,7 @@ describe('debugStore 断点同步', () => {
     expect(useDebugStore.getState().error).toContain('bot')
     // 断点本身仍然记在界面上，启动 bot 后会重新同步。
     expect(useDebugStore.getState().breakpoints).toEqual({
-      'src/main.ts': [{ line: 1, condition: null }],
+      'src/main.ts': [{ line: 1, condition: null, log: null }],
     })
   })
 })
@@ -152,7 +152,7 @@ describe('debugStore 条件断点', () => {
         type: 'debug.set-breakpoints',
         botId: 'bot-1',
         file: 'src/main.ts',
-        breakpoints: [{ line: 12, condition: 'count > 3 && state.ready' }],
+        breakpoints: [{ line: 12, condition: 'count > 3 && state.ready', log: null }],
       },
     ])
     // 同一行再改条件：整份替换，不叠加。
@@ -165,7 +165,7 @@ describe('debugStore 条件断点', () => {
         type: 'debug.set-breakpoints',
         botId: 'bot-1',
         file: 'src/main.ts',
-        breakpoints: [{ line: 12, condition: 'count > 9' }],
+        breakpoints: [{ line: 12, condition: 'count > 9', log: null }],
       },
     ])
   })
@@ -185,11 +185,11 @@ describe('debugStore 条件断点', () => {
         type: 'debug.set-breakpoints',
         botId: 'bot-1',
         file: 'src/main.ts',
-        breakpoints: [{ line: 4, condition: null }],
+        breakpoints: [{ line: 4, condition: null, log: null }],
       },
     ])
     expect(useDebugStore.getState().breakpoints['src/main.ts']).toEqual([
-      { line: 4, condition: null },
+      { line: 4, condition: null, log: null },
     ])
   })
 
@@ -206,7 +206,7 @@ describe('debugStore 条件断点', () => {
     expect(dispatch).not.toHaveBeenCalled()
     expect(useDebugStore.getState().error).toContain('上限')
     expect(useDebugStore.getState().breakpoints['src/main.ts']).toEqual([
-      { line: 8, condition: 'ready' },
+      { line: 8, condition: 'ready', log: null },
     ])
   })
 
@@ -218,13 +218,13 @@ describe('debugStore 条件断点', () => {
     await flushDebounce()
 
     expect(useDebugStore.getState().breakpoints).toEqual({
-      'src/main.ts': [{ line: 10, condition: null }],
+      'src/main.ts': [{ line: 10, condition: null, log: null }],
     })
     expect(sentCommands().at(-1)).toEqual({
       type: 'debug.set-breakpoints',
       botId: 'bot-1',
       file: 'src/main.ts',
-      breakpoints: [{ line: 10, condition: null }],
+      breakpoints: [{ line: 10, condition: null, log: null }],
     })
   })
 })
@@ -288,8 +288,8 @@ describe('debugStore 暂停现场', () => {
       botId: 'bot-1',
       breakpoints: {
         'src/a.ts': [
-          { line: 1, condition: null },
-          { line: 2, condition: 'count > 0' },
+          { line: 1, condition: null, log: null },
+          { line: 2, condition: 'count > 0', log: null },
         ],
       },
     })

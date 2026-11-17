@@ -195,13 +195,13 @@ describe('mockDispatch：条件断点', () => {
       botId: 'demo-bot',
       file: 'src/cond.ts',
       breakpoints: [
-        { line: 3, condition: null },
-        { line: 9, condition: 'count > 3' },
+        { line: 3, condition: null, log: null },
+        { line: 9, condition: 'count > 3', log: null },
       ],
     })
     expect(mockBreakpointsOf('src/cond.ts')).toEqual([
-      { line: 3, condition: null },
-      { line: 9, condition: 'count > 3' },
+      { line: 3, condition: null, log: null },
+      { line: 9, condition: 'count > 3', log: null },
     ])
 
     await mockDispatch({

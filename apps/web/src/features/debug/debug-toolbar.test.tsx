@@ -118,10 +118,10 @@ describe('DebugToolbar', () => {
       selectedFrame: 0,
       breakpoints: {
         'src/a.ts': [
-          { line: 3, condition: null },
-          { line: 9, condition: 'count > 3' },
+          { line: 3, condition: null, log: null },
+          { line: 9, condition: 'count > 3', log: null },
         ],
-        'src/b.ts': [{ line: 5, condition: null }],
+        'src/b.ts': [{ line: 5, condition: null, log: null }],
       },
     })
     const user = userEvent.setup()

@@ -21,9 +21,11 @@ import type {
   DeviceSettings,
   DeviceStatus,
   Event as CoreEvent,
+  FixtureRunReport,
   ReplayEntry,
   ReplayReport,
   RunLog,
+  SavedFixture,
 } from '../generated'
 import type {
   BotStatus,
@@ -642,6 +644,154 @@ function mockReplayReport(
   }
 }
 
+// ---------------------------------------------------------------------------
+// 夹具：一份**内存文件系统** + 确定性重跑
+// ---------------------------------------------------------------------------
+
+/**
+ * 夹具里一条事件的形状（与核心 `hbot_bot::event_json` 的十个键一致）。
+ *
+ * 注意它不是 `generated/` 里的 DTO —— 事件是 isolate 的入参，从来不过 wire，
+ * 所以本地补一个最小接口；多出来的键核心会忽略，mock 也不造。
+ */
+interface MockFixtureEvent {
+  botId: string
+  conversationId: string
+  messageId: string
+  externalId: string
+  senderId: string
+  /** 事件里 `text` 缺失时核心会补空串（`event_json` 的语义），所以这里也恒为字符串。 */
+  text: string
+  kind: string
+  conversationExternalId: string
+  receivedAt: number
+  payload: { text: string }
+}
+
+/**
+ * mock 的夹具"磁盘"：项目内相对路径 → 文件内容（事件数组）。
+ *
+ * 为什么真的存一份而不是每次回同一个常量：面板的「保存为夹具…」之后紧跟「运行夹具…」是
+ * 一条连续操作，回常量会让第二次点击看起来像"没读到我刚存的那份"。同理，`fixture_run`
+ * 读不到路径就**报错**（真机是 `-32002`），不静默造一份假夹具。
+ */
+const mockFixtureFiles = new Map<string, MockFixtureEvent[]>()
+
+/**
+ * 夹具路径守卫：项目内 + `.json` 结尾。
+ *
+ * 与 `assertWritable` 的区别是这里**允许** `.hbot/` —— 夹具的默认位置就是
+ * `.hbot/fixtures/`（它是运行数据，不是源码），真机也只对它做"项目内"这一条要求。
+ */
+function assertFixturePath(path: string): string {
+  const normalized = assertInsideProject(path)
+  if (!normalized.toLowerCase().endsWith('.json')) {
+    throw new Error(`夹具路径必须以 .json 结尾（${path}，-32002）`)
+  }
+  return normalized
+}
+
+/**
+ * mock 的"handler"：把事件文本变成回复，**确定性**、没有随机量。
+ *
+ * 空文本会让它抛错 —— 这不是为了凑 `errors > 0`，而是照 `MOCK_REPLAY_ENTRIES` 里那条
+ * error 条目（当时 handler 抛错，历史回复为空）保持同一条线索：夹具从回放条目导出，
+ * 重跑时那条仍然炸。界面因此能在浏览器里看到"出错高亮"这条路径。
+ */
+function mockFixtureHandler(text: string): string[] {
+  if (text.trim().length === 0) {
+    throw new Error('handler 抛错：事件没有文本，mock 的 handler 拒绝空文本')
+  }
+  return [`pong:${text}`]
+}
+
+/**
+ * 造一批事件（`replay_save_fixture` 的"读库"那一步）。
+ *
+ * 数据源就是 `MOCK_REPLAY_ENTRIES`：mock 没有 SQLite，回放的历史与夹具的历史必须是
+ * 同一批，否则"存了再跑"和"直接回放"在浏览器里会给出两套说法。
+ */
+function mockFixtureEvents(
+  botId: string,
+  from: number | null,
+  limit: number | null,
+): MockFixtureEvent[] {
+  if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+    throw new Error(`replay_save_fixture: limit 必须是正整数或 null（收到 ${limit}，-32002）`)
+  }
+  const inRange = MOCK_REPLAY_ENTRIES.filter((entry) => from === null || entry.receivedAt >= from)
+  const picked = limit === null ? inRange : inRange.slice(0, limit)
+  return picked.map((entry, index) => {
+    const text = entry.historical[0] ?? ''
+    return {
+      botId,
+      conversationId: MOCK_CONVERSATION.conversationId,
+      messageId: `mock-message-${index + 1}`,
+      externalId: entry.externalId,
+      senderId: '10086',
+      text,
+      kind: 'private',
+      conversationExternalId: entry.conversationExternalId,
+      receivedAt: entry.receivedAt,
+      payload: { text },
+    }
+  })
+}
+
+/** 存夹具：校验路径与参数 → 写进内存 → 回 `SavedFixture`。 */
+function mockSaveFixture(
+  botId: string,
+  from: number | null,
+  limit: number | null,
+  path: string,
+): SavedFixture {
+  if (botId.length === 0) throw new Error('replay_save_fixture: botId 不能为空（-32002）')
+  if (botId !== BOT_ID) throw new Error(`replay_save_fixture: 未知 bot（${botId}）`)
+  const target = assertFixturePath(path)
+  const events = mockFixtureEvents(botId, from, limit)
+  if (events.length === 0) {
+    throw new Error('replay_save_fixture: 这个范围里没有可保存的历史入站（-32001）')
+  }
+  mockFixtureFiles.set(target, events)
+  return { path: target, events: events.length }
+}
+
+/** 跑夹具：只读那份内存文件，逐条过 `mockFixtureHandler`，一条出错不影响其余。 */
+function mockRunFixture(botId: string, path: string): FixtureRunReport {
+  if (botId.length === 0) throw new Error('fixture_run: botId 不能为空（-32002）')
+  // 故意**不**校验 botId 是不是演示 bot：这条命令在真机上不查库，库里没有那个 bot
+  // 也照跑。mock 若在这里拒了，前端就会误以为"夹具重跑要求库里先有 bot"。
+  const target = assertFixturePath(path)
+  const events = mockFixtureFiles.get(target)
+  if (events === undefined) {
+    throw new Error(`fixture_run: 读不了夹具文件（${target}，不存在或不是 JSON 数组，-32002）`)
+  }
+
+  let replies = 0
+  let errors = 0
+  const entries = events.map((event, index) => {
+    const text = event.text.trim().length === 0 ? null : event.text
+    let entryReplies: string[] = []
+    let error: string | null = null
+    try {
+      entryReplies = mockFixtureHandler(event.text)
+      replies += entryReplies.length
+    } catch (failure) {
+      errors += 1
+      error = failure instanceof Error ? failure.message : String(failure)
+    }
+    return {
+      index,
+      externalId: event.externalId,
+      text,
+      replies: entryReplies,
+      error,
+    }
+  })
+
+  return { path: target, events: events.length, replies, errors, entries }
+}
+
 /** mock 分发：与 `dispatch()` 的返回类型一致，由 ipc.ts 收窄。 */
 export async function mockDispatch(command: Command): Promise<CommandOutputs[CommandType]> {
   switch (command.type) {
@@ -884,6 +1034,14 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
       if (command.botId !== BOT_ID) throw new Error(`replay_run: 未知 bot（${command.botId}）`)
       return mockReplayReport(command.botId, command.from, command.limit)
     }
+
+    // 夹具：写一份、再读一份（见上面那节）。两条命令的路径守卫都与核心同一套
+    // （项目内 + `.json`），所以越界路径在 mock 里也会被拒 —— 前端测试才测得到错误分支。
+    case 'replaySaveFixture':
+      return mockSaveFixture(command.botId, command.from, command.limit, command.path)
+
+    case 'fixtureRun':
+      return mockRunFixture(command.botId, command.path)
 
     default: {
       const exhaustive: never = command

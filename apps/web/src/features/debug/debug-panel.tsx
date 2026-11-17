@@ -15,7 +15,7 @@
 import type { DebugBreakpoint, StackFrame } from '../../generated'
 import { UNSERIALIZABLE, formatDebugValue } from '../../lib/debug-format'
 import { DEBUG_STACK_WIDTH } from '../../lib/layout'
-import { useDebugStore } from '../../stores/debug-store'
+import { useDebugStore, type LogLine } from '../../stores/debug-store'
 import { useWorkspaceStore } from '../../stores/workspace-store'
 import { DebugToolbar } from './debug-toolbar'
 
@@ -44,10 +44,11 @@ function frameRows(
 }
 
 /**
- * 断点清单：按文件分组，一行一个断点（行号 + 条件原文）。
+ * 断点/日志点清单：按文件分组，一行一条（行号 + 条件原文 / 日志点模板）。
  *
  * 条件为空显示「无条件」而不是留白：留白会被读成"这一行没加载出来"。
- * 点一行跳到那个位置 —— 清单的价值一半在"我还设过哪些断点"。
+ * 日志点标一个「日志点」前缀：同一个槽位里两种条目长得像，只靠模板文本分不出来这行
+ * 到底会不会停下来。点一行跳到那个位置 —— 清单的价值一半在"我还设过哪些"。
  */
 function breakpointRows(
   breakpoints: Record<string, DebugBreakpoint[]>,
@@ -55,7 +56,11 @@ function breakpointRows(
 ) {
   const files = Object.keys(breakpoints).sort()
   if (files.length === 0) {
-    return <p className="panel-hint">还没有断点。点编辑器行号左侧的槽位添加，右键可以写条件。</p>
+    return (
+      <p className="panel-hint">
+        还没有断点或日志点。点编辑器行号左侧的槽位加断点，右键可以写条件或加日志点。
+      </p>
+    )
   }
   return files.map((file) => (
     <section className="debug__bp-file" key={file} aria-label={file}>
@@ -63,26 +68,72 @@ function breakpointRows(
         {file}
       </h3>
       <ul className="debug__bp-list">
-        {(breakpoints[file] ?? []).map((entry) => (
-          <li key={entry.line}>
-            <button
-              type="button"
-              className="debug__bp"
-              onClick={() => onOpen(file, entry.line)}
-              title={entry.condition === null ? '无条件断点' : `条件：${entry.condition}`}
-            >
-              <span className="debug__bp-line">第 {entry.line} 行</span>
-              <span
-                className={`debug__bp-condition${entry.condition === null ? ' debug__bp-condition--none' : ''}`}
+        {(breakpoints[file] ?? []).map((entry) => {
+          const isLog = entry.log !== null
+          return (
+            <li key={`${entry.line}:${isLog ? 'log' : 'break'}`}>
+              <button
+                type="button"
+                className="debug__bp"
+                onClick={() => onOpen(file, entry.line)}
+                title={
+                  isLog
+                    ? `日志点：${entry.log ?? ''}（不暂停）`
+                    : entry.condition === null
+                      ? '无条件断点'
+                      : `条件：${entry.condition}`
+                }
               >
-                {entry.condition === null ? '无条件' : entry.condition}
-              </span>
-            </button>
-          </li>
-        ))}
+                <span className="debug__bp-line">第 {entry.line} 行</span>
+                <span
+                  className={`debug__bp-condition${isLog ? ' debug__bp-condition--log' : ''}${
+                    !isLog && entry.condition === null ? ' debug__bp-condition--none' : ''
+                  }`}
+                >
+                  {isLog ? `日志点 ${entry.log ?? ''}` : entry.condition === null ? '无条件' : entry.condition}
+                </span>
+              </button>
+            </li>
+          )
+        })}
       </ul>
     </section>
   ))
+}
+
+/** 日志面板最多渲染多少行（缓冲上限是 2000，但 DOM 里挂 2000 个按钮没必要）。 */
+const MAX_RENDERED_LOGS = 200
+
+/**
+ * 日志点输出：新的一条在最上面。
+ *
+ * 顺序反过来渲染（而不是把数组反着存）：缓冲要按时间序丢最旧的，存的顺序必须是
+ * 事件顺序，只有显示层反转。
+ */
+function logRows(logs: readonly LogLine[], onOpen: (file: string, line: number) => void) {
+  if (logs.length === 0) {
+    return <p className="panel-hint">还没有日志点输出。右键行号槽位可以加日志点。</p>
+  }
+  const visible = logs.slice(-MAX_RENDERED_LOGS).reverse()
+  return (
+    <ol className="debug__logs">
+      {visible.map((entry) => (
+        <li key={entry.seq}>
+          <button
+            type="button"
+            className="debug__log"
+            onClick={() => onOpen(entry.file, entry.line)}
+            title={`${entry.file}:${entry.line}`}
+          >
+            <span className="debug__log-location">
+              {entry.file}:{entry.line}
+            </span>
+            <span className="debug__log-message">{entry.message}</span>
+          </button>
+        </li>
+      ))}
+    </ol>
+  )
 }
 
 export function DebugPanel() {
@@ -92,6 +143,8 @@ export function DebugPanel() {
   const error = useDebugStore((state) => state.error)
   const dismissError = useDebugStore((state) => state.dismissError)
   const breakpoints = useDebugStore((state) => state.breakpoints)
+  const logs = useDebugStore((state) => state.logs)
+  const clearLogs = useDebugStore((state) => state.clearLogs)
   const openAt = useWorkspaceStore((state) => state.openAt)
 
   return (
@@ -179,8 +232,27 @@ export function DebugPanel() {
       )}
 
       <section className="debug__breakpoints" aria-label="断点">
-        <h3 className="debug__bp-heading">断点</h3>
+        <h3 className="debug__bp-heading">断点与日志点</h3>
         {breakpointRows(breakpoints, (file, line) => void openAt(file, line))}
+      </section>
+
+      <section className="debug__logs-section" aria-label="日志点输出">
+        <div className="debug__logs-header">
+          <h3 className="debug__bp-heading">日志输出</h3>
+          <span className="panel-hint">
+            {logs.length} 行
+          </span>
+          <button
+            type="button"
+            className="button"
+            onClick={clearLogs}
+            disabled={logs.length === 0}
+            aria-label="清空日志输出"
+          >
+            清空
+          </button>
+        </div>
+        {logRows(logs, (file, line) => void openAt(file, line))}
       </section>
     </section>
   )

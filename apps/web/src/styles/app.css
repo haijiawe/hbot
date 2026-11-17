@@ -1576,6 +1576,17 @@ body.is-resizing {
 }
 
 /*
+ * 日志点：**实心方块**（断点是圆点）。
+ *
+ * 形状必须和圆点分得开：日志点命中**不暂停**，把它画成圆点会让人以为这里会停下来。
+ * 用 `--accent`（与断点的 `--danger` 区分）：这不是"危险操作"，是一条观察。
+ */
+.debug-logpoint {
+  background: linear-gradient(var(--accent), var(--accent)) center / 8px 8px no-repeat;
+  cursor: pointer;
+}
+
+/*
  * 行槽位的右键菜单（`editor-surface.tsx`）：绝对定位在 `.editor-surface` 里，
  * 内联条件输入框换掉同一块面板，不弹 `window.prompt`（那是阻塞式的）。
  */
@@ -1759,6 +1770,77 @@ body.is-resizing {
 .debug__bp-condition--none {
   color: var(--fg-dim);
   font-style: italic;
+}
+
+/* 日志点条目：模板用等宽 + 强调色的小标签区分（它不会停，别和断点混同）。 */
+.debug__bp-condition--log {
+  color: var(--accent);
+}
+
+/* ---------- 日志点输出 ---------- */
+
+/*
+ * 日志缓冲（`debug.log` 的环形缓冲，上限 2000 行）。新的一条在最上面：
+ * 长跑时用户要的是"刚才那几条"，不是从头读。
+ */
+.debug__logs-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  margin-top: 8px;
+}
+
+.debug__logs-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.debug__logs-header .panel-hint {
+  flex: 1 1 auto;
+  margin: 0;
+}
+
+.debug__logs {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  max-height: 200px;
+  list-style: none;
+}
+
+.debug__log {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.debug__log:hover {
+  background: var(--bg-hover);
+}
+
+.debug__log-location {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+}
+
+.debug__log-message {
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .debug-paused-line {
@@ -2565,4 +2647,251 @@ body.is-resizing {
 
 .replay-entry__mark--reordered .replay-entry__mark-label {
   color: var(--warn);
+}
+
+/* ---------- 夹具（保存快照 / 不查库重跑） ---------- */
+
+/*
+ * 夹具区与回放报告并列：上面是"历史 vs 重跑"的对账，这里是"快照跑出什么"的清单。
+ * 两者是不同动作，视觉上也要能一眼分开（一条分隔线 + 自己的标题行）。
+ */
+.replay__fixtures {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.replay__fixture-hint code {
+  font-family: var(--font-mono);
+}
+
+.replay__fixture-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* 路径比其它字段长得多：给它可伸缩的空间，两个按钮保持固定宽度。 */
+.replay__field--path {
+  flex: 1 1 auto;
+  min-width: 200px;
+}
+
+.replay__input--path {
+  width: 100%;
+  font-family: var(--font-mono);
+}
+
+.replay__fixture-save,
+.replay__fixture-run {
+  flex: 0 0 auto;
+}
+
+.replay__fixture-report {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+
+/* 出错高亮：左侧红条 + 上面那条 `role="alert"` 文案（颜色不是唯一信号）。 */
+.replay__fixture-report--error {
+  padding-left: 8px;
+  border-left: 3px solid var(--danger);
+}
+
+.replay__fixture-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.replay__fixture-table th {
+  color: var(--fg-dim);
+  font-weight: 500;
+  text-align: left;
+  padding: 2px 8px 2px 0;
+  border-bottom: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+
+.replay__fixture-table td {
+  padding: 2px 8px 2px 0;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.replay__fixture-row--error td {
+  color: var(--danger);
+}
+
+/* ---------- 问题面板的动作按钮（docs/06-ide.md §5.3） ---------- */
+
+/*
+ * 一行 = 主按钮（跳转）+ 右侧动作组。`<li>` 自己排版，主按钮保持 `flex:1 1 auto`，
+ * 所以消息的省略号仍然生效；动作组 `flex:0 0 auto` 不会被压缩。
+ */
+.problems__item {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.problems__item > .problem {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.problem__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  align-items: baseline;
+  padding-right: 6px;
+}
+
+/* 次级小按钮：不与主按钮抢视觉权重（`.button` 那一档用于面板级动作）。 */
+.problem__action {
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.problem__action:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.problem__action:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 批量入口单独占一行，压在列表上方。 */
+.problems__actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 6px 8px 0;
+}
+
+/* 未保存缓冲区提示：这是"接受 Diff 前先保存"的警告，用警示色而不是错误色。 */
+.problems__dirty {
+  margin: 6px 8px 0;
+  padding: 4px 6px;
+  border-left: 2px solid var(--warn);
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.problems__notice {
+  margin: 6px 8px 0;
+  padding: 3px 6px;
+  border-left: 2px solid var(--ok);
+  border-radius: 3px;
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 行内编辑浮层（docs/06-ide.md §3.2） ---------- */
+
+/*
+ * 就地浮层：**没有遮罩**（与 `.breakpoint-menu__backdrop` 不同）—— 用户开着浮层时
+ * 仍然可以滚动、改选区、对照上下文；它只占自己那块 360×N 的角落。
+ * `left` / `top` 由 `editor-surface.tsx` 按 Monaco 的滚动可见位置算好并夹进容器。
+ */
+.inline-edit {
+  position: absolute;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 360px;
+  padding: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  box-sizing: border-box;
+}
+
+.inline-edit__header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.inline-edit__title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inline-edit__form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inline-edit__input {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  box-sizing: border-box;
+}
+
+.inline-edit__dirty {
+  margin: 0;
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.inline-edit__error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.inline-edit__actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.inline-edit__hint {
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.4;
 }

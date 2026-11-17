@@ -24,10 +24,12 @@ import type {
   DeviceStatus as DeviceStatusDto,
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
+  FixtureRunReport as FixtureRunReportDto,
   ProjectOpenResult as ProjectOpenResultDto,
   ProjectSummary as ProjectSummaryDto,
   ReplayReport as ReplayReportDto,
   RunLog as RunLogDto,
+  SavedFixture as SavedFixtureDto,
   StepKind as StepKindDto,
 } from '../generated'
 import { dispatchViaTauri, isTauriRuntime, subscribeCoreEvents } from './ipc-tauri'
@@ -270,6 +272,26 @@ export interface CommandInputs {
    * **`0` 是 `-32002`，不等于"全量"**，界面上要自己先拦住，别把 0 发给核心）。
    */
   replay_run: { botId: string; from: number | null; limit: number | null }
+  /**
+   * 把一批历史入站存成夹具文件（wire `replay_save_fixture`）。
+   *
+   * 夹具 = 一个 JSON 数组，元素就是 isolate 收到的那份事件（`botId` / `externalId` /
+   * `text` / `receivedAt` … 十个键）。存下来之后 `fixtureRun` 可以在**不查库**的情况下
+   * 重跑同一批事件，所以它是回归用例：改了 handler 再跑一遍，看回复还在不在。
+   *
+   * `path` 按项目根解析，**只能落在项目内**（`..`、盘符、项目外绝对路径都是 `-32002`）；
+   * 默认位置是 `.hbot/fixtures/<bot>-<时间>.json`（`.hbot/` 是运行数据目录，夹具放那儿
+   * 不会被当成源码）。`from` / `limit` 与 `replay_run` 同义，`limit: 0` 同样是 `-32002`。
+   */
+  replaySaveFixture: { botId: string; from: number | null; limit: number | null; path: string }
+  /**
+   * 把一份夹具从头跑一遍（wire `fixture_run`）。
+   *
+   * **不查库、不写库、不联网**：只读 `path` 那个文件，拿当前代码逐条 dispatch，
+   * 回复收集在内存里。所以库里没有这个 bot 也照样能跑 —— 这正是它作为回归用例的用处。
+   * `botId` 只是日志里的归属标记，不参与任何查询；路径校验与 `replaySaveFixture` 同一套。
+   */
+  fixtureRun: { botId: string; path: string }
 }
 
 export type CommandType = keyof CommandInputs
@@ -336,6 +358,17 @@ export interface CommandOutputs {
    * 报告是**一次性**返回值（回放没有事件流），所以失败只可能是一条 `IpcError`。
    */
   replay_run: ReplayReportDto
+  /**
+   * 存好的夹具：`path` 是核心回显的（规范化后的）项目内路径，`events` 是写进去的事件条数。
+   * 界面拿 `events` 告诉用户"存了几条"，不要自己数 —— 截断（`limit`）发生在核心那边。
+   */
+  replaySaveFixture: SavedFixtureDto
+  /**
+   * 夹具重跑报告：`entries` 是逐条明细（`index` / `externalId` / `replies` / `error`），
+   * `errors` 是抛错条数。与 `ReplayReport` 不同，它**没有历史可比**（夹具里只有入站），
+   * 所以只有"回了什么"和"哪条炸了"，没有一致/有差异这一档。
+   */
+  fixtureRun: FixtureRunReportDto
 }
 
 export type CommandResult<T extends Command> = CommandOutputs[T['type']]
