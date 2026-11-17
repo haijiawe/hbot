@@ -694,6 +694,8 @@ pub fn sandbox_executor(
         events,
         clock: Arc::new(SystemClock),
         replies,
+        // 对等性测试不装状态能力：本文件的新断言都不依赖 `ctx.kv`。
+        state: None,
     })
     // 热重载防抖在生产里是 300ms；测试里关掉，否则每条消息都要多等一拍。
     .with_debounce(Duration::ZERO);

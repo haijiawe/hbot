@@ -91,6 +91,16 @@ pub struct SandboxHandlerConfig {
     pub clock: Arc<dyn Clock>,
     /// `ctx.reply()` 产出的回复发到这里；由 supervisor 的 drain 任务转成 outbox 行。
     pub replies: mpsc::Sender<OutboundRequest>,
+    /// 状态能力（`ctx.kv` / `ctx.history`）的装配工厂。
+    ///
+    /// `None` = 这台宿主没有装配状态端口（测试、`hbot-bench`、以及任何没走
+    /// `AppState::start_bot` 的路径），此时生成代码里 `ctx.kv.*` 每次调用都回
+    /// `HBOT_STATE_UNAVAILABLE`，**不是**静默成功。
+    ///
+    /// 与 [`Self::device`] 同一套装配纪律：存的是工厂而不是现成实例，每次新建
+    /// isolate 时现调一次，这样清单被 Agent 改过之后热重载能读到新声明
+    /// （见 `crate::app::state` 的模块文档）。
+    pub state: Option<Arc<dyn crate::app::state::StateSource>>,
 }
 
 /// 一个 worker 槽位：指纹一致就复用，不一致说明代码变了，换新 isolate。
@@ -283,6 +293,11 @@ pub struct SandboxHandler {
     /// 存的是 `Arc<dyn …>`，在**每次新建 isolate 时**才装进沙箱（`:509` 那段），
     /// 这样热重载换版本时会连白名单一起重读（清单可能刚被 Agent 改过）。
     device: Option<DeviceAssembly>,
+    /// 状态能力（`ctx.kv` / `ctx.history`）的装配工厂（`None` = 未装配）。
+    ///
+    /// 在**每次新建 isolate 时**才调 `handles()` 并 `set_state`（下面 `worker` 那段），
+    /// 所以清单里 `capabilities.state` 的改动会在热重载后生效。
+    state: Option<Arc<dyn crate::app::state::StateSource>>,
 }
 
 /// 设备能力的两个端口 + 装配时刻。
@@ -317,6 +332,7 @@ impl SandboxHandler {
             workers,
             debug: crate::app::debug::registry(),
             device: None,
+            state: config.state,
         }
     }
 
@@ -337,6 +353,20 @@ impl SandboxHandler {
         backend: Arc<dyn hbot_core::DeviceBackend>,
     ) -> Self {
         self.device = Some(DeviceAssembly { gate, backend });
+        self
+    }
+
+    /// 装配状态能力（`ctx.kv` / `ctx.history` 的工厂）。在 [`Self::new`] 之后立刻调。
+    ///
+    /// 传的是工厂而不是现成实例：清单里的 `capabilities.state` 是**项目文件**，改了它
+    /// 不会产生别的信号，所以每次起 isolate 时现读一遍（见 `crate::app::state` 的模块
+    /// 文档）。不调用本方法 = `ctx.kv.*` 每次回 `HBOT_STATE_UNAVAILABLE`，明确失败，
+    /// 不是静默放行。
+    ///
+    /// 授权判据不在这里：声明闸在 [`crate::app::state::StoreBotState`] 的每个方法第一句
+    /// （唯一一份），这里只负责"把工厂装进去"。
+    pub fn with_state(mut self, source: Arc<dyn crate::app::state::StateSource>) -> Self {
+        self.state = Some(source);
         self
     }
 
@@ -572,6 +602,13 @@ impl SandboxHandler {
             if let Some(assembly) = &self.device {
                 sandbox.set_device(Arc::clone(&assembly.gate), Arc::clone(&assembly.backend));
                 sandbox.set_device_apps(device_apps(&self.project_root));
+            }
+
+            // 状态能力：工厂现读一次清单，把两个端口装进沙箱（每个新 isolate 装一次）。
+            // 漏掉这一步只会让 `ctx.kv.*` 报"尚未装配"，是明确的失败，不是静默放行。
+            if let Some(source) = &self.state {
+                let (state, history) = source.handles(&self.project_root);
+                sandbox.set_state(state, history);
             }
             tracing::debug!(
                 bot = %self.bot_id,
@@ -1174,6 +1211,8 @@ mod tests {
                     events: Arc::clone(&events),
                     clock: Arc::new(hbot_adapters::SystemClock),
                     replies: reply_tx,
+                    // 测试夹具不装状态能力：`ctx.kv.*` 一律回 `HBOT_STATE_UNAVAILABLE`。
+                    state: None,
                 })
                 .with_debounce(debounce)
                 .with_fingerprint_ttls(metadata_ttl, content_floor),

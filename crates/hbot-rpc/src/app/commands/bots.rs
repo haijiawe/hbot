@@ -150,6 +150,11 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
             events: Arc::clone(state.events()),
             clock: Arc::clone(state.clock()),
             replies: replies_tx,
+            // 状态能力：声明闸在 `StoreBotState` 里，工厂每次起 isolate 现读清单。
+            state: Some(Arc::new(crate::app::state::StoreStateSource::new(
+                Arc::clone(state.store()),
+                Arc::clone(state.clock()),
+            ))),
         })
         // 设备能力：闸是 `AppState` 那一份（唯一判据），后端是当前平台的那一个。
         // 生产装配只有这一处 —— 别的路径（测试/bench）不装，`ctx.device.*` 会明确报
