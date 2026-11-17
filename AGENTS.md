@@ -223,6 +223,20 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
    名字**一律当没命中**、同一 `file:line` 只 warn 一次、绝不打断 handler。UI 要如实提示上面两条，
    不要写"受限求值器"这种让人以为安全的描述。
 
+51. **断点与日志点是两张表，不是给断点加一个 `kind` 字段**（2026-11-17）。`crates/hbot-core/src/debug.rs` 的
+    `Breakpoints` 同时有 `files`（会停下）与 `logs`（只打印），各自 `set()` / `set_logs()` **整份替换单个文件**。
+    若合成一张带种类的表，"只改条件"和"只改日志点"会互相清掉对方：UI 单独加一个日志点，同文件所有断点消失。
+    因此 `hbot-rpc` 的 `plan_breakpoints` 必须按"这次请求里该文件出现了什么"分别构造两路，**只在非空时才调**对应 setter。
+    另一个哨兵：`DebugSink::logged` 有默认空实现（让只想处理暂停的实现不必改），所以真实 sink 忘了覆写时
+    **日志点在 UI 里什么都不会出现，且没有任何报错** —— 加新的 sink 实现时先搜一遍 `fn logged`。
+
+52. **资源上限必须 fail-closed：装不上就拒绝执行，不是"装不上就放开"**（2026-11-17）。`crates/hbot-command/src/limits.rs`
+    与 `containment*.rs` 里，CPU/内存/进程数/IO 四条限额谁的平台原语装不上，就让这次执行返回
+    `CommandDenied::{CpuLimit,MemoryLimit,IoLimit,ProcessLimit}`（`HBOT_COMMAND_*_LIMIT`），**绝不静默降级成无限额**。
+    下游 `crates/hbot-agent/src/tools/shell.rs` 的 `denied_to_result` 把这四类归到与 `TooLong` 同一类输出（命令真跑了并被杀，
+    所以不记 denied 以免污染审批率、也不记 internal 以免误导排障）。`CommandOutput` 多了 `usage: ResourceUsage` 字段，
+    加字段会打断所有测试字面量，改 core 公开结构后先 `cargo check --workspace --all-targets` 再报清单。
+
 ---
 
 ## 8. 新增 X 的步骤

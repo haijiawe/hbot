@@ -393,10 +393,12 @@ debug build: 源码 → SWC 去类型 → 插桩（每个语句前 __hbot_trace(
 release build: 源码 → SWC 去类型 → 执行（无插桩）
 ```
 
-- `__hbot_trace` 是宿主 API，默认 O(1) 返回；命中 UI 下发的断点时才阻塞 worker 并发 `debug.paused`。
+- `__hbot_trace` 是宿主 API，默认 O(1) 返回；命中 UI 下发的断点或日志点时才进慢路径（断点阻塞 worker 并发 `debug.paused`；日志点只发 `debug.log` 后立刻继续）。
 - **运行时恒用 debug 构建，但只在有断点时 arm**（2026-11-16 落地）：`sandbox_handler` 调 `compile_project_debug`，而"arm"由 `__hbot_dbg` 这个全局标志决定 —— 该 bot 没有断点时走普通 `dispatch`，探针快路径退化成每条语句一次全局读（实测 10 文件 24µs vs release 27µs，噪声内）；有断点时才传 sink 并 arm（probe-dense handler 最坏 **4.64×**，上限 5×）。两种构建的**编译产物大小**差别很大（10 文件 1,480 B → 20,596 B），这是"用不用都先付一点"的代价，换掉"断点在 release 构建上静默永不命中"这个更坏的失败模式。
 - 断点支持**行断点与条件断点**（条件于 2026-11-17 落地）。条件是一段 **JS 表达式**，在 isolate 的 JS 侧求值 —— 只有那里同时有 `ctx`、局部变量与模块作用域。三条硬约束：① 编译失败、抛错、引用不存在的名字一律当作**没命中**，同一个 `file:line` 只 warn 一次，绝不打断 handler；② 求值只发生在探针判为候选命中之后，**无条件路径的探针形状没变**（4.64× 预算未动）；③ 不支持 `await`（`new Function` 里顶层 await 是语法错误）。
   - 由此带来的两个可观察行为（都实测过，别当 bug）：条件里**能调用宿主函数**（`ctx.reply()` 会真发消息）；条件里**给名字赋值不生效**（scope 是快照），但改对象属性会真生效。
+  - **日志点（2026-11-17 落地）**：`debug_set_breakpoints` 里 `log` 非空的条目**不暂停**，命中时展开模板（`{count} items`）发 `debug.log` 然后照常跑。三条硬约束：① 单个表达式求值失败只把**那一段**换成 `<错误>`（同一条消息其余部分照常输出）；② 模板编译失败（括号不配对、嵌套 `{`）这个日志点静默，同一 `file:line` 只 warn 一次，绝不打断 handler；③ 模板编译结果按 `fileId:line` 缓存，模板字符串变了才重建。**一张日志点消息的求值成本只发生在命中时**，无日志点的快路径与之前完全一致（探针形状未变，4.64× 未动）。同一行既是断点又是日志点时，日志先发、再暂停。
+  - 日志点的模板上限是 **500 字符**（按字符算，中文正常用法）、条件上限 200；两个校验都在"bot 是否在跑"之前，参数错不会被 `-32005` 掩盖。
 - 步进**不靠 enter/exit 插桩**，而是在暂停那一刻读一次 `new Error().stack` 得到逻辑深度：`stepOver` = 下一条 `depth <= d`、`stepInto` = 下一条任意深度、`stepOut` = 下一条 `depth < d`。代价是"从一个长循环体里 StepOut"最坏可逼近 `handler_timeout`；好处是不用每个函数出口都插桩。
 - 暂停**不抵消** handler 超时：`handler_timeout` 照旧生效，用户挂太久也会 `HBOT_TIMEOUT`。
 - `Continue` 后同一 `(file, line)` 的后续语句会被抑制直到换行 —— 满足"不重复停在同一行"，代价是"整行写成的循环"一个事件只停一次。
@@ -408,23 +410,32 @@ release build: 源码 → SWC 去类型 → 执行（无插桩）
 
 详细 UI 与交互见 [06-ide.md](06-ide.md) 第 6 节。
 
-#### 6.5.1 调试端口契约（冻结，2026-11-16）
+#### 6.5.1 调试端口契约（冻结 2026-11-16，2026-11-17 加日志点）
 
 跨 crate 的对接面只有一处：`crates/hbot-core/src/debug.rs`。`hbot-code` 实现它，`hbot-rpc` 适配它，两边都只依赖 `hbot-core`，因此可以直接并行开发。
 
 ```rust
 // crates/hbot-core/src/debug.rs —— 冻结，改动必须走 ADR
-// 2026-11-17 起断点带可选的 JS 条件（ADR 记录在 02 §6.5 与 06 §6）
-pub struct Breakpoints { /* files: BTreeMap<String, BTreeMap<u32, Option<String>>> */ }
+// 2026-11-17：断点带可选 JS 条件；同日再加日志点与 LoggedAt
+pub struct Breakpoints {
+    /// 会停下的断点：文件 → 行 → 可选 JS 条件
+    /* files: BTreeMap<String, BTreeMap<u32, Option<String>>> */
+    /// 只打印的日志点：文件 → 行 → 消息模板（模板里的 {expr} 在 isolate 里展开）
+    /* logs:  BTreeMap<String, BTreeMap<u32, String>> */
+}
 impl Breakpoints {
     pub fn new() -> Self;
-    /// 空 map = 移除该文件；行号 0 忽略；`None` 表示无条件
+    /// 整份替换该文件的**断点表**；空 map = 移除该文件；行号 0 忽略；`None` 表示无条件
     pub fn set(&mut self, file: &str, lines: BTreeMap<u32, Option<String>>);
+    /// 整份替换该文件的**日志点表**；空表 = 移除该文件；行号 0 忽略；空白模板丢弃
+    pub fn set_logs(&mut self, file: impl Into<String>, entries: impl IntoIterator<Item = (u32, String)>);
     pub fn clear(&mut self);
-    pub fn is_empty(&self) -> bool;
+    pub fn is_empty(&self) -> bool;   // 两张表都空才为 true
     pub fn lines_of(&self, file: &str) -> Option<&BTreeMap<u32, Option<String>>>;
     pub fn condition_of(&self, file: &str, line: u32) -> Option<&str>;
+    pub fn log_of(&self, file: &str, line: u32) -> Option<&str>;
     pub fn files(&self) -> impl Iterator<Item = &str>;
+    /// 断点或日志点任一命中都算命中（插桩只需回答"这行要不要进慢路径"）
     pub fn hits(&self, file: &str, line: u32) -> bool;
 }
 
@@ -436,18 +447,27 @@ pub struct PausedAt {
     /// 非 `None` = 这次是条件算出为真才停（UI 用它解释"为什么停在这"）
     pub condition: Option<String>,
 }
+/// 日志点命中（不暂停）。`message` 已展开，展开失败的那一段是 `<错误>`。
+pub struct LoggedAt { pub file: String, pub line: u32, pub column: u32, pub message: String }
 pub enum DebugAction { Continue, StepOver, StepInto, StepOut }
 
 /// 同步阻塞：实现方负责超时并返回 `Continue`（建议 5 分钟 = 用户去泡杯咖啡）。
-pub trait DebugSink: Send + Sync { fn paused(&self, at: PausedAt) -> DebugAction; }
+pub trait DebugSink: Send + Sync {
+    fn paused(&self, at: PausedAt) -> DebugAction;
+    /// 默认空实现：只想处理暂停的实现与既有假 sink 不必改；真实实现必须覆写，
+    /// 否则日志点在 UI 里什么都不会出现（这是唯一一处"不覆写也不会报错"的哨兵）。
+    fn logged(&self, at: LoggedAt) { let _ = at; }
+}
 ```
+
+**为什么是两张表而不是给断点加 `kind` 字段**：`set()` 的语义是"整份替换这个文件的断点"。若把断点扩成带种类的合一表，"只改条件"和"只改日志点"会互相清掉对方——UI 单独加一个日志点就会把同文件所有断点删掉。两张表各自整份替换，互不干扰，`rpc` 层因此要按"这次请求里该文件出现了什么"分别构造两路，**只在非空时才调**对应 setter。
 
 两边各自的入口：
 
 | 侧 | 入口 | 约束 |
 |---|---|---|
-| `hbot-code` | `Sandbox::set_breakpoints(&self, Breakpoints)`、`Sandbox::dispatch_with_debug(&self, &Value, Option<&dyn DebugSink>)` | `DebugSink` 只能在 worker 线程里调用，绝不能在 reactor 线程阻塞 |
-| `hbot-rpc` | `Command::DebugSetBreakpoints{botId,file,breakpoints:[{line,condition}]}` / `DebugResume{botId}` / `DebugStep{botId,kind}` → `Event::DebugPaused{botId,file,line,scopes,callStack,condition}` / `DebugResumed{botId}` | 调试单位是 **bot** 而不是 agent 会话：断点属于某个 bot 的 isolate。`breakpoints: []` 取消该文件全部断点（整份替换语义），条件按**字符**计上限 200（超了 -32002，且校验在 bot 状态检查之前） |
+| `hbot-code` | `Sandbox::set_breakpoints(&self, Breakpoints)`、`Sandbox::dispatch_with_debug(&self, &Value, Option<&dyn DebugSink>)` | `DebugSink` 只能在 worker 线程里调用，绝不能在 reactor 线程阻塞。`logged` 走 `catch_unwind`，sink 里 panic 不能把 handler 带走 |
+| `hbot-rpc` | `Command::DebugSetBreakpoints{botId,file,breakpoints:[{line,condition,log}]}` / `DebugResume{botId}` / `DebugStep{botId,kind}` → `Event::DebugPaused{botId,file,line,scopes,callStack,condition}` / `DebugResumed{botId}` / `Event::DebugLog{botId,file,line,message}` | 调试单位是 **bot** 而不是 agent 会话：断点属于某个 bot 的 isolate。`breakpoints: []` 取消该文件全部断点与日志点；条件按**字符**计上限 200、日志模板上限 500（超了 -32002，且校验都在 bot 状态检查之前）。`log` 非空 = 日志点（**不暂停**）；`log` 与 `condition` 不能在同一条条目上组合——要"既打印又停下"就发两条条目，两路各记各的表 |
 
 为什么单位是 bot：同一份源码在两个 bot 的 isolate 里可以是不同版本（热重载时机不同），断点按会话走会串味。
 
@@ -591,6 +611,8 @@ pub enum Command {
 | `project_open` | `ProjectOpenResult{path}` | 返回核心规范化后的绝对路径；**只返回路径不返回 `name`/`entry`**，因为打开一个目录不要求它已经有 `hbot.json`（`project_create` 才会 scaffold） |
 | `project_create` | `ProjectSummary{path,name,entry}` | 新建成功后的项目摘要；`-32003` 表示目录非空或同路径已登记 |
 | `replay_run` | `ReplayReport{project,bot,from,limit,events,matchedEvents,differingEvents,failedEvents,same,extra,missing,reordered,entries[]}` | **只读、不联网**：用 `store.list_inbound_history_for_bot` 取历史事件，`dispatch_collecting` 收集回复，不写库也不调平台。`limit:0` 是 -32002；bot 或历史不存在是 -32001；编译/isolate 失败是 -32006。wire 里**没有** `database` 字段（IDE 不需要知道读的是哪份库） |
+| `replay_save_fixture` | `SavedFixture{path,events}` | **只读库、只写一个文件**：把历史入站导出成 JSON 数组夹具。`limit:0` 或路径为空/解析后落项目外是 -32002；没有历史/没有该 bot 是 -32001；写盘失败 -32006。**父目录可以不存在**（连同父目录一起建，原子写）。 |
+| `fixture_run` | `FixtureRunReport{path,events,replies,errors,entries[]}` | **不查库**：只读夹具文件、用当前代码重跑，所以夹具里的 bot 即使已从库里删掉也能跑。路径非法/文件不存在/不是 JSON 数组 = -32002；编译或 isolate 起不来 = -32006。`entries[].error` 非空表示那一轮 handler 抛错。 |
 
 - 桌面：Tauri `#[tauri::command] dispatch(cmd) -> Response`。
 - 后台/浏览器：JSON-RPC 2.0，唯一 method `dispatch`，`params = { command }`。
@@ -658,13 +680,17 @@ project.changed    { path, kind }
 file.search        { searchId, matches }   // 流式
 diagnostics        { path, items }
 agent.diff         { editId, files }       // 待审查的写入
-debug.paused       { botId, file, line, scopes, callStack }
+debug.paused       { botId, file, line, condition?, scopes, callStack }
 debug.resumed      { botId }
+debug.log          { botId, file, line, message }   // 日志点：不暂停，只打印
+device.status      { status }                       // 设备会话状态变化
+device.request     { botId, sub, reason, requestId } // bot 代码请求授权
+device.settings    { settings }                      // 宿主设置被改写/外部改动
 ```
 
 - 每连接有界发送队列（1024）；`agent.delta` 可合并，`approval.request`/`bot.status` 优先。
 - UI 断线重连后先拉快照，再订阅增量；不做“只靠事件”的状态。
-- 事件名清单（UI 侧订阅用）：`agent.delta` `agent.step` `agent.tool` `agent.diff` `approval.request` `bot.status` `run.log` `project.changed` `file.search` `diagnostics` `debug.paused` `debug.resumed`。改名等于改协议。
+- 事件名清单（UI 侧订阅用，共 16 个）：`agent.delta` `agent.step` `agent.tool` `agent.diff` `approval.request` `bot.status` `run.log` `project.changed` `file.search` `diagnostics` `debug.paused` `debug.resumed` `debug.log` `device.status` `device.request` `device.settings`。改名等于改协议；`crates/hbot-rpc/tests/events.rs` 钉住这 16 个名字。
 
 ### 9.3 鉴权与来源
 

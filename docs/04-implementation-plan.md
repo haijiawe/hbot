@@ -125,20 +125,20 @@
 1. 全局搜索/替换（流式、正则、glob）、符号大纲、重命名符号、多光标、分栏、面包屑。
 2. 行内编辑（`Cmd/Ctrl+K`）、问题面板 `Fix`、运行失败 `Ask Agent to fix`、整组撤销。
    - 2026-11-17 **整组撤销已落地**（web 侧）：`edit_apply` 在核心侧**真的写盘**并把 `saved` 对齐到 after，所以撤销只回退编辑器文本与标签、**不动 `saved`** —— 文件因此正确变成"有未保存改动"，保存一次才回到应用前。Monaco 的撤销栈按 model 各自独立，跨文件的"一次 Ctrl+Z"在 Monaco 里不存在，所以在应用那一刻拍一份浅快照（存字符串引用，不深拷贝），由卡片上的「撤销这次应用」承担。
-   - **仍未做**：行内编辑、`Fix`、`Ask Agent to fix`。
+   - 2026-11-17 **行内编辑与两个修复入口已落地**：`Cmd/Ctrl+K` 行内编辑（`apps/web/src/features/editor/inline-edit-popover.tsx` + 快捷键真源 `apps/web/src/lib/keybindings.ts` 的 `inline-edit`）、问题面板的 `Fix`（仅机械可修的一类：`HBOT_BARE_IMPORT`，`apps/web/src/lib/quick-fix.ts` 的 `canFixMechanically` 穷举 switch、默认 `false`，修法只把裸包名改成相对路径）与 `Ask Agent to fix` / `Ask Agent to fix all`（`apps/web/src/lib/agent-requests.ts`，把问题、光标、未保存缓冲区状态一起交给 Agent，从不自己写盘）。
 3. 命令面板、快捷键、布局单一真源、面板懒加载、主题与 i18n。
 4. **调试构建**：SWC 插桩、行断点、局部变量、步进、调用栈；运行时恒用 debug 构建但只在有断点时 arm；release 无插桩（`hbot check`/diagnostics 用 release）。
    - 2026-11-16 已落地（勾掉的部分）：插桩器 `crates/hbot-code/src/instrument.rs`、宿主 `runtime/debug_host.rs`、`BuildMode`/`DebugInfo`/`source_position`、`Sandbox::dispatch_with_debug`、rpc 三命令两事件（`app/debug/`）、web 断点/工具条/暂停面板、ws critical 通道。实测开销 **4.64×**（上限 5×）。
-   - **仍未做**：日志点、变量分页。
+   - 2026-11-17 **日志点与变量分页已落地**：`Breakpoints` 加第二张表 `logs`（断点与日志点各自整份替换单个文件，见 `AGENTS.md` 坑 51），`log` 非空即日志点、命中只发 `debug.log` 不暂停，模板 `{expr}` 在 isolate 的 JS 侧展开、单段失败换 `<错误>`；面板的日志区环形缓冲 2000 行、只渲染前 200 行。
    - 2026-11-17 **条件断点已落地**：`Breakpoints` 内部改成 `file -> line -> Option<条件>`（核心里仍不求值，只回答"这行有没有断点、条件是什么"），求值在 isolate 的 JS 侧（`new Function` + `with(scope)`，同一 `file:line` 缓存编译结果）。坏条件、抛错、引用不存在的名字一律**当作没命中**，同一行只 warn 一次；只有探针判为候选命中且非单步时才求值，所以无条件路径的探针形状没变（4.64× 未动）。wire：`debug_set_breakpoints { breakpoints: [{ line, condition }] }`，条件按字符计上限 200，超了 -32002 且校验在 bot 状态检查之前；`debug.paused` 带 `condition` 解释"为什么停在这"。两个反直觉但实测成立的行为：条件里**能调宿主函数**（`ctx.reply()` 会真发消息）、条件里给名字赋值不生效（scope 是快照），改对象属性则真生效。
-5. **回放**（FR-27）：`hbot replay <project-dir> --bot <bot-id> [--limit N] [--from <RFC3339>] [--json] [--save-fixture <path>]`。
+5. **回放**（FR-27）：`hbot replay <project-dir> --bot <bot-id> [--limit N] [--from <RFC3339>] [--json] [--save-fixture <path>]`；夹具复用走 `hbot fixture save|run`。
    - 2026-11-16 **后端已落地**：按 `(received_at, rowid)` 读 `<project>/.hbot/hbot.db` 的历史入站（**含已处理**——已处理才是"当时真跑过"的证据），按 `outbound.reply_to = inbound.external_id` 取当时的历史出站（被动回复的 `reply_to` 就是入站 `external_id`；时间窗口不可靠：同毫秒可多条入站、`ctx.sleep` 也能跨事件延迟回复）；然后用 `manifest::load` → `compile_project_with_entry` → `Sandbox::spawn` → 逐条 `dispatch_collecting` 这条**与生产相同**的路径在新 isolate 里重跑，事件 JSON 逐字复刻生产 `sandbox_handler` 的 `event_json`。
    - 对比结论四类：**一致 / 多出 / 缺少 / 顺序不同**（多重集匹配 + 最长递增子序列判顺序）。退出码三档：`0` 全一致、`1` 有差异、`2` 回放跑不起来（库缺失、bot 不存在、清单/编译失败…）；单条 handler 抛异常算"有差异"（1），不算"跑挂"。
    - `--save-fixture` 把这一批入站 `payload_json` 存成 JSON 数组（含 OneBot 11 原始事件，嵌在 `raw` 下），供后续 mock/回归复用。
    - 落地位置：`crates/hbot-cli/src/replay.rs`、`hbot-store` 两条只读查询（`list_inbound_history_for_bot` / `list_outbound_by_reply_to`，只加不改）、`crates/hbot-cli/tests/replay.rs`（真 scaffold + 真库 + spawn 真二进制的端到端）。
    - 2026-11-17 **内核搬进独立 crate 并有 UI 入口**：`crates/hbot-replay`（签名改成 `replay(store: &Store, options)`，因为 CLI 读 `<project>/.hbot/hbot.db`、桌面/无头读 `data_dir` 下的库，两者不是同一个文件），`hbot-cli/src/replay.rs` 941 → 197 行只剩解析/打印/退出码；新命令 `replay_run { botId, from, limit }`（只读、不联网）；第七个 lazy 页签回放面板（独立 chunk 7.62 kB）。错误码：没有项目或 `limit: 0` → -32002，bot/历史不存在 → -32001，编译或 isolate 失败 → -32006。wire 里**没有** `database` 字段（IDE 不需要知道读的是哪份库）。
-   - **仍未做**：fixture 的**复用端**（把 fixture 喂回 `mock` 事件与回归跑、跨项目共享）；跨事件的时间对齐（`ctx.sleep` 造成的延迟回复只能按 `reply_to` 归属，还原不了"当时在第几毫秒回"）。
-6. 项目模板、`AGENTS.md` 项目规则、多项目切换；每项目独立 DB 与日志。
+    - - 2026-11-17 **夹具复用端已落地**：`hbot fixture save <project> --bot <id> [--from] [--limit] [--path]` 从历史入站导出、`hbot fixture run <project> --path <file>` **完全不查库**地重跑（只读这一份 JSON），同名 rpc 命令 `replay_save_fixture { botId, from, limit, path }` / `fixture_run { botId, path }`，回放页签里有夹具区。夹具文件是**顶层 JSON 数组**，元素与运行时事件同形状（十键，由 `hbot_bot::event_json` 唯一生成）；多出的键忽略（向前兼容）、缺必填键报"第 N 条不是合法的事件对象"且**不静默跳过**。路径守卫在 `crates/hbot-replay/src/fixture.rs:369`（`resolve_fixture_path` 拒绝写出项目外，`!resolved.starts_with(&root)` 判据），写盘走 `hbot-workspace` 的原子写。**`--path` 的父目录可以不存在**（连同父目录一起建）。
+    - - **仍未做**：跨项目共享夹具（现在夹具属于单个项目目录）、跨事件的时间对齐（`ctx.sleep` 造成的延迟回复只能按 `reply_to` 归属，还原不了"当时在第几毫秒回"）。
 
 **出口**：
 

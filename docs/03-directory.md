@@ -38,7 +38,7 @@ crates/
   hbot-bot/              平台无关的 bot supervisor、会话队列、outbox、去重
   hbot-workspace/        项目文件、文件监听、全局搜索、符号/源码映射、编辑事务
   hbot-command/          受控命令执行：进程树隔离、程序清单、cwd/env 守卫、输出上限（只依赖 hbot-core）
-  hbot-replay/           回放内核：按历史 inbound 重跑 handler 并比对出站（依赖 core/store/code/bot）
+  hbot-replay/           回放内核：按历史 inbound 重跑 handler 并比对出站（依赖 core/store/code/bot/workspace）
   hbot-adapters/         OneBot/Webhook/Telegram…、keyring、HTTP 客户端、文件系统
   hbot-rpc/              Command/Event DTO、dispatch、WS 服务
   hbot-cli/              `hbot` 二进制：serve / check / run
@@ -70,9 +70,11 @@ hbot-bot 只依赖 hbot-core + hbot-store（自己定义它需要的平台端口
 5. `hbot-adapters` 只依赖 `hbot-core`；不得 import 具体服务 crate。
 5.1 `hbot-command` 只依赖 `hbot-core`：它实现 `hbot_core::ports::CommandRunner`，**不许**认识
    `hbot-agent`（agent 依赖它，不是反过来）；平台差异用 `cfg` + 自写 FFI，不引入第三方 crate。
-5.2 `hbot-replay` 依赖 `hbot-core` + `hbot-store` + `hbot-code` + `hbot-bot`，**不许**依赖
-   `hbot-rpc`/`hbot-cli`/`hbot-desktop`。它接收**调用方给的 `&Store`** 而不是自己去猜库路径：
+5.2 `hbot-replay` 依赖 `hbot-core` + `hbot-store` + `hbot-code` + `hbot-bot` + `hbot-workspace`，
+   **不许**依赖 `hbot-rpc`/`hbot-cli`/`hbot-desktop`。它接收**调用方给的 `&Store`** 而不是自己去猜库路径：
    CLI 读 `<project>/.hbot/hbot.db`，桌面/无头读 `data_dir` 下的库，两者不是同一个文件。
+   `hbot-workspace` 是 2026-11-17 加夹具（`fixture save` / `fixture run`）时显式加的：夹具文件的
+   "必须在项目内"判据与原子写复用 `Workspace`，**不**在回放层另造一份路径守卫。
 - **端口由消费方定义**：`hbot-bot` 里声明 `trait BotAdapter`（`crates/hbot-bot/src/adapter.rs`，`id/declared_conversations/subscribe/send`），`hbot-adapters` 只提供具体平台实现（`OneBotClient` 等）。两者之间的桥接（把 `OneBot` 的 `NormalizedInbound`/`OutboundSender` 适配成 `BotAdapter`）放在**组合根**（`hbot-rpc/src/bridge/` 或 `hbot-cli`），不放 bot、也不放 adapters —— 否则 bot 就得依赖 adapters，而 adapters 又可能想依赖 bot，形成双向。
 6. `hbot-rpc` 可以依赖六个实现 crate（store/code/bot/agent/workspace/replay），但只做参数校验、编排、错误映射；业务规则不下沉。
 7. `hbot-desktop` 不含业务规则；只做“Tauri ↔ core”的适配与窗口/托盘/更新。
