@@ -28,6 +28,59 @@
 //!
 //! 三道都过之后才碰 `SendInput`。`SendInput` 只送进一部分事件也当失败（不重试：UIPI 拦住的
 //! 重试一万次也一样，反而让"按了一半"的状态更难收拾）。
+//!
+//! # DPI：实测数字、声明前后各是什么，以及本 crate 做不到什么
+//!
+//! 这一节回答那个反复被问的问题："声明 Per-Monitor V2 之后，`GetMonitorInfoW` 的
+//! `rcMonitor` 是物理像素还是逻辑像素？`CreateDCW` 抓到的位图尺寸等于 `rcMonitor` 吗？"
+//!
+//! **先给结论，再给数字。**
+//!
+//! * 进程是 **DPI-Unaware**（没有 manifest、也没调运行时 API）时，系统对**本进程**虚拟化：
+//!   `rcMonitor` 是逻辑像素（`物理 / 缩放比`），`CreateDCW(szDevice)` 建出来的 DC 也被钉成
+//!   `LOGPIXELSX = 96`，`BitBlt` 抓出来的位图与 `rcMonitor` **一样大**（也一起被虚拟化）。
+//!   所以"截图宽高 = rcMonitor 宽高"这条**恒成立**，但两个都不是物理像素 —— 在 150% 缩放下
+//!   1920 宽的屏会报 1280、抓出 1280；把这张 1280 宽的图按 1280 归一化去点 1920 宽的物理屏，
+//!   点就落在 `x * 1920/1280 = 1.5x` 的位置。**上一批 `device-win2` 的跨屏点击偏差就是这个。**
+//! * 进程是 **Per-Monitor V2** 时，`rcMonitor` 是**物理像素**，`GetDeviceCaps(DESKTOPHORZRES)`
+//!   与它相等，`CreateDCW` 抓到的位图也等于它 —— 三者对齐，归一化坐标与像素坐标是同一个东西。
+//!
+//! 本机实测（Windows 11 26300，笔记本单屏 1920×1080，**100% 缩放**，`GetDpiForSystem() = 96`）：
+//!
+//! | 量 | 声明前（DPI-Unaware） | 声明后（Per-Monitor V2） |
+//! |---|---|---|
+//! | `GetDpiForSystem()` | 96 | 96 |
+//! | `GetDpiForMonitor(MDT_EFFECTIVE_DPI)` | 96 | 96 |
+//! | `rcMonitor` | 1920×1080 | 1920×1080 |
+//! | `GetDeviceCaps(DESKTOPHORZRES/VERTRES)` | 1920×1080 | 1920×1080 |
+//! | `GetDeviceCaps(LOGPIXELSX)` | 96 | 96 |
+//! | 截图位图 | 1920×1080 | 1920×1080 |
+//!
+//! **这张表不能证明虚拟化存在 —— 它证明的是本机 100% 缩放，所以没有虚拟化可做。** 上表四个
+//! 尺寸在两种档位下全等，正是"100% 缩放下两种档位等价"的实证；150% 缩放下声明前的
+//! `rcMonitor`/位图会变成 1280×720（1920/1.5），声明后仍是 1920×1080。这条是**系统文档
+//! 保证的行为**（DPI Virtualization），本机没有 150% 缩放可测，如实标注为未实测。
+//!
+//! 复现命令（真机、无需 GUI）：`cargo test -p hbot-device --test windows_dpi -- --nocapture`
+//! —— 它会把"声明前/声明后"两组数字打成表，并断言每块屏的 `scale_percent > 0`、
+//! `dpi_x`/`dpi_y` 在 96..=480、`display_metrics()` 与 `displays()` 一一对应。
+//!
+//! ## 本 crate 做不到什么（别在这里想办法）
+//!
+//! 1. **装 manifest**：Per-Monitor V2 的首选声明方式是 PE manifest，那是**可执行文件**的
+//!    资源，库改不了调用方的 exe；`hbot-device` 被 `hbot-rpc`/`hbot-cli`/`hbot-desktop`
+//!    三方共用，给其中一个装都会污染另外两个。运行时 API 那半套也必须在**宿主的最早期**
+//!    调用（窗口/WebView 创建之前），所以它属于壳 —— `crates/hbot-desktop/src/dpi.rs`。
+//! 2. **替宿主声明**：库里调用 `SetProcessDpiAwarenessContext` 会让"谁改了我的进程"变成
+//!    无法追查的隐式副作用（而且顺序取决于库的加载时机）。本 crate 只**读**当前档位的后果
+//!    （[`crate::display_metrics`] 的 `size_delta()`），不改变它。
+//! 3. **混合 DPI 下的跨屏拼图**：`screenshot(Some(i))` 每次只抓一块屏，跨屏拼图要调用方自己
+//!    按 `DisplayInfo` 的 `(x, y, width, height)` 摆放；当两块屏缩放比不同时，**逻辑坐标与
+//!    物理坐标没有统一的换算比**，任何"拼一张大图"的方案都得先选定基准坐标空间。本 crate
+//!    不替调用方选（选错了比不拼更糟）。
+//! 4. **WebView 内部**：Tauri 的 WebView2 有自己的 DPI 处理，本 crate 与壳的声明只影响
+//!    Win32 这一侧（`rcMonitor`/截图/`SendInput` 的坐标）。WebView 里 CSS 像素与屏幕像素的
+//!    换算由 WebView2 负责，不受这里影响。
 
 use std::ffi::c_void;
 use std::ptr;
@@ -46,9 +99,9 @@ use windows::Storage::Streams::DataWriter;
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GlobalFree, HANDLE, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDCW, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
-    GetWindowDC, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO, MONITORINFOEXW, ReleaseDC, SRCCOPY,
-    SelectObject,
+    DESKTOPHORZRES, DESKTOPVERTRES, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors,
+    GetDC, GetDeviceCaps, GetMonitorInfoW, GetWindowDC, HBITMAP, HDC, HGDIOBJ, HMONITOR,
+    LOGPIXELSX, MONITORINFO, MONITORINFOEXW, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows_sys::Win32::Storage::Xps::PrintWindow;
 // WinRT 的异步对象要求线程先初始化公寓（`RoInitialize` 就是 COM 公寓初始化的薄封装）。
@@ -66,6 +119,7 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
@@ -81,8 +135,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::{
-    Combo, ComboKey, ComboModifier, DisplayInfo, app_is_allowed, enforce_limit, parse_combo, png,
-    process_name,
+    Combo, ComboKey, ComboModifier, DisplayInfo, DisplayMetrics, app_is_allowed, enforce_limit,
+    parse_combo, png, process_name,
 };
 
 /// 窗口枚举上限（`docs/09` §6.3：列表是给人/模型看的，几百个窗口没有意义）。
@@ -575,13 +629,87 @@ impl WindowsBackend {
             }
         }
     }
+
+    /// 本机每块屏的 DPI / 缩放 / 虚拟化诊断指标（见 [`crate::DisplayMetrics`]）。
+    ///
+    /// 与 [`Self::displays`] 同一套枚举与排序（同一次 `EnumDisplayMonitors`、同样的三条
+    /// 排序键），所以两个列表的下标是**一一对应**的；区别是这里额外量了每块屏的物理像素
+    /// （`CreateDCW` + `GetDeviceCaps(DESKTOPHORZRES)`）与 DC 的 `LOGPIXELSX`。
+    ///
+    /// 探测失败时返回空 `Vec`（契约同 [`Self::displays`]：这是清单/诊断，不是错误码路径）。
+    /// 单块屏拿不到 DC 或 DPI 时**不整体失败**，只退化成 `rcMonitor` 尺寸 / 进程 DPI 并留
+    /// debug 日志 —— 一块屏量不准不该让整份诊断没有输出。
+    pub fn display_metrics() -> Vec<DisplayMetrics> {
+        match enumerate_monitor_facts() {
+            Ok(facts) => facts
+                .iter()
+                .enumerate()
+                .map(|(index, fact)| metrics_of(fact, index as u32))
+                .collect(),
+            Err(error) => {
+                tracing::debug!(error = %error, "枚举显示器失败，诊断指标返回空");
+                Vec::new()
+            }
+        }
+    }
+
+    /// 进程级 DPI（`GetDpiForSystem()`；100% = 96、150% = 144）。
+    ///
+    /// 这是**进程**的属性，与每块屏的 [`DisplayInfo::dpi_x`] 不同：DPI-Unaware 进程这里恒为
+    /// 96，Per-Monitor V2 进程拿到主屏的有效 DPI。
+    pub fn system_dpi() -> u32 {
+        process_dpi()
+    }
 }
 
-/// `EnumDisplayMonitors` 的回调：把每块屏的 `MONITORINFOEXW` 收集起来。
+/// `EnumDisplayMonitors` 回调交回来的原始事实：`MONITORINFOEXW` 与它对应的 `HMONITOR`。
+///
+/// **为什么连 `HMONITOR` 一起留着**：`GetDpiForMonitor` 只认 `HMONITOR`，而 `MONITORINFOEXW`
+/// 里没有句柄字段；排序又是按 `rcMonitor`/设备名做的，排完就找不到"哪块屏是哪个句柄"了。
+/// 所以在回调里顺手把句柄存下来，排序时一起搬 —— 之后 `DisplayInfo`（加 DPI）与
+/// `DisplayMetrics`（再加物理尺寸）都从同一份事实出，不会出现"清单和指标各枚举一次、
+/// 序号对不上"的分叉。
+struct MonitorFacts {
+    /// 系统给的显示器信息（`rcMonitor`、`dwFlags`、`szDevice`）。
+    info: MONITORINFOEXW,
+    /// 这块屏的句柄（`GetDpiForMonitor` 的入参）。
+    monitor: HMONITOR,
+}
+
+impl MonitorFacts {
+    /// 是不是主显示器。
+    fn primary(&self) -> bool {
+        self.info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0
+    }
+
+    /// `rcMonitor`（虚拟桌面坐标系；是否被虚拟化取决于进程 DPI 档位）。
+    fn rect(&self) -> RECT {
+        self.info.monitorInfo.rcMonitor
+    }
+
+    /// 设备名（`\\.\DISPLAY1`）。
+    fn device(&self) -> String {
+        device_name(&self.info.szDevice)
+    }
+
+    /// `rcMonitor` 的宽（负宽度按 0 处理：畸形拓扑不 panic）。
+    fn width(&self) -> u32 {
+        let rect = self.rect();
+        rect.right.saturating_sub(rect.left).max(0) as u32
+    }
+
+    /// `rcMonitor` 的高。
+    fn height(&self) -> u32 {
+        let rect = self.rect();
+        rect.bottom.saturating_sub(rect.top).max(0) as u32
+    }
+}
+
+/// `EnumDisplayMonitors` 的回调：把每块屏的 `MONITORINFOEXW` + `HMONITOR` 收集起来。
 ///
 /// 回调返回 `1`（TRUE）表示**继续枚举**；这里永远继续（过滤交给调用方，排序更与枚举顺序无关）。
 ///
-/// SAFETY: 契约要求 `hwnd` 由系统给出、`lparam` 是调用方传的那个 `&mut Vec<MONITORINFOEXW>`。
+/// SAFETY: 契约要求 `hwnd` 由系统给出、`lparam` 是调用方传的那个 `&mut Vec<MonitorFacts>`。
 unsafe extern "system" fn monitor_enum_proc(
     monitor: HMONITOR,
     _dc: HDC,
@@ -589,7 +717,7 @@ unsafe extern "system" fn monitor_enum_proc(
     lparam: LPARAM,
 ) -> BOOL {
     // SAFETY: `EnumDisplayMonitors` 是同步调用，`lparam` 指向调用栈上的 `Vec`，回调期间有效。
-    let collected = unsafe { &mut *(lparam as *mut Vec<MONITORINFOEXW>) };
+    let collected = unsafe { &mut *(lparam as *mut Vec<MonitorFacts>) };
     // SAFETY: `MONITORINFOEXW` 是 POD，全零合法；`cbSize` 必须写对，否则系统拒绝。
     let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
     info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
@@ -602,12 +730,12 @@ unsafe extern "system" fn monitor_enum_proc(
         )
     };
     if ok != 0 {
-        collected.push(info);
+        collected.push(MonitorFacts { info, monitor });
     }
     1
 }
 
-/// 枚举显示器并给出**稳定的序号**。
+/// 枚举显示器并给出**稳定的序号**，返回排好序的原始事实（[`MonitorFacts`]）。
 ///
 /// 排序规则（三条，全部只看系统给的静态属性，不掺枚举顺序）：
 ///
@@ -617,8 +745,8 @@ unsafe extern "system" fn monitor_enum_proc(
 ///    这与用户在显示设置里看到的排布一致（副屏在主屏左边时是负坐标，自然排在最前）；
 /// 3. 坐标完全相同（**克隆模式**：两块物理屏镜像同一个逻辑屏，`rcMonitor` 一模一样）时按
 ///    `szDevice` 字典序 —— 没有这一条，两块屏的相对次序就只能听枚举回调的（系统不保证）。
-fn enumerate_displays() -> Result<Vec<DisplayInfo>, DeviceError> {
-    let mut collected: Vec<MONITORINFOEXW> = Vec::new();
+fn enumerate_monitor_facts() -> Result<Vec<MonitorFacts>, DeviceError> {
+    let mut collected: Vec<MonitorFacts> = Vec::new();
     // SAFETY: `EnumDisplayMonitors` 同步调用回调；`&mut collected` 在调用期间有效且
     // 回调不保存这个指针。`NULL` hdc + `NULL` 裁剪矩形 = 枚举全部显示器。
     let ok = unsafe {
@@ -626,7 +754,7 @@ fn enumerate_displays() -> Result<Vec<DisplayInfo>, DeviceError> {
             ptr::null_mut(),
             ptr::null(),
             Some(monitor_enum_proc),
-            &mut collected as *mut Vec<MONITORINFOEXW> as LPARAM,
+            &mut collected as *mut Vec<MonitorFacts> as LPARAM,
         )
     };
     if ok == 0 {
@@ -641,38 +769,154 @@ fn enumerate_displays() -> Result<Vec<DisplayInfo>, DeviceError> {
         });
     }
 
-    let mut displays: Vec<DisplayInfo> = collected
-        .iter()
-        .map(|info| {
-            let rect = info.monitorInfo.rcMonitor;
-            DisplayInfo {
-                // 序号排序后回填。
-                index: 0,
-                primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
-                device: device_name(&info.szDevice),
-                x: rect.left,
-                y: rect.top,
-                width: rect.right.saturating_sub(rect.left).max(0) as u32,
-                height: rect.bottom.saturating_sub(rect.top).max(0) as u32,
-            }
-        })
-        .collect();
-
-    displays.sort_by(|left, right| {
+    collected.sort_by(|left, right| {
         // 1) 主屏优先（`false < true`，所以用 `b` 与 `a` 的 primary 比，让 true 排前面）。
         right
-            .primary
-            .cmp(&left.primary)
+            .primary()
+            .cmp(&left.primary())
             // 2) 虚拟桌面左上角，先左后上。
-            .then_with(|| left.x.cmp(&right.x))
-            .then_with(|| left.y.cmp(&right.y))
+            .then_with(|| left.rect().left.cmp(&right.rect().left))
+            .then_with(|| left.rect().top.cmp(&right.rect().top))
             // 3) 克隆模式下坐标相同，用设备名兜底，保证稳定。
-            .then_with(|| left.device.cmp(&right.device))
+            .then_with(|| left.device().cmp(&right.device()))
     });
-    for (index, display) in displays.iter_mut().enumerate() {
-        display.index = index as u32;
+    Ok(collected)
+}
+
+/// 枚举显示器并映射成 [`DisplayInfo`]（序号在排序后回填）。
+fn enumerate_displays() -> Result<Vec<DisplayInfo>, DeviceError> {
+    let facts = enumerate_monitor_facts()?;
+    Ok(facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| display_of(fact, index as u32))
+        .collect())
+}
+
+/// 一块屏 → [`DisplayInfo`]（含这块屏的 DPI 与缩放比）。
+fn display_of(fact: &MonitorFacts, index: u32) -> DisplayInfo {
+    let rect = fact.rect();
+    let (dpi_x, dpi_y) = monitor_dpi(fact.monitor);
+    DisplayInfo {
+        index,
+        primary: fact.primary(),
+        device: fact.device(),
+        x: rect.left,
+        y: rect.top,
+        width: fact.width(),
+        height: fact.height(),
+        dpi_x,
+        dpi_y,
+        scale_percent: scale_percent_of(dpi_x),
     }
-    Ok(displays)
+}
+
+/// 一块屏 → [`DisplayMetrics`]（在 [`display_of`] 之上再量物理像素与 DC 的 `LOGPIXELSX`）。
+fn metrics_of(fact: &MonitorFacts, index: u32) -> DisplayMetrics {
+    let device = fact.device();
+    let (dpi_x, dpi_y) = monitor_dpi(fact.monitor);
+    let width = fact.width();
+    let height = fact.height();
+    let (physical_width, physical_height, dc_log_pixels_x) =
+        physical_size_of(&device, width, height);
+    DisplayMetrics {
+        index,
+        device,
+        primary: fact.primary(),
+        x: fact.rect().left,
+        y: fact.rect().top,
+        width,
+        height,
+        dpi_x,
+        dpi_y,
+        scale_percent: scale_percent_of(dpi_x),
+        physical_width,
+        physical_height,
+        dc_log_pixels_x,
+        system_dpi: process_dpi(),
+    }
+}
+
+/// 量一块屏的物理像素宽高与 DC 的 `LOGPIXELSX`：`(宽, 高, log_pixels_x)`。
+///
+/// 数据源是 `CreateDCW(szDevice)` + `GetDeviceCaps`：
+///
+/// - `DESKTOPHORZRES`/`DESKTOPVERTRES`（118/117）是**设备**的像素数，也就是物理分辨率；
+/// - `LOGPIXELSX`（88）是这块 DC 的逻辑 DPI —— DPI-Aware 进程拿到的是真值（150% = 144），
+///   DPI-Unaware 进程被系统钉成 96。**这一项是虚拟化的直接证据**，比推算可靠。
+///
+/// 拿不到 DC / `GetDeviceCaps` 返回非正数时退化成 `rcMonitor` 的宽高（并留 debug 日志）：
+/// 诊断 API 的契约是"永远给得出数字"，不是"拿不到就报错"。
+fn physical_size_of(device: &str, fallback_width: u32, fallback_height: u32) -> (u32, u32, u32) {
+    let Ok(source) = SourceDc::device(device) else {
+        // `SourceDc::device` 自己会给出 `CreateDCW 失败` 的错误文案；这里只记退化的后果。
+        tracing::debug!(device, "拿不到显示器 DC，物理尺寸退化为 rcMonitor");
+        return (fallback_width, fallback_height, 0);
+    };
+    // SAFETY: `source` 刚刚建成且尚未释放，`raw()` 给出的 DC 在 `release()` 之前一直有效；
+    // `GetDeviceCaps` 只读这个 DC 的能力表，不改状态。
+    let (horz, vert, log_pixels) = unsafe {
+        (
+            GetDeviceCaps(source.raw(), DESKTOPHORZRES as i32),
+            GetDeviceCaps(source.raw(), DESKTOPVERTRES as i32),
+            GetDeviceCaps(source.raw(), LOGPIXELSX as i32),
+        )
+    };
+    // SAFETY: DC 由本函数创建、尚未释放，这里用完就还 —— 满足 `release` 的"只调用一次"契约。
+    unsafe { source.release() };
+    let positive = |value: i32, fallback: u32| {
+        if value > 0 { value as u32 } else { fallback }
+    };
+    (
+        positive(horz, fallback_width),
+        positive(vert, fallback_height),
+        positive(log_pixels, 0),
+    )
+}
+
+/// 一块屏的有效 DPI `(横轴, 纵轴)`。
+///
+/// 首选 `GetDpiForMonitor(MDT_EFFECTIVE_DPI)`（Win8.1+，混合缩放时两块屏可以不同）；
+/// 调用失败时退化到进程 DPI（`GetDpiForSystem`），再不行按 96 算 —— 退化的原因记在
+/// `tracing::debug`，不静默编数字。
+fn monitor_dpi(monitor: HMONITOR) -> (u32, u32) {
+    let mut dpi_x = 0u32;
+    let mut dpi_y = 0u32;
+    // SAFETY: `monitor` 来自 `EnumDisplayMonitors`（调用期间有效）；两个输出参数指向栈上
+    // 的 `u32`，`GetDpiForMonitor` 只在成功时写它们。
+    let hr = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    if hr >= 0 && dpi_x > 0 && dpi_y > 0 {
+        return (dpi_x, dpi_y);
+    }
+    let fallback = process_dpi();
+    tracing::debug!(
+        hr,
+        fallback,
+        "GetDpiForMonitor 失败，每屏 DPI 退化为进程 DPI"
+    );
+    (fallback, fallback)
+}
+
+/// 进程级 DPI（`GetDpiForSystem()`）。
+///
+/// 老系统（Win10 1607 之前）没有这个 API，`windows-sys` 的静态导入会直接让进程加载失败 ——
+/// 这不是本函数能兜的，本 crate 的目标就是 Windows 10/11（见 crate 文档的平台矩阵）。
+/// 运行期返回 0（理论上不会）时按 96 算。
+fn process_dpi() -> u32 {
+    // SAFETY: 无参数、无副作用，只读系统设置。
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi > 0 { dpi } else { 96 }
+}
+
+/// DPI → 缩放百分比（相对 96 的四舍五入）。
+///
+/// 96→100、120→125、144→150、168→175、192→200。用四舍五入而不是截断：Windows 的"自定义
+/// 缩放"允许 10% 步进，截断会把 115% 报成 114%，看着像算错了。
+fn scale_percent_of(dpi: u32) -> u32 {
+    if dpi == 0 {
+        return 0;
+    }
+    ((u64::from(dpi) * 100 + 48) / 96) as u32
 }
 
 /// 把 `MONITORINFOEXW::szDevice`（UTF-16，未终止时也要能读）转成 `String`。
@@ -2105,6 +2349,28 @@ mod tests {
 
     /// 串行化所有会走输入路径的单测：计数器是进程级的，并行跑会互相干扰。
     static INPUT_CALL_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `scale_percent_of` 是纯计算，但它决定了 `DisplayInfo::scale_percent` 的语义，
+    /// 而本机是 100% 缩放（只有 96 → 100 这一档能被真机覆盖），所以非 100% 的三档只能钉在这里。
+    ///
+    /// 断言的是「四舍五入到最近的整百分比」：Windows 设置页给的是 125%/150%/175%/200%，
+    /// 而 DPI 的真实取值就是 120/144/168/192 —— 差 1 个百分点都会让上层把 150% 判成 149%。
+    #[test]
+    fn scale_percent_rounds_dpi_to_the_nearest_whole_percent() {
+        assert_eq!(scale_percent_of(96), 100, "96 DPI 必须报 100%");
+        assert_eq!(scale_percent_of(120), 125, "120 DPI → 125%，不是 124%");
+        assert_eq!(scale_percent_of(144), 150, "144 DPI → 150%");
+        assert_eq!(scale_percent_of(168), 175, "168 DPI → 175%");
+        assert_eq!(scale_percent_of(192), 200, "192 DPI → 200%");
+        // 非整档：Windows 允许自定义缩放（如 110% → 105.6 DPI 取整 106），四舍五入即可。
+        assert_eq!(scale_percent_of(106), 110, "106 DPI → 110%");
+        // 退化值：拿不到 DPI 时 `monitor_dpi` 会兜底成 96，这里的 0 分支只为不 panic。
+        assert_eq!(
+            scale_percent_of(0),
+            0,
+            "0 DPI 只能是「拿不到」，不能谎报 100%"
+        );
+    }
 
     fn input_call_guard() -> MutexGuard<'static, ()> {
         // 某个测试 panic 会毒化锁；这里恢复内部值继续跑，避免级联失败。

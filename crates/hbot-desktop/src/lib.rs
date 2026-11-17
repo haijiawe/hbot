@@ -24,6 +24,7 @@
 pub mod autostart;
 pub mod cli;
 pub mod crash;
+pub mod dpi;
 pub mod settings;
 pub mod shell;
 
@@ -522,6 +523,15 @@ pub fn run() -> i32 {
     init_tracing();
     startup_trace::point("tracing_ready", "");
 
+    // 1.5 DPI 感知：**必须在任何窗口/WebView 创建之前**（Tauri 的窗口在 `Builder::run`
+    //     里才建；`EventLoop::new` 之前还有单实例插件与崩溃 hook）。声明成 Per-Monitor V2
+    //     之后 `GetMonitorInfoW` 的 `rcMonitor` 与 `CreateDCW` 抓到的位图都变成物理像素，
+    //     截图坐标与 `SendInput` 坐标才在同一个空间里（否则非 100% 缩放下差一个缩放因子，
+    //     这就是跨屏点击偏差的根因）。做不到就 warn 继续跑，绝不让应用起不来 ——
+    //     完整说明与实测表格见 `src/dpi.rs` 顶部。
+    let dpi_declaration = dpi::declare();
+    startup_trace::point("dpi_declared", &dpi_declaration.summary());
+
     // 2. 崩溃上报：只写本机 `<data_dir>/logs/crash-*.log`，下次启动变成一条 error 日志。
     //    数据目录算法只有一份（`hbot_core::data_dir`），这里和 `setup` 用的是同一个。
     //    同时把核心预取要用的绝对路径算出来：没有绝对路径时（极端环境缺 APPDATA）
@@ -570,6 +580,10 @@ pub fn run() -> i32 {
         .setup(move |app| {
             startup_trace::point("setup_enter", "");
             let handle = app.handle().clone();
+
+            // 主窗口已经存在（`tauri.conf.json` 的配置窗口在 `setup` 之前建），这里量一次
+            // 窗口级 DPI 作为"声明真的生效了"的证据：`GetDpiForWindow` + 该窗口的 DPI 上下文。
+            dpi::log_window_dpi(&handle);
 
             // 数据目录必须与 `hbot serve` / `hbot replay` 一致，否则同一个产品
             // 的桌面端和后台端会各开一个库（`%APPDATA%\hbot` vs

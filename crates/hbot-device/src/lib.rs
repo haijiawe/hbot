@@ -38,9 +38,14 @@
 //!   绝不静默退回主屏（那会让模型对着错误的画面决策）。
 //!   每块屏用 `CreateDCW(szDevice)` 取它**自己的** DC 抓图：`GetDC(NULL)` 只覆盖主屏，用它去
 //!   `BitBlt` 副屏坐标只会拿到一片黑。
-//! - **DPI**：本 crate 是库，**没法**给宿主进程装 Per-Monitor V2 manifest。宿主没声明 DPI 感知时，
-//!   系统会把窗口矩形与像素虚拟化（150% 缩放下一张 1920 宽的屏可能只有 1280 宽），坐标也会错位。
-//!   这条必须在 `hbot-desktop` 的壳里解决（`docs/09` §6.4），不是 backend 能修的。
+//! - **DPI**：本 crate 是库，**没法**给宿主进程装 Per-Monitor V2 manifest（manifest 是**可执行
+//!   文件**的属性，库改不了调用方的 PE 资源；运行时那条 API 也必须在宿主的最早期调用）。
+//!   宿主没声明 DPI 感知时，系统会把 `rcMonitor` 与 `CreateDCW` 得到的像素一起虚拟化
+//!   （150% 缩放下 1920 宽的屏报 1280、抓出来也是 1280），于是截图宽高不是物理像素、
+//!   归一化坐标与截图对不上。**这件事在 `hbot-desktop/src/dpi.rs` 解决**（壳在 `main()` 最早期
+//!   声明 PMv2）；本 crate 能做的是**如实报出每屏的 DPI/缩放与虚拟化前后的尺寸差**
+//!   （[`DisplayInfo::scale_percent`] 与 [`display_metrics`]），让上层能判断自己拿到的
+//!   坐标到底是物理的还是逻辑的，而不是猜。实测数字见 `src/windows.rs` 顶部。
 //! - **截图没有窗口级入口**：`ScreenshotRequest` 只有 `monitor` 参数，没有 `window_id`。
 //!   想"截某个窗口"要先用 [`windows()`](DeviceBackend::windows) 找到它、切到前台——这正是
 //!   "窗口级**截图**未做"的含义。按窗口**读字**是另一条路（`DeviceTarget::Window{process}`，
@@ -117,7 +122,16 @@ pub fn platform_backend() -> PlatformBackend {
 ///   [`device`](Self::device) 字典序。只依赖这三条，所以同一台机器上每次调用都稳定；
 /// - [`x`](Self::x)/[`y`](Self::y)：`rcMonitor` 左上角在**虚拟桌面坐标系**里的位置。主屏不一定
 ///   是 `(0, 0)` —— 主屏左边的副屏是负坐标，主屏本身被系统钉在 `(0, 0)`；
-/// - 宽高是 `rcMonitor` 的尺寸（**物理像素**，与 DPI 虚拟化无关的那一层；见 crate 文档的 DPI 一节）。
+/// - 宽高是 `rcMonitor` 的尺寸。**这一层到底是不是物理像素，取决于宿主进程的 DPI 感知档位**：
+///   Per-Monitor V2 下就是物理像素；进程是 DPI-Unaware 时系统会把 `rcMonitor` 虚拟化成逻辑
+///   像素（150% 缩放下 1 物理像素 = 1.5 逻辑像素）。本 crate 是库，**装不了 manifest**，
+///   所以这件事只能在壳里解决（`crates/hbot-desktop/src/dpi.rs`）。真实的对照数字见
+///   [`display_metrics`] 的 `physical_width`/`physical_height` 与 `size_delta()`。
+/// - [`dpi_x`](Self::dpi_x)/[`dpi_y`](Self::dpi_y)/[`scale_percent`](Self::scale_percent)：
+///   这块屏的**有效 DPI 与缩放比**（`GetDpiForMonitor(MDT_EFFECTIVE_DPI)`）。它是**每屏**的
+///   属性（混合缩放时两块屏可以不同），与进程 DPI 无关；100% = 96 = `scale_percent` 100。
+///   加这三个字段是纯新增：既有字段的名字与含义一个都没动，`DisplayInfo` 仍然只由本 crate
+///   构造（`hbot-rpc` 只用 `platform_backend()`，不手拼这个结构）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayInfo {
     /// 显示器序号（0 起，0 = 主屏）。截图时原样传给 `ScreenshotRequest::monitor`。
@@ -130,10 +144,20 @@ pub struct DisplayInfo {
     pub x: i32,
     /// `rcMonitor.top`（虚拟桌面坐标系）。
     pub y: i32,
-    /// `rcMonitor` 宽度（像素）。
+    /// `rcMonitor` 宽度（像素；是否为物理像素取决于宿主 DPI 感知档位，见类型文档）。
     pub width: u32,
-    /// `rcMonitor` 高度（像素）。
+    /// `rcMonitor` 高度（像素；同上）。
     pub height: u32,
+    /// 这块屏的有效 DPI 横轴值（`GetDpiForMonitor(MDT_EFFECTIVE_DPI)`，100% 缩放 = 96）。
+    ///
+    /// 拿不到时退化到进程 DPI（`GetDpiForSystem`），再拿不到是 96 —— 退化的原因记在
+    /// `tracing::debug` 里，不会静默编一个值。
+    pub dpi_x: u32,
+    /// 这块屏的有效 DPI 纵轴值（MSDN 保证与 [`dpi_x`](Self::dpi_x) 相同，仍然分开存：
+    /// 万一将来某块屏非方像素，上层不必改结构）。
+    pub dpi_y: u32,
+    /// 缩放百分比，`dpi_x` 相对 96 的四舍五入（96→100、120→125、144→150、192→200）。
+    pub scale_percent: u32,
 }
 
 /// 本机显示器清单，按 [`DisplayInfo::index`] 排好序（0 = 主屏）。
@@ -151,6 +175,106 @@ pub fn displays() -> Vec<DisplayInfo> {
 /// 本机显示器数量（= [`displays`]`.len()`，0 表示当前会话没有可交互桌面）。
 pub fn display_count() -> usize {
     displays().len()
+}
+
+/// 一块显示器的**诊断指标**：DPI / 缩放比 / 坐标与尺寸是被 DPI 虚拟化过的还是物理的。
+///
+/// 为什么需要它，而不是只看 [`DisplayInfo`]：`DisplayInfo` 报的是 `GetMonitorInfoW` 的
+/// `rcMonitor`，而**同一个 `rcMonitor` 在不同 DPI 感知档位下不是同一个东西** —— 进程
+/// DPI-Unaware 时它被系统虚拟化成逻辑像素，Per-Monitor V2 下才是物理像素。只报一个宽高
+/// 的调用方没法判断"我拿到的 1280 到底是不是这块屏真的 1280"。所以这里额外给出
+/// [`physical_width`](Self::physical_width)/[`physical_height`](Self::physical_height)
+/// （`CreateDCW(szDevice)` + `GetDeviceCaps(DESKTOPHORZRES/DESKTOPVERTRES)`，那是**设备**的
+/// 像素数，不受进程档位影响），两者的差就是虚拟化的量（[`size_delta`](Self::size_delta)）。
+///
+/// 本机实测（Windows 11 26300，单屏 1920×1080，100% 缩放）：
+/// `rcMonitor` 1920×1080、`DESKTOPHORZRES` 1920×1080、`LOGPIXELSX` 96、DPI 96、
+/// 截图位图 1920×1080 —— **四个数字全等**，因为 100% 缩放下没有虚拟化可做。
+/// 150% 缩放下的差异见 `src/windows.rs` 顶部的说明（那是机制推论，不是本机实测）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayMetrics {
+    /// 显示器序号（与 [`DisplayInfo::index`] 同一套规则：0 = 主屏）。
+    pub index: u32,
+    /// 设备名（`\\.\DISPLAY1`）。
+    pub device: String,
+    /// 是不是主显示器。
+    pub primary: bool,
+    /// `rcMonitor.left`（虚拟桌面坐标系）。
+    pub x: i32,
+    /// `rcMonitor.top`（虚拟桌面坐标系）。
+    pub y: i32,
+    /// `rcMonitor` 宽度（**当前进程 DPI 档位下**的坐标，不一定是物理像素）。
+    pub width: u32,
+    /// `rcMonitor` 高度（同上）。
+    pub height: u32,
+    /// 这块屏的有效 DPI 横轴值（100% = 96）。
+    pub dpi_x: u32,
+    /// 这块屏的有效 DPI 纵轴值。
+    pub dpi_y: u32,
+    /// 缩放百分比（`dpi_x` 相对 96 四舍五入）。
+    pub scale_percent: u32,
+    /// 这块屏的**物理像素**宽度（`GetDeviceCaps(hdc, DESKTOPHORZRES)`）。
+    ///
+    /// 拿不到显示 DC 时退化成 [`width`](Self::width)（并留 debug 日志），所以这个字段
+    /// 永远可用，但"退化了"这件事只能从日志里看，不能从值上猜。
+    pub physical_width: u32,
+    /// 这块屏的**物理像素**高度（`GetDeviceCaps(hdc, DESKTOPVERTRES)`）。
+    pub physical_height: u32,
+    /// 这块屏 DC 的 `LOGPIXELSX`。**它才是 DPI 虚拟化的直接证据**：DPI-Aware 进程拿到
+    /// 设备真实值（144 = 150%），DPI-Unaware 进程被系统钉成 96。
+    pub dc_log_pixels_x: u32,
+    /// 进程级 DPI（`GetDpiForSystem()`，同一进程的所有行都相同）。
+    ///
+    /// 放在每行里是因为诊断报告本来就是"一行一块屏"，让调用方不必再拼一次；重复的
+    /// 4 字节比"少一个字段再去问一遍"便宜。
+    pub system_dpi: u32,
+}
+
+impl DisplayMetrics {
+    /// `rcMonitor` 与物理像素的差 `(物理 - 报告)`。
+    ///
+    /// 两个分量都是 0 表示当前档位下**没有虚拟化**（进程已是 Per-Monitor V2，或本机
+    /// 所有屏都是 100%）；非 0 表示进程是 DPI-Unaware 且至少一块屏不是 100%，
+    /// 此时截图坐标与点击坐标会漂移（见 `src/windows.rs` 顶部的说明）。
+    pub fn size_delta(&self) -> (i64, i64) {
+        (
+            i64::from(self.physical_width) - i64::from(self.width),
+            i64::from(self.physical_height) - i64::from(self.height),
+        )
+    }
+
+    /// 这块屏的坐标/尺寸是否已被 DPI 虚拟化（等价于 [`size_delta`](Self::size_delta) 非 0）。
+    pub fn is_virtualized(&self) -> bool {
+        self.size_delta() != (0, 0)
+    }
+
+    /// 报告尺寸是否与物理尺寸一致（虚拟化的反向断言，便于测试与日志直接读）。
+    pub fn matches_physical(&self) -> bool {
+        !self.is_virtualized()
+    }
+}
+
+/// 本机每块屏的 DPI / 缩放 / 虚拟化诊断指标（[`DisplayMetrics`]），序号规则与 [`displays`] 相同。
+///
+/// 这是**诊断 API**，不是截图路径的一部分：截图仍然只认 [`ScreenshotRequest::monitor`]。
+/// 存在的理由有两个：
+///
+/// 1. 壳层/诊断脚本要能回答"这台机器的缩放到是多少、我拿到的宽高是不是物理像素"；
+/// 2. 本 crate 的回归测试要能在真机上钉住"每块屏都报得出 DPI 与缩放比"（见
+///    `tests/windows_dpi.rs`）。
+///
+/// 非 Windows 平台返回空 `Vec`（与 [`displays`] 的口径一致：那个平台没有实现）。
+pub fn display_metrics() -> Vec<DisplayMetrics> {
+    PlatformBackend::display_metrics()
+}
+
+/// 进程级 DPI（`GetDpiForSystem()`；100% 缩放 = 96，150% = 144）。
+///
+/// 与 [`DisplayInfo::dpi_x`] 的区别：那个是**每块屏**的属性，这个是**进程**的属性。
+/// DPI-Unaware 进程会被系统钉成 96，Per-Monitor V2 进程拿到的是主屏的有效 DPI。
+/// 非 Windows 平台返回 0（没有这个概念，不要拿 0 当 96 用）。
+pub fn system_dpi() -> u32 {
+    PlatformBackend::system_dpi()
 }
 
 // 调用方只需要认识这两个 crate 的类型，不必再手写 `hbot_core::device::…` 前缀。

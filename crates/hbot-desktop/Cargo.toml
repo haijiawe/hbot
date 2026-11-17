@@ -30,6 +30,21 @@ tracing-subscriber.workspace = true
 # 后者会额外拖进 chrono 一棵树。
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"
+# DPI 感知声明（`src/dpi.rs`）。为什么壳要直接依赖 windows-sys 而不是走 `hbot-device`：
+# `xtask/src/deps.rs` 的 ALLOWED 表钉死了"壳只许依赖 hbot-core + hbot-rpc"，往壳里拉一个
+# `hbot-device` 会让 `xtask deps` 红；而 DPI 声明本来就**只能**在宿主最早期调（库做不了，
+# 见 `src/dpi.rs` 顶部），所以直接调 Win32 才是正确归属。
+# **不新增第三方 crate**：windows-sys 0.59 已在工作区依赖图里（hbot-device / hbot-command），
+# 这里只是壳自己开一份 feature。逐个有理由：
+# - UI_HiDpi：`SetProcessDpiAwarenessContext` / `SetProcessDpiAwareness` /
+#   `GetThreadDpiAwarenessContext` / `AreDpiAwarenessContextsEqual` / `GetDpiForSystem` /
+#   `GetDpiForWindow` / `GetWindowDpiAwarenessContext`；
+# - UI_WindowsAndMessaging：`SetProcessDPIAware`（Vista+ 的最后一档回退，它在 windows-sys 里
+#   声明在这个模块，不在 HiDpi 里）。
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

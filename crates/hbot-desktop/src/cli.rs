@@ -43,6 +43,8 @@ pub enum Invocation {
     TrayAction(String),
     /// `--logs-tail [n]`：只读打印最近 n 条 logs（默认 20），给崩溃上报脚本取证。
     LogsTail(usize),
+    /// `--dpi-probe`：声明一次 Per-Monitor V2，把档位打成一行 JSON 后退出（不开窗口）。
+    DpiProbe,
     /// 没有任何参数：起 GUI。
     Launch,
     /// 不认识的长参数：报错退出，不要静默起 GUI（打错一个字母就不知道该发生了）。
@@ -90,6 +92,7 @@ pub fn parse(args: &[String]) -> Invocation {
                 index += 1;
                 invocation = Invocation::TrayAction(value.clone());
             }
+            "--dpi-probe" => invocation = Invocation::DpiProbe,
             "--logs-tail" => {
                 let value = args.get(index + 1);
                 match value {
@@ -132,6 +135,7 @@ pub fn run_headless(args: &[String]) -> Option<i32> {
         Invocation::PrintSettings => Some(print_settings()),
         Invocation::SetAutostart(desired) => Some(set_autostart(desired)),
         Invocation::LogsTail(limit) => Some(print_logs_tail(limit)),
+        Invocation::DpiProbe => Some(crate::dpi::probe()),
         // 留给单实例插件：先转发给已运行的实例，再在那边执行（见模块文档）。
         Invocation::TrayAction(_) => None,
     }
@@ -161,6 +165,7 @@ hbot —— HBot 桌面壳
   hbot --print-settings                  打印偏好与系统实际自启状态（JSON）
   hbot --tray-action show|autostart|quit 把一次托盘菜单动作交给已运行的实例（测试用）
   hbot --logs-tail [n]                   打印最近 n 条 logs（默认 20，测试/诊断用）
+  hbot --dpi-probe                       声明 Per-Monitor V2 并打印档位（JSON，诊断用）
   hbot --help                            显示这段帮助
 
 说明:
@@ -325,6 +330,17 @@ mod tests {
     fn non_flag_arguments_are_ignored() {
         // 安装器/快捷方式可能塞路径进来，那不是我们的参数，交给 GUI。
         assert_eq!(parse(&args(&["C:\\some\\path"])), Invocation::Launch);
+    }
+
+    #[test]
+    fn dpi_probe_is_headless_and_does_not_start_the_gui() {
+        assert_eq!(parse(&args(&["--dpi-probe"])), Invocation::DpiProbe);
+        // 与 `--logs-tail` 一样是**一次性**命令：`run_headless` 必须返回 `Some`，
+        // 否则会既打印 JSON 又起一个 GUI（脚本里就成了"探测顺带开窗口"）。
+        assert!(
+            run_headless(&args(&["--dpi-probe"])).is_some(),
+            "--dpi-probe 不能落到 GUI 分支"
+        );
     }
 
     #[test]

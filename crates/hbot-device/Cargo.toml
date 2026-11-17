@@ -25,7 +25,12 @@ tracing = { workspace = true }
 # - System_StationsAndDesktops：`OpenInputDesktop`（锁屏/安全桌面检测）；
 # - System_Threading：`OpenProcess` + `QueryFullProcessImageNameW`（进程映像名）；
 # - UI_Input_KeyboardAndMouse：`SendInput` 与 `INPUT`/虚拟键码；
-# - UI_WindowsAndMessaging：`EnumWindows`/`GetForegroundWindow`/窗口样式。
+# - UI_WindowsAndMessaging：`EnumWindows`/`GetForegroundWindow`/窗口样式；
+# - UI_HiDpi：`GetDpiForMonitor`（每屏有效 DPI）+ `GetDpiForSystem`（进程 DPI）。加它是因为
+#   `DisplayInfo` 现在要如实报出每屏的 DPI 与缩放比（见 `display_metrics`）。**不新增第三方
+#   crate**：windows-sys 本来就在依赖里，这里只多开一个 feature；`GetDpiForMonitor` 在
+#   windows-sys 里被 `Win32_Graphics_Gdi` 门控（`HMONITOR` 的类型在那个模块），所以那个
+#   feature 也必须在（截图已经要了它）。
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -45,6 +50,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
 ] }
 
 # OCR 走 WinRT 的 `Windows.Media.Ocr`，必须用 `windows`（带类型投影）而不是 `windows-sys`

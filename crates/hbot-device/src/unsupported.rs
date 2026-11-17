@@ -47,6 +47,17 @@ impl UnsupportedBackend {
     pub fn displays() -> Vec<crate::DisplayInfo> {
         Vec::new()
     }
+
+    /// 每屏 DPI/缩放诊断指标：这个平台没有实现，所以是空的（契约同 [`Self::displays`]）。
+    pub fn display_metrics() -> Vec<crate::DisplayMetrics> {
+        Vec::new()
+    }
+
+    /// 进程级 DPI：这个平台没有 DPI 这个概念，返回 0（**不要当 96 用** —— 见
+    /// [`crate::system_dpi`] 的约定）。
+    pub fn system_dpi() -> u32 {
+        0
+    }
 }
 
 impl DeviceBackend for UnsupportedBackend {
