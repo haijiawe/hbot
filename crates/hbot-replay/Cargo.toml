@@ -1,0 +1,17 @@
+[package]
+name = "hbot-replay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 只给本 workspace 用：回放的唯一消费方是 hbot-cli 与 hbot-rpc。
+publish = false
+
+[dependencies]
+hbot-core = { path = "../hbot-core" }
+hbot-store = { path = "../hbot-store" }
+hbot-code = { path = "../hbot-code" }
+hbot-bot = { path = "../hbot-bot" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

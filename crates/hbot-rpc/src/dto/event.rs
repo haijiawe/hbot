@@ -135,6 +135,12 @@ pub enum Event {
         file: String,
         /// 命中行号（1-based）。
         line: u32,
+        /// 这次暂停命中的条件表达式原文（`Some` = 条件断点自己算出为真才停的）；
+        /// `None`（wire 上是 `null`）= 无条件断点，或单步停在这里。
+        ///
+        /// 只用于 UI 显示"为什么停在这"，**不要**拿它去重新求值：条件在 isolate
+        /// 的 JS 侧算过一次，编辑器这一侧没有那个作用域。
+        condition: Option<String>,
         /// 作用域与局部变量（不可序列化的值显示为 `<unserializable>`）。
         scopes: Vec<DebugScope>,
         /// 逻辑调用栈（外层在前）。

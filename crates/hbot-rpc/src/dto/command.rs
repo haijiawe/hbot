@@ -9,7 +9,7 @@
 use hbot_core::{ApprovalDecision, ApprovalId, BotId, ConversationId, EditId, SearchId, SessionId};
 use serde::{Deserialize, Serialize};
 
-use super::StepKind;
+use super::{DebugBreakpoint, StepKind};
 
 /// UI 发往核心的一条命令。
 ///
@@ -271,16 +271,36 @@ pub enum Command {
         settings: super::DeviceSettings,
     },
 
+    /// 回放历史入站消息，用**当前代码**重跑一遍并逐条对比。
+    ///
+    /// 这是只读操作：不写库、不联网、不动正在跑的那个 bot —— 它另起一个全新 isolate
+    /// 逐条 dispatch，回复只收集在内存里。`data` 是
+    /// [`ReplayReport`](super::ReplayReport)。
+    ///
+    /// 失败通道：没有可回放的历史 `-32001`、参数非法（`limit: 0`）`-32002`、
+    /// 编译当前代码失败或 isolate 起不来 `-32006`（文案里带真实原因）。
+    ReplayRun {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 时间下界（Unix 毫秒）；`null` 表示不限。
+        from: Option<i64>,
+        /// 最多回放多少条；`null` 表示全量（`0` 是 `-32002`，不"等于全量"）。
+        limit: Option<u32>,
+    },
+
     /// 设置断点（调试构建）。
     ///
     /// 断点是**按 bot 的沙箱**生效的：同一份源码在不同 bot 的 isolate 里可以是不同版本。
+    ///
+    /// 整份替换语义：`breakpoints` 是这个文件的**全部**断点，不在列表里的行会被清掉。
+    /// `breakpoints: []` 表示取消该文件的全部断点。
     DebugSetBreakpoints {
         /// Bot ID。
         bot_id: BotId,
         /// 源文件路径（项目内相对路径）。
         file: String,
-        /// 行号（1-based）。
-        lines: Vec<u32>,
+        /// 这个文件的全部断点（行号 + 可选条件）。
+        breakpoints: Vec<DebugBreakpoint>,
     },
 
     /// 继续执行（步进后的恢复）。
@@ -342,6 +362,7 @@ impl Command {
             Self::DeviceRequest { .. } => "device_request",
             Self::DeviceSettingsGet => "device_settings_get",
             Self::DeviceSettingsSet { .. } => "device_settings_set",
+            Self::ReplayRun { .. } => "replay_run",
             Self::DebugSetBreakpoints { .. } => "debug_set_breakpoints",
             Self::DebugResume { .. } => "debug_resume",
             Self::DebugStep { .. } => "debug_step",

@@ -15,6 +15,7 @@ pub mod bots;
 pub mod debug;
 pub mod device;
 pub mod files;
+pub mod replay;
 pub mod system;
 
 use crate::dto::{ApiError, Response};

@@ -270,6 +270,31 @@ pub struct StackFrame {
     pub column: u32,
 }
 
+/// 一个断点：行号 + 可选条件。
+///
+/// 这是 [`Command::DebugSetBreakpoints`](crate::dto::Command::DebugSetBreakpoints)
+/// 的元素类型。断点是**整份替换**语义：一次命令给出该文件的全部断点，不在列表里的行
+/// 会被清掉；空数组表示取消该文件的全部断点。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugBreakpoint {
+    /// 行号（1-based）。`0` 无意义，宿主会忽略。
+    pub line: u32,
+    /// 停下之前必须为真的条件；`null` 表示无条件断点。
+    ///
+    /// 是一段**同步 JS 表达式**，在 bot 的 isolate 里求值——那里才有 `ctx`、局部变量
+    /// 与模块作用域，也只有那里求值才和用户在编辑器里看到的一致。两条硬规则：
+    ///
+    /// - 只支持同步表达式：`await` 是语法错误（会当成"不命中"并记一条 warn），
+    ///   而不是"异步等待后判断"。
+    /// - 求值抛错、编译失败、引用了不存在的名字，一律当作**不命中**，绝不打断 handler；
+    ///   同一行只 warn 一次，免得一个坏条件刷满日志。
+    ///
+    /// 副作用允许（那是用户自己的代码在自己的 isolate 里跑），但求值次数受命中点数量
+    /// 限制：只有真的执行到这一行才会求值。
+    pub condition: Option<String>,
+}
+
 /// `AppInfo` 命令的 data：应用与运行时信息。
 ///
 /// 启动时 UI 的第一条命令；`dataDir` 用于"打开日志目录/数据目录"这类入口。
@@ -354,6 +379,89 @@ pub struct RunLog {
     pub line: String,
     /// 日志来源：`bot` / `agent`（`logs_tail` 用它区分 Agent 行）。
     pub source: String,
+}
+
+/// 回放里"顺序不同"的一条回复：文本按多重集匹配上了，但相对位次变了。
+///
+/// 下标都是 0 起：`historicalIndex` 指历史出站里的位次，`replayedIndex` 指本次
+/// 重跑结果里的位次。UI 用它把两边并排高亮。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayReplyChange {
+    /// 回复文本。
+    pub text: String,
+    /// 在历史出站里的下标。
+    pub historical_index: u32,
+    /// 在本次重跑结果里的下标。
+    pub replayed_index: u32,
+}
+
+/// 一条历史入站事件的回放明细（`ReplayRun` 的 data 元素）。
+///
+/// `historical` 与 `replayed` 是**原始对照**，`same`/`extra`/`missing`/`reordered`
+/// 是同一对数组的分类结果 —— UI 想简单就渲染后者，想自己算就渲染前者。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayEntry {
+    /// 入站行主键。
+    pub inbound_id: String,
+    /// 入站行的 `external_id`（也是历史出站的 `reply_to`）。
+    pub external_id: String,
+    /// 会话的外部 id。
+    pub conversation_external_id: String,
+    /// 入站时间（Unix 毫秒，取平台给的 `timestamp`，不是本地收到的时间）。
+    pub received_at: i64,
+    /// 结论：`match` / `diff` / `error`（开放字符串，未知值 UI 按 `diff` 处理）。
+    pub status: String,
+    /// 历史出站文本（按 `created_at, rowid` 升序）。
+    pub historical: Vec<String>,
+    /// 本次重跑产生的回复（按 `reply(...)` 调用顺序）。
+    pub replayed: Vec<String>,
+    /// 逐条对比：一致。
+    pub same: Vec<String>,
+    /// 逐条对比：多出（重跑有、历史没有）。
+    pub extra: Vec<String>,
+    /// 逐条对比：缺少（历史有、重跑没有）。
+    pub missing: Vec<String>,
+    /// 逐条对比：顺序不同。
+    pub reordered: Vec<ReplayReplyChange>,
+    /// 结论为 `error` 时的原因。
+    pub error: Option<String>,
+}
+
+/// `ReplayRun` 的返回：一次回放的完整报告。
+///
+/// **回放不写库、不联网**：它另起一个全新 isolate 逐条 dispatch，回复只收集在内存里
+/// （`dispatch_collecting`），所以对正在跑的 bot 与真实平台都没有副作用。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayReport {
+    /// 回放用的项目目录（原样回显）。
+    pub project: String,
+    /// 回放的 bot id。
+    pub bot: String,
+    /// 时间下界（Unix 毫秒）；`null` 表示不限。
+    pub from: Option<i64>,
+    /// 要求的上限；`null` 表示全量。
+    pub limit: Option<u32>,
+    /// 实际回放的事件条数。
+    pub events: u32,
+    /// 其中一致的条数。
+    pub matched_events: u32,
+    /// 其中有差异的条数。
+    pub differing_events: u32,
+    /// 其中重跑失败的条数。
+    pub failed_events: u32,
+    /// 逐条回复统计：一致。
+    pub same: u32,
+    /// 逐条回复统计：多出。
+    pub extra: u32,
+    /// 逐条回复统计：缺少。
+    pub missing: u32,
+    /// 逐条回复统计：顺序不同。
+    pub reordered: u32,
+    /// 逐条明细。
+    pub entries: Vec<ReplayEntry>,
 }
 
 /// 命令的返回结果。

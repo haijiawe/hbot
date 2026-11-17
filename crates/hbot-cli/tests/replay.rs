@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use hbot_cli::replay::{EntryStatus, ReplayReport};
+// 报告类型从实现它的 crate 拿（`hbot-cli` 仍重导出，但测试直接指真源）。
+use hbot_replay::{EntryStatus, ReplayReport};
 use hbot_store::{
     Bot, BotId, Conversation, ConversationId, InboundId, NewInbound, NewOutbound, OutboundId,
     OutboundTarget, Project, ProjectId, Store,

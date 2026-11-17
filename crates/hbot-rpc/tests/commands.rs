@@ -1,10 +1,13 @@
-//! 命令契约测试：32 个 `Command` 的 `type` 值与字段名（命令一律 camelCase 字段）。
+//! 命令契约测试：33 个 `Command` 的 `type` 值与字段名（命令一律 camelCase 字段）。
 
 mod support;
 
 use hbot_core::{ApprovalDecision, BotStatus};
 use hbot_rpc::dto::DeviceSettings;
-use hbot_rpc::{AppInfo, BotSummary, Command, DirEntry, FileContent, LogLevel, RunLog, StepKind};
+use hbot_rpc::{
+    AppInfo, BotSummary, Command, DebugBreakpoint, DirEntry, FileContent, LogLevel, RunLog,
+    StepKind,
+};
 use serde_json::json;
 use support::{
     APPROVAL_UUID, AT, BOT_UUID, CONVERSATION_UUID, EDIT_UUID, SEARCH_UUID, SESSION_UUID, approval,
@@ -245,13 +248,25 @@ fn bot_debug_and_log_commands_use_camel_case_fields() {
         Command::DebugSetBreakpoints {
             bot_id: bot(),
             file: "src/main.rs".to_string(),
-            lines: vec![10, 20],
+            breakpoints: vec![
+                DebugBreakpoint {
+                    line: 10,
+                    condition: None,
+                },
+                DebugBreakpoint {
+                    line: 20,
+                    condition: Some("n % 2 === 0".to_string()),
+                },
+            ],
         },
         json!({
             "type": "debug_set_breakpoints",
             "botId": BOT_UUID,
             "file": "src/main.rs",
-            "lines": [10, 20],
+            "breakpoints": [
+                { "line": 10, "condition": null },
+                { "line": 20, "condition": "n % 2 === 0" },
+            ],
         }),
     );
 
@@ -357,7 +372,7 @@ fn device_and_settings_commands_use_camel_case_fields() {
 
 #[test]
 fn command_fields_never_serialize_as_snake_case() {
-    // 覆盖全部 32 个命令：任何一个字段漏改 camelCase 都会在这里红。
+    // 覆盖全部 33 个命令：任何一个字段漏改 camelCase 都会在这里红。
     // 与上面的形状断言重复构造是有意的——这里只关心"没有 `_` 字段名"。
     let commands = vec![
         Command::AppInfo,
@@ -445,10 +460,18 @@ fn command_fields_never_serialize_as_snake_case() {
         Command::DeviceSettingsSet {
             settings: settings(),
         },
+        Command::ReplayRun {
+            bot_id: bot(),
+            from: Some(AT),
+            limit: Some(50),
+        },
         Command::DebugSetBreakpoints {
             bot_id: bot(),
             file: "f".to_string(),
-            lines: vec![1],
+            breakpoints: vec![DebugBreakpoint {
+                line: 1,
+                condition: None,
+            }],
         },
         Command::DebugResume { bot_id: bot() },
         Command::DebugStep {
@@ -460,7 +483,7 @@ fn command_fields_never_serialize_as_snake_case() {
             limit: 1,
         },
     ];
-    assert_eq!(commands.len(), 32, "命令数量变化时同步这张表");
+    assert_eq!(commands.len(), 33, "命令数量变化时同步这张表");
 
     for command in &commands {
         let value = serde_json::to_value(command).expect("ser");

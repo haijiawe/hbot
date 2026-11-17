@@ -33,6 +33,12 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // Bot 运行时：会话队列、outbox、supervisor。handler 由外部注入，
     // 所以它不认识 hbot-agent / hbot-code。
     ("hbot-bot", &["hbot-core", "hbot-store"]),
+    // 回放：读历史入站/出站、编译项目、逐条 dispatch、比对。刻意**不**依赖 hbot-rpc
+    // （回放比协议层低一层：CLI 与 IDE 都调它，它不能反过来依赖协议的 DTO/dispatch）。
+    (
+        "hbot-replay",
+        &["hbot-core", "hbot-store", "hbot-code", "hbot-bot"],
+    ),
     // Agent：单循环 + ToolGateway + provider。不许依赖 bot/rpc/desktop。
     (
         "hbot-agent",
@@ -51,6 +57,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "hbot-agent",
             "hbot-command",
             "hbot-device",
+            "hbot-replay",
         ],
     ),
     // CLI：组合根之一。
@@ -65,6 +72,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "hbot-adapters",
             "hbot-bot",
             "hbot-agent",
+            "hbot-replay",
         ],
     ),
     // 桌面壳：只碰契约与 dispatch。

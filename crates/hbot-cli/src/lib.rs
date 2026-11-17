@@ -28,7 +28,9 @@ pub mod version;
 
 pub use check::{CheckReport, check_project};
 pub use cli::{CheckArgs, Cli, Command, ReplayArgs, ServeArgs};
-pub use replay::{InboundReplay, ReplayOptions, ReplayReport, replay};
+// 回放的实现与报告类型都在 `hbot-replay`（与 IDE 的 `replay_run` 共用一份）；这里重导出是为了
+// 不改 `hbot-cli` 已有的公开面（`hbot_cli::ReplayReport` 这些路径继续可用）。
+pub use hbot_replay::{InboundReplay, ReplayOptions, ReplayReport, replay};
 pub use serve::{ServePlan, TokenSource, generate_token, ready_line, resolve_token};
 pub use version::{VersionInfo, capabilities, version_info, version_text};
 

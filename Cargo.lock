@@ -1918,6 +1918,7 @@ dependencies = [
  "hbot-bot",
  "hbot-code",
  "hbot-core",
+ "hbot-replay",
  "hbot-rpc",
  "hbot-store",
  "serde",
@@ -1946,6 +1947,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1953,7 +1955,6 @@ name = "hbot-command"
 version = "0.1.0"
 dependencies = [
  "hbot-core",
- "libc",
  "serde",
  "tracing",
  "windows-sys 0.59.0",
@@ -2036,6 +2037,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hbot-replay"
+version = "0.1.0"
+dependencies = [
+ "hbot-bot",
+ "hbot-code",
+ "hbot-core",
+ "hbot-store",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "hbot-rpc"
 version = "0.1.0"
 dependencies = [
@@ -2049,6 +2063,7 @@ dependencies = [
  "hbot-command",
  "hbot-core",
  "hbot-device",
+ "hbot-replay",
  "hbot-store",
  "hbot-workspace",
  "serde",

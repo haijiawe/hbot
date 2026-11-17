@@ -11,6 +11,7 @@ import type { ApprovalDecision } from "./ApprovalDecision";
 import type { ApprovalId } from "./ApprovalId";
 import type { BotId } from "./BotId";
 import type { ConversationId } from "./ConversationId";
+import type { DebugBreakpoint } from "./DebugBreakpoint";
 import type { DeviceSettings } from "./DeviceSettings";
 import type { EditId } from "./EditId";
 import type { SearchId } from "./SearchId";
@@ -193,7 +194,19 @@ reason: string, } | { "type": "device_settings_get" } | { "type": "device_settin
 /**
  * 新的整份设置（不是补丁：少写的字段按默认值算，调用方要传全量）。
  */
-settings: DeviceSettings, } | { "type": "debug_set_breakpoints", 
+settings: DeviceSettings, } | { "type": "replay_run", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 时间下界（Unix 毫秒）；`null` 表示不限。
+ */
+from: number | null, 
+/**
+ * 最多回放多少条；`null` 表示全量（`0` 是 `-32002`，不"等于全量"）。
+ */
+limit: number | null, } | { "type": "debug_set_breakpoints", 
 /**
  * Bot ID。
  */
@@ -203,9 +216,9 @@ botId: BotId,
  */
 file: string, 
 /**
- * 行号（1-based）。
+ * 这个文件的全部断点（行号 + 可选条件）。
  */
-lines: Array<number>, } | { "type": "debug_resume", 
+breakpoints: Array<DebugBreakpoint>, } | { "type": "debug_resume", 
 /**
  * Bot ID。
  */

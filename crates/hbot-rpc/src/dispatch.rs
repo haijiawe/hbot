@@ -156,6 +156,9 @@ impl Dispatcher {
             | Command::DeviceSettingsSet { .. } => {
                 crate::app::commands::device::handle(state, command).await
             }
+
+            // 回放：只读历史 + 用当前代码重跑，不写库不联网。
+            Command::ReplayRun { .. } => crate::app::commands::replay::handle(state, command).await,
         }
     }
 }
@@ -324,10 +327,26 @@ mod tests {
                     max_actions_per_session: 100,
                 },
             },
+            Command::ReplayRun {
+                bot_id: parse(BOT),
+                from: Some(1_700_000_000_000),
+                limit: Some(50),
+            },
             Command::DebugSetBreakpoints {
                 bot_id: parse(BOT),
                 file: "src/main.rs".to_owned(),
-                lines: vec![3, 7],
+                breakpoints: vec![
+                    // 两个变体都要进样本：无条件 + 有条件，否则生成的 TS 夹具里
+                    // `condition` 只出现 `null` 一种取值，前端就测不到真条件。
+                    crate::dto::DebugBreakpoint {
+                        line: 3,
+                        condition: None,
+                    },
+                    crate::dto::DebugBreakpoint {
+                        line: 7,
+                        condition: Some("count > 3".to_owned()),
+                    },
+                ],
             },
             Command::DebugResume { bot_id: parse(BOT) },
             Command::DebugStep {
@@ -346,7 +365,7 @@ mod tests {
         let commands = sample_commands();
         assert_eq!(
             commands.len(),
-            32,
+            33,
             "命令数与 Command 变体数不一致：新增/删除命令时同步这张表"
         );
         for command in commands {

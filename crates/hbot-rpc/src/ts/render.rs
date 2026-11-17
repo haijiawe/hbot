@@ -14,10 +14,11 @@ use ts_rs::{Config, TS};
 
 use super::{GeneratedFile, HEADER, INDEX_FILE, TsGenError};
 use crate::dto::{
-    ApiError, AppInfo, BotSummary, Command, ConversationSummary, DebugScope, DeviceSettings,
-    DeviceStatus, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile, Event,
-    FileChangeKind, FileContent, LogLevel, ProjectOpenResult, ProjectSummary, Response, RiskLevel,
-    RunLog, SearchMatch, StackFrame, StepKind,
+    ApiError, AppInfo, BotSummary, Command, ConversationSummary, DebugBreakpoint, DebugScope,
+    DeviceSettings, DeviceStatus, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile,
+    Event, FileChangeKind, FileContent, LogLevel, ProjectOpenResult, ProjectSummary, ReplayEntry,
+    ReplayReplyChange, ReplayReport, Response, RiskLevel, RunLog, SearchMatch, StackFrame,
+    StepKind,
 };
 
 /// 渲染结果：文件本身 + 它 import 的依赖（供悬空 import 检查）。
@@ -57,6 +58,8 @@ pub fn generated_files() -> Result<Vec<GeneratedFile>, TsGenError> {
         EditFile,
         DiffHunk,
         DebugScope,
+        // `debug_set_breakpoints` 的条目：行号 + 可选的 JS 条件表达式。
+        DebugBreakpoint,
         StackFrame,
         StepKind,
         RiskLevel,
@@ -79,6 +82,8 @@ pub fn generated_files() -> Result<Vec<GeneratedFile>, TsGenError> {
     );
     // 宿主级设备设置（`device_settings_get` / `device_settings_set` 的载荷）。
     export!(DeviceSettings);
+    // 回放报告（`replay_run` 的载荷）：UI 按 entries 渲染逐条对照。
+    export!(ReplayReport, ReplayEntry, ReplayReplyChange);
     // 领域类型：事件载荷里出现的枚举 / 结构。
     export!(
         BotStatus,

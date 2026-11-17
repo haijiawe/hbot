@@ -58,7 +58,7 @@
 //! | `BotInject` | `null` |
 //! | `BotList` | `Vec<`[`BotSummary`]`>`（UI 启动时的运行态播种） |
 //! | `BotConversations` | `Vec<`[`ConversationSummary`]`>`（`bot_inject` 需要的 `conversationId` 由这里给；空数组表示还没有会话） |
-//! | `DebugSetBreakpoints` | `null` |
+//! | `DebugSetBreakpoints` | `null`（断点是整份替换：`breakpoints: []` 取消该文件的全部断点） |
 //! | `DebugResume` | `null`（结果经 `debug.resumed` / `debug.paused`） |
 //! | `DebugStep` | `null`（同上） |
 //! | `DeviceStatus` | [`DeviceStatus`]（**从不返回 `null`**：没会话时是 `state: "none"` 的快照，UI 直接用 `sub`/`allowedApps` 画设置页） |
@@ -77,9 +77,10 @@ pub mod event;
 
 pub use command::Command;
 pub use common::{
-    ApiError, AppInfo, BotSummary, ConversationSummary, DebugScope, DeviceSettings, DeviceStatus,
-    Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile, FileChangeKind, FileContent,
-    LogLevel, ProjectOpenResult, ProjectSummary, Response, RiskLevel, RunLog, SearchMatch,
-    StackFrame, StepKind,
+    ApiError, AppInfo, BotSummary, ConversationSummary, DebugBreakpoint, DebugScope,
+    DeviceSettings, DeviceStatus, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile,
+    FileChangeKind, FileContent, LogLevel, ProjectOpenResult, ProjectSummary, ReplayEntry,
+    ReplayReplyChange, ReplayReport, Response, RiskLevel, RunLog, SearchMatch, StackFrame,
+    StepKind,
 };
 pub use event::Event;
