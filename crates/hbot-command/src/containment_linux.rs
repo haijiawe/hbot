@@ -8,7 +8,8 @@
 //! 但那是另一层判断，两层各管各的：这里只管"杀得干净"）。
 //!
 //! 不引 `nix` 只为三个 POSIX 符号：手写声明即可（`std` 已经把 libc 链进来了）。
-//! 写隔离那一层要 `syscall` 号码与常量，才用了 `libc` crate。
+//! 写隔离那一层同样手写声明（`syscall` / `prctl` / `open` / `fcntl`），见
+//! `confinement_linux.rs` —— 两个文件都不引 `libc` crate。
 
 use crate::child::Spawned;
 use std::io;

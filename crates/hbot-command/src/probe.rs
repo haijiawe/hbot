@@ -154,8 +154,16 @@ impl CapabilityReport {
     pub fn probe_with(probe: &dyn IsolationProbe, platform: Platform) -> Self {
         Self {
             platform,
-            containment: outcome_of(probe.probe(IsolationLevel::Containment)),
-            write_confinement: outcome_of(probe.probe(IsolationLevel::WriteConfinement)),
+            containment: outcome_of(
+                probe.probe(IsolationLevel::Containment),
+                platform,
+                IsolationLevel::Containment,
+            ),
+            write_confinement: outcome_of(
+                probe.probe(IsolationLevel::WriteConfinement),
+                platform,
+                IsolationLevel::WriteConfinement,
+            ),
         }
     }
 
@@ -198,20 +206,47 @@ impl CapabilityReport {
     }
 }
 
-/// 把探测结果拼成一句话：可用就只说"可用"，不可用要带上原因。
+/// 把探测结果拼成一句话：不可用一定要带原因；可用时**只在有实现细节时才啰嗦**
+/// （"可用（Landlock ABI 3…）"），否则保持原来那句短的"可用"。
 fn phrase(outcome: &ProbeOutcome) -> String {
     if outcome.available {
-        "可用".to_owned()
+        if outcome.detail.is_empty() || outcome.detail == "可用" {
+            "可用".to_owned()
+        } else {
+            format!("可用（{}）", outcome.detail)
+        }
     } else {
         format!("不可用（{}）", outcome.detail)
     }
 }
 
-fn outcome_of(result: Result<(), String>) -> ProbeOutcome {
+fn outcome_of(
+    result: Result<(), String>,
+    platform: Platform,
+    level: IsolationLevel,
+) -> ProbeOutcome {
     match result {
-        Ok(()) => ProbeOutcome::available("可用"),
+        Ok(()) => ProbeOutcome::available(available_detail(platform, level)),
         Err(reason) => ProbeOutcome::unavailable(reason),
     }
+}
+
+/// "可用"时的实现说明。Linux 的写隔离要报出用的是 Landlock、ABI 是几、放行了哪些路径 ——
+/// 用户/审计看到的不该只是一个光秃秃的"可用"（不同 ABI 能申请的权限位不一样）。
+#[cfg(target_os = "linux")]
+fn available_detail(platform: Platform, level: IsolationLevel) -> String {
+    if matches!(platform, Platform::Linux) && level == IsolationLevel::WriteConfinement {
+        if let Some(detail) = confinement::describe() {
+            return detail;
+        }
+    }
+    "可用".to_owned()
+}
+
+/// 非 Linux 平台没有要报的实现细节，保持原来的短句。
+#[cfg(not(target_os = "linux"))]
+fn available_detail(_platform: Platform, _level: IsolationLevel) -> String {
+    "可用".to_owned()
 }
 
 #[cfg(test)]
@@ -261,5 +296,35 @@ mod tests {
         assert_eq!(available.to_string(), "可用：作业对象可用");
         let unavailable = ProbeOutcome::unavailable("landlock 未接入");
         assert!(unavailable.to_string().starts_with("不可用"));
+    }
+
+    #[test]
+    fn summary_keeps_the_short_word_without_a_detail() {
+        let report = CapabilityReport {
+            platform: Platform::Windows,
+            containment: ProbeOutcome::available("可用"),
+            write_confinement: ProbeOutcome::available("可用"),
+        };
+        assert_eq!(
+            report.summary_zh(),
+            "命令隔离能力（windows）：进程树与资源上限可用；写隔离可用"
+        );
+    }
+
+    #[test]
+    fn summary_shows_the_detail_when_the_probe_has_one() {
+        // Linux 的写隔离会带出「Landlock（ABI N）…」这段；它是用户判断
+        // "哪些路径可写"的唯一线索，不能只留一个"可用"。
+        let report = CapabilityReport {
+            platform: Platform::Linux,
+            containment: ProbeOutcome::available("可用"),
+            write_confinement: ProbeOutcome::available(
+                "Landlock（ABI 3）可用，可写范围 = 工作区 + 私有缓存目录（/tmp/x）",
+            ),
+        };
+        let summary = report.summary_zh();
+        assert!(summary.contains("可用（Landlock（ABI 3）"), "{summary}");
+        assert!(summary.contains("私有缓存目录"), "{summary}");
+        assert!(report.supports(SandboxMode::WorkspaceWrite));
     }
 }

@@ -68,3 +68,13 @@ impl WriteConfinement {
 pub(crate) fn probe() -> Result<(), String> {
     imp::probe()
 }
+
+/// 写隔离的**实现说明**（能力矩阵里展示"用的是哪套机制、放行了哪些路径"）。
+///
+/// 只有 Linux 有：那里是 Landlock，ABI 版本与可写范围都是用户该看到的承诺
+/// （"写隔离可用"这句话在不同 ABI 下能申请的权限位不一样）。拿不到 ABI 时返回 `None`，
+/// 此时 [`probe`] 已经在报不可用，不需要第二份说明。
+#[cfg(target_os = "linux")]
+pub(crate) fn describe() -> Option<String> {
+    imp::describe()
+}

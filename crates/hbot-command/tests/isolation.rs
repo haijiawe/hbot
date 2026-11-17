@@ -533,6 +533,55 @@ fn capability_report_advertises_write_confinement() {
 }
 
 // ---------------------------------------------------------------------------
+// 11. 能力矩阵：Linux 上写隔离报 Landlock（ABI 与可写范围要明说）
+// ---------------------------------------------------------------------------
+
+/// 两条判据都不许"跳过去"：
+///
+/// - 有 Landlock 的内核：报告必须写明**机制是 Landlock、ABI 是几、可写范围含私有缓存目录**，
+///   并且 `workspace-write` 真的可用（这正是本次改动的目标）；
+/// - 没有 Landlock 的内核（< 5.13 / LSM 未启用 / 容器里被 seccomp 挡）：报告必须继续报
+///   不可用、`workspace-write` 必须继续拒绝 —— 也就是 **fail-closed** 在能力矩阵上的投影。
+///
+/// 写成条件分支（而不是 `#[ignore]`）是因为"内核有没有 Landlock"是环境事实，
+/// 两种结论都要有断言；把不可用当失败会让老内核上的 CI 红，把可用当必然又会掩盖真问题。
+#[cfg(target_os = "linux")]
+#[test]
+fn capability_report_matches_landlock_availability() {
+    let caps = PlatformRunner::system().capabilities();
+    let summary = caps.summary_zh();
+    assert!(summary.contains("写隔离"), "总结必须提到写隔离：{summary}");
+
+    if caps.write_confinement.available {
+        assert!(
+            summary.contains("Landlock（ABI "),
+            "可用的写隔离必须报出机制与 ABI：{summary}"
+        );
+        assert!(
+            summary.contains("私有缓存目录"),
+            "可写范围必须写明含私有缓存目录：{summary}"
+        );
+        assert!(
+            caps.supports(SandboxMode::WorkspaceWrite),
+            "写隔离可用时 `workspace-write` 必须可用：{summary}"
+        );
+        assert_eq!(
+            hbot_command::CapabilityReport::required_level(SandboxMode::WorkspaceWrite),
+            Some(IsolationLevel::WriteConfinement)
+        );
+    } else {
+        assert!(
+            !caps.supports(SandboxMode::WorkspaceWrite),
+            "装不上写隔离就必须拒绝 `workspace-write`：{summary}"
+        );
+        assert!(summary.contains("不可用"), "不可用要带原因：{summary}");
+    }
+
+    // 只读档仍全平台拒绝 —— 这次改动不许把它带成"可用"。
+    assert!(!caps.supports(SandboxMode::ReadOnly));
+}
+
+// ---------------------------------------------------------------------------
 // helper：被上面的测试当作子进程启动
 // ---------------------------------------------------------------------------
 

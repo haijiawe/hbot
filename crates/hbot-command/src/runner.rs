@@ -128,6 +128,18 @@ impl CommandRunner for PlatformRunner {
         let program_path = program::resolve_program(&spec)?;
         let cwd = path::resolve_cwd(&spec.workspace_root, &spec.cwd)?;
         let env_pairs = env::build_env(&spec)?;
+        // `workspace-write` 档在 Linux 上只放行工作区 + 私有缓存根。包管理器（npm / pnpm /
+        // corepack / yarn）没有可写缓存目录就起不来，而失败的样子很像"隔离坏了"——
+        // 于是把它们的缓存变量默认指到 `cache::root()`：与 Landlock 规则用的是**同一个**
+        // 路径，不可能漂移。显式指定的值仍然优先（见 `cache::apply_write_cache_defaults`）。
+        #[cfg(target_os = "linux")]
+        let env_pairs = {
+            let mut pairs = env_pairs;
+            if level == IsolationLevel::WriteConfinement {
+                crate::cache::apply_write_cache_defaults(&mut pairs, &crate::cache::root());
+            }
+            pairs
+        };
 
         // 先建隔离范围：建不出来就不 spawn——绝不允许"先跑起来再想办法"。
         let guard =
@@ -229,6 +241,26 @@ impl CommandRunner for PlatformRunner {
                         stream,
                         limit_bytes: limit,
                     });
+                }
+                // 写隔离是在子进程的 `pre_exec` 里装的（fork 之后、exec 之前）。装不上时
+                // 子进程以哨兵码 127 退出并在 stderr 留一行标记 —— 那不是"命令自己失败了"，
+                // 而是"这台机器没装上隔离"。必须翻译成 `IsolationUnavailable`（fail-closed）：
+                // 绝不能把它当成一次普通的非零退出交给上层，否则调用方会以为"命令跑过了"。
+                #[cfg(not(windows))]
+                if confinement.is_some() {
+                    if let Some(reason) =
+                        crate::landlock::isolation_failure_reason(status.code(), &stderr)
+                    {
+                        tracing::warn!(
+                            program = %program_path.display(),
+                            %reason,
+                            "子进程未能装载写隔离，按隔离不可用拒绝",
+                        );
+                        return Err(CommandDenied::IsolationUnavailable {
+                            platform: self.platform,
+                            reason,
+                        });
+                    }
                 }
                 Ok(CommandOutput {
                     status: map_status(status),

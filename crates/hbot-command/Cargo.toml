@@ -29,7 +29,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# 只用它拿 Landlock 的 syscall 号与 prctl 常数（规则集本身直接 syscall，不自写 FFI
-# 是因为 syscall 号随架构变化，写死会在非 x86_64 上错）。
-libc = "0.2"
+# Linux 的写隔离（Landlock）**不引任何 crate**：它只碰 7 个符号（syscall / prctl /
+# open / fcntl / write / _exit / getuid），手写 `extern "C"` 即可（与
+# `containment_linux.rs` 从第一版起就是同一做法）。三个 syscall 号在**所有架构**上都是
+# 444/445/446（内核 5.13 统一分配），所以手写不会在非 x86_64 上写错 —— 当年引 `libc`
+# 的理由（"syscall 号随架构变化"）在这个具体场景并不成立。少一个依赖就少一份 SBOM。

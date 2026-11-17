@@ -14,7 +14,7 @@
 //! | 平台 | `Containment`（进程树 + 资源上限） | `WriteConfinement`（写隔离） |
 //! |---|---|---|
 //! | Windows | 作业对象：`KILL_ON_JOB_CLOSE` + 活跃进程数/内存上限 | 受限令牌：`WRITE_RESTRICTED` + 工作区 write SID + 该目录上的 ACE |
-//! | Linux | `setsid` + `killpg`（整个进程组） | Landlock（`landlock_restrict_self`，在 `pre_exec` 里装）；**只编译过，未在 Linux 上运行** |
+//! | Linux | `setsid` + `killpg`（整个进程组） | Landlock：`pre_exec` 里 `landlock_restrict_self`；按 ABI 1–5 收窄权限位，可写 = 工作区 + 私有缓存目录；**只交叉编译过，未在真实 Linux 内核上运行** |
 //! | macOS | **未实现**（`sandbox-exec` 已弃用） → `IsolationUnavailable` | **未实现**（同上） → `IsolationUnavailable` |
 //!
 //! 探测是**运行时**的：同样一份代码，装了 Landlock 的 Linux 与没装的是两个结论。
@@ -57,7 +57,14 @@
 //! 私有窗口站），见 ADR-0003 的后续项。
 //!
 //! 另一层现实代价：写隔离只是"写不出去"，所以需要可写缓存目录的命令（`npm`/`pnpm`/`cargo`）
-//! 在被降权后照样失败——本 crate **不**替它们准备可写缓存目录，也不往 ACE 里加临时目录。
+//! 容易失败。两平台处理不同，别混着记：
+//!
+//! - Windows：本 crate **不**替它们准备可写缓存目录（受限令牌的 ACE 只加在工作区上），
+//!   这类命令在 `workspace-write` 档下仍可能失败；
+//! - Linux：Landlock 规则里显式放行一个私有缓存根（`<tmpdir>/hbot-command-write-cache`），
+//!   并把 `npm_config_cache` / `COREPACK_HOME` / `PNPM_HOME` / `YARN_CACHE_FOLDER` /
+//!   `XDG_CACHE_HOME` 默认指过去（显式值优先）。规则与变量用同一个路径，不会漂移。
+//!   缓存目录的属主会被核对（它落在世界可写的 tmp 下），不是当前用户的目录直接拒绝。
 //!
 //! # 用法
 //!
@@ -79,16 +86,20 @@
 //! 同步、阻塞：async 调用方必须把它放进 `spawn_blocking`（见
 //! [`hbot_core::ports::CommandRunner`] 的文档）。
 //!
-//! Linux 分支的**写隔离**只做到"能交叉编译、逻辑与 Windows 对称"，**未在任何 Linux 上
-//! 运行过**（连一次 `cargo test` 都没跑过）；Landlock 的 ABI 判定与 `pre_exec` 装载
-//! 都只经过类型检查（见 ADR-0003 §验证）。
+//! Linux 分支的**写隔离**（Landlock）只做到"能交叉编译、纯判据有跨平台单测"，
+//! **未在任何真实 Linux 内核上运行过**（本机没有 WSL 发行版）；ABI 探测、规则集构造与
+//! `pre_exec` 装载都只经过类型检查与交叉编译（见 ADR-0003 §验证）。它的判据（按 ABI
+//! 收窄权限位、工作区/缓存/越界的可写判定、子进程失败码识别）抽在 `landlock.rs` 里，
+//! 由 `cargo test -p hbot-command` 在 Windows 上也可以覆盖。
 
 #![warn(missing_docs)]
 
+mod cache;
 mod child;
 mod confinement;
 mod containment;
 mod env;
+mod landlock;
 mod output;
 mod path;
 mod probe;
