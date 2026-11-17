@@ -48,6 +48,7 @@
 //! feature), so release overhead is exactly 0×, not "small".
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -194,7 +195,7 @@ fn a_line_breakpoint_pauses_with_the_source_file_and_line() {
 
     let sandbox = Sandbox::spawn(compiled, Limits::default()).expect("isolate starts");
     let mut breakpoints = Breakpoints::new();
-    breakpoints.set("src/main.ts", [breakpoint]);
+    breakpoints.set("src/main.ts", [(breakpoint, None)]);
     sandbox.set_breakpoints(breakpoints);
 
     let sink = Sink::default();
@@ -208,6 +209,10 @@ fn a_line_breakpoint_pauses_with_the_source_file_and_line() {
     let at = &stops[0];
     assert_eq!(at.file, "src/main.ts");
     assert_eq!(at.line, breakpoint);
+    assert!(
+        at.condition.is_none(),
+        "an unconditional breakpoint reports no hit condition"
+    );
     // The current frame is last, and it is the frame the breakpoint is in.
     let current = at.call_stack.last().expect("a frame for the current scope");
     assert_eq!(current.file, "src/main.ts");
@@ -246,7 +251,7 @@ export default defineBot({
     let sandbox = Sandbox::spawn(compiled, Limits::default()).expect("isolate starts");
 
     let mut breakpoints = Breakpoints::new();
-    breakpoints.set("src/main.ts", [breakpoint]);
+    breakpoints.set("src/main.ts", [(breakpoint, None)]);
     sandbox.set_breakpoints(breakpoints);
 
     let sink = Sink::scripted([DebugAction::Continue]);
@@ -271,7 +276,7 @@ fn step_over_stops_at_the_next_statement_in_the_same_frame() {
     let sandbox = Sandbox::spawn(compiled, Limits::default()).expect("isolate starts");
 
     let mut breakpoints = Breakpoints::new();
-    breakpoints.set("src/main.ts", [first]);
+    breakpoints.set("src/main.ts", [(first, None)]);
     sandbox.set_breakpoints(breakpoints);
 
     let sink = Sink::scripted([DebugAction::StepOver]);
@@ -320,7 +325,7 @@ export default defineBot({
     let sandbox = Sandbox::spawn(compiled, Limits::default()).expect("isolate starts");
 
     let mut breakpoints = Breakpoints::new();
-    breakpoints.set("src/lib.ts", [in_helper]);
+    breakpoints.set("src/lib.ts", [(in_helper, None)]);
     sandbox.set_breakpoints(breakpoints);
 
     let sink = Sink::scripted([DebugAction::StepOut]);
@@ -418,7 +423,7 @@ export default defineBot({
     let sandbox = Sandbox::spawn(compiled, limits).expect("isolate starts");
 
     let mut breakpoints = Breakpoints::new();
-    breakpoints.set("src/main.ts", [breakpoint]);
+    breakpoints.set("src/main.ts", [(breakpoint, None)]);
     sandbox.set_breakpoints(breakpoints);
 
     // The sink holds the isolate for longer than the whole handler budget: the
@@ -481,5 +486,194 @@ export default defineBot({
     assert!(
         stack.contains(&expected),
         "expected {expected:?} in:\n{stack}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8–12. Condition breakpoints: conditions are evaluated on the JS side.
+// ---------------------------------------------------------------------------
+//
+// The five tests below pin `hbot_core::debug::Breakpoints`' condition contract on
+// the real pipeline: a true condition stops, a false one does not, and a *broken*
+// condition (compile error / throw / `await`) is always "not hit" with exactly one
+// warning per line — never an exception that kills the handler.
+//
+// Cost note: the probe shape did not change, so the unconditional path pays
+// exactly what it paid before (4.64×, `docs/02-architecture.md` §6.5). Condition
+// evaluation only runs after `__hbot_trace` said "this is a candidate hit" and
+// only when `condition_of` is `Some`.
+
+/// Handler whose locals a condition can read: `count === 5`.
+const CONDITIONAL: &str = r#"import { defineBot } from 'hbot';
+
+export default defineBot({
+  onMessage(ctx) {
+    const count = 5;
+    ctx.log(String(count));
+    ctx.log('done');
+  },
+});
+"#;
+
+/// All-thread log buffer. The condition is evaluated on the **isolate thread**,
+/// so the thread-local `with_default` trick used by `tests/config_warnings.rs`
+/// would miss the warning: install one global subscriber for this test binary.
+static LOGS: std::sync::LazyLock<Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[derive(Clone)]
+struct GlobalWriter;
+
+impl Write for GlobalWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOGS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for GlobalWriter {
+    type Writer = Self;
+
+    fn make_writer(&self) -> Self::Writer {
+        Self
+    }
+}
+
+/// Installs the capturing subscriber once for the whole test binary.
+fn install_log_capture() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(GlobalWriter)
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        // A library under test never installs a subscriber, so this cannot clash;
+        // if another test binary already did, the counts below simply stay at 0
+        // and the assertion fails loudly instead of passing silently.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+/// Every captured log line since the process started (tests are parallel, so
+/// assert on counts of a *unique* needle rather than on the whole text).
+fn captured_logs() -> String {
+    String::from_utf8_lossy(&LOGS.lock().unwrap_or_else(PoisonError::into_inner)).to_string()
+}
+
+/// Runs one dispatch with a single conditional breakpoint on the `ctx.log` line,
+/// returning `(handler logs, stops, captured logs)`.
+fn run_with_condition(
+    name: &str,
+    condition: &str,
+    actions: impl IntoIterator<Item = DebugAction>,
+) -> (Vec<String>, Vec<PausedAt>, String) {
+    install_log_capture();
+    let project = project(name, &[("src/main.ts", CONDITIONAL)]);
+    let breakpoint = line_of(CONDITIONAL, "ctx.log(String(count))");
+    let compiled = compile_project_debug(project.path()).expect("debug build compiles");
+    let sandbox = Sandbox::spawn(compiled, Limits::default()).expect("isolate starts");
+
+    let mut breakpoints = Breakpoints::new();
+    breakpoints.set("src/main.ts", [(breakpoint, Some(condition.to_owned()))]);
+    sandbox.set_breakpoints(breakpoints);
+
+    let sink = Sink::scripted(actions);
+    let outcome = sandbox
+        .dispatch_with_debug(&event(), Some(&sink))
+        .expect("a broken condition must never fail the handler");
+    (outcome.logs, sink.stops(), captured_logs())
+}
+
+#[test]
+fn a_true_condition_pauses_at_the_breakpoint() {
+    let (logs, stops, captured) =
+        run_with_condition("cond-true", "count > 3", [DebugAction::Continue]);
+    assert_eq!(stops.len(), 1, "a true condition must stop:\n{captured}");
+    assert_eq!(logs, vec!["5", "done"], "pausing must not change the logs");
+    assert_eq!(
+        stops[0].condition.as_deref(),
+        Some("count > 3"),
+        "the paused picture must carry the condition that was hit"
+    );
+}
+
+#[test]
+fn a_false_condition_does_not_pause_and_the_handler_runs_on() {
+    let (logs, stops, _captured) =
+        run_with_condition("cond-false", "count > 9", [DebugAction::Continue]);
+    assert!(stops.is_empty(), "a false condition must not pause");
+    assert_eq!(
+        logs,
+        vec!["5", "done"],
+        "the handler must run to completion"
+    );
+}
+
+#[test]
+fn a_throwing_condition_is_a_miss_and_is_reported_once() {
+    // Two dispatches share one isolate ⇒ one `(file, line)` ⇒ exactly one warning.
+    install_log_capture();
+    let project = project("cond-throws", &[("src/main.ts", CONDITIONAL)]);
+    let breakpoint = line_of(CONDITIONAL, "ctx.log(String(count))");
+    let compiled = compile_project_debug(project.path()).expect("debug build compiles");
+    let sandbox = Sandbox::spawn(compiled, Limits::default()).expect("isolate starts");
+
+    const BROKEN: &str = "missingHelper(count) > 0";
+    let mut breakpoints = Breakpoints::new();
+    breakpoints.set("src/main.ts", [(breakpoint, Some(BROKEN.to_owned()))]);
+    sandbox.set_breakpoints(breakpoints);
+
+    let sink = Sink::default();
+    let first = sandbox
+        .dispatch_with_debug(&event(), Some(&sink))
+        .expect("a throwing condition must not fail the handler");
+    let second = sandbox
+        .dispatch_with_debug(&event(), Some(&sink))
+        .expect("a throwing condition must not fail the handler");
+
+    assert_eq!(
+        sink.stop_count(),
+        0,
+        "a throwing condition counts as a miss"
+    );
+    assert_eq!(first.logs, vec!["5", "done"]);
+    assert_eq!(second.logs, vec!["5", "done"]);
+
+    let warnings = captured_logs().matches(BROKEN).count();
+    assert_eq!(
+        warnings,
+        1,
+        "the same broken condition must warn exactly once, saw {warnings}:\n{}",
+        captured_logs()
+    );
+}
+
+#[test]
+fn a_condition_using_await_is_a_syntax_error_and_a_plain_miss() {
+    // Conditions are synchronous expressions only: top-level `await` inside
+    // `new Function` is a syntax error ⇒ compile fails ⇒ treated as not hit.
+    const AWAIT: &str = "await Promise.resolve(true)";
+    let (logs, stops, captured) = run_with_condition("cond-await", AWAIT, [DebugAction::Continue]);
+    assert!(
+        stops.is_empty(),
+        "an `await` condition must be a plain miss, not a pause:\n{captured}"
+    );
+    assert_eq!(
+        logs,
+        vec!["5", "done"],
+        "a syntax error in a condition must not become a handler failure"
+    );
+    let warnings = captured.matches(AWAIT).count();
+    assert_eq!(
+        warnings, 1,
+        "the syntax error should be reported once, saw {warnings}"
     );
 }

@@ -33,6 +33,30 @@
 //! thread and not from the thread that dispatched the event — exactly the
 //! constraint in §6.5.1. The sink is handed over as a raw pointer by
 //! [`DebugControl`]; see [`SinkSlot`] for the safety argument.
+//!
+//! # Conditions
+//!
+//! A breakpoint may carry a JS expression (`hbot_core::debug::Breakpoints`
+//! stores it, this module evaluates it). Evaluation happens **in this isolate**,
+//! through [`COND_FN`], never in Rust: only here do the user's bindings exist,
+//! and only here can the expression mean the same thing it means in the editor.
+//!
+//! Three rules follow, and they are contract, not implementation detail:
+//!
+//! - **Synchronous only.** The expression is compiled with `new Function`,
+//!   whose body cannot contain a top-level `await`; a condition using `await`
+//!   (or anything else non-expression) is a compile error, is reported as
+//!   "did not compile", and therefore never stops.
+//! - **Failures are not hits.** A condition that fails to compile or throws
+//!   while evaluating is treated as `false`: the handler keeps running, no
+//!   exception escapes into user code, and one warning per `<file>:<line>` is
+//!   logged so the mistake is visible without flooding the log.
+//! - **One evaluation per candidate hit.** The expression only runs after the
+//!   cheap `BTreeMap` hit test says "this line has a breakpoint", never for
+//!   unconditional breakpoints, and never for a step stop. Side effects are
+//!   therefore bounded by "how often this line was reached", the same budget as
+//!   `print()` in a handler. Side effects themselves are the user's own code
+//!   running in the user's own isolate, so allowing them is not a hole.
 
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
@@ -73,6 +97,80 @@ const STACK_SOURCE: &str = r#"(function __hbot_stack() {
 
 /// Upper bound on the variables reported for one frame.
 const MAX_VARIABLES: usize = 32;
+/// `globalThis.__hbot_cond` — compile and evaluate one breakpoint condition.
+///
+/// Signature: `__hbot_cond(key: string, source: string, locals: () => object)
+/// -> 1 | 0 | -1` (truthy / falsy / failed). `-1` also sets the text returned
+/// by [`COND_ERROR_FN`]. Everything is caught inside JS so no exception can
+/// reach the caller — a broken condition must never disturb the handler.
+pub(crate) const COND_FN: &str = "__hbot_cond";
+/// `globalThis.__hbot_cond_error` — why the last [`COND_FN`] call returned `-1`.
+///
+/// Only read on the failure path, which is also the only path that logs.
+pub(crate) const COND_ERROR_FN: &str = "__hbot_cond_error";
+
+/// Source of [`COND_FN`] / [`COND_ERROR_FN`]. Installed once per context.
+///
+/// The cache is keyed by `"<file>:<line>"` and stores the source it compiled.
+/// Re-compiling only happens when the text at that key changes (a reload, or the
+/// user edited the condition), so a hot path that hits the same line in a loop
+/// pays one `new Function` and then nothing. Compile failures are cached too: a
+/// condition with a typo must not re-compile — and re-throw — on every hit.
+///
+/// `new Function` bodies are parsed as non-strict, which is what makes the
+/// `with` scope lookup legal: inside `with (scope)` a bare identifier resolves
+/// to the captured local of the same name, and anything else falls through to
+/// the real global. The `"\n"` before the closing paren keeps a trailing `//`
+/// comment in the user's expression from swallowing it.
+const COND_SOURCE: &str = r#"(function () {
+    "use strict";
+    var cache = new Map();
+    var lastError = "";
+
+    function __hbot_cond(key, source, locals) {
+        var entry = cache.get(key);
+        if (entry === undefined || entry.source !== source) {
+            entry = { source: source, fn: null };
+            try {
+                entry.fn = new Function(
+                    "$hbot_scope",
+                    "with ($hbot_scope) { return (" + source + "\n); }"
+                );
+            } catch (error) {
+                entry.fn = null;
+                lastError = String(error);
+            }
+            cache.set(key, entry);
+        }
+        if (entry.fn === null) {
+            return -1;
+        }
+        var scope;
+        try {
+            scope = locals();
+        } catch (error) {
+            lastError = "reading locals failed: " + String(error);
+            return -1;
+        }
+        if (scope === null || (typeof scope !== "object" && typeof scope !== "function")) {
+            lastError = "reading locals failed: not an object";
+            return -1;
+        }
+        try {
+            return entry.fn(scope) ? 1 : 0;
+        } catch (error) {
+            lastError = String(error);
+            return -1;
+        }
+    }
+
+    function __hbot_cond_error() {
+        return lastError;
+    }
+
+    return { cond: __hbot_cond, error: __hbot_cond_error };
+})()"#;
+
 /// Upper bound on one variable's JSON text. Larger values become
 /// `<unserializable>` rather than blowing up the event payload.
 const MAX_VALUE_BYTES: usize = 4096;
@@ -83,6 +181,18 @@ const UNSERIALIZABLE: &str = "<unserializable>";
 
 /// Name a frame gets when QuickJS could not name it.
 const ANONYMOUS: &str = "<anonymous>";
+
+/// What a breakpoint condition decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConditionOutcome {
+    /// Truthy — the probe is a real hit.
+    True,
+    /// Falsy, or `null`/`undefined`: not a hit, keep running.
+    False,
+    /// Did not compile, or threw while evaluating: not a hit, and worth a
+    /// (once-per-line) warning.
+    Failed,
+}
 
 /// Everything a probe needs, cloned into the registered host functions.
 #[derive(Clone)]
@@ -108,8 +218,8 @@ impl DebugRuntime {
         }
     }
 
-    /// Install `__hbot_dbg`, `__hbot_stack`, `__hbot_trace` and `__hbot_pause`
-    /// on `globalThis`.
+    /// Install `__hbot_dbg`, `__hbot_stack`, `__hbot_trace`, `__hbot_pause` and
+    /// the condition helpers on `globalThis`.
     ///
     /// These are internal globals, deliberately *not* part of `hbot.d.ts`: user
     /// code never calls them and the d.ts stays a description of the public
@@ -120,6 +230,16 @@ impl DebugRuntime {
 
         let stack: Function<'js> = ctx.eval(STACK_SOURCE).map_err(js_error)?;
         globals.set(STACK_FN, stack).map_err(js_error)?;
+
+        // The condition cache lives for the lifetime of the context, so the
+        // compiled `Function` objects are never collected mid-handler.
+        let conditions: Object<'js> = ctx.eval(COND_SOURCE).map_err(js_error)?;
+        let condition: Function<'js> = conditions.get("cond").map_err(js_error)?;
+        globals.set(COND_FN, condition).map_err(js_error)?;
+        let condition_error: Function<'js> = conditions.get("error").map_err(js_error)?;
+        globals
+            .set(COND_ERROR_FN, condition_error)
+            .map_err(js_error)?;
 
         let trace = self.clone();
         let trace_fn = Function::new(
@@ -221,12 +341,55 @@ impl DebugRuntime {
             Err(poisoned) => poisoned.into_inner().step,
         };
 
-        let breakpoint = match self.state.lock() {
-            Ok(state) => state.breakpoints.hits(&path, line),
-            Err(poisoned) => poisoned.into_inner().breakpoints.hits(&path, line),
+        // One lock for both halves of the question: is this line a breakpoint,
+        // and if so does it carry a condition? `condition_of` returns `None`
+        // for an unconditional breakpoint, which is the common case.
+        let (breakpoint, condition) = match self.state.lock() {
+            Ok(state) => (
+                state.breakpoints.hits(&path, line),
+                state
+                    .breakpoints
+                    .condition_of(&path, line)
+                    .map(str::to_owned),
+            ),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (
+                    state.breakpoints.hits(&path, line),
+                    state
+                        .breakpoints
+                        .condition_of(&path, line)
+                        .map(str::to_owned),
+                )
+            }
         };
         if !breakpoint && step.is_none() {
             return;
+        }
+
+        // A conditional breakpoint is only a hit when the expression is truthy
+        // *now*. This runs before `capture_stack` on purpose: a false condition
+        // must cost one JS call and nothing else, and it must not pay for a
+        // stack that will be thrown away.
+        //
+        // A step stop is not a breakpoint hit, so stepping ignores conditions
+        // entirely — and therefore reports no hit condition either. The
+        // condition text that was actually satisfied travels in `PausedAt` so
+        // the debugger panel can show *why* it stopped here.
+        let mut hit_condition: Option<String> = None;
+        if step.is_none() {
+            if let Some(condition) = condition.as_deref() {
+                let key = format!("{path}:{line}");
+                match self.evaluate_condition(ctx, &key, condition, locals.clone()) {
+                    ConditionOutcome::True => hit_condition = Some(condition.to_owned()),
+                    ConditionOutcome::False => return,
+                    ConditionOutcome::Failed => {
+                        let detail = self.condition_error(ctx);
+                        self.note_condition_failure(&path, line, condition, &detail);
+                        return;
+                    }
+                }
+            }
         }
 
         // Only now is it worth reading the stack, and only now does the locals
@@ -274,6 +437,7 @@ impl DebugRuntime {
             file: path.clone(),
             line,
             column,
+            condition: hit_condition,
             scopes: vec![DebugScope {
                 name: frame_name,
                 variables,
@@ -395,6 +559,73 @@ impl DebugRuntime {
             let _ = ctx.catch();
         }
         variables
+    }
+
+    /// Compile (once, cached in JS) and evaluate one breakpoint condition.
+    ///
+    /// Everything that can go wrong inside the expression — a syntax error, a
+    /// `ReferenceError` for a name that is not a visible local, a getter that
+    /// throws — is caught by [`COND_SOURCE`] and comes back as `Failed`. The
+    /// only way this returns `Failed` from Rust is a missing helper or a
+    /// context-level failure, in which case the pending exception is cleared
+    /// here so it cannot leak into the user's handler.
+    fn evaluate_condition<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        key: &str,
+        source: &str,
+        locals: Function<'js>,
+    ) -> ConditionOutcome {
+        let Ok(condition) = ctx.globals().get::<_, Function<'js>>(COND_FN) else {
+            return ConditionOutcome::Failed;
+        };
+        match condition.call::<_, i32>((key, source, locals)) {
+            Ok(1) => ConditionOutcome::True,
+            Ok(0) => ConditionOutcome::False,
+            Ok(_) => ConditionOutcome::Failed,
+            Err(_) => {
+                let _ = ctx.catch();
+                ConditionOutcome::Failed
+            }
+        }
+    }
+
+    /// The message [`COND_FN`] recorded for the last failure, for the log line.
+    fn condition_error<'js>(&self, ctx: &Ctx<'js>) -> String {
+        let Ok(helper) = ctx.globals().get::<_, Function<'js>>(COND_ERROR_FN) else {
+            return String::new();
+        };
+        match helper.call::<_, rquickjs::String<'js>>(()) {
+            Ok(text) => text.to_string().unwrap_or_default(),
+            Err(_) => {
+                let _ = ctx.catch();
+                String::new()
+            }
+        }
+    }
+
+    /// Log a failed condition at most once per `<file>:<line>`.
+    ///
+    /// A typo in a condition fails on every hit of that line. Logging each one
+    /// would drown the log and compete with the user's own events for IO, while
+    /// what the user needs is one line saying "this breakpoint will never
+    /// fire". The dedupe set lives in [`DebugState`] and dies with the isolate,
+    /// which is the right lifetime: reloading the project re-reports.
+    fn note_condition_failure(&self, path: &str, line: u32, condition: &str, detail: &str) {
+        let key = format!("{path}:{line}");
+        let first = match self.state.lock() {
+            Ok(mut state) => state.warned_conditions.insert(key),
+            Err(poisoned) => poisoned.into_inner().warned_conditions.insert(key),
+        };
+        if first {
+            tracing::warn!(
+                file = path,
+                line,
+                condition,
+                detail,
+                "breakpoint condition did not compile or threw; treated as not hit"
+            );
+        }
     }
 }
 

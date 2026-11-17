@@ -23,9 +23,17 @@
 use super::{done, failed};
 use crate::app::AppState;
 use crate::app::debug::not_running;
-use crate::dto::{Command, Response, StepKind};
+use crate::dto::{Command, DebugBreakpoint, Response, StepKind};
 use hbot_core::debug::DebugAction;
 use hbot_core::{BotId, HbotError};
+
+/// 一条断点条件的长度上限（**字符**，不是字节）：超过它就是 `-32002`。
+///
+/// 条件是一段同步 JS 表达式，一行以内就该写完。上限存在的理由不是"防止慢"（求值次数
+/// 已经被命中点限制住了），而是防止把整段代码误粘进条件框：那既不是条件的用法，也会让
+/// 错误信息变成一整段源码。按字符数而不是字节数，是因为中文串在条件里是合法且常见的
+/// （`name === "你好"`），按字节算会让同样的表达式在中英文下限额差三倍。
+pub const MAX_CONDITION_CHARS: usize = 200;
 
 /// `debug_set_breakpoints`：记住断点，并推给这个 bot 现有的 isolate。
 ///
@@ -35,20 +43,66 @@ use hbot_core::{BotId, HbotError};
 /// * 插桩未就绪（`dispatch_with_debug` 还是空壳）：同样返回成功。断点被记住，等
 ///   `hbot-code` 落地后自动生效——**不能**因为"暂时不会命中"就报错，否则 UI 的断点面板
 ///   在对方落地前永远显示失败。
+/// * 条件超长（超过 [`MAX_CONDITION_CHARS`] 个字符）：`-32002 invalid`。这条在
+///   `ensure_running` **之前**判——参数不合法不该因为 bot 恰好没在跑就变成 `-32005`。
 /// * bot 不存在：`-32001 not_found`。
 /// * bot 存在但没在跑：`-32005 denied`（见 [`not_running`] 里的取舍说明）。
 pub async fn set_breakpoints(
     state: &AppState,
     bot_id: BotId,
     file: String,
-    lines: Vec<u32>,
+    breakpoints: Vec<DebugBreakpoint>,
 ) -> Response {
+    let entries = match breakpoint_entries(&breakpoints) {
+        Ok(entries) => entries,
+        Err(error) => return failed(error),
+    };
     if let Err(error) = ensure_running(state, bot_id).await {
         return failed(error);
     }
-    // 空 `lines` = 取消该文件的断点（`Breakpoints::set` 的语义）；行号 0 被忽略。
-    state.debug().set_breakpoints(&bot_id, &file, lines);
+    // 空 `breakpoints` = 取消该文件的断点（`Breakpoints::set` 的语义）；行号 0 被忽略。
+    // 条件原样交给登记表，**这里不求值**：求值在 isolate 的 JS 侧（`hbot-code`）。
+    state.debug().set_breakpoints(&bot_id, &file, entries);
     done()
+}
+
+/// 把 wire 上的断点列表翻译成 [`hbot_core::debug::Breakpoints::set`] 的条目。
+///
+/// 三条规则，都在这里而不是在 `hbot-core`：那是纯数据层，越少"命令语义"越好测试。
+///
+/// * 行号 `0` 忽略（1-based 语义，沿用现状）。
+/// * 空白条件（`"  "`、`""`）视作无条件：`Some("")` 只会让 isolate 每次命中都编译失败
+///   一次，然后按"不命中"处理，没有任何语义价值。
+/// * 条件两端空白会被去掉：条件是一段表达式，首尾空白不改变含义；去掉后长度校验与
+///   JS 侧缓存键更稳定。
+fn breakpoint_entries(
+    breakpoints: &[DebugBreakpoint],
+) -> Result<Vec<(u32, Option<String>)>, HbotError> {
+    let mut entries = Vec::with_capacity(breakpoints.len());
+    for breakpoint in breakpoints {
+        if breakpoint.line == 0 {
+            continue;
+        }
+        let Some(text) = breakpoint
+            .condition
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            entries.push((breakpoint.line, None));
+            continue;
+        };
+        let chars = text.chars().count();
+        if chars > MAX_CONDITION_CHARS {
+            return Err(HbotError::invalid(format!(
+                "第 {} 行的断点条件有 {chars} 个字符，超过上限 {MAX_CONDITION_CHARS} 个字符：\
+                 条件是一段同步 JS 表达式（如 `count > 3`），不该把整段代码粘进来",
+                breakpoint.line
+            )));
+        }
+        entries.push((breakpoint.line, Some(text.to_owned())));
+    }
+    Ok(entries)
 }
 
 /// `debug_resume`：让这个 bot 所有暂停中的 isolate 继续跑。
@@ -76,8 +130,8 @@ pub async fn handle(state: &AppState, command: Command) -> Response {
         Command::DebugSetBreakpoints {
             bot_id,
             file,
-            lines,
-        } => set_breakpoints(state, bot_id, file, lines).await,
+            breakpoints,
+        } => set_breakpoints(state, bot_id, file, breakpoints).await,
         Command::DebugResume { bot_id } => resume(state, bot_id).await,
         Command::DebugStep { bot_id, kind } => step(state, bot_id, kind).await,
         other => super::unimplemented(other.kind()),
@@ -136,5 +190,61 @@ mod tests {
         assert_eq!(action_of(StepKind::Over), DebugAction::StepOver);
         assert_eq!(action_of(StepKind::Into), DebugAction::StepInto);
         assert_eq!(action_of(StepKind::Out), DebugAction::StepOut);
+    }
+
+    fn breakpoint(line: u32, condition: Option<&str>) -> DebugBreakpoint {
+        DebugBreakpoint {
+            line,
+            condition: condition.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn blank_conditions_become_unconditional_and_line_zero_is_ignored() {
+        let entries = breakpoint_entries(&[
+            breakpoint(0, Some("a > 1")),
+            breakpoint(3, None),
+            breakpoint(4, Some("   ")),
+            breakpoint(5, Some("  count > 3  ")),
+        ])
+        .expect("合法输入不该报错");
+        assert_eq!(
+            entries,
+            vec![
+                (3, None),
+                (4, None),
+                // 两端空白被去掉：条件是表达式，首尾空白不改变含义。
+                (5, Some("count > 3".to_owned())),
+            ],
+            "行号 0 必须被忽略；空白条件必须退化成无条件"
+        );
+    }
+
+    #[test]
+    fn a_condition_at_the_limit_is_accepted_and_one_past_it_is_invalid() {
+        let at_limit = "a".repeat(MAX_CONDITION_CHARS);
+        let entries = breakpoint_entries(&[breakpoint(1, Some(&at_limit))])
+            .expect("正好等于上限必须接受（上限是闭区间）");
+        assert_eq!(entries[0].1.as_deref(), Some(at_limit.as_str()));
+
+        let error =
+            breakpoint_entries(&[breakpoint(7, Some(&"a".repeat(MAX_CONDITION_CHARS + 1)))])
+                .expect_err("超长条件必须是参数错误");
+        assert_eq!(error.code(), -32002, "-32002 才是 invalid");
+        let message = error.to_string();
+        assert!(
+            message.contains("上限") && message.contains('7'),
+            "文案要说清是哪一行、上限是多少：{message}"
+        );
+    }
+
+    #[test]
+    fn the_limit_counts_characters_not_bytes() {
+        // 每个中文字符 3 字节：按字节算会被误判超长。
+        let cjk = "名".repeat(MAX_CONDITION_CHARS);
+        assert!(cjk.len() > MAX_CONDITION_CHARS * 2, "前提：这是多字节串");
+        let entries =
+            breakpoint_entries(&[breakpoint(1, Some(&cjk))]).expect("按字符数算，这正好等于上限");
+        assert_eq!(entries.len(), 1);
     }
 }

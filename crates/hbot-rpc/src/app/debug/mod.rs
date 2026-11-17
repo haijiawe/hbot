@@ -135,18 +135,25 @@ impl DebugRegistry {
 
     /// 设某个文件的断点，并推给这个 bot 现有的 isolate。
     ///
-    /// `lines` 为空 = 移除该文件的断点（[`Breakpoints::set`] 的语义，行号 0 被忽略）。
+    /// `entries` 是 `(行号, 条件)`：条件原样存进 [`Breakpoints`]，**这里不求值**（求值在
+    /// 沙箱 isolate 的 JS 侧）。空 `entries` = 移除该文件的断点
+    /// （[`Breakpoints::set`] 的语义，行号 0 被忽略）。
+    ///
+    /// 长度上限（200 字符）与"空白条件当无条件"都在命令层
+    /// （[`crate::app::commands::debug::set_breakpoints`]）做：本层是状态层，把它当纯
+    /// 数据存，测试可以不经过命令层直接验证推送形状。
+    ///
     /// 返回这个 bot 设完之后的**完整**断点集合（诊断/日志用）。
     pub fn set_breakpoints(
         &self,
         bot_id: &BotId,
         file: &str,
-        lines: impl IntoIterator<Item = u32>,
+        entries: impl IntoIterator<Item = (u32, Option<String>)>,
     ) -> Breakpoints {
         let (snapshot, targets) = {
             let mut bots = self.lock();
             let state = bots.entry(*bot_id).or_default();
-            state.breakpoints.set(file, lines);
+            state.breakpoints.set(file, entries);
             (state.breakpoints.clone(), live(state))
         };
         // 锁外推送：见模块文档「锁的顺序」。
@@ -367,12 +374,22 @@ mod tests {
         target
     }
 
+    /// 一组无条件断点条目（大多数测试只关心行号）。
+    fn lines<const N: usize>(rows: [u32; N]) -> [(u32, Option<String>); N] {
+        rows.map(|line| (line, None))
+    }
+
+    /// 空条目列表（= 移除该文件的断点）。
+    fn no_lines() -> Vec<(u32, Option<String>)> {
+        Vec::new()
+    }
+
     #[test]
     fn breakpoints_are_remembered_per_bot() {
         let registry = DebugRegistry::new();
         let (a, b) = (bot(), bot());
 
-        let after = registry.set_breakpoints(&a, "src/main.ts", [3, 7, 0]);
+        let after = registry.set_breakpoints(&a, "src/main.ts", lines([3, 7, 0]));
         assert!(after.hits("src/main.ts", 3), "行号应被记住（0 被忽略）");
         assert!(after.hits("src/main.ts", 7));
         assert!(!after.hits("src/main.ts", 0), "行号 0 必须被忽略");
@@ -382,7 +399,7 @@ mod tests {
         );
 
         // 第二次设同一个文件 = 整体替换那个文件的行集合，不是追加。
-        let after = registry.set_breakpoints(&a, "src/main.ts", [9]);
+        let after = registry.set_breakpoints(&a, "src/main.ts", lines([9]));
         assert!(after.hits("src/main.ts", 9));
         assert!(!after.hits("src/main.ts", 3), "同文件应当整体替换");
     }
@@ -391,8 +408,8 @@ mod tests {
     fn empty_lines_remove_the_file() {
         let registry = DebugRegistry::new();
         let bot_id = bot();
-        registry.set_breakpoints(&bot_id, "src/main.ts", [3]);
-        let after = registry.set_breakpoints(&bot_id, "src/main.ts", []);
+        registry.set_breakpoints(&bot_id, "src/main.ts", lines([3]));
+        let after = registry.set_breakpoints(&bot_id, "src/main.ts", no_lines());
         assert!(
             after.lines_of("src/main.ts").is_none(),
             "空行集合 = 移除该文件的断点"
@@ -407,7 +424,7 @@ mod tests {
         let mine = attach_target(&registry, bot_id);
         let other = attach_target(&registry, bot());
 
-        registry.set_breakpoints(&bot_id, "src/main.ts", [4]);
+        registry.set_breakpoints(&bot_id, "src/main.ts", lines([4]));
 
         let applied = mine.applied();
         assert_eq!(applied.len(), 2, "出生一次 + 设断点一次");
@@ -423,7 +440,7 @@ mod tests {
     fn a_new_isolate_starts_with_the_remembered_breakpoints() {
         let registry = DebugRegistry::new();
         let bot_id = bot();
-        registry.set_breakpoints(&bot_id, "src/main.ts", [12]);
+        registry.set_breakpoints(&bot_id, "src/main.ts", lines([12]));
 
         // 这个 bot 之前没有 isolate（断点先到、沙箱后建）：出生时必须补上。
         let target = attach_target(&registry, bot_id);
@@ -439,12 +456,12 @@ mod tests {
 
         {
             let target = attach_target(&registry, bot_id);
-            registry.set_breakpoints(&bot_id, "src/main.ts", [1]);
+            registry.set_breakpoints(&bot_id, "src/main.ts", lines([1]));
             drop(target);
         }
 
         // 旧句柄已失效：下一次设断点不该再尝试推给它（也不该因此报错）。
-        registry.set_breakpoints(&bot_id, "src/main.ts", [2]);
+        registry.set_breakpoints(&bot_id, "src/main.ts", lines([2]));
         let target = attach_target(&registry, bot_id);
         assert_eq!(
             target.applied().len(),
@@ -532,7 +549,7 @@ mod tests {
     fn forget_clears_breakpoints_and_waiters() {
         let registry = DebugRegistry::new();
         let bot_id = bot();
-        registry.set_breakpoints(&bot_id, "src/main.ts", [3]);
+        registry.set_breakpoints(&bot_id, "src/main.ts", lines([3]));
         let ticket = registry.register_pause(bot_id, "src/main.ts", 3);
 
         registry.forget(&bot_id);

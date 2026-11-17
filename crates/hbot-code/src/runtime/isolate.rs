@@ -126,6 +126,13 @@ pub struct DebugState {
     pub breakpoints: Breakpoints,
     /// Set while the worker is parked at a breakpoint.
     pub paused: bool,
+    /// `"<path>:<line>"` of conditional breakpoints whose condition already
+    /// failed to compile or evaluate.
+    ///
+    /// A broken condition fails on *every* hit of its line, so warning each time
+    /// would flood the log (and compete with the user's own events for IO).
+    /// One warning per line is enough to make the mistake visible.
+    pub(crate) warned_conditions: std::collections::BTreeSet<String>,
 }
 
 impl Sandbox {

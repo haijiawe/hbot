@@ -23,3 +23,7 @@ swc_ecma_visit = "=30.0.0"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
+
+[dev-dependencies]
+# `tests/s1_debug_instrument.rs` 需要一个能写进内存的 fmt 订阅者来断言"坏条件只 warn 一次"。
+tracing-subscriber.workspace = true

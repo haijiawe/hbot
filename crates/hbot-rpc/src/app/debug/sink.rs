@@ -82,6 +82,7 @@ impl DebugSink for BotDebugSink {
             bot_id: self.bot_id,
             file: at.file.clone(),
             line: at.line,
+            condition: at.condition.clone(),
             scopes: at.scopes.iter().map(scope_of).collect(),
             call_stack: at.call_stack.iter().map(frame_of).collect(),
         });
@@ -161,7 +162,7 @@ mod tests {
         BotId::from_uuid(uuid::Uuid::new_v4())
     }
 
-    /// 一次"有人在断点上停下来"的现场：局部变量 + 两层调用栈。
+    /// 一次"有人在条件断点上停下来"的现场：局部变量 + 两层调用栈。
     fn paused_at() -> PausedAt {
         let mut variables = BTreeMap::new();
         variables.insert("count".to_owned(), json!(3));
@@ -170,6 +171,7 @@ mod tests {
             file: "src/main.ts".to_owned(),
             line: 42,
             column: 7,
+            condition: Some("count > 3".to_owned()),
             scopes: vec![CoreScope {
                 name: "onMessage".to_owned(),
                 variables,
@@ -217,6 +219,7 @@ mod tests {
             bot_id: event_bot,
             file,
             line,
+            condition,
             scopes,
             call_stack,
         } = paused
@@ -226,6 +229,11 @@ mod tests {
         assert_eq!(event_bot, bot_id);
         assert_eq!(file, "src/main.ts");
         assert_eq!(line, 42);
+        assert_eq!(
+            condition.as_deref(),
+            Some("count > 3"),
+            "命中的条件要原样带到事件里（面板靠它显示「为什么停在这」）"
+        );
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].name, "onMessage");
         assert_eq!(scopes[0].variables.get("count"), Some(&json!(3)));

@@ -31,12 +31,12 @@ use hbot_bot::{
     AdapterSubscription, BotAdapter, BotSpec, HandlerExecutor, MessageCtx, OutboundEnvelope,
     Supervisor, SupervisorDeps,
 };
-use hbot_core::debug::DebugAction;
+use hbot_core::debug::{Breakpoints, DebugAction};
 use hbot_core::{BotId, HbotError, ProjectId, Timestamp};
 use hbot_rpc::app::bots::running_bot;
-use hbot_rpc::app::debug::PauseTicket;
+use hbot_rpc::app::debug::{BreakpointTarget, PauseTicket};
 use hbot_rpc::app::ids::UuidIds;
-use hbot_rpc::{AppState, Command, Dispatcher, Response, StepKind};
+use hbot_rpc::{AppState, Command, DebugBreakpoint, Dispatcher, Response, StepKind};
 use serde_json::{Value, json};
 
 /// 临时目录（`Drop` 递归删除）。刻意不引 `tempfile`，与 `src/app/test_support.rs` 同款。
@@ -224,11 +224,34 @@ fn project() -> ProjectId {
     ProjectId::from_uuid(uuid::Uuid::new_v4())
 }
 
+/// 一组无条件断点（大多数测试只关心行号）。
 fn set_breakpoints(bot_id: BotId, file: &str, lines: &[u32]) -> Command {
+    let breakpoints = lines
+        .iter()
+        .map(|line| DebugBreakpoint {
+            line: *line,
+            condition: None,
+        })
+        .collect();
     Command::DebugSetBreakpoints {
         bot_id,
         file: file.to_owned(),
-        lines: lines.to_vec(),
+        breakpoints,
+    }
+}
+
+/// 一组带（或不带）条件的断点。
+fn set_conditional(bot_id: BotId, file: &str, breakpoints: &[(u32, Option<&str>)]) -> Command {
+    Command::DebugSetBreakpoints {
+        bot_id,
+        file: file.to_owned(),
+        breakpoints: breakpoints
+            .iter()
+            .map(|(line, condition)| DebugBreakpoint {
+                line: *line,
+                condition: condition.map(str::to_owned),
+            })
+            .collect(),
     }
 }
 
@@ -307,6 +330,102 @@ async fn set_breakpoints_on_a_running_bot_returns_null_and_is_remembered() {
             .is_none(),
         "空行集合应当移除该文件的断点"
     );
+}
+
+// ---------------------------------------------------------------- 条件断点
+
+/// 记录"设断点被推给 isolate 时带的是什么"的假接收方。
+#[derive(Default)]
+struct RecordingTarget {
+    applied: std::sync::Mutex<Vec<Breakpoints>>,
+}
+
+impl BreakpointTarget for RecordingTarget {
+    fn apply_breakpoints(&self, breakpoints: Breakpoints) {
+        self.applied.lock().expect("假接收方锁").push(breakpoints);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_condition_reaches_the_isolate_verbatim() {
+    let harness = Harness::new("conditional");
+    let (bot_id, project_id) = (bot(), project());
+    harness.insert_bot_rows(bot_id, project_id);
+    harness.mark_running(bot_id, project_id);
+
+    let target = Arc::new(RecordingTarget::default());
+    harness
+        .state
+        .debug()
+        .attach(bot_id, Arc::clone(&target) as Arc<dyn BreakpointTarget>);
+
+    let response = harness
+        .call(set_conditional(
+            bot_id,
+            "src/main.ts",
+            &[
+                (3, None),
+                (9, Some("count > 3 && state.ready")),
+                // 空白条件 = 无条件（`Breakpoints::set` 的语义，命令层先归一化）。
+                (12, Some("   ")),
+            ],
+        ))
+        .await;
+    assert_ok_null(&response);
+
+    // 登记表里条件原样存着：**求值**在 isolate 的 JS 侧，命令层只搬数据。
+    let remembered = harness.state.debug().breakpoints_of(&bot_id);
+    assert!(remembered.hits("src/main.ts", 3));
+    assert_eq!(remembered.condition_of("src/main.ts", 3), None, "无条件");
+    assert_eq!(
+        remembered.condition_of("src/main.ts", 9),
+        Some("count > 3 && state.ready"),
+        "条件必须原样到达登记表"
+    );
+    assert_eq!(
+        remembered.condition_of("src/main.ts", 12),
+        None,
+        "空白条件必须退化成无条件"
+    );
+
+    // 推给 isolate 的是完整快照，条件不能在路上丢。
+    let applied = target.applied.lock().expect("假接收方锁").clone();
+    assert_eq!(applied.len(), 2, "attach 一次 + 设断点一次");
+    assert_eq!(
+        applied[1].condition_of("src/main.ts", 9),
+        Some("count > 3 && state.ready"),
+        "推给 isolate 的快照不能丢条件"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_long_condition_is_invalid_and_changes_nothing() {
+    let harness = Harness::new("long-condition");
+    let (bot_id, project_id) = (bot(), project());
+    harness.insert_bot_rows(bot_id, project_id);
+    harness.mark_running(bot_id, project_id);
+
+    // 上限是 200 个字符，201 就是参数错误（-32002，不是 -32006）。
+    let long = "a".repeat(201);
+    let response = harness
+        .call(set_conditional(bot_id, "src/main.ts", &[(4, Some(&long))]))
+        .await;
+    assert_error_code(&response, -32002);
+    assert!(
+        harness.state.debug().breakpoints_of(&bot_id).is_empty(),
+        "被拒绝的条件不该留下半份断点"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_condition_limit_is_checked_before_the_bot_state() {
+    // 参数不合法不该被 bot 状态掩盖：连 bot 都不存在时，超长条件也报 -32002。
+    let harness = Harness::new("long-condition-unknown-bot");
+    let long = "a".repeat(201);
+    let response = harness
+        .call(set_conditional(bot(), "src/main.ts", &[(4, Some(&long))]))
+        .await;
+    assert_error_code(&response, -32002);
 }
 
 // ---------------------------------------------------------------- resume / step

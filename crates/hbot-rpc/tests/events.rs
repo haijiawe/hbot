@@ -238,6 +238,7 @@ fn diff_and_debug_events_use_dotted_type_and_camel_case_fields() {
             bot_id: bot(),
             file: "src/main.rs".to_string(),
             line: 12,
+            condition: Some("count > 3".to_string()),
             scopes: vec![DebugScope {
                 name: "locals".to_string(),
                 variables: [("count".to_string(), json!(3))].into_iter().collect(),
@@ -254,6 +255,7 @@ fn diff_and_debug_events_use_dotted_type_and_camel_case_fields() {
             "botId": BOT_UUID,
             "file": "src/main.rs",
             "line": 12,
+            "condition": "count > 3",
             "scopes": [{ "name": "locals", "variables": { "count": 3 } }],
             "callStack": [{
                 "name": "main",

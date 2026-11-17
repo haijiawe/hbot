@@ -1285,6 +1285,7 @@ mod tests {
                 .expect("测试 UUID"),
             file: "src/main.ts".to_owned(),
             line: 12,
+            condition: None,
             scopes: Vec::new(),
             call_stack: Vec::new(),
         };
