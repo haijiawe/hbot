@@ -408,7 +408,8 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 
 | 顺序 | 做什么 | 解锁 |
 |---|---|---|
-| 1 | `C2.kv` + `C2.history` | 多轮聊天、游戏存档（两类 bot 同时可用） || 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 |
+| 1 | `C2.kv` + `C2.history` | 多轮聊天、游戏存档（两类 bot 同时可用） |
+| 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 |
 | 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 |
 | 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 |
 | 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 |
