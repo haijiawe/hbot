@@ -25,6 +25,7 @@
 
 #![warn(missing_docs)]
 
+pub mod bot_state;
 pub mod command;
 pub mod debug;
 pub mod device;
@@ -35,6 +36,11 @@ pub mod paths;
 pub mod ports;
 pub mod redact;
 
+pub use bot_state::{
+    BotState, BotStateError, HistoryDirection, HistoryEntry, HistoryReader, KvEntry,
+    KvWriteOptions, MAX_HISTORY, MAX_KV_BATCH, MAX_KV_KEY_BYTES, MAX_KV_LIST, MAX_KV_TTL,
+    MAX_KV_VALUE_BYTES, history_limit, validate_batch, validate_key, validate_ttl, validate_value,
+};
 pub use command::{
     CommandDenied, CommandOutput, CommandSpec, CommandStatus, IoDirection, OutputStream, Platform,
     ResourceLimits, ResourceUsage,

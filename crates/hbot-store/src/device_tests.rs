@@ -368,9 +368,14 @@ fn reopening_a_database_with_device_tables_does_not_rerun_migrations() {
             migrations::latest_version()
         );
     }
+    // 断言的是"0004 这个名字必须挂在版本 4 上"，**不是**"当前最新版本是 4"：
+    // 后面还会有 0005、0006…，写成 latest_version() == 4 的测试会在每次加迁移时假红。
+    let device = migrations::MIGRATIONS
+        .iter()
+        .find(|migration| migration.name == "0004_device")
+        .expect("0004_device 必须在迁移表里");
     assert_eq!(
-        migrations::latest_version(),
-        4,
+        device.version, 4,
         "0004_device 必须是第 4 条迁移（版本号与文件名前缀一致）"
     );
 
@@ -379,7 +384,13 @@ fn reopening_a_database_with_device_tables_does_not_rerun_migrations() {
         .execute("UPDATE schema_migrations SET applied_at = ?1", [SENTINEL])
         .expect("write sentinel");
     let before = migration_rows(&dir);
-    assert_eq!(before.len(), 4, "0001–0004 各一行");
+    // 行数写成"迁移表有几条"而不是常量 4：这条测试要证明的是
+    // 「每条迁移各登记一行、第二次打开没有新增或重放」，行数会随迁移增加。
+    assert_eq!(
+        before.len(),
+        migrations::MIGRATIONS.len(),
+        "每条迁移必须各登记一行"
+    );
     assert!(
         before
             .iter()

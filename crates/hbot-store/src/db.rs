@@ -39,9 +39,10 @@ use crate::error::{Result, StoreError};
 use crate::ids::{BotId, ConversationId, InboundId, OutboundId};
 use crate::migrations;
 use crate::models::{
-    BOT_STATUSES, Bot, BotStatusRow, Conversation, DeviceAuditRow, DeviceSessionRow,
+    BOT_STATUSES, Bot, BotStatusRow, Conversation, DeviceAuditRow, DeviceSessionRow, HistoryRow,
     InboundReplayRow, InboundRow, LogRow, NewAgentLog, NewDeviceAudit, NewDeviceSession,
-    NewInbound, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project, is_valid_bot_status,
+    NewInbound, NewKvEntry, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project,
+    is_valid_bot_status,
 };
 use crate::repositories;
 use crate::startup_trace;
@@ -219,6 +220,59 @@ enum StoreOp {
         bot_id: BotId,
         limit: usize,
         reply: Reply<Vec<DeviceAuditRow>>,
+    },
+    /// 读一个 KV 键；过期行不算存在。**必须与写同序**（走 db 线程而不是只读池）：
+    /// `set_kv` 返回后紧接着的这条读不能还看到旧值（与 [`StoreOp::LatestDeviceSession`]
+    /// 同一条理由）。
+    GetKv {
+        bot_id: BotId,
+        key: String,
+        now: i64,
+        reply: Reply<Option<String>>,
+    },
+    /// 写一个 KV 键（存在则覆盖，`expires_at` 可把旧 TTL 清成 NULL）。
+    SetKv {
+        bot_id: BotId,
+        key: String,
+        value_json: String,
+        expires_at: Option<i64>,
+        now: i64,
+        reply: Reply<()>,
+    },
+    /// 删一个 KV 键；返回是否真的删到行。
+    DeleteKv {
+        bot_id: BotId,
+        key: String,
+        reply: Reply<bool>,
+    },
+    /// 列出未过期的 KV 键名（按 key 升序，可选前缀）。与写同序的理由同 [`StoreOp::GetKv`]。
+    ListKv {
+        bot_id: BotId,
+        prefix: Option<String>,
+        limit: u32,
+        now: i64,
+        reply: Reply<Vec<String>>,
+    },
+    /// 一次事务里批量 upsert（全成或全不成）。
+    SetKvMany {
+        bot_id: BotId,
+        entries: Vec<NewKvEntry>,
+        now: i64,
+        reply: Reply<()>,
+    },
+    /// 合成 `inbound` / `outbound` 的会话历史，最近 `limit` 条、升序。
+    ///
+    /// **生产读路径不走这个变体**：历史只追加、不回读刚写的行，所以
+    /// [`Store::list_history`] 走只读连接池（见那边的注释）。这里保留 db 线程的孪生分支是
+    /// 为了"读写同序"这条路径随时可用（`crate::db::tests` 用它对拍两条路径的结果，
+    /// 防止只读池与写线程的读法漂移）。宁可留一个未构造的变体，也不让两条读路径各写一份
+    /// SQL —— SQL 只能出现在 `repositories/`（本 crate 的硬规则）。
+    #[allow(dead_code)]
+    ListHistory {
+        bot_id: BotId,
+        conversation_id: ConversationId,
+        limit: u32,
+        reply: Reply<Vec<HistoryRow>>,
     },
 }
 
@@ -777,6 +831,123 @@ impl Store {
         })
     }
 
+    /// 读一个 KV 键；不存在或**已过期**（`expires_at IS NOT NULL AND expires_at <= now`）
+    /// 都返回 `Ok(None)`。
+    ///
+    /// ## 为什么走 db 线程而不是只读连接池
+    ///
+    /// 与 [`Store::latest_device_session`] 同一条理由：**顺序可见性**。`set_kv` 返回后，
+    /// 调用方紧接着的 `get_kv` 必须能看到刚写的值——生成代码里"写标记 → 立刻检查标记"
+    /// 是最常见的形状，走只读池会读到还没追上 WAL 的快照，表现为"刚写的丢了"。
+    /// 这条路排在本线程已入队的写之后，代价是一次排队，换来的是**读写同序**。
+    ///
+    /// 已过期的行**不删**（本方法只有一条 SELECT）：清理是另一件事，读不许变成写。
+    pub fn get_kv(&self, bot_id: &BotId, key: &str, now: i64) -> Result<Option<String>> {
+        let bot_id = *bot_id;
+        let key = key.to_owned();
+        self.submit(|reply| StoreOp::GetKv {
+            bot_id,
+            key,
+            now,
+            reply,
+        })
+    }
+
+    /// 写一个 KV 键（存在则覆盖）。`expires_at = None` 表示永不过期，并且会**把旧的到期时间
+    /// 清成 NULL**（不是"保留旧值"）。
+    ///
+    /// `now` 只用于写 `updated_at`，由调用方注入（存储层不读时钟）。
+    pub fn set_kv(
+        &self,
+        bot_id: &BotId,
+        key: &str,
+        value_json: &str,
+        expires_at: Option<i64>,
+        now: i64,
+    ) -> Result<()> {
+        let bot_id = *bot_id;
+        let key = key.to_owned();
+        let value_json = value_json.to_owned();
+        self.submit(|reply| StoreOp::SetKv {
+            bot_id,
+            key,
+            value_json,
+            expires_at,
+            now,
+            reply,
+        })
+    }
+
+    /// 删一个 KV 键；返回是否真的删到行（`false` = 本来就不存在）。
+    ///
+    /// 已过期的行也算删到（`true`）：本方法按主键删，不看 `expires_at`。
+    pub fn delete_kv(&self, bot_id: &BotId, key: &str) -> Result<bool> {
+        let bot_id = *bot_id;
+        let key = key.to_owned();
+        self.submit(|reply| StoreOp::DeleteKv { bot_id, key, reply })
+    }
+
+    /// 按 `key` 升序列出未过期的键名，最多 `limit` 条；`prefix` 是字面量前缀
+    /// （LIKE 通配符 `%` / `_` / `\` 会被转义，不会被当成通配符）。
+    ///
+    /// 与写同序（走 db 线程）：`set_kv_many` 返回后紧接着的 `list_kv` 必须看得到那批键。
+    pub fn list_kv(
+        &self,
+        bot_id: &BotId,
+        prefix: Option<&str>,
+        limit: u32,
+        now: i64,
+    ) -> Result<Vec<String>> {
+        let bot_id = *bot_id;
+        let prefix = prefix.map(str::to_owned);
+        self.submit(|reply| StoreOp::ListKv {
+            bot_id,
+            prefix,
+            limit,
+            now,
+            reply,
+        })
+    }
+
+    /// 一次事务里批量 upsert；任何一条失败整批回滚（**不会**留下写了一半的状态）。
+    ///
+    /// 同批出现重复键时后者覆盖前者。空切片是合法的（不写、不报错）。`now` 是整批的
+    /// `updated_at`（同一批共享一个写入时刻，便于排障时看出"这是一次批量写"）。
+    pub fn set_kv_many(&self, bot_id: &BotId, entries: &[NewKvEntry], now: i64) -> Result<()> {
+        let bot_id = *bot_id;
+        let entries = entries.to_vec();
+        self.submit(|reply| StoreOp::SetKvMany {
+            bot_id,
+            entries,
+            now,
+            reply,
+        })
+    }
+
+    /// 会话历史：把 `inbound` 与 `outbound` 合成一张表，返回最近的 `limit` 条，
+    /// **时间升序、最老的在前**（聊天记录的自然阅读顺序）。`limit == 0` 返回空表。
+    ///
+    /// 同一毫秒的多条用 `message_id` 作次级键，所以两次调用顺序一致。
+    ///
+    /// ## 为什么走只读连接池（不是 db 线程）
+    ///
+    /// 历史是**只追加**的账本：调用方读的是"已经发生过的对话"，不回读自己刚写的那一行
+    /// （写历史的是 supervisor，读的是生成代码，两者不在同一个先后依赖里）。WAL 下只读
+    /// 连接不会挡住正在写新消息的 db 线程，所以这条读不该排进写队列。
+    /// 与之相反的是 KV 读（[`Store::get_kv`]）：那边"写完立刻读"是合法且常见的用法。
+    pub fn list_history(
+        &self,
+        bot_id: &BotId,
+        conversation_id: &ConversationId,
+        limit: u32,
+    ) -> Result<Vec<HistoryRow>> {
+        let bot_id = *bot_id;
+        let conversation_id = *conversation_id;
+        self.read(|connection| {
+            repositories::history::history(connection, &bot_id, &conversation_id, limit)
+        })
+    }
+
     /// 把操作投递给 db 线程并等回复。
     ///
     /// `op` 在持有通道锁时构造，保证 `Shutdown` 之后不会再有请求入队。
@@ -1083,6 +1254,67 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::device::list_audit(&connection, &bot_id, limit),
+                );
+            }
+            StoreOp::GetKv {
+                bot_id,
+                key,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::kv::get(&connection, &bot_id, &key, now),
+                );
+            }
+            StoreOp::SetKv {
+                bot_id,
+                key,
+                value_json,
+                expires_at,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::kv::set(&connection, &bot_id, &key, &value_json, expires_at, now),
+                );
+            }
+            StoreOp::DeleteKv { bot_id, key, reply } => {
+                reply_send(reply, repositories::kv::delete(&connection, &bot_id, &key));
+            }
+            StoreOp::ListKv {
+                bot_id,
+                prefix,
+                limit,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::kv::list(&connection, &bot_id, prefix.as_deref(), limit, now),
+                );
+            }
+            StoreOp::SetKvMany {
+                bot_id,
+                entries,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::kv::set_many(&connection, &bot_id, &entries, now),
+                );
+            }
+            StoreOp::ListHistory {
+                bot_id,
+                conversation_id,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::history::history(&connection, &bot_id, &conversation_id, limit),
                 );
             }
         }

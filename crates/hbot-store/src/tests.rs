@@ -408,6 +408,9 @@ fn deleting_a_project_cascades_to_children() {
             at: 10,
         })
         .expect("append log");
+    store
+        .set_kv(&bot_id(), "cascade-key", "1", None, 10)
+        .expect("set kv");
     drop(store);
 
     let raw = raw(&dir);
@@ -418,7 +421,15 @@ fn deleting_a_project_cascades_to_children() {
     ))
     .expect("delete project");
 
-    for table in ["bots", "conversations", "inbound", "outbound", "logs"] {
+    for table in [
+        "bots",
+        "conversations",
+        "inbound",
+        "outbound",
+        "logs",
+        // 0005 的 bot_kv 也挂 `ON DELETE CASCADE`：删项目不许留下"已删 bot 的 KV"孤儿行。
+        "bot_kv",
+    ] {
         let count: i64 = raw
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                 row.get(0)
@@ -1121,7 +1132,11 @@ fn upgrading_from_0001_keeps_rows_and_adds_new_columns() {
     }
 
     let store = Store::open(dir.db_path()).expect("open and upgrade legacy store");
-    assert_eq!(store.schema_version().expect("schema version"), 4);
+    assert_eq!(
+        store.schema_version().expect("schema version"),
+        migrations::latest_version(),
+        "老库必须升到本二进制支持的最新版本"
+    );
 
     let pending = store.list_pending_outbound(10).expect("list pending");
     assert_eq!(pending.len(), 1, "升级不得丢旧行");
@@ -1187,7 +1202,10 @@ fn upgrading_from_0002_keeps_existing_logs_with_bot_id_and_bot_source() {
     }
 
     let store = Store::open(dir.db_path()).expect("open and upgrade v2 store");
-    assert_eq!(store.schema_version().expect("schema version"), 4);
+    assert_eq!(
+        store.schema_version().expect("schema version"),
+        migrations::latest_version()
+    );
 
     let rows = store
         .list_logs(Some(&bot_id()), 10)
@@ -1209,7 +1227,13 @@ fn upgrading_from_0002_keeps_existing_logs_with_bot_id_and_bot_source() {
     let user_version: i64 = raw
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user_version");
-    assert_eq!(user_version, 4, "user_version 必须推进到 4");
+    // 这条测试关心的是"从 0002 的库升上来后 user_version 被推到本二进制支持的最新版"，
+    // 而不是某个具体数字：每加一条迁移都改一次常量等于让测试跟着实现走。
+    assert_eq!(
+        user_version,
+        i64::from(migrations::latest_version()),
+        "user_version 必须推进到最新迁移版本"
+    );
 
     let table_sql: String = raw
         .query_row(
@@ -1300,4 +1324,180 @@ fn outbound_state_constants_are_distinct() {
     assert_eq!(OUTBOUND_STATE_FAILED, "failed");
     assert_ne!(OUTBOUND_STATE_FAILED, OUTBOUND_STATE_SENT);
     assert_ne!(OUTBOUND_STATE_FAILED, crate::OUTBOUND_STATE_PENDING);
+}
+
+/// 0004 老库升级到 0005：`bot_kv` 建出来、旧数据一条不少、水位推到 5。
+///
+/// 与 `upgrading_from_0001_…` / `upgrading_from_0002_…` 同一手法：手写一个只到 0004 的库
+/// （不经过 `Store::open`），再用当前二进制打开它。这条专门钉住 0005 的两个风险点：
+///
+/// 1. **老库能不能升**：0005 之前用户机器上的库只有 1–4，`bot_kv` 不存在；升上来必须是
+///    "新表 + 旧行都在"，而不是重建式迁移把已有会话冲掉。
+/// 2. **水位推到 5**：`PRAGMA user_version` 与 `schema_migrations` 必须各就各位
+///    （G6 的「user_version 单调」判据）。这里写常数 5 是刻意的——它断言的是
+///    "0005_bot_kv 这个名字挂在版本 5 上"，版本号本身就是已发布的契约。
+#[test]
+fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
+    let dir = TempDir::new("upgrade-0004-kv");
+    {
+        let conn = raw(&dir);
+        for migration in &migrations::MIGRATIONS[..4] {
+            conn.execute_batch(migration.sql)
+                .unwrap_or_else(|error| panic!("apply {} by hand: {error}", migration.name));
+        }
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version    INTEGER PRIMARY KEY NOT NULL,
+                 name       TEXT    NOT NULL,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations (version, name, applied_at) VALUES
+                 (1, '0001_init', 0),
+                 (2, '0002_outbound_routing_and_status', 0),
+                 (3, '0003_agent_logs', 0),
+                 (4, '0004_device', 0);
+             PRAGMA user_version = 4;",
+        )
+        .expect("record migrations 1..4 as applied");
+
+        conn.execute(
+            "INSERT INTO projects (id, name, path, created_at) VALUES (?1, 'legacy', '/tmp/legacy', 1)",
+            params![project_id().to_string()],
+        )
+        .expect("insert legacy project");
+        conn.execute(
+            "INSERT INTO bots (id, project_id, name, platform, config_json, enabled, created_at)
+             VALUES (?1, ?2, 'legacy-bot', 'onebot', '{}', 1, 2)",
+            params![bot_id().to_string(), project_id().to_string()],
+        )
+        .expect("insert legacy bot");
+        conn.execute(
+            "INSERT INTO conversations (id, bot_id, external_id, kind, created_at)
+             VALUES (?1, ?2, 'group-42', 'group', 3)",
+            params![conversation_id().to_string(), bot_id().to_string()],
+        )
+        .expect("insert legacy conversation");
+        conn.execute(
+            "INSERT INTO logs (bot_id, level, line, at, source) VALUES (?1, 'info', 'legacy-line', 4, 'bot')",
+            params![bot_id().to_string()],
+        )
+        .expect("insert legacy log");
+
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'bot_kv'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("probe bot_kv before upgrade");
+        assert_eq!(table_exists, 0, "0004 的库里还不该有 bot_kv");
+    }
+
+    let store = Store::open(dir.db_path()).expect("open and upgrade v4 store");
+    assert_eq!(
+        store.schema_version().expect("schema version"),
+        5,
+        "0005_bot_kv 必须把水位推到 5"
+    );
+    assert_eq!(
+        store.journal_mode().expect("journal mode"),
+        "wal",
+        "升级不得把 WAL 改回去"
+    );
+
+    // 旧数据一条不少。
+    let logs = store.list_logs(Some(&bot_id()), 10).expect("legacy logs");
+    assert_eq!(logs.len(), 1, "升级不得丢旧日志");
+    assert_eq!(logs[0].line, "legacy-line");
+    assert!(
+        store.get_bot_status(&bot_id()).expect("bot").is_some(),
+        "升级不得丢旧 bot 行"
+    );
+
+    // 新表可用：写进去再读回来（证明升级后不是"有表但没有列"）。
+    store
+        .set_kv(&bot_id(), "counter", "1", None, 5)
+        .expect("set kv after upgrade");
+    assert_eq!(
+        store.get_kv(&bot_id(), "counter", 5).expect("get kv"),
+        Some("1".to_owned())
+    );
+    drop(store);
+
+    let conn = raw(&dir);
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user_version");
+    assert_eq!(user_version, 5, "user_version 必须推进到 5");
+
+    let recorded: Vec<(i64, String)> = conn
+        .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+        .expect("prepare schema_migrations")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query schema_migrations")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect schema_migrations");
+    assert_eq!(recorded.len(), 5, "0001–0005 各登记一行");
+    assert_eq!(
+        recorded[4],
+        (5, "0005_bot_kv".to_owned()),
+        "第 5 行必须是 0005_bot_kv"
+    );
+
+    // 表结构：列名/顺序/非空与 TTL 可空性都按契约；主键已承担 (bot_id, key) 唯一索引，
+    // 不额外建索引（多一棵 B 树只是浪费）。
+    let columns: Vec<(String, String, i64, Option<String>)> = conn
+        .prepare("PRAGMA table_info(bot_kv)")
+        .expect("prepare table_info")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .expect("query table_info")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect table_info");
+    let shape: Vec<(String, String, i64)> = columns
+        .iter()
+        .map(|(name, kind, not_null, _)| (name.clone(), kind.clone(), *not_null))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("bot_id".to_owned(), "TEXT".to_owned(), 1),
+            ("key".to_owned(), "TEXT".to_owned(), 1),
+            ("value_json".to_owned(), "TEXT".to_owned(), 1),
+            ("updated_at".to_owned(), "INTEGER".to_owned(), 1),
+            // expires_at 必须可空：NULL = 永不过期。
+            ("expires_at".to_owned(), "INTEGER".to_owned(), 0),
+        ],
+        "bot_kv 的列名、类型、非空约束都是冻结契约"
+    );
+
+    let indexes: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'bot_kv'")
+        .expect("prepare index query")
+        .query_map([], |row| row.get(0))
+        .expect("query indexes")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect indexes");
+    assert!(
+        indexes
+            .iter()
+            .all(|name| name.starts_with("sqlite_autoindex_bot_kv_")),
+        "除主键自动索引外不许有额外索引：{indexes:?}"
+    );
+
+    // 0005 自身也必须幂等（全部 CREATE … IF NOT EXISTS），且重跑不清数据。
+    conn.execute_batch(migrations::MIGRATIONS[4].sql)
+        .expect("0005 必须可重跑");
+    conn.execute_batch(migrations::MIGRATIONS[4].sql)
+        .expect("0005 必须可重跑（第二遍）");
+    let kv_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM bot_kv", [], |row| row.get(0))
+        .expect("count kv");
+    assert_eq!(kv_count, 1, "重跑 0005 不许清表");
 }

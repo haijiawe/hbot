@@ -314,3 +314,57 @@ pub struct NewDeviceAudit {
     pub target: Option<String>,
     pub outcome: String,
 }
+
+// ---------------------------------------------------------------------------
+// Bot 侧状态（C2）：KV 与历史（`hbot_core::bot_state` 的存储侧行形状）
+// ---------------------------------------------------------------------------
+
+/// 一行 KV。
+///
+/// `value_json` 是**原样字符串**：存储层不解析 JSON（与 [`DeviceSessionRow::sub_json`]
+/// 同口径），解析与类型判断在 `hbot-rpc` 那一层做 —— 那边才有 `serde_json::Value`。
+///
+/// `expires_at` 是 Unix 毫秒到期时刻，`None` = 永不过期。过期判定还需要一个 `now`，
+/// 所以本结构只描述列，不自己判断"现在过没过期"（见 [`crate::Store::get_kv`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvRow {
+    pub key: String,
+    pub value_json: String,
+    pub expires_at: Option<i64>,
+}
+
+/// 待写入的一条 KV（[`crate::Store::set_kv_many`] 的批量元素）。
+///
+/// 与 [`KvRow`] 同形状但**语义不同**：`expires_at` 是"这次写入后到期时刻"，`None` 表示
+/// 把到期时间清成永不过期（覆盖旧值时必须能把非 NULL 改回 NULL）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewKvEntry {
+    pub key: String,
+    pub value_json: String,
+    pub expires_at: Option<i64>,
+}
+
+/// 历史里的一条消息（`inbound` 或 `outbound`）。
+///
+/// 两个方向被**合成一张表**返回（[`crate::Store::list_history`]）：生成代码的
+/// `ctx.history(n)` 只关心"谁、什么时候、说了什么"，而它们分居两表。
+///
+/// `direction` 是 `"inbound"` / `"outbound"`（与
+/// `hbot_core::HistoryDirection::as_str()` 同值）；`message_id` 是各自表的主键，
+/// `at` 是各自的业务时间（inbound `received_at` / outbound `created_at`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRow {
+    /// `"inbound"` | `"outbound"`。
+    pub direction: String,
+    /// `inbound.id` / `outbound.id`（UUID 字符串）。
+    pub message_id: String,
+    /// `inbound.external_id` / `outbound.reply_to.unwrap_or_default()`。
+    pub external_id: String,
+    /// `inbound.sender_id` / `""`（出站行没有发送者）。
+    pub sender_id: String,
+    /// `inbound`：`payload_json` 里 `"text"` 的字符串值（缺失/非字符串/整段非法 JSON → `""`）；
+    /// `outbound`：`outbound.text`。
+    pub text: String,
+    /// `inbound.received_at` / `outbound.created_at`（Unix 毫秒）。
+    pub at: i64,
+}
