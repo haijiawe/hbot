@@ -73,9 +73,9 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | | `webhook` | 外部系统打进来（HTTP 入口） | `设计` |
 | | `lifecycle` | `onStart` / `onStop` | `设计` |
 | | `device` | 屏幕变化、输入事件（预留，见 §9） | `未做` |
-| **C2 状态** | `kv` | 每 bot 命名空间的键值（JSON 值、TTL、批量原子写） | `设计` |
+| **C2 状态** | `kv` | 每 bot 命名空间的键值（JSON 值、TTL、批量原子写） | `已实现`（2026-11-18） |
 | | `sql` | 每 bot 一套表（迁移文件定义，只允许参数化 DML） | `设计` |
-| | `history` | 最近 N 条消息（只读） | `设计` |
+| | `history` | 最近 N 条消息（只读） | `已实现`（2026-11-18） |
 | | `session` | 会话状态机 + "等下一条消息" | `设计` |
 | **C3 出口** | `reply` | 被动回复（绑定入站消息） | `已实现` |
 | | `send` | 主动推送到指定会话 | `设计` |
@@ -186,6 +186,36 @@ ctx.jobs.enqueue('settle-war', { warId })
 | `sql` | `ctx.sql.query/exec`，只允许参数化语句 | schema 由项目里的 `migrations/*.sql` 定义，**运行时不许 DDL**；每 bot 独立 schema 前缀 |
 | `history` | `ctx.history(n)` 返回最近 n 条（含自己发过的） | 只读；由 supervisor 维护，来自 `inbound`/`outbound` 表 |
 | `session` | `ctx.session.get/set` + `await(predicate, timeoutMs)` | **归属键必须是 `(bot_id, conversation_id, sender_id)`**，且落库 |
+
+### 5.0 已落地：`kv` 与 `history`（2026-11-18）
+
+声明的写法（`hbot.json`，两个布尔各自独立）：
+
+```json
+{ "name": "my-bot", "platform": { "kind": "local" },
+  "capabilities": { "state": { "kv": true, "history": true } } }
+```
+
+**三道判据，一层一份，都不许在别的层重写**：
+
+| 层 | 判据 | 位置 | 没过的症状 |
+|---|---|---|---|
+| 声明层 | 清单里 `capabilities.state.kv/history` | `hbot-rpc` 的 `StoreBotState::require_kv/require_history`（每个方法第一句） | `HBOT_STATE_NOT_DECLARED` |
+| 装配层 | 宿主有没有 `set_state` | `hbot-code` 的 `StateSlot::handles()` | `HBOT_STATE_UNAVAILABLE` |
+| 参数层 | 键长/值大小/批量/TTL/history 上限 | `hbot-core` 的 `validate_*` / `history_limit`（**唯一一份**） | `HBOT_STATE_INVALID` |
+
+参数闸的量纲：键 **128 字节**、值 **64 KiB**（序列化后）、`setMany` **100 条**、TTL **30 天**、`list` **1000 个键**、`history` **上限 50 条**（默认 20）。
+
+**两条故意相反的口径**（都在代码注释里写了理由）：
+
+- TTL 超 30 天 **报错不截断** —— 截断会让调用方以为设的值生效了；
+- `history(1000)` **夹到 50 不报错** —— 意图明确是"尽量多给"，夹住是用户想要的结果。
+
+**历史项的字段不含 `payload`**（原始平台事件几十 KB，塞进上下文没有理由）：`direction` / `messageId` / `externalId` / `senderId` / `text` / `at`，时间升序、含 outbound。
+
+**存储形态**：`bot_kv(bot_id, key, value_json, updated_at, expires_at)`，主键 `(bot_id, key)`；过期是**读语义**不是删除动作（读路径要能跑只读连接，所以 `WHERE expires_at IS NULL OR expires_at > now`，行不删）。KV 的读也走 store 的单写者线程 —— `set` 返回后紧接着的 `get` 必须看得见（与 `setMany` 同一理由）。
+
+> `kv` 是全库唯一的"生成代码可写的持久状态"口子。`sql`（§5 表里第二行）尚未实现，`hbot.json` 里写 `capabilities.state.sql` 会 `unknown field` 加载失败 —— 这是故意的（见 §3.2 规则 1）。
 
 ### 5.1 `session.await` 是旧项目 P0 的直接教训
 
@@ -378,8 +408,7 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 
 | 顺序 | 做什么 | 解锁 |
 |---|---|---|
-| 1 | `C2.kv` + `C2.history` | 多轮聊天、游戏存档（两类 bot 同时可用） |
-| 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 |
+| 1 | `C2.kv` + `C2.history` | 多轮聊天、游戏存档（两类 bot 同时可用） || 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 |
 | 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 |
 | 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 |
 | 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 |
