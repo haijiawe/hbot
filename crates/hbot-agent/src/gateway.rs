@@ -1097,6 +1097,7 @@ mod tests {
                 },
                 stdout: "wired".to_string(),
                 stderr: String::new(),
+                usage: Default::default(),
                 duration: std::time::Duration::from_millis(1),
             })
         }

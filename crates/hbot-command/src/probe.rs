@@ -147,11 +147,22 @@ pub struct CapabilityReport {
     pub containment: ProbeOutcome,
     /// 写隔离。
     pub write_confinement: ProbeOutcome,
+    /// 能不能按 `ResourceLimits::cpu_ms` 限 CPU 时间。
+    pub cpu_limit: bool,
+    /// 能不能按 `ResourceLimits::memory_bytes` 限内存。
+    pub memory_limit: bool,
+    /// 能不能按 `ResourceLimits::read_bytes` / `write_bytes` 限 I/O 字节数。
+    pub io_limit: bool,
+    /// 能不能按 `ResourceLimits::process_count` 限并发进程数。
+    pub process_limit: bool,
 }
 
 impl CapabilityReport {
     /// 用给定探测实现生成一份矩阵。
     pub fn probe_with(probe: &dyn IsolationProbe, platform: Platform) -> Self {
+        // 资源上限的支持矩阵与 `require_isolation` 的 fail-closed 检查共用
+        // `limits::support`：两处各写一份的话，总有一天会出现"能力面板说支持、实际被拒"。
+        let limit_support = crate::limits::support(platform);
         Self {
             platform,
             containment: outcome_of(
@@ -164,6 +175,10 @@ impl CapabilityReport {
                 platform,
                 IsolationLevel::WriteConfinement,
             ),
+            cpu_limit: limit_support.cpu,
+            memory_limit: limit_support.memory,
+            io_limit: limit_support.io,
+            process_limit: limit_support.processes,
         }
     }
 
@@ -195,14 +210,28 @@ impl CapabilityReport {
 
     /// 给用户看的一句中文总结（能力矩阵面板 / 拒绝横幅用）。
     ///
-    /// 形如「命令隔离能力（windows）：进程树与资源上限可用；写隔离不可用（…）」。
+    /// 形如「命令隔离能力（windows）：进程树与资源上限可用；写隔离不可用（…）；
+    /// 资源上限（CPU 毫秒级…）」。最后一段是**这台机器上各类限额的真实精度**：
+    /// "能不能限"和"限得准不准"是两件事，只说前者等于没说完。
     pub fn summary_zh(&self) -> String {
         format!(
-            "命令隔离能力（{}）：进程树与资源上限{}；写隔离{}",
+            "命令隔离能力（{}）：进程树与资源上限{}；写隔离{}；资源上限（{}）",
             self.platform,
             phrase(&self.containment),
-            phrase(&self.write_confinement)
+            phrase(&self.write_confinement),
+            crate::limits::support_summary_zh(self.platform)
         )
+    }
+
+    /// 请求的这些限额，这台机器能兑现吗（`false` 表示会被 `require_isolation` 拒）。
+    ///
+    /// 注意 `limits` 为空时恒为 `true`：不请求限额就与改动前完全一致。
+    pub fn supports_limits(&self, limits: &hbot_core::ResourceLimits) -> bool {
+        (limits.cpu_ms.is_none() || self.cpu_limit)
+            && (limits.memory_bytes.is_none() || self.memory_limit)
+            && (limits.read_bytes.is_none() || self.io_limit)
+            && (limits.write_bytes.is_none() || self.io_limit)
+            && (limits.process_count.is_none() || self.process_limit)
     }
 }
 
@@ -261,6 +290,25 @@ mod tests {
         }
     }
 
+    /// 测试用构造：只关心两层探测结果，资源上限四项按平台真实支持矩阵填
+    /// （手写四个 `true` 会让"能力面板说支持、实际被拒"从测试里就种下去）。
+    fn report(
+        platform: Platform,
+        containment: ProbeOutcome,
+        write_confinement: ProbeOutcome,
+    ) -> CapabilityReport {
+        let support = crate::limits::support(platform);
+        CapabilityReport {
+            platform,
+            containment,
+            write_confinement,
+            cpu_limit: support.cpu,
+            memory_limit: support.memory,
+            io_limit: support.io,
+            process_limit: support.processes,
+        }
+    }
+
     #[test]
     fn report_reflects_injected_probe() {
         let report = CapabilityReport::probe_with(&DenyAll, Platform::Linux);
@@ -274,11 +322,11 @@ mod tests {
 
     #[test]
     fn read_only_never_supports_commands() {
-        let report = CapabilityReport {
-            platform: Platform::Windows,
-            containment: ProbeOutcome::available("ok"),
-            write_confinement: ProbeOutcome::available("ok"),
-        };
+        let report = report(
+            Platform::Windows,
+            ProbeOutcome::available("ok"),
+            ProbeOutcome::available("ok"),
+        );
         assert!(
             !report.supports(SandboxMode::ReadOnly),
             "只读档恒不放行命令"
@@ -300,14 +348,56 @@ mod tests {
 
     #[test]
     fn summary_keeps_the_short_word_without_a_detail() {
-        let report = CapabilityReport {
-            platform: Platform::Windows,
-            containment: ProbeOutcome::available("可用"),
-            write_confinement: ProbeOutcome::available("可用"),
+        let report = report(
+            Platform::Windows,
+            ProbeOutcome::available("可用"),
+            ProbeOutcome::available("可用"),
+        );
+        let summary = report.summary_zh();
+        assert!(
+            summary.starts_with(
+                "命令隔离能力（windows）：进程树与资源上限可用；写隔离可用；资源上限（"
+            ),
+            "{summary}"
+        );
+        // 精度说明必须真的在句子里——只说"支持"不告诉调用方"秒级还是毫秒级"等于没说。
+        assert!(summary.contains("10 ms"), "{summary}");
+    }
+
+    #[test]
+    fn linux_report_admits_the_limits_it_cannot_enforce() {
+        let report = CapabilityReport::probe_with(&DenyAll, Platform::Linux);
+        assert!(report.cpu_limit, "Linux 用 RLIMIT_CPU");
+        assert!(report.memory_limit, "Linux 用 RLIMIT_AS");
+        assert!(
+            !report.io_limit,
+            "Linux 的 io.max 要 cgroup v2 + 特权，不做"
+        );
+        assert!(!report.process_limit, "RLIMIT_NPROC 按用户统计，不能限树");
+
+        let io = hbot_core::ResourceLimits {
+            read_bytes: Some(1024),
+            ..hbot_core::ResourceLimits::default()
         };
-        assert_eq!(
-            report.summary_zh(),
-            "命令隔离能力（windows）：进程树与资源上限可用；写隔离可用"
+        assert!(
+            !report.supports_limits(&io),
+            "Linux 上请求 I/O 上限必须被判不支持"
+        );
+        assert!(
+            report.supports_limits(&hbot_core::ResourceLimits::default()),
+            "不请求限额时恒为支持（既有行为不变）"
+        );
+
+        let windows = CapabilityReport::probe_with(&DenyAll, Platform::Windows);
+        assert!(
+            windows.supports_limits(&hbot_core::ResourceLimits {
+                cpu_ms: Some(100),
+                memory_bytes: Some(1024),
+                read_bytes: Some(1024),
+                write_bytes: Some(1024),
+                process_count: Some(2),
+            }),
+            "Windows 上五类限额都支持"
         );
     }
 
@@ -315,13 +405,13 @@ mod tests {
     fn summary_shows_the_detail_when_the_probe_has_one() {
         // Linux 的写隔离会带出「Landlock（ABI N）…」这段；它是用户判断
         // "哪些路径可写"的唯一线索，不能只留一个"可用"。
-        let report = CapabilityReport {
-            platform: Platform::Linux,
-            containment: ProbeOutcome::available("可用"),
-            write_confinement: ProbeOutcome::available(
+        let report = report(
+            Platform::Linux,
+            ProbeOutcome::available("可用"),
+            ProbeOutcome::available(
                 "Landlock（ABI 3）可用，可写范围 = 工作区 + 私有缓存目录（/tmp/x）",
             ),
-        };
+        );
         let summary = report.summary_zh();
         assert!(summary.contains("可用（Landlock（ABI 3）"), "{summary}");
         assert!(summary.contains("私有缓存目录"), "{summary}");

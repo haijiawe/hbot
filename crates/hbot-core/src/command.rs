@@ -68,6 +68,98 @@ impl std::fmt::Display for Platform {
     }
 }
 
+/// 一次调用请求的资源上限（**整棵进程树**口径，不是单进程）。
+///
+/// 全 `None` = "不额外限制"，也就是本字段出现之前的行为。哪些平台真能兑现、
+/// 兑现到什么精度，见 `hbot-command` 的 [`CapabilityReport`] 与 `limits()` 支持矩阵：
+/// 请求了平台做不到的限额会得到 [`CommandDenied::IsolationUnavailable`]，
+/// **不会**被静默忽略（静默忽略等于骗调用方）。
+///
+/// 单位：
+///
+/// - `cpu_ms`：**用户态 CPU 毫秒**（Windows job 的 `PerJobUserTimeLimit` 是 100ns 单位，
+///   精度取决于内核记账；Linux `RLIMIT_CPU` 只有**秒级且向上取整**）；
+/// - `memory_bytes`：**提交/地址空间**字节。Windows 是 job 提交内存总量；
+///   Linux 是 `RLIMIT_AS`（虚拟地址空间，比 RSS 严——程序 `mmap` 未触碰的页也算）；
+/// - `read_bytes`/`write_bytes`：整棵树累计的 I/O 传输字节（不是"瞬时速率"）；
+/// - `process_count`：整棵树**同时存活**的进程数上限（不是累计创建数）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ResourceLimits {
+    /// 用户态 CPU 毫秒上限。`Some(0)` 不合法（见 `CommandDenied::InvalidSpec`）。
+    pub cpu_ms: Option<u64>,
+    /// 内存字节上限。
+    pub memory_bytes: Option<u64>,
+    /// 累计读取字节上限。
+    pub read_bytes: Option<u64>,
+    /// 累计写出字节上限。
+    pub write_bytes: Option<u64>,
+    /// 同时存活的进程数上限（Windows 内核硬上限夹在 `1..=64`）。
+    pub process_count: Option<u32>,
+}
+
+impl ResourceLimits {
+    /// 是否**没有**请求任何限额（等价于本字段出现之前的行为）。
+    ///
+    /// 实现层用它跳过"平台不支持"检查：没请求就不该因为平台做不到而拒绝。
+    pub const fn is_empty(&self) -> bool {
+        self.cpu_ms.is_none()
+            && self.memory_bytes.is_none()
+            && self.read_bytes.is_none()
+            && self.write_bytes.is_none()
+            && self.process_count.is_none()
+    }
+}
+
+/// I/O 方向（只用于拒绝原因与日志）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoDirection {
+    /// 读取。
+    Read,
+    /// 写出。
+    Write,
+}
+
+impl IoDirection {
+    /// 稳定字符串。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+impl fmt::Display for IoDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Read => "读取",
+            Self::Write => "写出",
+        })
+    }
+}
+
+/// 一次命令执行**实际**消耗了多少资源（时间、内存、I/O、进程数）。
+///
+/// 全部是"整棵树"口径的观测值，`0` 表示**没有测量**（该平台没有这项计数器），
+/// 不表示"用了 0"。具体每项的精度与盲区见 `hbot-command` 的模块文档
+/// 「资源上限的语义与代价」。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ResourceUsage {
+    /// 用户态 CPU 毫秒（Windows：job `TotalUserTime`；Linux：`RUSAGE_CHILDREN` 差值）。
+    pub cpu_ms: u64,
+    /// 内存峰值字节（Windows：`PeakJobMemoryUsed`；Linux：`ru_maxrss`，**上界估计**）。
+    pub peak_memory_bytes: u64,
+    /// 累计读取字节（Linux 恒为 0：未测量）。
+    pub read_bytes: u64,
+    /// 累计写出字节（Linux 恒为 0：未测量）。
+    pub write_bytes: u64,
+    /// 观测到的同时存活进程数峰值（10 ms 采样，**短命进程可能漏计**）。
+    pub peak_processes: u32,
+}
+
 /// 一次命令执行的完整规格。
 ///
 /// **字段都是显式的**：没有"继承父进程"的默认值，没有 shell，没有通配。
@@ -130,6 +222,14 @@ pub struct CommandSpec {
     /// 这一次打算跑什么"，用来把审批范围钉死在一个具体动作上；拿它当隔离用
     /// 就会重演旧项目的坑（`AGENTS.md` §7 第 7 条）。
     pub allowed_programs: Vec<String>,
+
+    /// 本次调用请求的资源上限（CPU 毫秒 / 内存字节 / I/O 字节 / 进程数）。
+    ///
+    /// 默认 [`ResourceLimits::default`]（全 `None`）= 不额外限制。请求了平台做不到的
+    /// 限额会被 [`CommandDenied::IsolationUnavailable`] 拒绝，**不会**静默降级。
+    /// 纯新增字段：老调用方不设它，行为与本字段出现之前完全一致。
+    #[serde(default)]
+    pub limits: ResourceLimits,
 }
 
 /// 手写 `Debug`（**不要**换回 `#[derive(Debug)]`）：RT-06。
@@ -138,7 +238,7 @@ pub struct CommandSpec {
 /// `--token=sk-…` / `Authorization: Bearer …` 原样打进 `tracing::warn!(?spec)`、
 /// `thiserror` 的 `#[source]` 链和工具输出 —— 一次打印就是一条永久落进 `logs` 表的密钥。
 ///
-/// 形状与派生实现保持一致（11 个字段名都在、非敏感值原样），只有敏感值变成
+/// 形状与派生实现保持一致（12 个字段名都在、非敏感值原样），只有敏感值变成
 /// [`crate::redact::REDACTED`]：`args` 走 [`RedactedArgs`]（含 `--flag value` 分开的形态），
 /// `env` 走 [`RedactedEnv`]（变量名保留、按键名判值）。判据见 [`crate::redact`]。
 impl fmt::Debug for CommandSpec {
@@ -155,6 +255,7 @@ impl fmt::Debug for CommandSpec {
             .field("max_output_bytes", &self.max_output_bytes)
             .field("sandbox", &self.sandbox)
             .field("allowed_programs", &self.allowed_programs)
+            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -177,6 +278,7 @@ impl CommandSpec {
             max_output_bytes: 256 * 1024,
             sandbox: SandboxMode::WorkspaceWrite,
             allowed_programs: Vec::new(),
+            limits: ResourceLimits::default(),
         }
     }
 
@@ -227,6 +329,11 @@ pub struct CommandOutput {
     pub stderr: String,
     /// 从 spawn 到结束（或超时杀树）的墙钟耗时。
     pub duration: Duration,
+    /// 本次执行的资源消耗观测值（纯新增字段；未测量的项为 0）。
+    ///
+    /// 语义见 [`ResourceUsage`]：它是"整棵树"口径，且某些平台干脆没有对应计数器。
+    #[serde(default)]
+    pub usage: ResourceUsage,
 }
 
 /// 拒绝执行的原因。
@@ -313,6 +420,80 @@ pub enum CommandDenied {
         /// 系统错误文本。
         reason: String,
     },
+
+    /// CPU 时间超过调用方给的上限（[`ResourceLimits::cpu_ms`]）。
+    #[error(
+        "命令的 CPU 时间已用 {used_ms} 毫秒，超过 {limit_ms} 毫秒上限（超出 {} 毫秒），已终止整棵进程树。",
+        .used_ms.saturating_sub(*limit_ms)
+    )]
+    CpuLimit {
+        /// 实际用量（毫秒，观测值）。
+        used_ms: u64,
+        /// 调用方给的上限（毫秒）。
+        limit_ms: u64,
+    },
+
+    /// 内存占用超过调用方给的上限（[`ResourceLimits::memory_bytes`]）。
+    #[error(
+        "命令内存占用超过 {limit_bytes} 字节（约 {} MiB）上限，已终止整棵进程树。",
+        .limit_bytes / (1024 * 1024)
+    )]
+    MemoryLimit {
+        /// 调用方给的上限（字节）。
+        limit_bytes: u64,
+    },
+
+    /// I/O 传输量超过调用方给的上限（[`ResourceLimits::read_bytes`] /
+    /// [`ResourceLimits::write_bytes`]）。
+    #[error(
+        "命令的{direction} I/O 已传 {used_bytes} 字节，超过 {limit_bytes} 字节上限（超出 {} 字节），已终止整棵进程树。",
+        .used_bytes.saturating_sub(*limit_bytes)
+    )]
+    IoLimit {
+        /// 触发的方向。
+        direction: IoDirection,
+        /// 实际用量（字节，观测值）。
+        used_bytes: u64,
+        /// 调用方给的上限（字节）。
+        limit_bytes: u64,
+    },
+
+    /// 同时存活的进程数触到调用方给的上限（[`ResourceLimits::process_count`]）。
+    ///
+    /// Windows 上这条是**内核硬上限**：`ActiveProcessLimit` 让第 `limit + 1` 个进程
+    /// **创建失败**，而不是我们事后杀树——所以命令可能是"自己 spawn 失败后退出"，
+    /// 不一定变成这个拒绝原因（见 `hbot-command` 的 `containment_win` 注释）。
+    #[error("命令的并发进程数触到 {limit} 个上限（整棵进程树，含根进程），已终止整棵进程树。")]
+    ProcessLimit {
+        /// 调用方给的上限。
+        limit: u32,
+    },
+}
+
+impl CommandDenied {
+    /// 稳定的错误码串（日志、审计、UI 分流用；**不要**用它做本地化）。
+    ///
+    /// 风格与 `hbot-code` 的 `CodeError::code()`（`HBOT_TIMEOUT` 一族）一致：
+    /// 全大写、`HBOT_` 前缀、下划线分词。新增变体必须同时给码，否则这里编译不过
+    /// （`match` 没有 `_` 兜底）。
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::IsolationUnavailable { .. } => "HBOT_COMMAND_ISOLATION_UNAVAILABLE",
+            Self::ProgramNotAllowed { .. } => "HBOT_COMMAND_PROGRAM_NOT_ALLOWED",
+            Self::ProgramNotFound { .. } => "HBOT_COMMAND_PROGRAM_NOT_FOUND",
+            Self::OutsideWorkspace { .. } => "HBOT_COMMAND_OUTSIDE_WORKSPACE",
+            Self::TooLong { .. } => "HBOT_COMMAND_TOO_LONG",
+            Self::InheritEnvRejected { .. } => "HBOT_COMMAND_INHERIT_ENV_REJECTED",
+            Self::SandboxDenied { .. } => "HBOT_COMMAND_SANDBOX_DENIED",
+            Self::InvalidSpec { .. } => "HBOT_COMMAND_INVALID_SPEC",
+            Self::SpawnFailed { .. } => "HBOT_COMMAND_SPAWN_FAILED",
+            Self::IoFailed { .. } => "HBOT_COMMAND_IO_FAILED",
+            Self::CpuLimit { .. } => "HBOT_COMMAND_CPU_LIMIT",
+            Self::MemoryLimit { .. } => "HBOT_COMMAND_MEMORY_LIMIT",
+            Self::IoLimit { .. } => "HBOT_COMMAND_IO_LIMIT",
+            Self::ProcessLimit { .. } => "HBOT_COMMAND_PROCESS_LIMIT",
+        }
+    }
 }
 
 /// 输出流标识（只用于拒绝原因与日志）。
@@ -383,5 +564,217 @@ mod tests {
         assert!(message.contains("已拒绝执行"), "{message}");
         assert!(message.contains("landlock 不可用"), "{message}");
         assert!(message.contains("linux"), "{message}");
+    }
+
+    #[test]
+    fn new_spec_requests_no_resource_limits() {
+        let spec = CommandSpec::new("cargo", "C:\\proj");
+        assert!(spec.limits.is_empty(), "默认不额外限制，保持既有行为");
+        assert_eq!(spec.limits, ResourceLimits::default());
+        assert_eq!(spec.limits.cpu_ms, None);
+        assert_eq!(spec.limits.memory_bytes, None);
+        assert_eq!(spec.limits.read_bytes, None);
+        assert_eq!(spec.limits.write_bytes, None);
+        assert_eq!(spec.limits.process_count, None);
+    }
+
+    #[test]
+    fn any_single_limit_makes_limits_non_empty() {
+        let base = ResourceLimits::default();
+        assert!(
+            !ResourceLimits {
+                cpu_ms: Some(1),
+                ..base
+            }
+            .is_empty()
+        );
+        assert!(
+            !ResourceLimits {
+                memory_bytes: Some(1),
+                ..base
+            }
+            .is_empty()
+        );
+        assert!(
+            !ResourceLimits {
+                read_bytes: Some(1),
+                ..base
+            }
+            .is_empty()
+        );
+        assert!(
+            !ResourceLimits {
+                write_bytes: Some(1),
+                ..base
+            }
+            .is_empty()
+        );
+        assert!(
+            !ResourceLimits {
+                process_count: Some(1),
+                ..base
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn resource_usage_default_means_unmeasured() {
+        let usage = ResourceUsage::default();
+        assert_eq!(usage.cpu_ms, 0);
+        assert_eq!(usage.peak_memory_bytes, 0);
+        assert_eq!(usage.read_bytes, 0);
+        assert_eq!(usage.write_bytes, 0);
+        assert_eq!(usage.peak_processes, 0);
+    }
+
+    #[test]
+    fn io_direction_names_both_sides_in_chinese() {
+        assert_eq!(IoDirection::Read.as_str(), "read");
+        assert_eq!(IoDirection::Write.as_str(), "write");
+        assert_eq!(IoDirection::Read.to_string(), "读取");
+        assert_eq!(IoDirection::Write.to_string(), "写出");
+    }
+
+    #[test]
+    fn resource_limit_denials_state_the_limit_and_the_overshoot() {
+        let cpu = CommandDenied::CpuLimit {
+            used_ms: 640,
+            limit_ms: 100,
+        };
+        let cpu_message = cpu.to_string();
+        assert!(cpu_message.contains("640"), "{cpu_message}");
+        assert!(cpu_message.contains("100"), "{cpu_message}");
+        assert!(cpu_message.contains("540"), "要说清超出多少：{cpu_message}");
+        assert!(cpu_message.contains("CPU"), "{cpu_message}");
+
+        let memory = CommandDenied::MemoryLimit {
+            limit_bytes: 64 * 1024 * 1024,
+        };
+        let memory_message = memory.to_string();
+        assert!(memory_message.contains("67108864"), "{memory_message}");
+        assert!(memory_message.contains("64 MiB"), "{memory_message}");
+        assert!(memory_message.contains("内存"), "{memory_message}");
+
+        let io = CommandDenied::IoLimit {
+            direction: IoDirection::Write,
+            used_bytes: 4096,
+            limit_bytes: 1024,
+        };
+        let io_message = io.to_string();
+        assert!(io_message.contains("写出"), "{io_message}");
+        assert!(io_message.contains("4096"), "{io_message}");
+        assert!(io_message.contains("3072"), "要说清超出多少：{io_message}");
+
+        let process = CommandDenied::ProcessLimit { limit: 3 };
+        let process_message = process.to_string();
+        assert!(process_message.contains('3'), "{process_message}");
+        assert!(process_message.contains("进程数"), "{process_message}");
+        assert!(process_message.contains("整棵进程树"), "{process_message}");
+    }
+
+    #[test]
+    fn every_denial_has_a_stable_machine_readable_code() {
+        let cases: Vec<(CommandDenied, &str)> = vec![
+            (
+                CommandDenied::IsolationUnavailable {
+                    platform: Platform::Linux,
+                    reason: String::new(),
+                },
+                "HBOT_COMMAND_ISOLATION_UNAVAILABLE",
+            ),
+            (
+                CommandDenied::ProgramNotAllowed {
+                    program: "cmd".to_owned(),
+                },
+                "HBOT_COMMAND_PROGRAM_NOT_ALLOWED",
+            ),
+            (
+                CommandDenied::ProgramNotFound {
+                    program: "cmd".to_owned(),
+                },
+                "HBOT_COMMAND_PROGRAM_NOT_FOUND",
+            ),
+            (
+                CommandDenied::OutsideWorkspace {
+                    path: "..".to_owned(),
+                },
+                "HBOT_COMMAND_OUTSIDE_WORKSPACE",
+            ),
+            (
+                CommandDenied::TooLong {
+                    stream: OutputStream::Stdout,
+                    limit_bytes: 1,
+                },
+                "HBOT_COMMAND_TOO_LONG",
+            ),
+            (
+                CommandDenied::InheritEnvRejected {
+                    vars: String::new(),
+                },
+                "HBOT_COMMAND_INHERIT_ENV_REJECTED",
+            ),
+            (
+                CommandDenied::SandboxDenied {
+                    mode: SandboxMode::ReadOnly,
+                },
+                "HBOT_COMMAND_SANDBOX_DENIED",
+            ),
+            (
+                CommandDenied::InvalidSpec {
+                    reason: String::new(),
+                },
+                "HBOT_COMMAND_INVALID_SPEC",
+            ),
+            (
+                CommandDenied::SpawnFailed {
+                    program: "cmd".to_owned(),
+                    reason: String::new(),
+                },
+                "HBOT_COMMAND_SPAWN_FAILED",
+            ),
+            (
+                CommandDenied::IoFailed {
+                    context: String::new(),
+                    reason: String::new(),
+                },
+                "HBOT_COMMAND_IO_FAILED",
+            ),
+            (
+                CommandDenied::CpuLimit {
+                    used_ms: 1,
+                    limit_ms: 1,
+                },
+                "HBOT_COMMAND_CPU_LIMIT",
+            ),
+            (
+                CommandDenied::MemoryLimit { limit_bytes: 1 },
+                "HBOT_COMMAND_MEMORY_LIMIT",
+            ),
+            (
+                CommandDenied::IoLimit {
+                    direction: IoDirection::Read,
+                    used_bytes: 1,
+                    limit_bytes: 1,
+                },
+                "HBOT_COMMAND_IO_LIMIT",
+            ),
+            (
+                CommandDenied::ProcessLimit { limit: 1 },
+                "HBOT_COMMAND_PROCESS_LIMIT",
+            ),
+        ];
+        for (denied, expected) in cases {
+            assert_eq!(denied.code(), expected, "{denied:?}");
+            assert!(
+                denied.code().starts_with("HBOT_COMMAND_"),
+                "错误码要能按前缀成族：{}",
+                denied.code()
+            );
+            assert!(
+                !denied.to_string().is_empty(),
+                "每个拒绝都要有人读得懂的中文：{denied:?}"
+            );
+        }
     }
 }

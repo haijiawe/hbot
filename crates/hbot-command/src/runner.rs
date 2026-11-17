@@ -20,12 +20,13 @@ use std::time::{Duration, Instant};
 
 use hbot_core::{
     CommandDenied, CommandOutput, CommandRunner, CommandSpec, CommandStatus, OutputStream,
-    Platform, SandboxMode,
+    Platform, ResourceLimits, SandboxMode,
 };
 
 use crate::child::{Exit, Spawned};
 use crate::confinement::WriteConfinement;
 use crate::containment::Containment;
+use crate::limits::{self, LimitViolation};
 use crate::output::BoundedOutput;
 use crate::probe::{CapabilityReport, IsolationLevel, IsolationProbe, SystemProbe};
 use crate::{env, path, program};
@@ -91,6 +92,22 @@ impl PlatformRunner {
             SandboxMode::WorkspaceWrite => IsolationLevel::WriteConfinement,
             SandboxMode::Danger => IsolationLevel::Containment,
         };
+        // 平台兑现不了的限额**在探测隔离层之前**就拒绝：静默忽略限额等于骗调用方
+        // （调用方会以为"最多 100 ms CPU"已经生效，于是拿它当护栏）。
+        // 放在这里而不是 `validate_spec` 里，是因为它依赖"这台机器"而不是"这份规格"：
+        // 同一份规格在 Windows 上合法、在 Linux 上要拒（Linux 没有 I/O 上限）。
+        if let Some(reason) = limits::unsupported_reason(&spec.limits, self.platform) {
+            tracing::debug!(
+                program = %spec.program,
+                platform = %self.platform,
+                %reason,
+                "请求了本平台做不到的资源上限，拒绝执行",
+            );
+            return Err(CommandDenied::IsolationUnavailable {
+                platform: self.platform,
+                reason,
+            });
+        }
         if let Err(reason) = self.probe.probe(level) {
             tracing::debug!(
                 program = %spec.program,
@@ -142,11 +159,14 @@ impl CommandRunner for PlatformRunner {
         };
 
         // 先建隔离范围：建不出来就不 spawn——绝不允许"先跑起来再想办法"。
-        let guard =
-            Containment::create().map_err(|reason| CommandDenied::IsolationUnavailable {
+        // 资源上限也在这一步落进内核（Windows 写进作业对象、Linux 记下来在子进程里 setrlimit）：
+        // 限额装不上和隔离装不上同罪，都按 `IsolationUnavailable` 拒绝。
+        let guard = Containment::create(&spec.limits).map_err(|reason| {
+            CommandDenied::IsolationUnavailable {
                 platform: self.platform,
                 reason,
-            })?;
+            }
+        })?;
 
         // 写隔离层：只有 `workspace-write` 档需要它。**建不出来就拒绝**——探测说可用
         // 但真建时失败（权限被收回、路径消失）同样不能放行，所以这里再失败一次。
@@ -212,12 +232,17 @@ impl CommandRunner for PlatformRunner {
 
         let limit = spec.max_output_bytes;
         let output = BoundedOutput::spawn(stdout, stderr, limit);
-        let outcome = wait_for_finish(&mut child, &guard, &output, spec.timeout)?;
+        let outcome = wait_for_finish(&mut child, &guard, &output, spec.timeout, &spec.limits)?;
 
         // 不论正常退出、超时还是超限，都把整棵树收掉：命令返回就不该留下后代进程。
         let _ = guard.kill_tree(&mut child);
         let _ = child.wait();
         output.wait_closed(READER_GRACE);
+
+        // 用量必须在这里读：Windows 上作业对象的累计记账随 `CloseHandle` 消失（`guard` 在
+        // 函数末尾才 drop），Linux 上 `RUSAGE_CHILDREN` 只有在 `wait` 回收了子进程之后才有数。
+        // 超时分支也带它：调用方要看到"超时那一刻已经用了多少"。
+        let usage = guard.usage();
 
         let duration = started.elapsed();
         let (stdout, stderr, late_overflow) = output.into_parts();
@@ -227,11 +252,15 @@ impl CommandRunner for PlatformRunner {
                 stream,
                 limit_bytes: limit,
             }),
+            // 轮询判定超限：与超时同一处理路径（杀树已经在上面做了），但错误原因不同——
+            // "被限额杀掉"和"跑太久"对调用方是两件事。
+            WaitOutcome::Limited(violation) => Err(violation.into_denied()),
             WaitOutcome::TimedOut => Ok(CommandOutput {
                 status: CommandStatus::TimedOut,
                 stdout,
                 stderr,
                 duration,
+                usage,
             }),
             WaitOutcome::Exited(status) => {
                 // 子进程刚好在超限那一刻退出：字节确实超了，照样按 TooLong 报，
@@ -262,22 +291,50 @@ impl CommandRunner for PlatformRunner {
                         });
                     }
                 }
+                // Linux 的 CPU 上限由 `RLIMIT_CPU` 直接生效：内核到点发 SIGXCPU，进程就此
+                // 退出。**必须**把 `Exited { signal: 24 }` 翻译回 `CpuLimit`，否则调用方只看到
+                // "被信号 24 杀了"，得自己去查信号表才知道撞的是我们设的上限。
+                #[cfg(target_os = "linux")]
+                if let Some(limit_ms) = guard.cpu_kill_hint(status.signal()) {
+                    tracing::warn!(
+                        program = %program_path.display(),
+                        used_ms = usage.cpu_ms,
+                        limit_ms,
+                        "子进程被 RLIMIT_CPU 杀掉（SIGXCPU），按 CPU 上限拒绝",
+                    );
+                    return Err(CommandDenied::CpuLimit {
+                        used_ms: usage.cpu_ms,
+                        limit_ms,
+                    });
+                }
+                // 收尾再判一次：轮询最后一次采样之后到进程真正退出之间，用量可能刚好越线
+                // （尤其是 I/O 累计量与 Windows 的 CPU 记账）。漏了这一下会把"超限了但它自己
+                // 先退了"当成成功——那是最不该给调用方的假话。
+                if let Some(violation) = guard.violation(&spec.limits) {
+                    return Err(violation.into_denied());
+                }
                 Ok(CommandOutput {
                     status: map_status(status),
                     stdout,
                     stderr,
                     duration,
+                    usage,
                 })
             }
         }
     }
 }
 
-/// 等待结束的三种情形。
+/// 等待结束的几种情形。
 enum WaitOutcome {
+    /// 自己退出了（可能是正常退出，也可能是被内核按上限杀掉——看退出码/信号）。
     Exited(Exit),
+    /// 等到了墙钟超时。
     TimedOut,
+    /// 输出超过 `max_output_bytes`。
     Overflow(OutputStream),
+    /// 轮询发现突破了资源上限（Windows 的 CPU / 内存 / I/O）。
+    Limited(LimitViolation),
 }
 
 fn wait_for_finish(
@@ -285,11 +342,18 @@ fn wait_for_finish(
     guard: &Containment,
     output: &BoundedOutput,
     timeout: Duration,
+    limits: &ResourceLimits,
 ) -> Result<WaitOutcome, CommandDenied> {
     let started = Instant::now();
     loop {
         if let Some(stream) = output.overflow_stream() {
             return Ok(WaitOutcome::Overflow(stream));
+        }
+        // 限额判定和等待共用这一个 10 ms 循环（不另开线程）：多一次 `QueryInformationJobObject`
+        // 是几十微秒，比一次 `try_wait` 还便宜。判定放在 `try_wait` **之前**，是为了让
+        // "刚好撞上限又刚好退出"的命令报 CpuLimit 而不是 Exited。
+        if let Some(violation) = guard.violation(limits) {
+            return Ok(WaitOutcome::Limited(violation));
         }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(WaitOutcome::Exited(status)),
@@ -330,6 +394,9 @@ fn validate_spec(spec: &CommandSpec) -> Result<(), CommandDenied> {
             reason: format!("输出上限不能超过 {} MiB", MAX_OUTPUT_BYTES / (1024 * 1024)),
         });
     }
+    // 限额的**合法性**（`Some(0)` 之类）在这里判；平台**支持性**在 `require_isolation` 里判
+    // （那条依赖这台机器，不依赖规格本身）。
+    limits::validate(&spec.limits)?;
     program::validate_args(&spec.args)
 }
 
@@ -457,5 +524,27 @@ mod tests {
             validate_spec(&spec),
             Err(CommandDenied::InvalidSpec { .. })
         ));
+    }
+
+    #[test]
+    fn invalid_limits_are_rejected_before_isolation_is_consulted() {
+        // 顺序契约：规格校验在隔离探测之前。`process_count = 0` 是作业对象的保留值
+        // （表示"不限"），照抄进去等于把限制关掉，所以必须报 `InvalidSpec`，
+        // 而不是被注入的 DenyAll 探测先拒成 `IsolationUnavailable`。
+        let runner = PlatformRunner::with_probe(Arc::new(DenyAll));
+        let mut spec = danger_spec();
+        spec.limits.process_count = Some(0);
+        let denied = runner.run(spec).expect_err("必须拒绝");
+        assert!(
+            matches!(denied, CommandDenied::InvalidSpec { .. }),
+            "{denied:?}"
+        );
+        assert_eq!(denied.code(), "HBOT_COMMAND_INVALID_SPEC");
+    }
+
+    #[test]
+    fn default_limits_pass_spec_validation() {
+        // 不请求限额时必须与改动前完全一致（既有行为不变）。
+        assert_eq!(validate_spec(&danger_spec()), Ok(()));
     }
 }

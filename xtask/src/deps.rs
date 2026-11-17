@@ -35,9 +35,18 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("hbot-bot", &["hbot-core", "hbot-store"]),
     // 回放：读历史入站/出站、编译项目、逐条 dispatch、比对。刻意**不**依赖 hbot-rpc
     // （回放比协议层低一层：CLI 与 IDE 都调它，它不能反过来依赖协议的 DTO/dispatch）。
+    // `hbot-workspace` 是 2026-11-17（fixture 那批）显式加的：夹具文件的"项目内路径"判据
+    // 与原子写必须复用 `Workspace`，不能在这里另造一份路径守卫（`.git/`、保留名、
+    // 符号链接逃逸、Windows rename 重试都在那边）。
     (
         "hbot-replay",
-        &["hbot-core", "hbot-store", "hbot-code", "hbot-bot"],
+        &[
+            "hbot-core",
+            "hbot-store",
+            "hbot-code",
+            "hbot-bot",
+            "hbot-workspace",
+        ],
     ),
     // Agent：单循环 + ToolGateway + provider。不许依赖 bot/rpc/desktop。
     (

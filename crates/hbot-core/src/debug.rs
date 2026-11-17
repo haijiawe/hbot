@@ -28,7 +28,14 @@ use std::collections::BTreeMap;
 /// `hbot-code` 的 isolate 里（见模块文档第 5 点）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Breakpoints {
+    /// 会让 isolate **停下来**的断点：文件 → 行 → 条件。
     files: BTreeMap<String, BTreeMap<u32, Option<String>>>,
+    /// **不**停下来、只打一条消息的日志点：文件 → 行 → 消息模板。
+    ///
+    /// 为什么单独一张表而不是给断点加字段：`set()` 的语义是"整份替换这个文件的断点"，
+    /// 把它扩成带种类会让"UI 只改条件"与"UI 只改日志点"互相清掉对方。两张表各自
+    /// 整份替换，互不干扰。
+    logs: BTreeMap<String, BTreeMap<u32, String>>,
 }
 
 impl Breakpoints {
@@ -64,14 +71,15 @@ impl Breakpoints {
         }
     }
 
-    /// 清空全部断点。
+    /// 清空全部断点与日志点。
     pub fn clear(&mut self) {
         self.files.clear();
+        self.logs.clear();
     }
 
-    /// 没有任何断点。
+    /// 没有任何断点或日志点。
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.files.is_empty() && self.logs.is_empty()
     }
 
     /// 某个文件的断点行号（升序）。没有这个文件时为 `None`。
@@ -87,14 +95,56 @@ impl Breakpoints {
         self.files.iter().map(|(k, v)| (k.as_str(), v))
     }
 
+    /// 整份替换某个文件的**日志点**（不暂停、只发一条 `debug.log`）。
+    ///
+    /// 与 [`Breakpoints::set`] 一样是整份替换，但只动日志点那一张表：改条件的操作
+    /// 不会清掉日志点，反之亦然。`entries` 为空表示"这个文件不再有日志点"。
+    /// 行号 `0` 被忽略；空白消息被丢弃（打一条空消息没有意义）。同一行重复出现时
+    /// 后者覆盖前者。
+    pub fn set_logs(
+        &mut self,
+        file: impl Into<String>,
+        entries: impl IntoIterator<Item = (u32, String)>,
+    ) {
+        let mut lines = BTreeMap::new();
+        for (line, message) in entries {
+            let message = message.trim();
+            if line > 0 && !message.is_empty() {
+                lines.insert(line, message.to_owned());
+            }
+        }
+        let file = file.into();
+        if lines.is_empty() {
+            self.logs.remove(&file);
+        } else {
+            self.logs.insert(file, lines);
+        }
+    }
+
+    /// 这一行的日志点消息模板；`None` = 这一行不是日志点。
+    ///
+    /// 模板里的 `{表达式}` 由 `hbot-code` 在 isolate 里展开（那里才有作用域）。
+    /// 本层只存原文、原样取出。
+    pub fn log_of(&self, file: &str, line: u32) -> Option<&str> {
+        self.logs
+            .get(file)
+            .and_then(|lines| lines.get(&line))
+            .map(|message| message.as_str())
+    }
+
     /// 这一行是否命中。`file` 必须与 [`Breakpoints::set`] 时一致。
     ///
     /// **不看条件**：条件求值在 isolate 的 JS 侧，命中之后才做（这样"有没有断点"这一
-    /// 问题仍然是一次 map 查找）。
+    /// 问题仍然是一次 map 查找）。**日志点也算命中**——插桩侧只需要回答"这一行要不要
+    /// 进慢路径"，至于停下来还是打日志，由 `log_of` 决定。
     pub fn hits(&self, file: &str, line: u32) -> bool {
         self.files
             .get(file)
             .is_some_and(|lines| lines.contains_key(&line))
+            || self
+                .logs
+                .get(file)
+                .is_some_and(|lines| lines.contains_key(&line))
     }
 
     /// 这一行的条件：`Some(表达式)` = 有条件；`None` = 没有条件。
@@ -169,6 +219,19 @@ pub enum DebugAction {
     StepOut,
 }
 
+/// 打点现场（日志点命中，**不暂停**）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoggedAt {
+    /// 命中日志点的项目内相对路径。
+    pub file: String,
+    /// 1-based。
+    pub line: u32,
+    /// 1-based。
+    pub column: u32,
+    /// 展开后的消息（模板里的 `{表达式}` 已由 `hbot-code` 在 isolate 里替换）。
+    pub message: String,
+}
+
 /// 暂停回调。**同步阻塞**：实现方在里面发事件、等用户操作，然后返回指令。
 ///
 /// 实现方必须在超时后返回 [`DebugAction::Continue`]（建议 5 分钟并在 UI 上提示），
@@ -176,6 +239,14 @@ pub enum DebugAction {
 pub trait DebugSink: Send + Sync {
     /// isolate 已暂停，等一个恢复指令。
     fn paused(&self, at: PausedAt) -> DebugAction;
+
+    /// 命中了日志点：**不要**在这里阻塞，发一条事件就返回。
+    ///
+    /// 给默认空实现是为了让"只想暂停"的实现方（以及既有测试的假 sink）不用改；
+    /// 真实实现必须覆写，否则日志点在 UI 上什么都不会出现。
+    fn logged(&self, at: LoggedAt) {
+        let _ = at;
+    }
 }
 
 #[cfg(test)]

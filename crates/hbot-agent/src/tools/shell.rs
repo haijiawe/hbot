@@ -311,6 +311,16 @@ fn denied_to_result(denied: CommandDenied, sandbox: SandboxMode) -> Result<ToolO
             "命令输出超过 {limit_bytes} 字节上限，已终止整棵进程树并丢弃本次输出；\
              请减小输出量（加 --quiet、只打印摘要、或重定向到项目内文件）后重试。"
         ))),
+        // 资源限额：与 `TooLong` 同一分类 —— 命令**真的跑了**并因超限被杀，
+        // 记成 denied 会是假话（污染审批率），记成 internal 又会误导排障。
+        // 模型能做的是"少用一点资源"，所以把上限与真实用量都告诉它。
+        CommandDenied::CpuLimit { .. }
+        | CommandDenied::MemoryLimit { .. }
+        | CommandDenied::IoLimit { .. }
+        | CommandDenied::ProcessLimit { .. } => Ok(ToolOutput::error(format!(
+            "命令触到资源上限，已终止整棵进程树并丢弃本次输出：{message}\
+             请减少资源占用（缩小输入、分批处理、别起常驻子进程）后重试。"
+        ))),
         CommandDenied::IsolationUnavailable { .. } => Err(HbotError::denied(format!(
             "命令未执行：当前沙箱档 {} 需要{}，但这台机器建立不了。{message}",
             sandbox.as_str(),
@@ -452,6 +462,7 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             duration: Duration::from_millis(7),
+            usage: Default::default(),
         }
     }
 
@@ -833,6 +844,7 @@ mod tests {
             stdout: "half".to_string(),
             stderr: String::new(),
             duration: Duration::from_millis(30_000),
+            usage: Default::default(),
         })));
         let dynamic: Arc<dyn CommandRunner> = runner.clone();
         let output = run_with(

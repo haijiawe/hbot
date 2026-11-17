@@ -531,3 +531,370 @@ async fn e08_同会话里一次handler崩溃不得让该会话永久失效() {
         queues.depth(&key)
     );
 }
+
+// ── 2. 命令沙箱内的资源耗尽（对象：`hbot-command` 的 `CommandSpec::limits`）─────
+//
+// 上面那一组打的是 QuickJS 沙箱；这一组打的是**命令沙箱**：攻击者不需要写 JS，
+// 只要让模型跑一条 `while true` 的命令，或者跑一个不断 malloc 的程序，就能吃掉宿主。
+//
+// 四条判据（crates/hbot-command 的 `limits`）：
+//
+// * `cpu_ms`    —— 死循环必须在**约 1 秒内**被杀，且拒绝原因是 **CPU**，不是 timeout
+//                  （timeout 是"等到 30 秒也没结束"，CPU 上限是"它烧了这么多 CPU"）；
+// * `memory_bytes` —— 持续分配的程序**不许跑完**（要么被判超限，要么分配失败自己退出）；
+// * `process_count` —— 自己再 spawn 子进程的树，超限必须被拒/终止；
+// * `read_bytes` —— Windows 上由 10 ms 轮询兑现；**Linux 上必须 `IsolationUnavailable`**
+//                  （平台做不到就 fail-closed，绝不静默放行）。
+//
+// helper 用**测试二进制自己**（`current_exe` + `--exact e_helper --ignored`），
+// 行为由 `HBOT_RT_MODE` 选：`spin` / `hog` / `spawn` / `read`。
+
+use std::path::Path;
+
+use hbot_command::PlatformRunner;
+use hbot_core::{
+    CommandDenied, CommandOutput, CommandRunner, CommandSpec, ResourceLimits, SandboxMode,
+};
+
+/// 一条 `danger` 档的 helper 规格：允许清单里只有测试二进制自己。
+fn e_helper_spec(root: &Path, mode: &str) -> CommandSpec {
+    let exe = std::env::current_exe().expect("current_exe 应可用");
+    let program = exe.display().to_string();
+    let mut spec = CommandSpec::new(program.clone(), root);
+    spec.allowed_programs = vec![program];
+    spec.sandbox = SandboxMode::Danger;
+    spec.args = vec![
+        "--exact".to_owned(),
+        "e_helper".to_owned(),
+        "--ignored".to_owned(),
+        "--nocapture".to_owned(),
+    ];
+    spec.env.push(("HBOT_RT_MODE".to_owned(), mode.to_owned()));
+    spec.timeout = Duration::from_secs(30);
+    spec
+}
+
+/// 本机必须能建立进程树隔离，否则这几条测的是"平台不支持"，不是"实现不足"。
+fn require_containment() -> hbot_command::CapabilityReport {
+    let caps = PlatformRunner::system().capabilities();
+    assert!(
+        caps.supports(SandboxMode::Danger),
+        "本机无法建立进程树隔离，本组用例无法验证（{}）",
+        caps.summary_zh()
+    );
+    caps
+}
+
+fn describe(outcome: &Result<CommandOutput, CommandDenied>) -> String {
+    match outcome {
+        Ok(output) => format!("status={:?} stdout={:?}", output.status, output.stdout),
+        Err(denied) => format!("{denied}（code={}）", denied.code()),
+    }
+}
+
+fn run_with(
+    root: &Path,
+    mode: &str,
+    limits: impl FnOnce(&mut ResourceLimits),
+) -> (Result<CommandOutput, CommandDenied>, Duration) {
+    let mut spec = e_helper_spec(root, mode);
+    limits(&mut spec.limits);
+    let requested = spec.limits;
+    let started = Instant::now();
+    let outcome = PlatformRunner::system().run(spec);
+    let elapsed = started.elapsed();
+    // 实机证据：`--nocapture` 时把"请求了什么限额、跑了多久、最后报什么"打出来。
+    eprintln!(
+        "[redteam] mode={mode} limits={requested:?} elapsed={elapsed:?} -> {}",
+        describe(&outcome)
+    );
+    (outcome, elapsed)
+}
+
+/// e09：`cpu_ms = 100` 的死循环必须在约 1 秒内被杀，原因是 **CPU**，不是 timeout。
+#[test]
+fn e09_命令的_cpu_上限必须比超时先到_而不是超时() {
+    require_containment();
+    let tree = TempTree::new("cmd-cpu");
+    let (outcome, elapsed) = run_with(tree.path(), "spin", |limits| limits.cpu_ms = Some(100));
+    let denied = match &outcome {
+        Ok(_) => panic!(
+            "死循环必须被 CPU 上限杀掉，却正常结束：{}",
+            describe(&outcome)
+        ),
+        Err(denied) => denied,
+    };
+    assert!(
+        matches!(denied, CommandDenied::CpuLimit { .. }),
+        "拒绝原因必须是 CPU 上限（不是 timeout、不是别的）：{}",
+        describe(&outcome)
+    );
+    assert_eq!(
+        denied.code(),
+        "HBOT_COMMAND_CPU_LIMIT",
+        "错误码要能把 CPU 超限和超时分开"
+    );
+    // 100 ms 的死循环不该等到 30 秒的 timeout；给足三倍余量（慢机器也不误判）。
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "CPU 上限生效太慢：耗时 {elapsed:?}（请求 100 ms，期望约 1 秒内被杀）"
+    );
+}
+
+/// e10：`memory_bytes = 64 MiB` 时，持续分配的程序**不许跑完**。
+///
+/// 真实表现有两种，都算"上限生效"：① 被轮询判 `MemoryLimit` 杀树；② 内核让分配失败，
+/// 程序自己非零退出（Windows 的 job 内存上限就是这种）。**只有跑完全程才算失败。**
+#[test]
+fn e10_命令的内存上限必须让持续分配跑不完() {
+    require_containment();
+    let tree = TempTree::new("cmd-memory");
+    let (outcome, elapsed) = run_with(tree.path(), "hog", |limits| {
+        limits.memory_bytes = Some(64 * 1024 * 1024);
+    });
+    match &outcome {
+        Err(denied) => assert!(
+            matches!(denied, CommandDenied::MemoryLimit { .. }),
+            "只可能是内存上限：{}",
+            describe(&outcome)
+        ),
+        Ok(output) => {
+            assert!(
+                !output.stdout.contains("HOG=done"),
+                "内存上限没生效：分配器一路跑到结束（{}）",
+                describe(&outcome)
+            );
+            assert_ne!(
+                output.status,
+                hbot_core::CommandStatus::Exited {
+                    code: Some(0),
+                    signal: None
+                },
+                "内存到顶时程序不该干净退出（{}）",
+                describe(&outcome)
+            );
+        }
+    }
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "内存上限不该拖到超时：耗时 {elapsed:?}"
+    );
+}
+
+/// e11：`process_count = 2` 时，一个自己再 spawn 子进程的程序必须被拒/终止。
+///
+/// 注意 Windows 的树里还有个 `conhost.exe`（隐藏的控制台宿主，是根进程的子进程），
+/// 所以预算 2 实际只够"根 + conhost"，子进程一定会被挡——这正是要断言的效果。
+#[test]
+fn e11_命令的并发进程数超限必须被拒绝或终止() {
+    let caps = require_containment();
+    let tree = TempTree::new("cmd-process");
+    let (outcome, elapsed) = run_with(tree.path(), "spawn", |limits| {
+        limits.process_count = Some(2);
+    });
+    if !caps.process_limit {
+        // Linux：平台做不到就**必须**拒绝（fail-closed）。
+        match &outcome {
+            Ok(_) => panic!(
+                "平台不支持进程数上限时必须拒绝执行，实际却跑了：{}",
+                describe(&outcome)
+            ),
+            Err(denied) => assert!(
+                matches!(denied, CommandDenied::IsolationUnavailable { .. }),
+                "必须是 IsolationUnavailable：{}",
+                describe(&outcome)
+            ),
+        }
+        return;
+    }
+    match &outcome {
+        Err(denied) => assert!(
+            matches!(denied, CommandDenied::ProcessLimit { .. }),
+            "只可能是进程数上限：{}",
+            describe(&outcome)
+        ),
+        Ok(output) => {
+            // 内核让"第 N+1 个进程"创建失败的真实表现：helper 把失败打印出来。
+            assert!(
+                !output.stdout.contains("SPAWN=ok"),
+                "进程数上限没生效：子进程居然起来了（{}）",
+                describe(&outcome)
+            );
+            assert!(
+                output.stdout.contains("SPAWN=fail") || !output.stderr.is_empty(),
+                "helper 应当报出子进程创建失败（{}）",
+                describe(&outcome)
+            );
+            assert_ne!(
+                output.status,
+                hbot_core::CommandStatus::Exited {
+                    code: Some(0),
+                    signal: None
+                },
+                "子进程被拒后 helper 不该当作成功（{}）",
+                describe(&outcome)
+            );
+        }
+    }
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "进程数上限不该拖到超时：耗时 {elapsed:?}"
+    );
+}
+
+/// e12：`read_bytes = 1 KiB`。
+///
+/// * **Windows**：靠 10 ms 轮询读作业对象的 `ReadTransferCount`，超了就 `TerminateJobObject`；
+/// * **Linux**：没有 per-cgroup 的 I/O 上限（要 cgroup v2 + `io.max` + root/委派），
+///   **必须** `IsolationUnavailable`。
+///
+/// 跨平台共有的性质是"绝不静默放行"——下面两个 `#[cfg]` 分支断言的是同一件事的两面。
+#[test]
+fn e12_命令的读取字节上限_windows_上兑现_linux_上必须拒绝() {
+    let caps = require_containment();
+    let tree = TempTree::new("cmd-io");
+    // 1 MiB 载荷：远超 1 KiB 上限。
+    let payload = tree.path().join("payload.bin");
+    std::fs::write(&payload, vec![b'z'; 1024 * 1024]).expect("写测试载荷");
+
+    let mut spec = e_helper_spec(tree.path(), "read");
+    spec.env
+        .push(("HBOT_RT_FILE".to_owned(), payload.display().to_string()));
+    spec.limits.read_bytes = Some(1024);
+    let started = Instant::now();
+    let outcome = PlatformRunner::system().run(spec);
+    // 实机证据：载荷 1 MiB、上限 1 KiB。
+    eprintln!(
+        "[redteam] mode=read payload=1048576B read_bytes=1024 elapsed={:?} io_limit={} -> {}",
+        started.elapsed(),
+        caps.io_limit,
+        describe(&outcome)
+    );
+
+    if !caps.io_limit {
+        // Linux / 其它平台：fail-closed。
+        match &outcome {
+            Ok(_) => panic!(
+                "平台做不到 I/O 上限时必须拒绝执行，不能静默放行：{}",
+                describe(&outcome)
+            ),
+            Err(denied) => {
+                assert!(
+                    matches!(denied, CommandDenied::IsolationUnavailable { .. }),
+                    "必须是 IsolationUnavailable：{}",
+                    describe(&outcome)
+                );
+                assert_eq!(denied.code(), "HBOT_COMMAND_ISOLATION_UNAVAILABLE");
+            }
+        }
+        return;
+    }
+
+    // Windows：轮询必须把读 1 MiB 的进程杀掉。
+    // 作业对象的 I/O 记账连**加载镜像/DLL** 的读都算，所以这条上限往往在 helper
+    // 还没读到自己的文件时就到顶——这仍然是"上限生效"。
+    match &outcome {
+        Ok(_) => panic!("读 1 MiB 必须触到 1 KiB 的读取上限：{}", describe(&outcome)),
+        Err(denied) => {
+            assert!(
+                matches!(
+                    denied,
+                    CommandDenied::IoLimit {
+                        direction: hbot_core::IoDirection::Read,
+                        ..
+                    }
+                ),
+                "必须是读取方向的 I/O 上限：{}",
+                describe(&outcome)
+            );
+            assert_eq!(denied.code(), "HBOT_COMMAND_IO_LIMIT");
+        }
+    }
+}
+
+/// helper：被 e09–e12 当作子进程拉起（按 `HBOT_RT_MODE` 扮演不同角色）。
+#[test]
+#[ignore = "helper：只由本文件的用例以子进程方式拉起，不单独运行"]
+fn e_helper() {
+    use std::io::Write;
+
+    match std::env::var("HBOT_RT_MODE").unwrap_or_default().as_str() {
+        // 纯算术死循环：不分配、不读盘，只烧 CPU。
+        "spin" => {
+            let mut acc: u64 = 0;
+            loop {
+                acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
+                std::hint::black_box(acc);
+            }
+        }
+        // 持续分配并真的碰到每一页（只 reserve 不写不会提交）。
+        "hog" => {
+            let mut held: Vec<Vec<u8>> = Vec::new();
+            let chunk = 8 * 1024 * 1024;
+            for _ in 0..256 {
+                let mut block: Vec<u8> = Vec::new();
+                if block.try_reserve_exact(chunk).is_err() {
+                    println!("HOG=fail");
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(3);
+                }
+                block.resize(chunk, 1);
+                held.push(block);
+            }
+            println!("HOG=done");
+            let _ = std::io::stdout().flush();
+        }
+        // 自己再起一个子进程：作业对象的进程数上限在这里生效。
+        "spawn" => {
+            match spawn_one_child() {
+                Ok(pid) => println!("SPAWN=ok({pid})"),
+                Err(error) => println!("SPAWN=fail({error})"),
+            }
+            let _ = std::io::stdout().flush();
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        // 读一个大文件：作业对象的 I/O 记账会先到顶。
+        "read" => {
+            let path = std::env::var("HBOT_RT_FILE").expect("helper 需要 HBOT_RT_FILE");
+            match std::fs::read(&path) {
+                Ok(bytes) => println!("BYTES={}", bytes.len()),
+                Err(error) => println!("READ=fail({error})"),
+            }
+            let _ = std::io::stdout().flush();
+        }
+        other => panic!("未知 helper 模式：{other:?}"),
+    }
+}
+
+#[cfg(windows)]
+fn spawn_one_child() -> std::io::Result<u32> {
+    use std::process::{Command, Stdio};
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    let ping = Path::new(&system_root).join("System32").join("PING.EXE");
+    Command::new(ping)
+        .args(["-n", "120", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|child| child.id())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_one_child() -> std::io::Result<u32> {
+    use std::process::{Command, Stdio};
+
+    Command::new("/bin/sleep")
+        .arg("120")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|child| child.id())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn spawn_one_child() -> std::io::Result<u32> {
+    Err(std::io::Error::other("本平台未实现子进程夹具"))
+}

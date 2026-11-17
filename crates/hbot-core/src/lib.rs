@@ -36,9 +36,10 @@ pub mod ports;
 pub mod redact;
 
 pub use command::{
-    CommandDenied, CommandOutput, CommandSpec, CommandStatus, OutputStream, Platform,
+    CommandDenied, CommandOutput, CommandSpec, CommandStatus, IoDirection, OutputStream, Platform,
+    ResourceLimits, ResourceUsage,
 };
-pub use debug::{Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, PausedAt};
+pub use debug::{Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, LoggedAt, PausedAt};
 pub use device::{
     CapabilityGate, ClipboardOp, ClipboardValue, DeviceActor, DeviceAuditEntry, DeviceBackend,
     DeviceCapability, DeviceCapabilityReport, DeviceError, DeviceGate, DeviceRateLimits,

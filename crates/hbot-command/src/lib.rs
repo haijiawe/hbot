@@ -13,8 +13,8 @@
 //!
 //! | 平台 | `Containment`（进程树 + 资源上限） | `WriteConfinement`（写隔离） |
 //! |---|---|---|
-//! | Windows | 作业对象：`KILL_ON_JOB_CLOSE` + 活跃进程数/内存上限 | 受限令牌：`WRITE_RESTRICTED` + 工作区 write SID + 该目录上的 ACE |
-//! | Linux | `setsid` + `killpg`（整个进程组） | Landlock：`pre_exec` 里 `landlock_restrict_self`；按 ABI 1–5 收窄权限位，可写 = 工作区 + 私有缓存目录；**只交叉编译过，未在真实 Linux 内核上运行** |
+//! | Windows | 作业对象：`KILL_ON_JOB_CLOSE` + 活跃进程数/内存上限 + 作业 CPU 时间上限 | 受限令牌：`WRITE_RESTRICTED` + 工作区 write SID + 该目录上的 ACE |
+//! | Linux | `setsid` + `killpg`（整个进程组）+ `RLIMIT_CPU` / `RLIMIT_AS`（**每进程**，秒级） | Landlock：`pre_exec` 里 `landlock_restrict_self`；按 ABI 1–5 收窄权限位，可写 = 工作区 + 私有缓存目录；**只交叉编译过，未在真实 Linux 内核上运行** |
 //! | macOS | **未实现**（`sandbox-exec` 已弃用） → `IsolationUnavailable` | **未实现**（同上） → `IsolationUnavailable` |
 //!
 //! 探测是**运行时**的：同样一份代码，装了 Landlock 的 Linux 与没装的是两个结论。
@@ -30,9 +30,47 @@
 //! 写类访问）。读不受影响——写限制只参与写类访问检查。
 //!
 //! 挡不住：**网络**（写隔离不管网络）、**注册表**（`HKCU` 的写不经过文件 DACL）、
-//! **已在内存里的敏感数据**、**CPU 时间**；以及**可写句柄**——父进程继承过去的句柄不再
+//! **已在内存里的敏感数据**；以及**可写句柄**——父进程继承过去的句柄不再
 //! 走访问检查，所以原生 spawn 只继承 stdin/stdout/stderr 三个句柄（`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`），
 //! 别的句柄一律不外泄。
+//!
+//! # 资源上限的语义与代价（[`hbot_core::CommandSpec::limits`]）
+//!
+//! 调用方用 `limits` 请求五类上限。**它们不是五张同样的牌**：有的是内核硬上限，
+//! 有的是 10 ms 轮询探测，有的平台根本做不到。做不到的那些**直接拒绝**
+//! （`CommandDenied::IsolationUnavailable`，见 [`PlatformRunner`] 的
+//! `require_isolation`），**绝不静默忽略**——静默忽略等于让调用方拿一个不存在的护栏当护栏。
+//!
+//! | 限额 | Windows | Linux | 单位 | 真实精度 |
+//! |---|---|---|---|---|
+//! | `cpu_ms` | 作业对象 `PerJobUserTimeLimit`（内核硬上限，**整棵树**）+ 10 ms 轮询读记账 | `RLIMIT_CPU`（内核硬上限，**每进程**） | 毫秒 | Windows：±10 ms（轮询间隔）；Linux：**秒级、向上取整**（100 ms 实得 1 s） |
+//! | `memory_bytes` | 作业对象 `ProcessMemoryLimit` + `JobMemoryLimit`（内核硬上限） | `RLIMIT_AS`（内核硬上限，虚拟地址空间） | 字节（提交内存 / 地址空间） | 内核页粒度；Windows 到顶是**分配失败**不是杀进程，峰值到顶由轮询补报 |
+//! | `read_bytes` / `write_bytes` | 只有 `JobObjectBasicAndIoAccountingInformation` 记账，10 ms 轮询超了就杀 | **做不到** → 拒绝 | 字节（累计传输量） | Windows：可能超出约"10 ms 内能传的量"；Linux：无 |
+//! | `process_count` | 作业对象 `ActiveProcessLimit`（内核硬上限，整棵树） | **做不到** → 拒绝 | 个（同时存活） | Windows：内核让第 `limit+1` 个进程**创建失败**（不是我们主动拒），`0` 是保留值故有效范围 `1..=64`；Linux：`RLIMIT_NPROC` 按用户统计，不能限树 |
+//!
+//! 三条必须知道的取舍：
+//!
+//! 1. **Windows 的 CPU 上限是双保险**：内核上限负责"到点就杀"，轮询负责"说清为什么被杀、
+//!    用了多少"。只靠轮询会漏（进程可能在两次采样之间烧掉几十毫秒），只靠内核拿不到数字。
+//! 2. **Windows 的 I/O 上限只可能是轮询**：作业对象没有 I/O 上限开关，所以命令可能比
+//!    `limit` 多传一点才被杀——**这不是 bug，是这套机制的全部能力**。要精确只有 ETW/过滤器驱动。
+//! 3. **内存上限是"分配失败"而不是"被杀"**：Windows 的 job 内存上限与 Linux 的 `RLIMIT_AS`
+//!    都让分配失败，程序可能自己崩、也可能老老实实报错退出。所以"内存超限"既可能在轮询里
+//!    报 `MemoryLimit`，也可能表现为一次普通的非零退出。
+//!
+//! 还有两条**关于数字本身**的坑（都是本机实测出来的，不是推测）：
+//!
+//! - **`process_count` 的树里有个不速之客：`conhost.exe`。** 命令用 `CREATE_NO_WINDOW`
+//!   起，内核仍会给它配一个隐藏的控制台宿主，而它是根进程的子进程、因此也在作业里。
+//!   所以"根进程 + 1 个子进程"实际占 **3** 个名额。预算给 2 时会在第一个采样点就被杀
+//!   （实测约 25 ms，报 `ProcessLimit`）。要给子进程留位置，就得把 conhost 那一份算进去。
+//! - **`process_count` 的判据是 `>`，不是 `>=`**：`process_count = N` 是"最多 N 个同时存活"，
+//!   正好 N 个是合法的（内核会在第 N+1 个创建时拒绝）。按 `>=` 判会把合规的树杀掉，
+//!   等于把"限制并发"变成"禁止 spawn"。
+//!
+//! `CommandOutput::usage` 回报**实测用量**（`ResourceUsage`）：Windows 读作业对象记账
+//! （整棵树口径，`CloseHandle` 之前必须读完），Linux 读 `getrusage(RUSAGE_CHILDREN)` 的差值
+//! （每子进程口径，同进程里并发跑命令时会串味）。**0 表示"这个平台没测量"**，不是"用了 0"。
 //!
 //! # Windows 上实测到的启动率代价（本机实测，不是推测）
 //!
@@ -100,6 +138,7 @@ mod confinement;
 mod containment;
 mod env;
 mod landlock;
+mod limits;
 mod output;
 mod path;
 mod probe;
@@ -113,5 +152,6 @@ pub use runner::PlatformRunner;
 
 // 调用方只需要认识这两个 crate 的类型，不必再手写 `hbot_core::…` 前缀。
 pub use hbot_core::{
-    CommandDenied, CommandOutput, CommandSpec, CommandStatus, OutputStream, Platform,
+    CommandDenied, CommandOutput, CommandSpec, CommandStatus, IoDirection, OutputStream, Platform,
+    ResourceLimits, ResourceUsage,
 };
