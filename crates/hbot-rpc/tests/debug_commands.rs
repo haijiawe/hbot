@@ -31,12 +31,12 @@ use hbot_bot::{
     AdapterSubscription, BotAdapter, BotSpec, HandlerExecutor, MessageCtx, OutboundEnvelope,
     Supervisor, SupervisorDeps,
 };
-use hbot_core::debug::{Breakpoints, DebugAction};
+use hbot_core::debug::{Breakpoints, DebugAction, DebugSink, LoggedAt};
 use hbot_core::{BotId, HbotError, ProjectId, Timestamp};
 use hbot_rpc::app::bots::running_bot;
-use hbot_rpc::app::debug::{BreakpointTarget, PauseTicket};
+use hbot_rpc::app::debug::{BotDebugSink, BreakpointTarget, PauseTicket};
 use hbot_rpc::app::ids::UuidIds;
-use hbot_rpc::{AppState, Command, DebugBreakpoint, Dispatcher, Response, StepKind};
+use hbot_rpc::{AppState, Command, DebugBreakpoint, Dispatcher, Event, Response, StepKind};
 use serde_json::{Value, json};
 
 /// 临时目录（`Drop` 递归删除）。刻意不引 `tempfile`，与 `src/app/test_support.rs` 同款。
@@ -231,6 +231,7 @@ fn set_breakpoints(bot_id: BotId, file: &str, lines: &[u32]) -> Command {
         .map(|line| DebugBreakpoint {
             line: *line,
             condition: None,
+            log: None,
         })
         .collect();
     Command::DebugSetBreakpoints {
@@ -250,6 +251,7 @@ fn set_conditional(bot_id: BotId, file: &str, breakpoints: &[(u32, Option<&str>)
             .map(|(line, condition)| DebugBreakpoint {
                 line: *line,
                 condition: condition.map(str::to_owned),
+                log: None,
             })
             .collect(),
     }
@@ -558,4 +560,236 @@ async fn debug_commands_serialize_to_the_frozen_wire_shape() {
             .contains("bot"),
         "not_found 的消息应当说明是哪个实体：{wire}"
     );
+}
+
+// ---------------------------------------------------------------- 日志点
+
+/// 一条日志点（`log: Some(template)`，不停下）。
+fn logpoint(line: u32, template: &str) -> DebugBreakpoint {
+    DebugBreakpoint {
+        line,
+        condition: None,
+        log: Some(template.to_owned()),
+    }
+}
+
+fn set_logpoints(bot_id: BotId, file: &str, logs: &[(u32, &str)]) -> Command {
+    Command::DebugSetBreakpoints {
+        bot_id,
+        file: file.to_owned(),
+        breakpoints: logs
+            .iter()
+            .map(|(line, template)| logpoint(*line, template))
+            .collect(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_logpoint_is_remembered_in_its_own_table_and_still_hits() {
+    let harness = Harness::new("logpoint-remembered");
+    let (bot_id, project_id) = (bot(), project());
+    harness.insert_bot_rows(bot_id, project_id);
+    harness.mark_running(bot_id, project_id);
+
+    let response = harness
+        .call(set_logpoints(
+            bot_id,
+            "src/main.ts",
+            &[(7, "count={count}"), (9, "  done  ")],
+        ))
+        .await;
+    assert_ok_null(&response);
+
+    let remembered = harness.state.debug().breakpoints_of(&bot_id);
+    // 模板被去掉两端空白后原样存着：展开在 isolate 的 JS 侧，命令层只搬数据。
+    assert_eq!(remembered.log_of("src/main.ts", 7), Some("count={count}"));
+    assert_eq!(remembered.log_of("src/main.ts", 9), Some("done"));
+    // 日志点**不进**断点表：`log: Some` 的契约就是不停下。
+    assert_eq!(
+        remembered.condition_of("src/main.ts", 7),
+        None,
+        "日志点不该同时是断点"
+    );
+    // 但 `hits` 必须为真，否则 `__hbot_trace` 的快路径根本不会进慢路径（日志点就永远不打）。
+    assert!(remembered.hits("src/main.ts", 7));
+    assert!(remembered.hits("src/main.ts", 9), "日志点也算命中");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_logpoint_emits_debug_log_and_never_pauses_the_isolate() {
+    let harness = Harness::new("logpoint-event");
+    let (bot_id, project_id) = (bot(), project());
+    harness.insert_bot_rows(bot_id, project_id);
+    harness.mark_running(bot_id, project_id);
+
+    let response = harness
+        .call(set_logpoints(
+            bot_id,
+            "src/main.ts",
+            &[(7, "count={count}")],
+        ))
+        .await;
+    assert_ok_null(&response);
+
+    // sink 就是 `hbot-code` 命中时回调的那一层；这里直接调 `logged`，等价于 isolate 在
+    // 第 7 行展开完模板（真实展开由 `hbot-code` 的 `s1_debug_logpoints.rs` 钉住）。
+    let mut events = harness.state.events().subscribe();
+    let sink = BotDebugSink::new(
+        bot_id,
+        harness.state.debug(),
+        Arc::clone(harness.state.events()),
+    );
+    sink.logged(LoggedAt {
+        file: "src/main.ts".to_owned(),
+        line: 7,
+        column: 4,
+        message: "count=3".to_owned(),
+    });
+
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+
+    // 日志点**不暂停**：事件流里不能出现 debug.paused，登记表里也不能多出等待位。
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, Event::DebugPaused { .. })),
+        "日志点不该让 isolate 停下来：{seen:?}"
+    );
+    assert!(
+        !harness.state.debug().is_paused(&bot_id),
+        "日志点不登记等待位"
+    );
+    assert_eq!(harness.state.debug().paused(&bot_id), 0);
+
+    let log = seen
+        .iter()
+        .find_map(|event| match event {
+            Event::DebugLog {
+                file,
+                line,
+                message,
+                ..
+            } => Some((file.clone(), *line, message.clone())),
+            _ => None,
+        })
+        .expect("命中日志点必须发 debug.log");
+    assert_eq!(log, ("src/main.ts".to_owned(), 7, "count=3".to_owned()));
+
+    // wire 形状：UI 按 `type` 分派、按 `file:line` 跳转。
+    let wire = serde_json::to_value(
+        seen.iter()
+            .find(|event| matches!(event, Event::DebugLog { .. }))
+            .expect("上面已经确认有这条事件"),
+    )
+    .expect("序列化 Event");
+    assert_eq!(wire["type"], json!("debug.log"));
+    assert_eq!(wire["botId"], json!(bot_id.to_string()));
+    assert_eq!(wire["file"], json!("src/main.ts"));
+    assert_eq!(wire["line"], json!(7));
+    assert_eq!(wire["message"], json!("count=3"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_logpoint_only_request_keeps_the_existing_breakpoints() {
+    let harness = Harness::new("logpoint-keeps-breakpoints");
+    let (bot_id, project_id) = (bot(), project());
+    harness.insert_bot_rows(bot_id, project_id);
+    harness.mark_running(bot_id, project_id);
+
+    assert_ok_null(
+        &harness
+            .call(set_breakpoints(bot_id, "src/main.ts", &[3, 9]))
+            .await,
+    );
+
+    // 只给日志点：`files` 表必须原封不动（`set_logs` 只整份替换 `logs`）。
+    assert_ok_null(
+        &harness
+            .call(set_logpoints(bot_id, "src/main.ts", &[(12, "{n}")]))
+            .await,
+    );
+    let after_logs = harness.state.debug().breakpoints_of(&bot_id);
+    let mut lines: Vec<u32> = after_logs
+        .lines_of("src/main.ts")
+        .expect("断点不该被日志点请求清掉")
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![3, 9], "只给日志点不能清掉已有断点");
+    assert_eq!(after_logs.log_of("src/main.ts", 12), Some("{n}"));
+
+    // 反向：只给断点也不能把该文件的日志点清掉（`set` 只整份替换 `files`）。
+    assert_ok_null(
+        &harness
+            .call(set_breakpoints(bot_id, "src/main.ts", &[5]))
+            .await,
+    );
+    let after_lines = harness.state.debug().breakpoints_of(&bot_id);
+    let mut lines: Vec<u32> = after_lines
+        .lines_of("src/main.ts")
+        .expect("这次给了断点")
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![5], "给断点就是整份替换断点表");
+    assert_eq!(
+        after_lines.log_of("src/main.ts", 12),
+        Some("{n}"),
+        "只给断点不能清掉已有日志点"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blank_log_template_falls_back_to_a_plain_breakpoint() {
+    let harness = Harness::new("blank-log");
+    let (bot_id, project_id) = (bot(), project());
+    harness.insert_bot_rows(bot_id, project_id);
+    harness.mark_running(bot_id, project_id);
+
+    let response = harness
+        .call(set_logpoints(bot_id, "src/main.ts", &[(4, "   ")]))
+        .await;
+    assert_ok_null(&response);
+
+    let remembered = harness.state.debug().breakpoints_of(&bot_id);
+    assert_eq!(
+        remembered.log_of("src/main.ts", 4),
+        None,
+        "空白模板 = 没有模板"
+    );
+    assert!(
+        remembered.lines_of("src/main.ts").is_some(),
+        "空白模板的条目退回普通断点（用户至少还能停下）"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_long_log_template_is_invalid_and_changes_nothing() {
+    let harness = Harness::new("long-log");
+    let (bot_id, project_id) = (bot(), project());
+    harness.insert_bot_rows(bot_id, project_id);
+    harness.mark_running(bot_id, project_id);
+
+    // 上限是 500 个字符，501 就是参数错误（-32002，与超长条件同一个码）。
+    let long = "a".repeat(hbot_rpc::app::commands::debug::MAX_LOG_CHARS + 1);
+    let response = harness
+        .call(set_logpoints(bot_id, "src/main.ts", &[(4, &long)]))
+        .await;
+    assert_error_code(&response, -32002);
+    assert!(
+        harness.state.debug().breakpoints_of(&bot_id).is_empty(),
+        "被拒绝的日志点不该留下半份状态"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_log_template_limit_is_checked_before_the_bot_state() {
+    // 与超长条件同一条顺序：参数不合法先报 -32002，不该被"bot 不存在"（-32001）掩盖。
+    let harness = Harness::new("long-log-unknown-bot");
+    let long = "a".repeat(hbot_rpc::app::commands::debug::MAX_LOG_CHARS + 1);
+    let response = harness
+        .call(set_logpoints(bot(), "src/main.ts", &[(4, &long)]))
+        .await;
+    assert_error_code(&response, -32002);
 }

@@ -133,6 +133,13 @@ pub struct DebugState {
     /// would flood the log (and compete with the user's own events for IO).
     /// One warning per line is enough to make the mistake visible.
     pub(crate) warned_conditions: std::collections::BTreeSet<String>,
+    /// `"<path>:<line>"` of logpoints whose message template already failed to
+    /// compile.
+    ///
+    /// Same reason as [`Self::warned_conditions`]: a broken template is broken on
+    /// every hit, so the warning is emitted once and the logpoint then stays
+    /// silent instead of switching the whole probe path off.
+    pub(crate) warned_logs: std::collections::BTreeSet<String>,
 }
 
 impl Sandbox {

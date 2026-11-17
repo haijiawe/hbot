@@ -274,7 +274,7 @@ fn diff_and_debug_events_use_dotted_type_and_camel_case_fields() {
 
 #[test]
 fn event_names_are_exactly_the_documented_set() {
-    // 防止改名/加变体时悄悄破坏 UI 订阅表：这里逐一列出 §9.2 的 12 个事件名。
+    // 防止改名/加变体时悄悄破坏 UI 订阅表：这里逐一列出 Event 的全部 wire 名（16 个）。
     let names = [
         "agent.delta",
         "agent.step",
@@ -288,8 +288,12 @@ fn event_names_are_exactly_the_documented_set() {
         "agent.diff",
         "debug.paused",
         "debug.resumed",
+        "debug.log",
+        "device.status",
+        "device.request",
+        "device.settings",
     ];
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 16);
 
     for name in names {
         let err = serde_json::from_value::<Event>(json!({ "type": name }));

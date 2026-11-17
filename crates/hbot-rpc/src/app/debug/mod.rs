@@ -163,6 +163,37 @@ impl DebugRegistry {
         snapshot
     }
 
+    /// 设某个文件的**日志点**，并推给这个 bot 现有的 isolate。
+    ///
+    /// 与 [`DebugRegistry::set_breakpoints`] 逐字对称，只是落在
+    /// [`Breakpoints::set_logs`] 那张表上：`entries` 是 `(行号, 消息模板)`，模板原样存进
+    /// [`Breakpoints`]，**这里不展开**（展开在沙箱 isolate 的 JS 侧）。空 `entries` =
+    /// 移除该文件的日志点。
+    ///
+    /// 为什么要有两条方法而不是一条：`set` 与 `set_logs` 各自**整份替换**自己那张表，
+    /// 合并成一条就得在这里猜"调用方到底想动哪张"——而命令层恰好知道（见
+    /// [`crate::app::commands::debug::set_breakpoints`] 的两路拆分）。状态层只负责存与推。
+    ///
+    /// 返回这个 bot 设完之后的**完整**断点集合（含日志点；诊断/日志用）。
+    pub fn set_logpoints(
+        &self,
+        bot_id: &BotId,
+        file: &str,
+        entries: impl IntoIterator<Item = (u32, String)>,
+    ) -> Breakpoints {
+        let (snapshot, targets) = {
+            let mut bots = self.lock();
+            let state = bots.entry(*bot_id).or_default();
+            state.breakpoints.set_logs(file, entries);
+            (state.breakpoints.clone(), live(state))
+        };
+        // 锁外推送：见模块文档「锁的顺序」。
+        for target in targets {
+            target.apply_breakpoints(snapshot.clone());
+        }
+        snapshot
+    }
+
     /// 这个 bot 当前的断点（副本；`bot_start` 之前设置过就会在这里）。
     pub fn breakpoints_of(&self, bot_id: &BotId) -> Breakpoints {
         self.lock()

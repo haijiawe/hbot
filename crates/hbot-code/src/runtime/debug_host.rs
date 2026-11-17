@@ -63,7 +63,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use hbot_core::debug::{DebugAction, DebugFrame, DebugScope, DebugSink, PausedAt};
+use hbot_core::debug::{DebugAction, DebugFrame, DebugScope, DebugSink, LoggedAt, PausedAt};
 use rquickjs::{Ctx, Function, Object, Value};
 use serde_json::Value as Json;
 
@@ -171,6 +171,129 @@ const COND_SOURCE: &str = r#"(function () {
     return { cond: __hbot_cond, error: __hbot_cond_error };
 })()"#;
 
+/// `globalThis.__hbot_log` — expand one **logpoint** message template.
+///
+/// Signature: `__hbot_log(key: string, template: string, locals: () => object)
+/// -> { ok: boolean, text: string }`. `ok === false` means the template did not
+/// compile; the host reports that **once per line** and the logpoint stays
+/// silent afterwards. A single expression that throws does not fail the whole
+/// message: that fragment becomes `"<错误>"` and the rest still expands.
+///
+/// Unlike a condition, a logpoint never decides anything — it only produces
+/// text, so a broken one can neither stop nor disturb the handler.
+pub(crate) const LOG_FN: &str = "__hbot_log";
+/// `globalThis.__hbot_log_error` — why the last [`LOG_FN`] call returned
+/// `ok: false`. Only read on the failure path, which is the only path that logs.
+pub(crate) const LOG_ERROR_FN: &str = "__hbot_log_error";
+
+/// Source of [`LOG_FN`] / [`LOG_ERROR_FN`]. Installed once per context.
+///
+/// Template grammar (deliberately small): literal text with `{expression}`
+/// holes. There is no escaping, no nesting and no `await` — an expression is
+/// compiled with `new Function` exactly like a condition, so anything that is
+/// not a synchronous expression is a compile error. An unbalanced `{` is
+/// treated as literal text (a typo must not turn a whole message into silence);
+/// an empty or nested `{...}` *is* a compile error.
+///
+/// The cache is keyed by `"<file>:<line>"` and stores the template it compiled,
+/// so a hot line pays one `new Function` per expression and then nothing — the
+/// same shape as [`COND_SOURCE`]. Compile failures are cached too: a template
+/// with a typo must not re-compile (and re-warn) on every hit.
+const LOG_SOURCE: &str = r#"(function () {
+    "use strict";
+    var cache = new Map();
+    var lastError = "";
+
+    // Split `template` into literal strings and compiled expression functions.
+    // A mixed array is enough: `typeof part === "string"` distinguishes them.
+    function compile(template) {
+        var parts = [];
+        var literal = "";
+        var index = 0;
+        while (index < template.length) {
+            var open = template.indexOf("{", index);
+            if (open < 0) {
+                literal += template.slice(index);
+                break;
+            }
+            literal += template.slice(index, open);
+            var close = template.indexOf("}", open + 1);
+            if (close < 0) {
+                // Unbalanced "{": keep the rest as literal text.
+                literal += template.slice(open);
+                break;
+            }
+            var source = template.slice(open + 1, close);
+            if (source.indexOf("{") >= 0) {
+                throw new Error("nested braces are not supported in logpoint templates");
+            }
+            if (source.trim().length === 0) {
+                throw new Error("empty expression in logpoint template");
+            }
+            parts.push(literal);
+            literal = "";
+            parts.push(new Function(
+                "$hbot_scope",
+                "with ($hbot_scope) { return (" + source + "\n); }"
+            ));
+            index = close + 1;
+        }
+        parts.push(literal);
+        return parts;
+    }
+
+    function __hbot_log(key, template, locals) {
+        var entry = cache.get(key);
+        if (entry === undefined || entry.source !== template) {
+            entry = { source: template, parts: null };
+            try {
+                entry.parts = compile(template);
+            } catch (error) {
+                entry.parts = null;
+                lastError = String(error);
+            }
+            cache.set(key, entry);
+        }
+        if (entry.parts === null) {
+            return { ok: false, text: "" };
+        }
+        var scope = null;
+        try {
+            scope = locals();
+        } catch (error) {
+            lastError = "reading locals failed: " + String(error);
+            scope = null;
+        }
+        var usable =
+            scope !== null && (typeof scope === "object" || typeof scope === "function");
+        var text = "";
+        for (var i = 0; i < entry.parts.length; i++) {
+            var part = entry.parts[i];
+            if (typeof part === "string") {
+                text += part;
+                continue;
+            }
+            if (!usable) {
+                text += "<错误>";
+                continue;
+            }
+            try {
+                text += String(part(scope));
+            } catch (error) {
+                lastError = String(error);
+                text += "<错误>";
+            }
+        }
+        return { ok: true, text: text };
+    }
+
+    function __hbot_log_error() {
+        return lastError;
+    }
+
+    return { log: __hbot_log, error: __hbot_log_error };
+})()"#;
+
 /// Upper bound on one variable's JSON text. Larger values become
 /// `<unserializable>` rather than blowing up the event payload.
 const MAX_VALUE_BYTES: usize = 4096;
@@ -192,6 +315,17 @@ enum ConditionOutcome {
     /// Did not compile, or threw while evaluating: not a hit, and worth a
     /// (once-per-line) warning.
     Failed,
+}
+
+/// What a logpoint template produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LogOutcome {
+    /// The template expanded. Expression failures are already replaced inline by
+    /// the `"<错误>"` placeholder, so the text is always sendable as-is.
+    Message(String),
+    /// The template did not compile (or the helper vanished): nothing is sent,
+    /// and the host warns once per line.
+    Broken,
 }
 
 /// Everything a probe needs, cloned into the registered host functions.
@@ -239,6 +373,16 @@ impl DebugRuntime {
         let condition_error: Function<'js> = conditions.get("error").map_err(js_error)?;
         globals
             .set(COND_ERROR_FN, condition_error)
+            .map_err(js_error)?;
+
+        // Logpoint templates share the condition cache's shape: one compile per
+        // `(file, line)` for the lifetime of the context, failures cached too.
+        let logpoints: Object<'js> = ctx.eval(LOG_SOURCE).map_err(js_error)?;
+        let logpoint: Function<'js> = logpoints.get("log").map_err(js_error)?;
+        globals.set(LOG_FN, logpoint).map_err(js_error)?;
+        let logpoint_error: Function<'js> = logpoints.get("error").map_err(js_error)?;
+        globals
+            .set(LOG_ERROR_FN, logpoint_error)
             .map_err(js_error)?;
 
         let trace = self.clone();
@@ -341,29 +485,19 @@ impl DebugRuntime {
             Err(poisoned) => poisoned.into_inner().step,
         };
 
-        // One lock for both halves of the question: is this line a breakpoint,
-        // and if so does it carry a condition? `condition_of` returns `None`
-        // for an unconditional breakpoint, which is the common case.
-        let (breakpoint, condition) = match self.state.lock() {
-            Ok(state) => (
-                state.breakpoints.hits(&path, line),
-                state
-                    .breakpoints
-                    .condition_of(&path, line)
-                    .map(str::to_owned),
-            ),
+        // One lock for the three questions the slow path needs: is this line a
+        // *breakpoint* (the `files` table — `hits` alone would also be true for
+        // a logpoint), does it carry a condition, and does it carry a logpoint
+        // template? `condition_of` returns `None` for an unconditional
+        // breakpoint, which is the common case.
+        let (breakpoint, condition, log) = match self.state.lock() {
+            Ok(state) => probe_entry(&state.breakpoints, &path, line),
             Err(poisoned) => {
                 let state = poisoned.into_inner();
-                (
-                    state.breakpoints.hits(&path, line),
-                    state
-                        .breakpoints
-                        .condition_of(&path, line)
-                        .map(str::to_owned),
-                )
+                probe_entry(&state.breakpoints, &path, line)
             }
         };
-        if !breakpoint && step.is_none() {
+        if !breakpoint && step.is_none() && log.is_none() {
             return;
         }
 
@@ -376,20 +510,36 @@ impl DebugRuntime {
         // entirely — and therefore reports no hit condition either. The
         // condition text that was actually satisfied travels in `PausedAt` so
         // the debugger panel can show *why* it stopped here.
+        //
+        // "Not a hit" is not "return" any more: the line may also be a
+        // logpoint, which prints regardless of the condition's verdict.
         let mut hit_condition: Option<String> = None;
+        let mut hit = breakpoint;
         if step.is_none() {
             if let Some(condition) = condition.as_deref() {
                 let key = format!("{path}:{line}");
                 match self.evaluate_condition(ctx, &key, condition, locals.clone()) {
                     ConditionOutcome::True => hit_condition = Some(condition.to_owned()),
-                    ConditionOutcome::False => return,
+                    ConditionOutcome::False => hit = false,
                     ConditionOutcome::Failed => {
                         let detail = self.condition_error(ctx);
                         self.note_condition_failure(&path, line, condition, &detail);
-                        return;
+                        hit = false;
                     }
                 }
             }
+        }
+
+        // The logpoint, if any, comes *before* the pause decision: when a line is
+        // both, the panel must already have the message by the time the paused
+        // frame arrives. A logpoint never pauses by itself — it falls through to
+        // the `!hit` check below and returns, leaving the handler running.
+        if let Some(template) = log.as_deref() {
+            self.emit_logpoint(ctx, &path, line, column, template, locals.clone());
+        }
+
+        if !hit && step.is_none() {
+            return;
         }
 
         // Only now is it worth reading the stack, and only now does the locals
@@ -627,6 +777,128 @@ impl DebugRuntime {
             );
         }
     }
+
+    /// Expand one logpoint template and hand the text to the sink.
+    ///
+    /// Never pauses, never throws, never returns an error: a logpoint is a
+    /// print statement, so the worst case is "the user gets `<错误>` instead of a
+    /// value" or "a broken template stays silent".
+    fn emit_logpoint<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        path: &str,
+        line: u32,
+        column: u32,
+        template: &str,
+        locals: Function<'js>,
+    ) {
+        let key = format!("{path}:{line}");
+        match self.evaluate_logpoint(ctx, &key, template, locals) {
+            LogOutcome::Message(message) => self.control.call_logged(LoggedAt {
+                file: path.to_owned(),
+                line,
+                column,
+                message,
+            }),
+            LogOutcome::Broken => {
+                let detail = self.logpoint_error(ctx);
+                self.note_logpoint_failure(path, line, template, &detail);
+            }
+        }
+    }
+
+    /// Run [`LOG_FN`] for one template.
+    ///
+    /// All the failure handling lives in JS: compile errors come back as
+    /// `ok: false`, and expression errors are already replaced by the
+    /// `"<错误>"` placeholder inside the text. From here, a JS-level failure is
+    /// indistinguishable from a missing helper and is treated as `Broken`.
+    fn evaluate_logpoint<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        key: &str,
+        template: &str,
+        locals: Function<'js>,
+    ) -> LogOutcome {
+        let Ok(logpoint) = ctx.globals().get::<_, Function<'js>>(LOG_FN) else {
+            return LogOutcome::Broken;
+        };
+        let Ok(value) = logpoint.call::<_, Value<'js>>((key, template, locals)) else {
+            let _ = ctx.catch();
+            return LogOutcome::Broken;
+        };
+        let Some(result) = value.into_object() else {
+            return LogOutcome::Broken;
+        };
+        if !result.get::<_, bool>("ok").unwrap_or(false) {
+            return LogOutcome::Broken;
+        }
+        let text = result
+            .get::<_, rquickjs::String<'js>>("text")
+            .ok()
+            .and_then(|text| text.to_string().ok())
+            .unwrap_or_default();
+        LogOutcome::Message(text)
+    }
+
+    /// The message [`LOG_FN`] recorded for the last failure, for the log line.
+    fn logpoint_error<'js>(&self, ctx: &Ctx<'js>) -> String {
+        let Ok(helper) = ctx.globals().get::<_, Function<'js>>(LOG_ERROR_FN) else {
+            return String::new();
+        };
+        match helper.call::<_, rquickjs::String<'js>>(()) {
+            Ok(text) => text.to_string().unwrap_or_default(),
+            Err(_) => {
+                let _ = ctx.catch();
+                String::new()
+            }
+        }
+    }
+
+    /// Log a broken logpoint template at most once per `<file>:<line>`.
+    ///
+    /// Same reasoning as [`Self::note_condition_failure`]: the mistake would
+    /// otherwise repeat on every hit of the line. After the one warning the
+    /// logpoint stays dead for the lifetime of the isolate (`set_logs` on
+    /// reload rebuilds the entry and it gets another chance).
+    fn note_logpoint_failure(&self, path: &str, line: u32, template: &str, detail: &str) {
+        let key = format!("{path}:{line}");
+        let first = match self.state.lock() {
+            Ok(mut state) => state.warned_logs.insert(key),
+            Err(poisoned) => poisoned.into_inner().warned_logs.insert(key),
+        };
+        if first {
+            tracing::warn!(
+                file = path,
+                line,
+                template,
+                detail,
+                "logpoint message did not compile; this logpoint is silent"
+            );
+        }
+    }
+}
+
+/// The slow path's lookup: `(is a breakpoint, its condition, its logpoint)`.
+///
+/// `hits` answers "does this line have *anything*" and is what the probe fast
+/// path asks; the slow path needs the two tables apart, because a logpoint must
+/// print without pausing while a breakpoint pauses. `files()`/`log_of` are the
+/// only accessors the (frozen) `Breakpoints` contract exposes for that.
+fn probe_entry(
+    breakpoints: &hbot_core::debug::Breakpoints,
+    path: &str,
+    line: u32,
+) -> (bool, Option<String>, Option<String>) {
+    let entry = breakpoints
+        .files()
+        .find(|(file, _)| *file == path)
+        .and_then(|(_, lines)| lines.get(&line));
+    (
+        entry.is_some(),
+        entry.and_then(|condition| condition.clone()),
+        breakpoints.log_of(path, line).map(str::to_owned),
+    )
 }
 
 fn render_value<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Json {
@@ -824,6 +1096,27 @@ impl DebugControl {
                 tracing::error!("debug sink panicked; continuing the handler");
                 DebugAction::Continue
             }
+        }
+    }
+
+    /// Hand one logpoint message to the sink.
+    ///
+    /// Unlike [`Self::call_sink`] the answer is `()`, so the only failure mode is
+    /// a sink that panics; that is swallowed for the same reason (it must not
+    /// unwind through the QuickJS C frames), and the handler keeps running.
+    fn call_logged(&self, at: LoggedAt) {
+        let guard = match self.sink.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(slot) = guard.as_ref() else {
+            return;
+        };
+        // SAFETY: the sink lock is held and the slot is `Some`, which is exactly
+        // the window described on [`SinkSlot`].
+        let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe { slot.sink() }.logged(at)));
+        if result.is_err() {
+            tracing::error!("debug sink panicked while logging; continuing the handler");
         }
     }
 }

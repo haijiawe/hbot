@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hbot_core::BotId;
-use hbot_core::debug::{DebugAction, DebugSink, PausedAt};
+use hbot_core::debug::{DebugAction, DebugSink, LoggedAt, PausedAt};
 
 use crate::app::debug::DebugRegistry;
 use crate::app::events::EventBus;
@@ -112,6 +112,25 @@ impl DebugSink for BotDebugSink {
         self.emit_resumed();
 
         action
+    }
+
+    /// 日志点命中：只发一条 `debug.log`，**不停下、不写库**。
+    ///
+    /// 与 [`Self::paused`] 的三处刻意的不同：
+    ///
+    /// * 不占等待位、不发 `debug.paused`：日志点的契约就是"不停下"（`dto/common.rs` 的
+    ///   `DebugBreakpoint.log`）。发一条 paused 会让 UI 进暂停态、命令层还得等一个永远
+    ///   不会来的 resume。
+    /// * 不阻塞：这是高频路径（循环里的日志点每圈一行），阻塞会直接把 handler 拖死。
+    /// * 不落库：事件走 [`EventBus`] 推给 UI 就够；一条循环日志几百上千行，写 SQLite 会
+    ///   把沙箱 worker 线程钉在 IO 上。历史日志在 UI 侧用环形缓冲（上限 2000 行）兜。
+    fn logged(&self, at: LoggedAt) {
+        self.events.send(Event::DebugLog {
+            bot_id: self.bot_id,
+            file: at.file,
+            line: at.line,
+            message: at.message,
+        });
     }
 }
 
