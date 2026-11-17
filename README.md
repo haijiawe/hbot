@@ -98,6 +98,7 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | [`docs/adr/0005-capability-ceiling-and-device-grant.md`](docs/adr/0005-capability-ceiling-and-device-grant.md) | 决策：能力上限不砍、默认全关、逐项授权（含键鼠注入的三层闸） |
 | [`docs/adr/0006-execution-backend.md`](docs/adr/0006-execution-backend.md) | 决策：运行位置可选（本机/局域网/云端）、单一写者、换位置靠搬家不靠热迁移 |
 | [`docs/spikes/`](docs/spikes/) | 实测记录（内存、QuickJS、启动、打包、QQ 官方握手、**QQ 真机端到端**、性能预算） |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | **交接快照**：决策权、工作方式、六道闸门、已完成/剩余、外部依赖（不是真源，冲突以 `AGENTS.md` 与 `04` 为准） |
 | [`AGENTS.md`](AGENTS.md) | Agent/新人入口：规则、地图、命令、坑 |
 | [`_research/`](_research/) | 旧项目四份只读审查原始证据（不是产品文档） |
 
