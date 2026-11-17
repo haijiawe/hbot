@@ -137,8 +137,8 @@
    - `--save-fixture` 把这一批入站 `payload_json` 存成 JSON 数组（含 OneBot 11 原始事件，嵌在 `raw` 下），供后续 mock/回归复用。
    - 落地位置：`crates/hbot-cli/src/replay.rs`、`hbot-store` 两条只读查询（`list_inbound_history_for_bot` / `list_outbound_by_reply_to`，只加不改）、`crates/hbot-cli/tests/replay.rs`（真 scaffold + 真库 + spawn 真二进制的端到端）。
    - 2026-11-17 **内核搬进独立 crate 并有 UI 入口**：`crates/hbot-replay`（签名改成 `replay(store: &Store, options)`，因为 CLI 读 `<project>/.hbot/hbot.db`、桌面/无头读 `data_dir` 下的库，两者不是同一个文件），`hbot-cli/src/replay.rs` 941 → 197 行只剩解析/打印/退出码；新命令 `replay_run { botId, from, limit }`（只读、不联网）；第七个 lazy 页签回放面板（独立 chunk 7.62 kB）。错误码：没有项目或 `limit: 0` → -32002，bot/历史不存在 → -32001，编译或 isolate 失败 → -32006。wire 里**没有** `database` 字段（IDE 不需要知道读的是哪份库）。
-    - - 2026-11-17 **夹具复用端已落地**：`hbot fixture save <project> --bot <id> [--from] [--limit] [--path]` 从历史入站导出、`hbot fixture run <project> --path <file>` **完全不查库**地重跑（只读这一份 JSON），同名 rpc 命令 `replay_save_fixture { botId, from, limit, path }` / `fixture_run { botId, path }`，回放页签里有夹具区。夹具文件是**顶层 JSON 数组**，元素与运行时事件同形状（十键，由 `hbot_bot::event_json` 唯一生成）；多出的键忽略（向前兼容）、缺必填键报"第 N 条不是合法的事件对象"且**不静默跳过**。路径守卫在 `crates/hbot-replay/src/fixture.rs:369`（`resolve_fixture_path` 拒绝写出项目外，`!resolved.starts_with(&root)` 判据），写盘走 `hbot-workspace` 的原子写。**`--path` 的父目录可以不存在**（连同父目录一起建）。
-    - - **仍未做**：跨项目共享夹具（现在夹具属于单个项目目录）、跨事件的时间对齐（`ctx.sleep` 造成的延迟回复只能按 `reply_to` 归属，还原不了"当时在第几毫秒回"）。
+    - 2026-11-17 **夹具复用端已落地**：`hbot fixture save <project> --bot <id> [--from] [--limit] [--path]` 从历史入站导出、`hbot fixture run <project> --path <file>` **完全不查库**地重跑（只读这一份 JSON），同名 rpc 命令 `replay_save_fixture { botId, from, limit, path }` / `fixture_run { botId, path }`，回放页签里有夹具区。夹具文件是**顶层 JSON 数组**，元素与运行时事件同形状（十键，由 `hbot_bot::event_json` 唯一生成）；多出的键忽略（向前兼容）、缺必填键报"第 N 条不是合法的事件对象"且**不静默跳过**。路径守卫在 `crates/hbot-replay/src/fixture.rs:369`（`resolve_fixture_path` 拒绝写出项目外，`!resolved.starts_with(&root)` 判据），写盘走 `hbot-workspace` 的原子写。**`--path` 的父目录可以不存在**（连同父目录一起建）。
+    - **仍未做**：跨项目共享夹具（现在夹具属于单个项目目录）、跨事件的时间对齐（`ctx.sleep` 造成的延迟回复只能按 `reply_to` 归属，还原不了"当时在第几毫秒回"）。
 
 **出口**：
 
