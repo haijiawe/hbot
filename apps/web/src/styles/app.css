@@ -1548,6 +1548,219 @@ body.is-resizing {
   cursor: pointer;
 }
 
+/*
+ * 有条件断点：空心圆点 + 右下角问号。
+ *
+ * 只靠颜色区分不够（色弱、以及暂停行本身就是暖色底）；这里用**形状**分辨：
+ * 实心 = 无条件，空心带问号 = 有条件的。
+ */
+.debug-breakpoint--conditional {
+  background: radial-gradient(
+    circle at center,
+    transparent 0 3px,
+    var(--danger) 3.4px 4.6px,
+    transparent 5px
+  );
+  position: relative;
+}
+
+.debug-breakpoint--conditional::after {
+  content: '?';
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  color: var(--danger);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/*
+ * 行槽位的右键菜单（`editor-surface.tsx`）：绝对定位在 `.editor-surface` 里，
+ * 内联条件输入框换掉同一块面板，不弹 `window.prompt`（那是阻塞式的）。
+ */
+.breakpoint-menu {
+  position: absolute;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 168px;
+  max-width: 320px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+/* 透明遮罩：点别处关菜单；`z-index` 比菜单低，所以菜单里的点击不会被吞。 */
+.breakpoint-menu__backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 29;
+}
+
+.breakpoint-menu__item {
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.breakpoint-menu__item:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.breakpoint-menu__item:disabled {
+  color: var(--fg-dim);
+  cursor: default;
+}
+
+.breakpoint-menu__form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px;
+}
+
+.breakpoint-menu__label {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+
+.breakpoint-menu__input {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  box-sizing: border-box;
+}
+
+.breakpoint-menu__actions {
+  display: flex;
+  gap: 6px;
+}
+
+.breakpoint-menu__hint {
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* 暂停时"命中的条件"：一行文本，不占面板高度。 */
+.debug__condition {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  align-items: baseline;
+  margin: 0;
+  padding: 2px 0;
+  font-size: 12px;
+}
+
+.debug__condition-label {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.debug__condition-text {
+  color: var(--fg);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* 断点清单：固定在面板底部，长了就自己滚，不挤占调用栈。 */
+.debug__breakpoints {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 40%;
+  overflow: auto;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.debug__bp-heading {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.debug__bp-file {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.debug__bp-title {
+  margin: 0;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug__bp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.debug__bp {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.debug__bp:hover {
+  background: var(--bg-hover);
+}
+
+.debug__bp-line {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+}
+
+.debug__bp-condition {
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug__bp-condition--none {
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
 .debug-paused-line {
   background-color: rgba(224, 179, 65, 0.16);
   box-shadow: inset 2px 0 0 var(--warn);
@@ -2061,4 +2274,295 @@ body.is-resizing {
 .device-settings__number:focus {
   outline: 2px solid var(--focus);
   outline-offset: -1px;
+}
+
+/* ---------- 事件回放（用当前代码重跑历史事件并对账） ---------- */
+
+/*
+ * 回放面板同样挂在底部面板的「回放」页签里：高度来自 `--bottom-panel-height`，
+ * 滚动交给 `.bottom-panel__body`，这里只排内部结构（与 `.device-panel` 同一条纪律，
+ * 面板自己再套一层 overflow 会出现双滚动条）。
+ */
+.replay {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+/* "不联网、不写库"这句话是使用前提，不是提示语，所以不靠 tooltip 承载。 */
+.replay__warning {
+  margin: 0;
+}
+
+.replay__form {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.replay__field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.replay__field--limit {
+  max-width: 140px;
+}
+
+.replay__label {
+  color: var(--fg-dim);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.replay__select,
+.replay__input {
+  padding: 3px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+  outline: none;
+}
+
+.replay__select {
+  max-width: 240px;
+}
+
+.replay__select:focus,
+.replay__input:focus {
+  border-color: var(--accent);
+}
+
+.replay__run {
+  flex: 0 0 auto;
+}
+
+.replay__error,
+.replay__empty,
+.replay__truncated {
+  margin: 0;
+}
+
+.replay__report {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.replay__meta {
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.replay__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+}
+
+/* 统计项用左侧色条区分，文字标签本身已经说明了含义 —— 颜色只是第二信号。 */
+.replay__summary-item {
+  padding: 2px 8px;
+  border-left: 3px solid var(--border-strong);
+  border-radius: 0 4px 4px 0;
+  background: var(--bg-hover);
+}
+
+.replay__summary-item--match {
+  border-left-color: var(--ok);
+}
+
+.replay__summary-item--diff {
+  border-left-color: var(--warn);
+}
+
+.replay__summary-item--error {
+  border-left-color: var(--danger);
+}
+
+.replay__reply-summary {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+
+.replay__entries {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.replay-entry {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+}
+
+/* 一条事件的整体状态：左粗边 + 头部中文标签，两处都说同一件事。 */
+.replay-entry--match {
+  border-left-color: var(--ok);
+}
+
+.replay-entry--diff {
+  border-left-color: var(--warn);
+}
+
+.replay-entry--error {
+  border-left-color: var(--danger);
+}
+
+.replay-entry__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.replay-entry__seq {
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+}
+
+.replay-entry__status {
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.replay-entry__status--match {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.replay-entry__status--diff {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.replay-entry__status--error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.replay-entry__time {
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+}
+
+.replay-entry__external {
+  margin-left: auto;
+  overflow: hidden;
+  max-width: 50%;
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.replay-entry__error {
+  margin: 6px 0 0;
+}
+
+/* 历史 / 重跑并排：回放要读的是"同一句话两边怎么写"，上下堆叠会失去对照。 */
+.replay-entry__columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.replay-entry__column {
+  min-width: 0;
+}
+
+.replay-entry__column-title {
+  margin: 0 0 4px;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.replay-entry__replies {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.replay-entry__reply {
+  padding: 3px 6px;
+  border-left: 2px solid var(--border-strong);
+  border-radius: 0 3px 3px 0;
+  background: var(--bg-hover);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.replay-entry__empty {
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.replay-entry__marks {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+}
+
+.replay-entry__mark {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  overflow-wrap: anywhere;
+}
+
+.replay-entry__mark-label {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+
+/* 差异正文单独成节点：标记词与内容各有各的语义，别把两者拼成一个字符串。 */
+.replay-entry__mark-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.replay-entry__mark--extra .replay-entry__mark-label {
+  color: var(--ok);
+}
+
+.replay-entry__mark--missing .replay-entry__mark-label {
+  color: var(--danger);
+}
+
+.replay-entry__mark--reordered .replay-entry__mark-label {
+  color: var(--warn);
 }

@@ -334,6 +334,82 @@ export function applyEditsAsOneUndoGroup(
   return operations.length
 }
 
+/** 整份文本在 Monaco 坐标里的末位（行号/列号 1-based）。 */
+function documentEnd(text: string): { line: number; column: number } {
+  const lines = text.split(/\r\n|\n/)
+  return { line: lines.length, column: (lines[lines.length - 1]?.length ?? 0) + 1 }
+}
+
+/**
+ * 把模型内容整份恢复成一个 undo 组（撤销一次应用时用）。
+ *
+ * 为什么不用 `setValue`：那会清空这个模型自己的 undo 栈，用户**应用之前**的编辑历史
+ * 会一起消失。这里按与 `applyEditsAsOneUndoGroup` 同一约定走
+ * 「先闭合 → 一次 `pushEditOperations` → 再闭合」，所以恢复本身也是一个独立元素
+ * （撤销之后还能再撤销回去）。返回是否真的改了文本。
+ */
+export function restoreModelAsOneUndoGroup(model: UndoableModel, text: string): boolean {
+  const current = model.getValue()
+  if (current === text) return false
+  const end = documentEnd(current)
+  model.pushStackElement()
+  model.pushEditOperations([
+    {
+      range: { startLineNumber: 1, startColumn: 1, endLineNumber: end.line, endColumn: end.column },
+      text,
+      forceMoveMarkers: true,
+    },
+  ])
+  model.pushStackElement()
+  return true
+}
+
+/** 快照里一个文件的「应用前」样子。 */
+export interface ApplySnapshotFile {
+  path: string
+  /**
+   * 应用前的缓冲区文本（**引用**，不是拷贝：store 里的字符串不可变，每次编辑都造新串，
+   * 所以存引用既省内存又不会被后续编辑改掉）。
+   *
+   * `null` = 应用前这个文件根本没有缓冲区（这次 Diff 新建的文件，或本来就没在编辑器里打开）。
+   * 这种文件没有文本可恢复，撤销时只能把「应用后出现的标签」从编辑器里移掉。
+   */
+  before: string | null
+}
+
+/**
+ * 一次 `edit.apply` 的「应用前快照」。
+ *
+ * 为什么必须自己拍：Monaco 的撤销栈是**按 model 各自独立**的，一次 Ctrl+Z 只回退当前
+ * 文件；而一次应用可能改多个文件，所以「整组撤销」只能靠这份快照把每个文件一起退回去。
+ */
+export interface ApplySnapshot {
+  editId: string
+  files: ApplySnapshotFile[]
+}
+
+/**
+ * 从一次应用的规划结果里拍快照（**只在应用那一刻拍一次**）。
+ *
+ * - `apply` 的文件带自己的 `before`（precheck 时读到的应用前文本）；
+ * - `skip` 的文件（没打开 / 新建）只能记 `null`；
+ * - `reject` 的文件核心根本没写，撤销时碰它等于多改一次，所以不进快照。
+ */
+export function captureApplySnapshot(
+  editId: string,
+  decisions: readonly FileDecision[],
+): ApplySnapshot {
+  const files: ApplySnapshotFile[] = []
+  for (const decision of decisions) {
+    if (decision.action === 'reject') continue
+    files.push({
+      path: decision.path,
+      before: decision.action === 'apply' ? decision.before : null,
+    })
+  }
+  return { editId, files }
+}
+
 function conflictDiagnostic(
   path: string,
   hunk: DiffHunk | undefined,
@@ -455,4 +531,11 @@ export interface EditApplyHooks {
     files: readonly EditFile[]
     acceptHunks: readonly number[]
   }) => Promise<void> | void
+  /**
+   * 用户点「撤销这次应用」时：按快照把**这次应用碰过的所有文件**退回应用前。
+   *
+   * 与 Ctrl+Z 的差别只有范围：Ctrl+Z 只退当前 model（Monaco 的撤销栈不跨 model），
+   * 这里一次退掉整组；退完之后 `contents` 必须等于快照，`saved`（磁盘基线）不动。
+   */
+  undo?: (input: { editId: string }) => Promise<void> | void
 }

@@ -8,8 +8,14 @@
 
 import { describe, expect, it } from 'vitest'
 import type { DeviceSettings } from '../generated'
-import type { FileNode } from './ipc'
-import { MOCK_PROJECT_PATH, mockDispatch } from './ipc-mock'
+import type { CoreEvent, FileNode } from './ipc'
+import {
+  MOCK_PROJECT_PATH,
+  mockBreakpointsOf,
+  mockDispatch,
+  simulateMockPause,
+  subscribeMockEvents,
+} from './ipc-mock'
 
 describe('mockDispatch：project.open', () => {
   it('把用户输入归一成斜杠路径，并回 { path }（与核心的字符串 data 对齐）', async () => {
@@ -171,5 +177,69 @@ describe('mockDispatch：宿主设备设置', () => {
     ).rejects.toThrow('-32002')
 
     expect(await mockDispatch({ type: 'deviceSettingsGet' })).toEqual(before)
+  })
+})
+
+/**
+ * 条件断点在 mock 链路上的两个观察点：
+ * 1. `debug.set-breakpoints` 的 `breakpoints` 里带的条件要**原样存下**（不是只记行号），
+ *    否则浏览器里写好的条件切一次文件就没了；
+ * 2. `debug.paused` 事件里的 `condition` 要能透传到订阅者 —— 调试面板的"命中的条件"
+ *    完全依赖这一个字段。mock 不自动伪造暂停（见 `simulateMockPause` 的注释），
+ *    所以第二条要用显式入口造事件。
+ */
+describe('mockDispatch：条件断点', () => {
+  it('mock 记下断点条目（含条件），空数组等于清空该文件', async () => {
+    await mockDispatch({
+      type: 'debug.set-breakpoints',
+      botId: 'demo-bot',
+      file: 'src/cond.ts',
+      breakpoints: [
+        { line: 3, condition: null },
+        { line: 9, condition: 'count > 3' },
+      ],
+    })
+    expect(mockBreakpointsOf('src/cond.ts')).toEqual([
+      { line: 3, condition: null },
+      { line: 9, condition: 'count > 3' },
+    ])
+
+    await mockDispatch({
+      type: 'debug.set-breakpoints',
+      botId: 'demo-bot',
+      file: 'src/cond.ts',
+      breakpoints: [],
+    })
+    expect(mockBreakpointsOf('src/cond.ts')).toEqual([])
+  })
+
+  it('simulateMockPause 造的 debug.paused 带条件，订阅者能收到', () => {
+    const events: CoreEvent[] = []
+    const unsubscribe = subscribeMockEvents((event) => events.push(event))
+
+    simulateMockPause({ file: 'src/cond.ts', line: 9, condition: 'count > 3' })
+    simulateMockPause({ file: 'src/cond.ts', line: 3 })
+    unsubscribe()
+
+    expect(events).toEqual([
+      {
+        type: 'debug.paused',
+        botId: 'demo-bot',
+        file: 'src/cond.ts',
+        line: 9,
+        condition: 'count > 3',
+        scopes: [],
+        callStack: [{ name: 'onMessage', file: 'src/cond.ts', line: 9, column: 1 }],
+      },
+      {
+        type: 'debug.paused',
+        botId: 'demo-bot',
+        file: 'src/cond.ts',
+        line: 3,
+        condition: null,
+        scopes: [],
+        callStack: [{ name: 'onMessage', file: 'src/cond.ts', line: 3, column: 1 }],
+      },
+    ])
   })
 })

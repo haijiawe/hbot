@@ -97,6 +97,7 @@ describe('BottomPanel 页签', () => {
       paused: {
         file: 'src/main.ts',
         line: 3,
+        condition: null,
         scopes: [],
         callStack: [{ name: 'main', file: 'src/main.ts', line: 3, column: 1 }],
       },

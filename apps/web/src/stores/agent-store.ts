@@ -27,7 +27,7 @@ export interface AgentMessage {
   at: number
 }
 
-export type AgentDiffStatus = 'pending' | 'accepted' | 'rejected'
+export type AgentDiffStatus = 'pending' | 'accepted' | 'rejected' | 'undone'
 
 /** 待审阅的一次编辑（`agent.diff` 事件）：可能跨多个文件，按块接受。 */
 export interface PendingEdit {
@@ -72,6 +72,13 @@ export interface AgentState {
   answerApproval: (decision: ApprovalDecisionInput, always: boolean) => Promise<void>
   acceptEdit: (hooks?: EditApplyHooks) => Promise<void>
   rejectEdit: () => Promise<void>
+  /**
+   * 撤销**已经接受**的这次应用（回到应用前的文本）。
+   *
+   * 与拒绝的区别：拒绝 = 核心根本没写盘、缓冲区也没动；撤销 = 已经应用过了，现在退回。
+   * 只有 `accepted` 能撤销（`pending` 应该点拒绝，`undone` / `rejected` 无处可退）。
+   */
+  undoEdit: (hooks?: EditApplyHooks) => Promise<void>
   dismissError: () => void
 }
 
@@ -272,6 +279,24 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       set({ edit: { ...edit, status: 'rejected' } })
     } catch (error) {
       set({ error: `拒绝改动失败：${errorMessage(error)}` })
+    }
+  },
+
+  async undoEdit(hooks) {
+    const edit = get().edit
+    // 只有"已经接受"能撤销；`pending` 该点拒绝，`rejected` / `undone` 没有可退的东西。
+    if (!edit || edit.status !== 'accepted') return
+    if (!hooks?.undo) {
+      // 没有快照就不要假装撤回了：状态一旦改成 undone，用户会以为改动已经退回去。
+      set({ error: '这次应用没有留下可撤销的编辑器快照，只能用编辑器自己的撤销。' })
+      return
+    }
+    try {
+      await hooks.undo({ editId: edit.editId })
+      set({ edit: { ...edit, status: 'undone' }, error: null })
+    } catch (error) {
+      // 失败时保持 accepted：卡片仍显示"已接受 + 可撤销"，用户能再试一次。
+      set({ error: `撤销这次应用失败：${errorMessage(error)}` })
     }
   },
 

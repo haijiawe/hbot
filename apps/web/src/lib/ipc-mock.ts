@@ -16,7 +16,15 @@
  * "假结果"（`crates/hbot-rpc/src/app/commands/files.rs` 的 `search` 在 cancelled 时直接返回）。
  */
 
-import type { DeviceSettings, DeviceStatus, Event as CoreEvent, RunLog } from '../generated'
+import type {
+  DebugBreakpoint,
+  DeviceSettings,
+  DeviceStatus,
+  Event as CoreEvent,
+  ReplayEntry,
+  ReplayReport,
+  RunLog,
+} from '../generated'
 import type {
   BotStatus,
   Command,
@@ -38,13 +46,15 @@ const BOT_PLATFORM = 'local'
 const MOCK_SESSION_ID = 'mock-session'
 
 /**
- * mock 里记下的断点（`file -> 行号`，与核心的 `Breakpoints` 同语义：全量覆盖、空集移除）。
+ * mock 里记下的断点（`file -> { line, condition }`，与核心的 `Breakpoints` 同语义：
+ * 全量覆盖、空集移除、`condition: null` 是无条件）。
  *
  * 只用来让"点了 gutter 之后命令确实发出去了"这件事在浏览器里可复现；mock **不伪造
  * `debug.paused`**（docs/06-ide.md §6.2 的暂停语义要真跑起来才有），所以调试面板在 mock
- * 下始终停在"未在调试"。
+ * 下始终停在"未在调试"。想看暂停面板长什么样，用下面的 `simulateMockPause` 手动造一条
+ * 事件（只给测试与手动调试，不该有产品代码调用它）。
  */
-const mockBreakpoints = new Map<string, number[]>()
+const mockBreakpoints = new Map<string, DebugBreakpoint[]>()
 
 /**
  * mock 的设备会话（与核心的 `device_sessions` 同字段语义，见
@@ -477,6 +487,36 @@ function emitMockEvent(event: CoreEvent): void {
   for (const listener of [...eventListeners]) listener(event)
 }
 
+/** mock 记下的某个文件的断点（测试用；顺序与写入时一致）。 */
+export function mockBreakpointsOf(file: string): DebugBreakpoint[] {
+  return (mockBreakpoints.get(file) ?? []).map((entry) => ({ ...entry }))
+}
+
+/**
+ * 手动造一条 `debug.paused`（**只给测试与手动调试用**，产品代码不该调用）。
+ *
+ * 为什么不是 mock 自己推：`docs/06-ide.md` §6.2 的暂停语义是"worker 真的卡在断点上"，
+ * mock 没有插桩执行器，自动伪造只会让浏览器里看起来能调试、真机上却不会。所以暂停
+ * 事件留一个显式入口：要验证调试面板（含"命中的条件"）时，由测试/人明确造一条。
+ */
+export function simulateMockPause(pause: {
+  botId?: string
+  file: string
+  line: number
+  /** 命中的条件原文；`null`/省略 = 无条件断点或单步暂停。 */
+  condition?: string | null
+}): void {
+  emitMockEvent({
+    type: 'debug.paused',
+    botId: pause.botId ?? BOT_ID,
+    file: pause.file,
+    line: pause.line,
+    condition: pause.condition ?? null,
+    scopes: [],
+    callStack: [{ name: 'onMessage', file: pause.file, line: pause.line, column: 1 }],
+  })
+}
+
 // ---------------------------------------------------------------------------
 // 搜索（`search_start` 回 `data: null`，命中合成一条 `file.search`）
 // ---------------------------------------------------------------------------
@@ -490,6 +530,117 @@ function nextSearchId(): string {
 
 /** 已取消、但事件还没送出的搜索 ID：送出前丢掉，模拟核心"取消后不再推"。 */
 const cancelledSearches = new Set<string>()
+
+/**
+ * mock 分发的回放基线时间（固定值，不用 `Date.now()`）。
+ *
+ * 为什么固定：面板把 `receivedAt` 格式化成时钟，卡在"现在"上会让断言随运行时刻漂移；
+ * 三条事件彼此相隔一分钟，也顺手覆盖了"按时间顺序读"这条读法。
+ */
+const MOCK_REPLAY_BASE_AT = 1_735_689_600_000
+
+/**
+ * mock 的回放条目：三种状态（`match` / `diff` / `error`）**各一条**。
+ *
+ * 为什么必须造出差异：回放面板的全部价值在于「历史 vs 重跑」的对照。若 mock 回一份全一致的
+ * 报告，浏览器里永远看不到「多出 / 缺少 / 顺序不同」的标记 —— 这块 UI 在唯一能跑的模式下
+ * 就无法验证（真机要跑起来才有数据）。
+ */
+const MOCK_REPLAY_ENTRIES: readonly ReplayEntry[] = [
+  {
+    inboundId: 'mock-inbound-1',
+    externalId: 'local:default',
+    conversationExternalId: 'local:default',
+    receivedAt: MOCK_REPLAY_BASE_AT,
+    status: 'match',
+    historical: ['在的，有什么可以帮你'],
+    replayed: ['在的，有什么可以帮你'],
+    same: ['在的，有什么可以帮你'],
+    extra: [],
+    missing: [],
+    reordered: [],
+    error: null,
+  },
+  {
+    inboundId: 'mock-inbound-2',
+    externalId: 'local:default',
+    conversationExternalId: 'local:default',
+    receivedAt: MOCK_REPLAY_BASE_AT + 60_000,
+    status: 'diff',
+    historical: ['收到，我看一下', '查到了：今天有 3 条待办', '稍后给你详细列表'],
+    replayed: ['查到了：今天有 3 条待办', '收到，我看一下', '另外提醒你喝水'],
+    same: [],
+    extra: ['另外提醒你喝水'],
+    missing: ['稍后给你详细列表'],
+    reordered: [
+      { text: '收到，我看一下', historicalIndex: 0, replayedIndex: 1 },
+      { text: '查到了：今天有 3 条待办', historicalIndex: 1, replayedIndex: 0 },
+    ],
+    error: null,
+  },
+  {
+    inboundId: 'mock-inbound-3',
+    externalId: 'local:default',
+    conversationExternalId: 'local:default',
+    receivedAt: MOCK_REPLAY_BASE_AT + 120_000,
+    status: 'error',
+    historical: [],
+    replayed: [],
+    same: [],
+    extra: [],
+    missing: [],
+    reordered: [],
+    error: 'handler 抛错：TypeError: reply 不是函数（模拟改了 reply.ts 的签名）',
+  },
+]
+
+/**
+ * 造一份回放报告：`from` 按 `receivedAt` 下限过滤，`limit` 截断条数。
+ *
+ * 计数与 `entries` 取自**同一批**数据（截断之后的），所以面板上的统计永远和下面列出的条目对得上；
+ * 真机核心是否对"整批"统计属于契约细节，UI 不依赖这一点。
+ */
+function mockReplayReport(
+  botId: string,
+  from: number | null,
+  limit: number | null,
+): ReplayReport {
+  // 0 / 负数不是"全量"而是非法参数（契约：`limit: null` 才是全量，`0` 是 -32002）。
+  // 前端会先拦一道，但 mock 也照核心的形状拒一次 —— 两层都在，UI 的拦截才不是唯一防线。
+  if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+    throw new Error(`replay_run: limit 必须是正整数或 null（收到 ${limit}，-32002）`)
+  }
+  const inRange = MOCK_REPLAY_ENTRIES.filter(
+    (entry) => from === null || entry.receivedAt >= from,
+  )
+  const entries = (limit === null ? inRange : inRange.slice(0, limit)).map((entry) => ({
+    ...entry,
+    historical: [...entry.historical],
+    replayed: [...entry.replayed],
+    same: [...entry.same],
+    extra: [...entry.extra],
+    missing: [...entry.missing],
+    reordered: entry.reordered.map((change) => ({ ...change })),
+  }))
+  const count = (pick: (entry: ReplayEntry) => number): number =>
+    entries.reduce((total, entry) => total + pick(entry), 0)
+  return {
+    project: MOCK_PROJECT_PATH,
+    bot: botId,
+    from,
+    limit,
+    events: entries.length,
+    matchedEvents: entries.filter((entry) => entry.status === 'match').length,
+    differingEvents: entries.filter((entry) => entry.status !== 'match' && entry.status !== 'error')
+      .length,
+    failedEvents: entries.filter((entry) => entry.status === 'error').length,
+    same: count((entry) => entry.same.length),
+    extra: count((entry) => entry.extra.length),
+    missing: count((entry) => entry.missing.length),
+    reordered: count((entry) => entry.reordered.length),
+    entries,
+  }
+}
 
 /** mock 分发：与 `dispatch()` 的返回类型一致，由 ipc.ts 收窄。 */
 export async function mockDispatch(command: Command): Promise<CommandOutputs[CommandType]> {
@@ -641,7 +792,8 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
 
     case 'debug.set-breakpoints':
       // 全量覆盖：空数组 = 移除该文件（与核心 `Breakpoints::set` 一致）。
-      mockBreakpoints.set(command.file, [...command.lines])
+      // 条件原样记下（`null` = 无条件），mock 不求值任何表达式。
+      mockBreakpoints.set(command.file, command.breakpoints.map((entry) => ({ ...entry })))
       return null
 
     case 'debug.resume':
@@ -723,6 +875,14 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
       }
       mockProjects.set(path, { path, name, entry: 'src/main.ts' })
       return { path, name, entry: 'src/main.ts' }
+    }
+
+    // 回放：不联网、不写库，一次回整份对账报告（没有事件可等）。
+    // botId 照 device 系列同样校验：拿空串/别的 bot 去回放，等于对着不存在的 bot 跑一遍历史。
+    case 'replay_run': {
+      if (command.botId.length === 0) throw new Error('replay_run: botId 不能为空（-32002）')
+      if (command.botId !== BOT_ID) throw new Error(`replay_run: 未知 bot（${command.botId}）`)
+      return mockReplayReport(command.botId, command.from, command.limit)
     }
 
     default: {

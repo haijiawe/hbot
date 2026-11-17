@@ -31,6 +31,8 @@
  *   绝对路径；不是 `ProjectSummary`，见 `projectOpenResult` 的注释）。旧的裸字符串
  *   形状仍然兼容，统一归一成 `{ path }`；
  *   `project.create` → `project_create`：`data` 才是 `ProjectSummary`。
+ * - `replay_run` → `replay_run`（同名）：`data` 是整份 `ReplayReport`（含逐条 `entries`）。
+ *   回放不写库、不联网，核心用新 isolate 重跑后把对账结果一次回传，所以这里没有事件可等。
  */
 
 import type {
@@ -45,6 +47,7 @@ import type {
   Event as CoreEvent,
   FileContent,
   ProjectSummary,
+  ReplayReport,
   Response,
   RunLog,
 } from '../generated'
@@ -485,12 +488,13 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
     case 'edit.reject':
       return callWireVoid('edit_reject', { type: 'edit_reject', editId: command.editId })
     case 'debug.set-breakpoints':
-      // 全量覆盖：`lines: []` 就是"移除该文件的断点"（契约 §6.5.1）。
+      // 全量覆盖：`breakpoints: []` 就是"移除该文件的断点"（契约 §6.5.1）。
+      // 条件原样过 wire：核心会把它推给 isolate，在那边求值，这里不做任何解析。
       return callWireVoid('debug_set_breakpoints', {
         type: 'debug_set_breakpoints',
         botId: command.botId,
         file: command.file,
-        lines: command.lines,
+        breakpoints: command.breakpoints,
       })
     case 'debug.resume':
       return callWireVoid('debug_resume', { type: 'debug_resume', botId: command.botId })
@@ -538,6 +542,15 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
       return callWire<DeviceSettings>('device_settings_set', {
         type: 'device_settings_set',
         settings: command.settings,
+      })
+    case 'replay_run':
+      // 报告是**一次性**结果（不是事件流）：`entries` 与计数都在同一个 data 里，
+      // 所以走 `callWire` —— `data: null` 只该出现在真出错时，当成功会画出空报告。
+      return callWire<ReplayReport>('replay_run', {
+        type: 'replay_run',
+        botId: command.botId,
+        from: command.from,
+        limit: command.limit,
       })
     case 'project.open':
       // `project_open` 成功时 data 是 `ProjectOpenResult{path}`（兼容旧的裸字符串）；

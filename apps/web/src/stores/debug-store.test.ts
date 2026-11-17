@@ -1,18 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CoreEvent } from '../lib/ipc'
 import { dispatch } from '../lib/ipc'
-import { BREAKPOINT_FLUSH_MS, useDebugStore } from './debug-store'
+import { BREAKPOINT_FLUSH_MS, MAX_CONDITION_CHARS, useDebugStore } from './debug-store'
 
 // 拦截 ipc：断点同步 / 继续 / 单步都在这里被断言（不碰 Tauri、不碰 mock 运行时）。
 vi.mock('../lib/ipc', () => ({ dispatch: vi.fn(async () => null) }))
 
 /** 一个两帧的暂停事件（契约：callStack 外层在前，当前帧是最后一项）。 */
-function pausedEvent(botId = 'bot-1'): CoreEvent {
+function pausedEvent(botId = 'bot-1', condition: string | null = null): CoreEvent {
   return {
     type: 'debug.paused',
     botId,
     file: 'src/main.ts',
     line: 12,
+    condition,
     scopes: [{ name: '局部变量', variables: { text: 'hi', count: 2 } }],
     callStack: [
       { name: 'onMessage', file: 'src/main.ts', line: 12, column: 3 },
@@ -51,7 +52,7 @@ afterEach(() => {
 })
 
 describe('debugStore 断点同步', () => {
-  it('同一文件连点几行只发一条 debug_set_breakpoints，lines 是合并后的全量行号', async () => {
+  it('同一文件连点几行只发一条 debug_set_breakpoints，breakpoints 是合并后的全量条目', async () => {
     useDebugStore.setState({ botId: 'bot-1' })
     const { toggleBreakpoint } = useDebugStore.getState()
 
@@ -65,11 +66,20 @@ describe('debugStore 断点同步', () => {
 
     expect(dispatch).toHaveBeenCalledTimes(1)
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/main.ts', lines: [1, 2, 3] },
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-1',
+        file: 'src/main.ts',
+        breakpoints: [
+          { line: 1, condition: null },
+          { line: 2, condition: null },
+          { line: 3, condition: null },
+        ],
+      },
     ])
   })
 
-  it('再点一次已存在的行等于移除，lines 按全量覆盖语义变短', async () => {
+  it('再点一次已存在的行等于移除，breakpoints 按全量覆盖语义变短', async () => {
     useDebugStore.setState({ botId: 'bot-1' })
     useDebugStore.getState().toggleBreakpoint('src/main.ts', 5)
     useDebugStore.getState().toggleBreakpoint('src/main.ts', 9)
@@ -80,11 +90,16 @@ describe('debugStore 断点同步', () => {
     await flushDebounce()
 
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/main.ts', lines: [9] },
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-1',
+        file: 'src/main.ts',
+        breakpoints: [{ line: 9, condition: null }],
+      },
     ])
   })
 
-  it('两个文件各改一次 → 两条命令，各带自己的全量行号', async () => {
+  it('两个文件各改一次 → 两条命令，各带自己的全量条目', async () => {
     useDebugStore.setState({ botId: 'bot-1' })
     const { toggleBreakpoint } = useDebugStore.getState()
 
@@ -95,8 +110,21 @@ describe('debugStore 断点同步', () => {
 
     expect(dispatch).toHaveBeenCalledTimes(2)
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/a.ts', lines: [2, 4] },
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/b.ts', lines: [7] },
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-1',
+        file: 'src/a.ts',
+        breakpoints: [
+          { line: 2, condition: null },
+          { line: 4, condition: null },
+        ],
+      },
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-1',
+        file: 'src/b.ts',
+        breakpoints: [{ line: 7, condition: null }],
+      },
     ])
   })
 
@@ -107,7 +135,97 @@ describe('debugStore 断点同步', () => {
     expect(dispatch).not.toHaveBeenCalled()
     expect(useDebugStore.getState().error).toContain('bot')
     // 断点本身仍然记在界面上，启动 bot 后会重新同步。
-    expect(useDebugStore.getState().breakpoints).toEqual({ 'src/main.ts': [1] })
+    expect(useDebugStore.getState().breakpoints).toEqual({
+      'src/main.ts': [{ line: 1, condition: null }],
+    })
+  })
+})
+
+describe('debugStore 条件断点', () => {
+  it('设置条件后 debug_set_breakpoints 的载荷含 { line, condition }', async () => {
+    useDebugStore.setState({ botId: 'bot-1' })
+    useDebugStore.getState().setBreakpointCondition('src/main.ts', 12, 'count > 3 && state.ready')
+    await flushDebounce()
+
+    expect(sentCommands()).toEqual([
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-1',
+        file: 'src/main.ts',
+        breakpoints: [{ line: 12, condition: 'count > 3 && state.ready' }],
+      },
+    ])
+    // 同一行再改条件：整份替换，不叠加。
+    vi.mocked(dispatch).mockClear()
+    useDebugStore.getState().setBreakpointCondition('src/main.ts', 12, 'count > 9')
+    await flushDebounce()
+
+    expect(sentCommands()).toEqual([
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-1',
+        file: 'src/main.ts',
+        breakpoints: [{ line: 12, condition: 'count > 9' }],
+      },
+    ])
+  })
+
+  it('清空条件时发 condition: null，断点本身留下', async () => {
+    useDebugStore.setState({ botId: 'bot-1' })
+    useDebugStore.getState().setBreakpointCondition('src/main.ts', 4, 'ready')
+    await flushDebounce()
+    vi.mocked(dispatch).mockClear()
+
+    // 清除条件 = 空串（用户把输入框清空），不是删断点。
+    useDebugStore.getState().setBreakpointCondition('src/main.ts', 4, '   ')
+    await flushDebounce()
+
+    expect(sentCommands()).toEqual([
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-1',
+        file: 'src/main.ts',
+        breakpoints: [{ line: 4, condition: null }],
+      },
+    ])
+    expect(useDebugStore.getState().breakpoints['src/main.ts']).toEqual([
+      { line: 4, condition: null },
+    ])
+  })
+
+  it('超过 200 字符的条件在本地就被拒，原条件不动', async () => {
+    useDebugStore.setState({ botId: 'bot-1' })
+    useDebugStore.getState().setBreakpointCondition('src/main.ts', 8, 'ready')
+    await flushDebounce()
+    vi.mocked(dispatch).mockClear()
+
+    const tooLong = 'a'.repeat(MAX_CONDITION_CHARS + 1)
+    useDebugStore.getState().setBreakpointCondition('src/main.ts', 8, tooLong)
+    await flushDebounce()
+
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(useDebugStore.getState().error).toContain('上限')
+    expect(useDebugStore.getState().breakpoints['src/main.ts']).toEqual([
+      { line: 8, condition: 'ready' },
+    ])
+  })
+
+  it('删掉断点会连条件一起删（不留孤儿条件）', async () => {
+    useDebugStore.setState({ botId: 'bot-1' })
+    useDebugStore.getState().setBreakpointCondition('src/main.ts', 6, 'x > 0')
+    useDebugStore.getState().toggleBreakpoint('src/main.ts', 10)
+    useDebugStore.getState().removeBreakpoint('src/main.ts', 6)
+    await flushDebounce()
+
+    expect(useDebugStore.getState().breakpoints).toEqual({
+      'src/main.ts': [{ line: 10, condition: null }],
+    })
+    expect(sentCommands().at(-1)).toEqual({
+      type: 'debug.set-breakpoints',
+      botId: 'bot-1',
+      file: 'src/main.ts',
+      breakpoints: [{ line: 10, condition: null }],
+    })
   })
 })
 
@@ -120,6 +238,7 @@ describe('debugStore 暂停现场', () => {
     expect(state.paused).toEqual({
       file: 'src/main.ts',
       line: 12,
+      condition: null,
       scopes: [{ name: '局部变量', variables: { text: 'hi', count: 2 } }],
       callStack: [
         { name: 'onMessage', file: 'src/main.ts', line: 12, column: 3 },
@@ -127,6 +246,12 @@ describe('debugStore 暂停现场', () => {
       ],
     })
     expect(state.selectedFrame).toBe(1)
+  })
+
+  it('把暂停事件里"命中的条件"原样存进现场', () => {
+    useDebugStore.getState().ingestEvent(pausedEvent('bot-1', 'count > 3'))
+
+    expect(useDebugStore.getState().paused?.condition).toBe('count > 3')
   })
 
   it('selectFrame 选中指定帧，越界 / 非法值夹到有效下标', () => {
@@ -159,13 +284,21 @@ describe('debugStore 暂停现场', () => {
   })
 
   it('停止调试先逐文件清断点、再继续（顺序反了会撞下一个断点）', async () => {
-    useDebugStore.setState({ botId: 'bot-1', breakpoints: { 'src/a.ts': [1, 2] } })
+    useDebugStore.setState({
+      botId: 'bot-1',
+      breakpoints: {
+        'src/a.ts': [
+          { line: 1, condition: null },
+          { line: 2, condition: 'count > 0' },
+        ],
+      },
+    })
     useDebugStore.getState().ingestEvent(pausedEvent())
 
     await useDebugStore.getState().stopDebugging()
 
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/a.ts', lines: [] },
+      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/a.ts', breakpoints: [] },
       { type: 'debug.resume', botId: 'bot-1' },
     ])
     expect(useDebugStore.getState().breakpoints).toEqual({})

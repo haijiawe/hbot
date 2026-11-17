@@ -9,7 +9,7 @@ import { useEffect, useRef } from 'react'
 import { formatClock } from '../../lib/format'
 import { useAgentStore } from '../../stores/agent-store'
 import { useWorkspaceStore } from '../../stores/workspace-store'
-import { acceptEditInEditor } from './accept-edit'
+import { acceptEditInEditor, undoEditInEditor } from './accept-edit'
 import { ApprovalCard } from './approval-card'
 import { DiffCard } from './diff-card'
 
@@ -112,6 +112,7 @@ export function AgentPanel() {
           dirtyPaths={dirtyPaths}
           onAccept={() => void acceptEditInEditor()}
           onReject={() => void rejectEdit()}
+          onUndo={() => void undoEditInEditor()}
         />
       ) : null}
 

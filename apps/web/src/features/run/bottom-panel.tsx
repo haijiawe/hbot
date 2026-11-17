@@ -1,8 +1,8 @@
 /**
- * 底部面板（lazy chunk）：日志 / 问题 / 搜索 / 调试 / 试跑 / 设备六个页签 + 启停控制。
+ * 底部面板（lazy chunk）：日志 / 问题 / 搜索 / 调试 / 试跑 / 设备 / 回放七个页签 + 启停控制。
  *
- * 六个页签共用同一块区域，高度只来自 `lib/layout.ts` 的 `--bottom-panel-height`，
- * 不另起第二套布局常量。默认导出是 React.lazy 的要求；试跑面板与设备面板同样 **lazy**，
+ * 七个页签共用同一块区域，高度只来自 `lib/layout.ts` 的 `--bottom-panel-height`，
+ * 不另起第二套布局常量。默认导出是 React.lazy 的要求；试跑面板、设备面板与回放面板同样 **lazy**，
  * 别改成静态 import（首屏预算被钉住了，见 AGENTS.md §5.6）。
  */
 
@@ -28,7 +28,20 @@ const DevicePanel = lazy(() =>
   import('../device/device-panel').then((module) => ({ default: module.DevicePanel })),
 )
 
-const TABS: readonly BottomPanelTab[] = ['logs', 'problems', 'search', 'debug', 'tryrun', 'device']
+/** 回放面板：第七个页签，lazy —— 回放是排查工具，首屏用不到它。 */
+const ReplayPanel = lazy(() =>
+  import('../replay/replay-panel').then((module) => ({ default: module.ReplayPanel })),
+)
+
+const TABS: readonly BottomPanelTab[] = [
+  'logs',
+  'problems',
+  'search',
+  'debug',
+  'tryrun',
+  'device',
+  'replay',
+]
 const TAB_LABEL: Record<BottomPanelTab, string> = {
   logs: '日志',
   problems: '问题',
@@ -36,6 +49,7 @@ const TAB_LABEL: Record<BottomPanelTab, string> = {
   debug: '调试',
   tryrun: '试跑',
   device: '设备',
+  replay: '回放',
 }
 const TAB_ID: Record<BottomPanelTab, string> = {
   logs: 'bottom-tab-logs',
@@ -44,6 +58,7 @@ const TAB_ID: Record<BottomPanelTab, string> = {
   debug: 'bottom-tab-debug',
   tryrun: 'bottom-tab-tryrun',
   device: 'bottom-tab-device',
+  replay: 'bottom-tab-replay',
 }
 
 /** 页签上的计数（`null` = 不显示徽标）。 */
@@ -68,6 +83,9 @@ function tabCount(
       return null
     case 'device':
       // 设备页签的"条数"是会话能力数，不是待处理事项，别挂在页签上。
+      return null
+    case 'replay':
+      // 回放没有"待办条数"：报告是用户点出来的，挂徽标会把结果说成积压。
       return null
     default: {
       const exhaustive: never = tab
@@ -102,6 +120,12 @@ function panelBody(tab: BottomPanelTab) {
       return (
         <Suspense fallback={<p className="panel-empty">正在加载设备面板…</p>}>
           <DevicePanel />
+        </Suspense>
+      )
+    case 'replay':
+      return (
+        <Suspense fallback={<p className="panel-empty">正在加载回放面板…</p>}>
+          <ReplayPanel />
         </Suspense>
       )
     default: {

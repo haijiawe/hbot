@@ -6,17 +6,20 @@
  * 仍然可能把卡片点掉、以为自己的字丢了。所以这里钉住无障碍名与汇总提示里都带路径。
  */
 
-import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PendingEdit } from '../../stores/agent-store'
 import { DiffCard } from './diff-card'
 
 afterEach(cleanup)
 
-function makeEdit(paths: readonly string[]): PendingEdit {
+function makeEdit(
+  paths: readonly string[],
+  status: PendingEdit['status'] = 'pending',
+): PendingEdit {
   return {
     editId: 'edit-1',
-    status: 'pending',
+    status,
     files: paths.map((path, index) => ({
       path,
       hunks: [
@@ -43,6 +46,7 @@ describe('DiffCard：未保存改动的提示', () => {
         dirtyPaths={['src/a.ts']}
         onAccept={noop}
         onReject={noop}
+        onUndo={noop}
       />,
     )
 
@@ -57,6 +61,7 @@ describe('DiffCard：未保存改动的提示', () => {
         dirtyPaths={['src/a.ts']}
         onAccept={noop}
         onReject={noop}
+        onUndo={noop}
       />,
     )
 
@@ -71,6 +76,7 @@ describe('DiffCard：未保存改动的提示', () => {
         dirtyPaths={['src/b.ts']}
         onAccept={noop}
         onReject={noop}
+        onUndo={noop}
       />,
     )
 
@@ -87,10 +93,66 @@ describe('DiffCard：未保存改动的提示', () => {
         dirtyPaths={[]}
         onAccept={noop}
         onReject={noop}
+        onUndo={noop}
       />,
     )
 
     expect(screen.queryAllByRole('note')).toHaveLength(0)
     expect(screen.getByText(/接受后由核心按块落盘/)).toBeTruthy()
+  })
+})
+
+describe('DiffCard：撤销这次应用', () => {
+  it('只有已接受的卡片能点「撤销这次应用」，点了就调 onUndo', () => {
+    const onUndo = vi.fn()
+    render(
+      <DiffCard
+        edit={makeEdit(['src/a.ts'], 'accepted')}
+        dirtyPaths={[]}
+        onAccept={noop}
+        onReject={noop}
+        onUndo={onUndo}
+      />,
+    )
+
+    const button = screen.getByRole('button', { name: '撤销这次应用：src/a.ts' })
+    expect((button as HTMLButtonElement).disabled).toBe(false)
+
+    fireEvent.click(button)
+    expect(onUndo).toHaveBeenCalledTimes(1)
+  })
+
+  it('待审阅时撤销不可点（该点拒绝：核心还没写盘）', () => {
+    render(
+      <DiffCard
+        edit={makeEdit(['src/a.ts'])}
+        dirtyPaths={[]}
+        onAccept={noop}
+        onReject={noop}
+        onUndo={noop}
+      />,
+    )
+
+    const button = screen.getByRole('button', { name: '撤销这次应用：src/a.ts' }) as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+  })
+
+  it('撤销后显示"已撤销"，三种操作全部不可再点', () => {
+    render(
+      <DiffCard
+        edit={makeEdit(['src/a.ts'], 'undone')}
+        dirtyPaths={[]}
+        onAccept={noop}
+        onReject={noop}
+        onUndo={noop}
+      />,
+    )
+
+    expect(screen.getByText('已撤销')).toBeTruthy()
+    expect(screen.getByText(/已撤销这次应用/)).toBeTruthy()
+    for (const name of ['接受对 src/a.ts 的改动', '拒绝对 src/a.ts 的改动', '撤销这次应用：src/a.ts']) {
+      const button = screen.getByRole('button', { name }) as HTMLButtonElement
+      expect(button.disabled).toBe(true)
+    }
   })
 })

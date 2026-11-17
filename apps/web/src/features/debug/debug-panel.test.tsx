@@ -53,6 +53,7 @@ function pauseEvent(
     botId?: string
     file?: string
     line?: number
+    condition?: string | null
     scopes?: DebugScope[]
     callStack?: StackFrame[]
   } = {},
@@ -62,6 +63,7 @@ function pauseEvent(
     botId: options.botId ?? BOT_ID,
     file: options.file ?? 'src/handlers/message.ts',
     line: options.line ?? 7,
+    condition: options.condition ?? null,
     scopes: options.scopes ?? [],
     callStack: options.callStack ?? STACK,
   }
@@ -201,5 +203,54 @@ describe('DebugPanel', () => {
     expect(frames).toHaveLength(3)
     expect(screen.getByRole('region', { name: '调试' }).textContent).toContain('src/a.ts')
     expect(screen.getByRole('region', { name: '调试' }).textContent).not.toContain('src/other.ts')
+  })
+
+  it('暂停时显示命中的条件原文（条件断点 vs 无条件断点的区别就在这）', () => {
+    render(<DebugPanel />)
+    ingest(pauseEvent({ condition: 'count > 3 && state.ready' }))
+
+    const panel = screen.getByRole('region', { name: '调试' })
+    expect(panel.textContent).toContain('命中的条件')
+    expect(panel.textContent).toContain('count > 3 && state.ready')
+  })
+
+  it('无条件断点 / 单步暂停不显示命中的条件（condition 是 null）', () => {
+    render(<DebugPanel />)
+    ingest(pauseEvent({ condition: null }))
+
+    expect(screen.getByRole('region', { name: '调试' }).textContent).not.toContain('命中的条件')
+  })
+
+  it('断点清单显示行号与条件原文，没有条件的行显示「无条件」', () => {
+    useDebugStore.setState({
+      breakpoints: {
+        'src/main.ts': [
+          { line: 3, condition: null },
+          { line: 12, condition: 'count > 3' },
+        ],
+      },
+    })
+    render(<DebugPanel />)
+
+    const list = screen.getByRole('region', { name: '断点' })
+    expect(list.textContent).toContain('src/main.ts')
+    expect(list.textContent).toContain('第 3 行')
+    expect(list.textContent).toContain('第 12 行')
+    expect(list.textContent).toContain('无条件')
+    expect(list.textContent).toContain('count > 3')
+  })
+
+  it('点断点清单里的一行：编辑器跳到那个文件行', async () => {
+    const user = userEvent.setup()
+    useDebugStore.setState({ breakpoints: { 'src/main.ts': [{ line: 12, condition: null }] } })
+    render(<DebugPanel />)
+
+    await user.click(screen.getByText('第 12 行').closest('button') as HTMLButtonElement)
+
+    await waitFor(() => {
+      const workspace = useWorkspaceStore.getState()
+      expect(workspace.activePath).toBe('src/main.ts')
+      expect(workspace.reveal).toMatchObject({ path: 'src/main.ts', line: 12 })
+    })
   })
 })

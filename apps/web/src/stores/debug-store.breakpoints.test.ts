@@ -1,11 +1,12 @@
 /**
  * 断点写入的**乐观路径**与"编辑器 ↔ store"最小面（120ms 防抖）。
  *
- * `debug-store.test.ts` 已经钉了合并/移除/换 bot 等主要行为；这里补它没覆盖的三条，
+ * `debug-store.test.ts` 已经钉了合并/移除/换 bot 等主要行为；这里补它没覆盖的几条，
  * 都是编辑器 gutter 点击直接依赖的：
  * 1. 点下去**立刻**写进 store（不等命令往返）——否则 gutter 上的断点要点两下才出现；
- * 2. 防抖窗口内只发一条命令，且发的是窗口结束时的最终行号（不是中间态）；
- * 3. `lines: []` 才是"移除"的线上表示（空数组不能变成"什么都不发"）。
+ * 2. 防抖窗口内只发一条命令，且发的是窗口结束时的最终条目（不是中间态）；
+ * 3. `breakpoints: []` 才是"移除"的线上表示（空数组不能变成"什么都不发"）；
+ * 4. 条件跟着条目一起重发——换 bot / 重连后条件不能丢（丢了就变成"每次路过都停"）。
  *
  * 为什么不测 Monaco 那一侧：见 `features/editor/editor-surface.tsx` 顶部注释 ——
  * 断点点击绑在真 Monaco 实例的 `onMouseDown`（`MouseTargetType.GUTTER_GLYPH_MARGIN`）上，
@@ -52,7 +53,9 @@ describe('断点：乐观写入 + 防抖', () => {
     useDebugStore.getState().toggleBreakpoint('src/main.ts', 5)
 
     // 同一个 tick：UI 读到的状态已经是"这一行有断点"。
-    expect(useDebugStore.getState().breakpoints).toEqual({ 'src/main.ts': [5] })
+    expect(useDebugStore.getState().breakpoints).toEqual({
+      'src/main.ts': [{ line: 5, condition: null }],
+    })
     expect(sentCommands()).toEqual([])
 
     // 窗口没走完也不发。
@@ -61,7 +64,12 @@ describe('断点：乐观写入 + 防抖', () => {
 
     await flushDebounce()
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/main.ts', lines: [5] },
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-1',
+        file: 'src/main.ts',
+        breakpoints: [{ line: 5, condition: null }],
+      },
     ])
   })
 
@@ -69,38 +77,64 @@ describe('断点：乐观写入 + 防抖', () => {
     const { toggleBreakpoint } = useDebugStore.getState()
 
     toggleBreakpoint('src/main.ts', 5)
-    expect(useDebugStore.getState().breakpoints).toEqual({ 'src/main.ts': [5] })
+    expect(useDebugStore.getState().breakpoints).toEqual({
+      'src/main.ts': [{ line: 5, condition: null }],
+    })
 
     toggleBreakpoint('src/main.ts', 5)
     expect(useDebugStore.getState().breakpoints).toEqual({})
 
     await flushDebounce()
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/main.ts', lines: [] },
+      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/main.ts', breakpoints: [] },
     ])
   })
 
-  it('清空所有断点：每个文件各发一条 lines: []（空数组 = 移除，不是"不发"）', async () => {
-    useDebugStore.setState({ breakpoints: { 'src/a.ts': [1, 4], 'src/b.ts': [9] } })
+  it('清空所有断点：每个文件各发一条 breakpoints: []（空数组 = 移除，不是"不发"）', async () => {
+    useDebugStore.setState({
+      breakpoints: {
+        'src/a.ts': [
+          { line: 1, condition: null },
+          { line: 4, condition: 'count > 2' },
+        ],
+        'src/b.ts': [{ line: 9, condition: null }],
+      },
+    })
 
     useDebugStore.getState().clearBreakpoints()
     expect(useDebugStore.getState().breakpoints).toEqual({})
 
     await flushDebounce()
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/a.ts', lines: [] },
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/b.ts', lines: [] },
+      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/a.ts', breakpoints: [] },
+      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/b.ts', breakpoints: [] },
     ])
   })
 
-  it('换调试目标：已有断点重发给新 bot（旧 bot 上不残留）', async () => {
-    useDebugStore.setState({ botId: 'bot-1', breakpoints: { 'src/a.ts': [2] } })
+  it('换调试目标：已有断点（含条件）重发给新 bot（旧 bot 上不残留）', async () => {
+    useDebugStore.setState({
+      botId: 'bot-1',
+      breakpoints: {
+        'src/a.ts': [
+          { line: 2, condition: null },
+          { line: 6, condition: 'state.ready' },
+        ],
+      },
+    })
 
     useDebugStore.getState().setBotId('bot-2')
     await flushDebounce()
 
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-2', file: 'src/a.ts', lines: [2] },
+      {
+        type: 'debug.set-breakpoints',
+        botId: 'bot-2',
+        file: 'src/a.ts',
+        breakpoints: [
+          { line: 2, condition: null },
+          { line: 6, condition: 'state.ready' },
+        ],
+      },
     ])
     // 换目标时旧暂停现场作废。
     expect(useDebugStore.getState().paused).toBeNull()
@@ -115,16 +149,18 @@ describe('断点：乐观写入 + 防抖', () => {
     expect(sentCommands()).toEqual([])
     expect(useDebugStore.getState().error).toContain('还没有可调试的 bot')
     // 断点本身保留：等 bot 起来（setBotId）再同步，不能让用户白点。
-    expect(useDebugStore.getState().breakpoints).toEqual({ 'src/main.ts': [5] })
+    expect(useDebugStore.getState().breakpoints).toEqual({
+      'src/main.ts': [{ line: 5, condition: null }],
+    })
   })
 
   it('停止调试时本来就没暂停：只清断点，不凭空发 resume', async () => {
-    useDebugStore.setState({ breakpoints: { 'src/main.ts': [5] } })
+    useDebugStore.setState({ breakpoints: { 'src/main.ts': [{ line: 5, condition: null }] } })
 
     await useDebugStore.getState().stopDebugging()
 
     expect(sentCommands()).toEqual([
-      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/main.ts', lines: [] },
+      { type: 'debug.set-breakpoints', botId: 'bot-1', file: 'src/main.ts', breakpoints: [] },
     ])
   })
 })

@@ -4,16 +4,25 @@
  * 一个文件一个 model：切 tab 只 `setModel`，不重建成字符串；关 tab 由 openKey 的
  * 变化统一回收 model。模型里的文本是唯一真源，store 只保存副本用于脏标记与保存。
  *
- * 断点：行槽位（glyph margin）点击 → `debugStore.toggleBreakpoint`，断点点由这里
- * 打装饰；暂停行另有一层整行高亮。调试面板本身在底部面板的"调试"页签里，这里只管
- * "让断点与当前执行行在代码上看得见"。
+ * 断点：行槽位（glyph margin）左键点击 → `debugStore.toggleBreakpoint`；右键 → 行内
+ * 菜单（编辑条件… / 清除条件 / 删除断点）。条件输入走**内联**输入框而不是
+ * `window.prompt`：prompt 是阻塞式的，会把整条事件循环按住（这个窗口里还有正在跑的
+ * bot 事件与日志流），而且样式不可控。断点点由这里打装饰；暂停行另有一层整行高亮。
+ * 调试面板本身在底部面板的"调试"页签里，这里只管"让断点与当前执行行在代码上看得见"。
  */
 
 import * as monaco from 'monaco-editor'
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { DebugBreakpoint } from '../../generated'
 import { languageForPath } from '../../lib/paths'
 import { setupMonaco } from '../../lib/monaco/setup'
-import { useDebugStore } from '../../stores/debug-store'
+import {
+  MAX_CONDITION_CHARS,
+  conditionAt,
+  hasBreakpointAt,
+  useDebugStore,
+} from '../../stores/debug-store'
+import { breakpointGlyphs } from './breakpoint-decorations'
 import { useWorkspaceStore } from '../../stores/workspace-store'
 
 const MODEL_SCHEME = 'hbot'
@@ -26,17 +35,30 @@ function pathFromUri(uri: monaco.Uri): string {
   return uri.path.startsWith('/') ? uri.path.slice(1) : uri.path
 }
 
-/** 断点行号 → glyph margin 上的圆点装饰（只给有效范围内的行）。 */
+/** 断点条目 → glyph margin 上的装饰（行号越界的丢掉，见 `breakpointGlyphs`）。 */
 function breakpointDecorations(
-  lines: readonly number[],
+  entries: readonly DebugBreakpoint[] | undefined,
   lineCount: number,
 ): monaco.editor.IModelDeltaDecoration[] {
-  return lines
-    .filter((line) => line >= 1 && line <= lineCount)
-    .map((line) => ({
-      range: new monaco.Range(line, 1, line, 1),
-      options: { glyphMarginClassName: 'debug-breakpoint' },
-    }))
+  return breakpointGlyphs(entries, lineCount).map((glyph) => ({
+    range: new monaco.Range(glyph.line, 1, glyph.line, 1),
+    // `hoverMessage` 要 `IMarkdownString`（`{ value }`），不是裸 string。
+    options: {
+      glyphMarginClassName: glyph.className,
+      hoverMessage: { value: glyph.hoverMessage },
+    },
+  }))
+}
+
+/** 行内菜单/条件输入框的位置与目标行。 */
+interface GutterMenu {
+  file: string
+  line: number
+  /** 相对 `.editor-surface` 的左上角（像素）。 */
+  left: number
+  top: number
+  /** `menu` = 显示三个动作；`edit` = 显示条件输入框。 */
+  mode: 'menu' | 'edit'
 }
 
 export default function EditorSurface() {
@@ -51,6 +73,11 @@ export default function EditorSurface() {
   const subscriptionsRef = useRef(new Map<string, monaco.IDisposable>())
   /** 每个 model 上一次打的装饰 id：`deltaDecorations` 按 model 覆盖，不叠加。 */
   const decorationsRef = useRef(new Map<string, string[]>())
+  const [menu, setMenu] = useState<GutterMenu | null>(null)
+  /** 条件输入框的受控值（打开时填当前条件，提交时写回 store）。 */
+  const [draft, setDraft] = useState('')
+  const menuRef = useRef<GutterMenu | null>(null)
+  menuRef.current = menu
 
   // 只创建一次编辑器实例；真正的 model 在下一个 effect 里挂载。
   useEffect(() => {
@@ -78,17 +105,42 @@ export default function EditorSurface() {
     })
     editorRef.current = editor
 
-    // 行槽位点击 = 切换该行断点。行号区域的点击仍是正常选行，不做处理。
+    // 行槽位左键 = 切换该行断点。行号区域的点击仍是正常选行，不做处理。
     const gutterClick = editor.onMouseDown((event) => {
       if (event.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return
       const line = event.target.position?.lineNumber
       const path = useWorkspaceStore.getState().activePath
       if (line === undefined || path === null) return
+      setMenu(null)
       useDebugStore.getState().toggleBreakpoint(path, line)
+    })
+
+    // 行槽位右键 = 该行断点的菜单（只在已有断点时出现：没有断点时右键的意图不明确，
+    // 而"加断点"本来左键一下就够了）。
+    const gutterMenu = editor.onContextMenu((event) => {
+      if (event.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return
+      const line = event.target.position?.lineNumber
+      const path = useWorkspaceStore.getState().activePath
+      if (line === undefined || path === null) return
+      const entries = useDebugStore.getState().breakpoints[path]
+      if (!hasBreakpointAt(entries, line)) return
+      // 拦掉 Monaco 自己的右键菜单：这一行的上下文就是断点，不是编辑器命令。
+      event.event.preventDefault()
+      event.event.stopPropagation()
+      const rect = container.getBoundingClientRect()
+      setMenu({
+        file: path,
+        line,
+        left: event.event.posx - rect.left,
+        top: event.event.posy - rect.top,
+        mode: 'menu',
+      })
+      setDraft(conditionAt(entries, line) ?? '')
     })
 
     return () => {
       gutterClick.dispose()
+      gutterMenu.dispose()
       for (const subscription of subscriptionsRef.current.values()) subscription.dispose()
       subscriptionsRef.current.clear()
       decorationsRef.current.clear()
@@ -105,6 +157,7 @@ export default function EditorSurface() {
   useEffect(() => {
     const editor = editorRef.current
     if (!editor) return
+    setMenu(null)
     if (!activePath) {
       editor.setModel(null)
       return
@@ -134,8 +187,8 @@ export default function EditorSurface() {
     if (!editor || !model) return
 
     const lineCount = model.getLineCount()
-    const lines = activePath === null ? [] : (breakpoints[activePath] ?? [])
-    const next = breakpointDecorations(lines, lineCount)
+    const entries = activePath === null ? [] : (breakpoints[activePath] ?? [])
+    const next = breakpointDecorations(entries, lineCount)
     if (paused !== null && paused.file === activePath) {
       const line = Math.min(Math.max(paused.line, 1), lineCount)
       next.push({
@@ -148,6 +201,16 @@ export default function EditorSurface() {
     const previous = decorationsRef.current.get(key) ?? []
     decorationsRef.current.set(key, editor.deltaDecorations(previous, next))
   }, [activePath, breakpoints, paused])
+
+  // 菜单打开时按 Esc 关闭（输入框自己也处理 Esc，这里是"点了菜单但没输入"的兜底）。
+  useEffect(() => {
+    if (menu === null) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMenu(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [menu])
 
   // 关闭 tab：回收对应 model 与监听。
   useEffect(() => {
@@ -188,5 +251,110 @@ export default function EditorSurface() {
     editor.revealLineInCenter(line)
   }, [paused, activePath])
 
-  return <div className="editor-surface" ref={containerRef} />
+  const submitCondition = () => {
+    const target = menuRef.current
+    if (target === null) return
+    useDebugStore.getState().setBreakpointCondition(target.file, target.line, draft)
+    setMenu(null)
+  }
+
+  return (
+    <div className="editor-surface" ref={containerRef}>
+      {menu !== null && (
+        <>
+          {/* 点空白处关菜单：透明遮罩，不吃编辑器的键盘事件。 */}
+          <div
+            className="breakpoint-menu__backdrop"
+            onPointerDown={() => setMenu(null)}
+            aria-hidden="true"
+          />
+          <div
+            className="breakpoint-menu"
+            style={{ left: `${menu.left}px`, top: `${menu.top}px` }}
+            role="menu"
+            aria-label={`第 ${menu.line} 行的断点`}
+          >
+            {menu.mode === 'menu' ? (
+              <>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="breakpoint-menu__item"
+                  onClick={() => {
+                    setDraft(conditionAt(breakpoints[menu.file], menu.line) ?? '')
+                    setMenu({ ...menu, mode: 'edit' })
+                  }}
+                >
+                  编辑条件…
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="breakpoint-menu__item"
+                  disabled={conditionAt(breakpoints[menu.file], menu.line) === null}
+                  onClick={() => {
+                    useDebugStore.getState().setBreakpointCondition(menu.file, menu.line, null)
+                    setMenu(null)
+                  }}
+                >
+                  清除条件
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="breakpoint-menu__item"
+                  onClick={() => {
+                    useDebugStore.getState().removeBreakpoint(menu.file, menu.line)
+                    setMenu(null)
+                  }}
+                >
+                  删除断点
+                </button>
+              </>
+            ) : (
+              <form
+                className="breakpoint-menu__form"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  submitCondition()
+                }}
+              >
+                <label className="breakpoint-menu__label" htmlFor="breakpoint-condition">
+                  第 {menu.line} 行的条件（同步 JS 表达式，留空 = 无条件）
+                </label>
+                <input
+                  id="breakpoint-condition"
+                  className="breakpoint-menu__input"
+                  // 自动聚焦：右键之后直接用键盘输入是主路径，不必再点一下输入框。
+                  autoFocus
+                  value={draft}
+                  maxLength={MAX_CONDITION_CHARS}
+                  placeholder="例如 count > 3 && state.ready"
+                  onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape') {
+                      event.preventDefault()
+                      setMenu(null)
+                    }
+                  }}
+                />
+                <div className="breakpoint-menu__actions">
+                  <button type="submit" className="button button--primary">
+                    保存
+                  </button>
+                  <button type="button" className="button" onClick={() => setMenu(null)}>
+                    取消
+                  </button>
+                </div>
+                <p className="breakpoint-menu__hint">
+                  条件在 isolate 里求值：抛错或编译失败一律当作没命中（每行只提示一次），
+                  不支持 await。
+                </p>
+              </form>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
 }

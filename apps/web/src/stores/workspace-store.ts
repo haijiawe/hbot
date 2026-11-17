@@ -6,6 +6,7 @@
  */
 
 import { create } from 'zustand'
+import type { ApplySnapshot } from '../lib/edit-apply'
 import { errorMessage } from '../lib/format'
 import type { CoreEvent, Diagnostic, FileNode } from '../lib/ipc'
 import { DIAGNOSTIC_SEVERITY_ORDER, dispatch } from '../lib/ipc'
@@ -60,6 +61,16 @@ export interface EditorTab {
 /** 项目对话框的两种模式：「打开项目…」/「新建项目…」。 */
 export type ProjectDialogMode = 'open' | 'create'
 
+/** `undoLastApply` 实际动了哪些路径（界面据此说明"哪些退回去了、哪些没动"）。 */
+export interface UndoApplyResult {
+  /** 缓冲区已回到应用前文本的文件。 */
+  restored: string[]
+  /** 这次 Diff 新建、标签已从编辑器移除的文件（**磁盘上的文件仍在**，见 `undoLastApply`）。 */
+  closed: string[]
+  /** 应用前没缓冲区、应用后出现了标签，但里面已经有用户改动 —— 留给用户，不动它。 */
+  kept: string[]
+}
+
 export interface WorkspaceState {
   rootName: string
   /**
@@ -102,6 +113,14 @@ export interface WorkspaceState {
    * （同 `reveal`），否则得给面板加一堆回调 props。
    */
   projectDialog: ProjectDialogMode | null
+  /**
+   * 最近一次成功应用的「应用前快照」（`null` = 没有可撤销的应用）。
+   *
+   * 为什么放在这里而不是 `agent-store`：撤销要同时回退**多个文件**的缓冲区与标签，
+   * 而 Monaco 的撤销栈按 model 各自独立（一次 Ctrl+Z 只退当前文件），所以必须先留一份
+   * "应用那一刻"的文本才能整组退回去。快照是编辑器现场的一部分，跟 `contents` 同域。
+   */
+  lastApply: ApplySnapshot | null
 
   loadTree: () => Promise<void>
   /** 记下当前项目根（`project_open` 成功后由 `lib/session-persistence.ts` 调用）。 */
@@ -149,6 +168,22 @@ export interface WorkspaceState {
    * 走 `diagnostics` 而不是另开一个"应用错误"列表：用户已经知道去哪儿看问题。
    */
   reportProblems: (problems: readonly Diagnostic[]) => void
+  /**
+   * 记下这次应用的「应用前快照」（`edit.apply` 落盘成功后由 `features/agent/accept-edit.ts` 调）。
+   *
+   * 只记最近一次：卡片上只有"撤销这次应用"一个入口，历史应用由用户自己的 Ctrl+Z 负责。
+   */
+  recordApplySnapshot: (snapshot: ApplySnapshot) => void
+  /**
+   * 按快照撤销最近一次应用：缓冲区回到应用前文本，`saved`（磁盘基线）**不动**。
+   *
+   * 为什么 `saved` 不能跟着改：核心落盘后磁盘就是应用后的内容，撤销只退回编辑器里的文本
+   * —— 于是这些文件立刻变成"有未保存改动"（这是正确状态，用户保存一次就把磁盘也退回去）。
+   * 若在这里顺手改 `saved`，用户会以为磁盘已经退回去了，下次保存反而把应用后的内容又写一遍。
+   *
+   * 返回实际动过的路径；`null` = 没有快照或快照不属于这次编辑（无处可撤）。
+   */
+  undoLastApply: (editId: string) => UndoApplyResult | null
   /**
    * 恢复上次的会话现场（journal → 标签顺序/光标/活动标签/未保存缓冲区）。
    *
@@ -267,6 +302,7 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
   reveal: null,
   diagnostics: [],
   projectDialog: null,
+  lastApply: null,
 
   async loadTree() {
     try {
@@ -294,7 +330,8 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
   },
 
   resetSession() {
-    set({ tabs: [], contents: {}, saved: {}, cursors: {}, activePath: null })
+    // 快照跟着现场一起丢：切项目后拿旧项目的"应用前文本"去"撤销"会把别人的文件写脏。
+    set({ tabs: [], contents: {}, saved: {}, cursors: {}, activePath: null, lastApply: null })
   },
 
   async openFile(path) {
@@ -410,6 +447,70 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
     })
   },
 
+  recordApplySnapshot(snapshot) {
+    set({ lastApply: snapshot })
+  },
+
+  undoLastApply(editId) {
+    const snapshot = get().lastApply
+    if (snapshot === null || snapshot.editId !== editId) return null
+
+    const state = get()
+    const contents = { ...state.contents }
+    const saved = { ...state.saved }
+    const cursors = { ...state.cursors }
+    let tabs = state.tabs
+    const restored: string[] = []
+    const closed: string[] = []
+    const kept: string[] = []
+
+    for (const file of snapshot.files) {
+      if (file.before !== null) {
+        // 标签在应用后被用户关掉了：没有缓冲区可回退，磁盘内容也不在这里猜（不碰盘）。
+        if (contents[file.path] === undefined) continue
+        contents[file.path] = file.before
+        restored.push(file.path)
+        continue
+      }
+
+      // 应用前没有缓冲区（这次 Diff 新建 / 本来没打开的文件）：没有文本可恢复，
+      // 只能把应用后出现的标签移掉。
+      const tab = tabs.find((item) => item.path === file.path)
+      if (tab === undefined) continue
+      const buffer = contents[file.path]
+      const baseline = saved[file.path]
+      // 用户在应用之后打开这个新文件又敲了字：撤销不能吞掉用户的输入（脏就不动它）。
+      if (buffer !== undefined && baseline !== undefined && buffer !== baseline) {
+        kept.push(file.path)
+        continue
+      }
+      tabs = tabs.filter((item) => item.path !== file.path)
+      delete contents[file.path]
+      delete saved[file.path]
+      delete cursors[file.path]
+      closed.push(file.path)
+    }
+
+    const alive = new Set(tabs.map((item) => item.path))
+    let activePath = state.activePath
+    if (activePath !== null && !alive.has(activePath)) {
+      // 活动标签正是被撤掉的那个新文件：退回最后一个标签即可（邻居选谁不影响语义）。
+      const fallback = tabs[tabs.length - 1]
+      activePath = fallback === undefined ? null : fallback.path
+    }
+
+    set({
+      contents,
+      saved,
+      cursors,
+      activePath,
+      tabs: tabs.map((tab) => ({ ...tab, dirty: isDirty(contents[tab.path], saved[tab.path]) })),
+      // 一次应用只能撤销一次：快照用完即作废，否则再点一次会把后来的编辑一起退掉。
+      lastApply: null,
+    })
+    return { restored, closed, kept }
+  },
+
   async restoreSession(snapshot) {
     const restored: EditorTab[] = []
     const contents: Record<string, string> = {}
@@ -442,6 +543,8 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
       saved,
       cursors,
       activePath,
+      // 恢复出来的现场里没有"刚才那次应用"：快照必须一起清空（否则撤销会退到别人的文本）。
+      lastApply: null,
       error: failures.length > 0 ? failures.join('；') : null,
     })
   },

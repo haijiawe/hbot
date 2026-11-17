@@ -10,7 +10,13 @@
  */
 
 import type { EditApplyHooks, EditApplyPlan, FileDecision } from '../../lib/edit-apply'
-import { EDIT_APPLY_CONFLICT_CODE, applyEditsAsOneUndoGroup, planEditApply } from '../../lib/edit-apply'
+import {
+  EDIT_APPLY_CONFLICT_CODE,
+  applyEditsAsOneUndoGroup,
+  captureApplySnapshot,
+  planEditApply,
+  restoreModelAsOneUndoGroup,
+} from '../../lib/edit-apply'
 import { editorModel } from '../../lib/editor-model-bridge'
 import { errorMessage } from '../../lib/format'
 import { dispatch, type Diagnostic } from '../../lib/ipc'
@@ -66,11 +72,20 @@ export function createEditApplyHooks(): EditApplyHooks {
       return { acceptHunks: kept }
     },
 
-    async afterApply() {
+    async afterApply({ editId }) {
       const current = plan
       if (current === null) return
+
+      // 快照只在**应用这一刻**拍一次，而且必须在改缓冲区之前：`decision.before` 是 precheck
+      // 时读到的应用前文本，下面每个文件都会被写成应用后的内容 —— 之后再想拿"应用前"就只能靠
+      // 历史版本，而 store 里没有历史。
+      useWorkspaceStore
+        .getState()
+        .recordApplySnapshot(captureApplySnapshot(editId, current.decisions))
+
       const applied = current.decisions.filter(
-        (decision): decision is Extract<FileDecision, { action: 'apply' }> => decision.action === 'apply',
+        (decision): decision is Extract<FileDecision, { action: 'apply' }> =>
+          decision.action === 'apply',
       )
 
       for (const decision of applied) {
@@ -126,6 +141,27 @@ export function createEditApplyHooks(): EditApplyHooks {
         }
       }
     },
+
+    async undo({ editId }) {
+      const workspace = useWorkspaceStore.getState()
+      const snapshot = workspace.lastApply
+      if (snapshot === null || snapshot.editId !== editId) {
+        throw new Error('这次应用没有留下可撤销的编辑器快照')
+      }
+
+      // 先退模型、再退缓冲区：模型变更会经 `onDidChangeContent` 回写 `contents`，
+      // 顺序反了会被随后的缓冲区恢复盖成中间态（多文件时尤其明显）。
+      for (const file of snapshot.files) {
+        if (file.before === null) continue
+        const model = editorModel(file.path)
+        if (model !== null) restoreModelAsOneUndoGroup(model, file.before)
+      }
+
+      // 缓冲区与标签（新建文件）由 store 一次退完 —— 多文件的"一次 Ctrl+Z"只能这么实现。
+      if (workspace.undoLastApply(editId) === null) {
+        throw new Error('这次应用没有留下可撤销的编辑器快照')
+      }
+    },
   }
 }
 
@@ -140,4 +176,14 @@ function normalizeEol(text: string): string {
  */
 export async function acceptEditInEditor(): Promise<void> {
   await useAgentStore.getState().acceptEdit(createEditApplyHooks())
+}
+
+/**
+ * 组件里调的那个入口：「撤销这次应用」。
+ *
+ * 效果与 Ctrl+Z 一致，但范围是**这次应用碰过的所有文件**（Monaco 的撤销栈不跨 model，
+ * 所以多文件只能靠快照一起退）。状态改动仍走 store。
+ */
+export async function undoEditInEditor(): Promise<void> {
+  await useAgentStore.getState().undoEdit(createEditApplyHooks())
 }

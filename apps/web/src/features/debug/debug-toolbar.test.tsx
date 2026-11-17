@@ -5,7 +5,7 @@
  * 工具条不自己做事，只把点击翻译成命令。这里钉三件容易回归的：
  * 1. 没有暂停现场时五个按钮全禁用（避免对着空气发 resume）；
  * 2. 继续 / 单步三种各自 dispatch 什么；
- * 3. **停止的顺序**：先逐文件 `set-breakpoints{lines:[]}`，再 `debug.resume`。
+ * 3. **停止的顺序**：先逐文件 `set-breakpoints{breakpoints:[]}`，再 `debug.resume`。
  *    反过来的话 worker 会在断点清掉之前撞上下一个断点，白停一次（见 debug-store 注释）。
  *
  * 注意：`useDebugStore.setState(...)` 必须在 `render` **之前**（或包在 `act` 里）——
@@ -34,6 +34,7 @@ function sent(): Record<string, unknown>[] {
 const PAUSED = {
   file: 'src/handlers/message.ts',
   line: 7,
+  condition: null,
   scopes: [],
   callStack: [{ name: 'reply', file: 'src/handlers/message.ts', line: 7, column: 1 }],
 }
@@ -115,7 +116,13 @@ describe('DebugToolbar', () => {
     useDebugStore.setState({
       paused: PAUSED,
       selectedFrame: 0,
-      breakpoints: { 'src/a.ts': [3, 9], 'src/b.ts': [5] },
+      breakpoints: {
+        'src/a.ts': [
+          { line: 3, condition: null },
+          { line: 9, condition: 'count > 3' },
+        ],
+        'src/b.ts': [{ line: 5, condition: null }],
+      },
     })
     const user = userEvent.setup()
     render(<DebugToolbar />)
@@ -124,8 +131,8 @@ describe('DebugToolbar', () => {
 
     await waitFor(() =>
       expect(sent()).toEqual([
-        { type: 'debug.set-breakpoints', botId: BOT_ID, file: 'src/a.ts', lines: [] },
-        { type: 'debug.set-breakpoints', botId: BOT_ID, file: 'src/b.ts', lines: [] },
+        { type: 'debug.set-breakpoints', botId: BOT_ID, file: 'src/a.ts', breakpoints: [] },
+        { type: 'debug.set-breakpoints', botId: BOT_ID, file: 'src/b.ts', breakpoints: [] },
         { type: 'debug.resume', botId: BOT_ID },
       ]),
     )

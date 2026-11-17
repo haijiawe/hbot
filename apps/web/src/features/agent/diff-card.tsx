@@ -7,6 +7,7 @@ const STATUS_LABEL: Record<PendingEdit['status'], string> = {
   pending: '待审阅',
   accepted: '已接受',
   rejected: '已拒绝',
+  undone: '已撤销',
 }
 
 interface DiffCardProps {
@@ -20,10 +21,18 @@ interface DiffCardProps {
   dirtyPaths: readonly string[]
   onAccept: () => void
   onReject: () => void
+  /**
+   * 撤销这张卡片已经应用过的改动（回到应用前）。
+   *
+   * 只在 `accepted` 时可点：`pending` 该点拒绝（核心还没写盘），`undone` / `rejected`
+   * 没有可退的东西。效果与 Ctrl+Z 一致，但范围是这次应用碰过的全部文件。
+   */
+  onUndo: () => void
 }
 
-export function DiffCard({ edit, dirtyPaths, onAccept, onReject }: DiffCardProps) {
+export function DiffCard({ edit, dirtyPaths, onAccept, onReject, onUndo }: DiffCardProps) {
   const pending = edit.status === 'pending'
+  const accepted = edit.status === 'accepted'
   const dirty = new Set(dirtyPaths)
   const stats = editStats(edit.files)
   const title = edit.files.map((file) => file.path).join('、') || '（空编辑）'
@@ -84,12 +93,23 @@ export function DiffCard({ edit, dirtyPaths, onAccept, onReject }: DiffCardProps
         >
           拒绝
         </button>
+        <button
+          type="button"
+          className="button"
+          disabled={!accepted}
+          onClick={onUndo}
+          aria-label={`撤销这次应用：${title}`}
+        >
+          撤销这次应用
+        </button>
       </div>
 
       <p className="diff-card__note">
-        {dirtyFiles.length > 0
-          ? `标了「有未保存改动」的文件（${dirtyFiles.join('、')}）：接受时会先按你手上的缓冲区校验，冲突的块会被拒并留在这张卡片上，不会覆盖你没存的字。`
-          : '接受后由核心按块落盘（`edit_apply`，哈希过期会拒绝并保留这张卡片）；拒绝则丢弃这次编辑。'}
+        {edit.status === 'undone'
+          ? '已撤销这次应用：缓冲区回到应用前的文本。磁盘上仍是应用后的内容 —— 保存一次就能把磁盘也退回；本次新建的文件仍留在磁盘上（编辑器里不会再自动打开它）。'
+          : dirtyFiles.length > 0
+            ? `标了「有未保存改动」的文件（${dirtyFiles.join('、')}）：接受时会先按你手上的缓冲区校验，冲突的块会被拒并留在这张卡片上，不会覆盖你没存的字。`
+            : '接受后由核心按块落盘（`edit_apply`，哈希过期会拒绝并保留这张卡片）；拒绝则丢弃这次编辑。'}
       </p>
     </article>
   )

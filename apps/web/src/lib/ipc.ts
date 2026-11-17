@@ -19,12 +19,14 @@ import type {
   BotStatus as BotStatusDto,
   BotSummary as BotSummaryDto,
   ConversationSummary as ConversationSummaryDto,
+  DebugBreakpoint as DebugBreakpointDto,
   DeviceSettings as DeviceSettingsDto,
   DeviceStatus as DeviceStatusDto,
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
   ProjectOpenResult as ProjectOpenResultDto,
   ProjectSummary as ProjectSummaryDto,
+  ReplayReport as ReplayReportDto,
   RunLog as RunLogDto,
   StepKind as StepKindDto,
 } from '../generated'
@@ -199,10 +201,11 @@ export interface CommandInputs {
   /**
    * 同步一个文件的断点（**全量覆盖**语义）。
    *
-   * `lines` 是该文件当前全部断点行号（1-based，空数组 = 移除该文件的断点）；
-   * 契约见 docs/02-architecture.md §6.5.1 的 `Breakpoints::set`。
+   * `breakpoints` 是该文件当前全部断点（行号 1-based，`condition` 为同步 JS 表达式
+   * 或 `null`；空数组 = 移除该文件的断点）。契约见 docs/02-architecture.md §6.5.1
+   * 的 `Breakpoints::set`。
    */
-  'debug.set-breakpoints': { botId: string; file: string; lines: number[] }
+  'debug.set-breakpoints': { botId: string; file: string; breakpoints: DebugBreakpointDto[] }
   /** 继续运行到下一个断点（暂停期间核心阻塞等这一条）。 */
   'debug.resume': { botId: string }
   /** 单步：`over` 跳过 / `into` 进入 / `out` 跳出。 */
@@ -259,6 +262,14 @@ export interface CommandInputs {
    * `defaultMinutes > maxMinutes`、应用名空串），核心不会"就近取一个合法值"响应用户。
    */
   deviceSettingsSet: { settings: DeviceSettingsDto }
+  /**
+   * 用当前代码重跑历史入站事件（wire `replay_run`）。
+   *
+   * 回放**不联网、不写库**：核心另起一个全新 isolate 逐条 dispatch，回复只收集在内存里。
+   * `from` 是 Unix 毫秒下限（`null` = 不限），`limit` 是条数上限（`null` = 全量；
+   * **`0` 是 `-32002`，不等于"全量"**，界面上要自己先拦住，别把 0 发给核心）。
+   */
+  replay_run: { botId: string; from: number | null; limit: number | null }
 }
 
 export type CommandType = keyof CommandInputs
@@ -320,6 +331,11 @@ export interface CommandOutputs {
    * 核心可能沿用默认值或规范化大小写，界面用它覆盖本地那份，不再猜。
    */
   deviceSettingsSet: DeviceSettingsDto
+  /**
+   * 回放报告：`entries` 是逐条事件的对账结果，`*Events` / `same` / `extra` / … 是它的汇总。
+   * 报告是**一次性**返回值（回放没有事件流），所以失败只可能是一条 `IpcError`。
+   */
+  replay_run: ReplayReportDto
 }
 
 export type CommandResult<T extends Command> = CommandOutputs[T['type']]
