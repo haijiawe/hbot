@@ -155,7 +155,23 @@ callStack: Array<StackFrame>, } | { "type": "debug.resumed",
 /**
  * Bot ID。
  */
-botId: BotId, } | { "type": "device.status", 
+botId: BotId, } | { "type": "debug.log", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 日志点所在的文件（项目内相对路径）。
+ */
+file: string, 
+/**
+ * 行号（1-based）。
+ */
+line: number, 
+/**
+ * 展开后的消息（模板里的 `{表达式}` 已替换；展开失败则原样保留）。
+ */
+message: string, } | { "type": "device.status", 
 /**
  * 会话快照（`state == "none"` 时只有 `botId` 与 `state` 有意义）。
  */

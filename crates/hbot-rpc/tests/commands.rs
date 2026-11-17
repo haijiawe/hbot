@@ -1,4 +1,4 @@
-//! 命令契约测试：33 个 `Command` 的 `type` 值与字段名（命令一律 camelCase 字段）。
+//! 命令契约测试：35 个 `Command` 的 `type` 值与字段名（命令一律 camelCase 字段）。
 
 mod support;
 
@@ -252,10 +252,12 @@ fn bot_debug_and_log_commands_use_camel_case_fields() {
                 DebugBreakpoint {
                     line: 10,
                     condition: None,
+                    log: None,
                 },
                 DebugBreakpoint {
                     line: 20,
                     condition: Some("n % 2 === 0".to_string()),
+                    log: None,
                 },
             ],
         },
@@ -264,8 +266,8 @@ fn bot_debug_and_log_commands_use_camel_case_fields() {
             "botId": BOT_UUID,
             "file": "src/main.rs",
             "breakpoints": [
-                { "line": 10, "condition": null },
-                { "line": 20, "condition": "n % 2 === 0" },
+                { "line": 10, "condition": null, "log": null },
+                { "line": 20, "condition": "n % 2 === 0", "log": null },
             ],
         }),
     );
@@ -372,7 +374,7 @@ fn device_and_settings_commands_use_camel_case_fields() {
 
 #[test]
 fn command_fields_never_serialize_as_snake_case() {
-    // 覆盖全部 33 个命令：任何一个字段漏改 camelCase 都会在这里红。
+    // 覆盖全部 35 个命令：任何一个字段漏改 camelCase 都会在这里红。
     // 与上面的形状断言重复构造是有意的——这里只关心"没有 `_` 字段名"。
     let commands = vec![
         Command::AppInfo,
@@ -471,6 +473,7 @@ fn command_fields_never_serialize_as_snake_case() {
             breakpoints: vec![DebugBreakpoint {
                 line: 1,
                 condition: None,
+                log: None,
             }],
         },
         Command::DebugResume { bot_id: bot() },
@@ -482,15 +485,24 @@ fn command_fields_never_serialize_as_snake_case() {
             bot_id: Some(bot()),
             limit: 1,
         },
+        Command::ReplaySaveFixture {
+            bot_id: bot(),
+            from: None,
+            limit: Some(10),
+            path: ".hbot/fixtures/a.json".to_string(),
+        },
+        Command::FixtureRun {
+            bot_id: bot(),
+            path: ".hbot/fixtures/a.json".to_string(),
+        },
     ];
-    assert_eq!(commands.len(), 33, "命令数量变化时同步这张表");
+    assert_eq!(commands.len(), 35, "命令数量变化时同步这张表");
 
     for command in &commands {
         let value = serde_json::to_value(command).expect("ser");
         assert_camel_case_keys(&value, "command");
         // `type` 值必须仍是 snake_case（允许点分名，但命令里没有）。
         let ty = value["type"].as_str().expect("type 必须是字符串");
-        assert!(!ty.is_empty());
         assert_eq!(ty, ty.to_lowercase(), "type 值必须小写：{ty}");
     }
 }

@@ -79,8 +79,8 @@ pub use command::Command;
 pub use common::{
     ApiError, AppInfo, BotSummary, ConversationSummary, DebugBreakpoint, DebugScope,
     DeviceSettings, DeviceStatus, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile,
-    FileChangeKind, FileContent, LogLevel, ProjectOpenResult, ProjectSummary, ReplayEntry,
-    ReplayReplyChange, ReplayReport, Response, RiskLevel, RunLog, SearchMatch, StackFrame,
-    StepKind,
+    FileChangeKind, FileContent, FixtureEntry, FixtureRunReport, LogLevel, ProjectOpenResult,
+    ProjectSummary, ReplayEntry, ReplayReplyChange, ReplayReport, Response, RiskLevel, RunLog,
+    SavedFixture, SearchMatch, StackFrame, StepKind,
 };
 pub use event::Event;

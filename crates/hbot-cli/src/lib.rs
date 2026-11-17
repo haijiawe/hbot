@@ -22,12 +22,18 @@
 
 pub mod check;
 pub mod cli;
+pub mod fixture;
 pub mod replay;
 pub mod serve;
 pub mod version;
 
 pub use check::{CheckReport, check_project};
-pub use cli::{CheckArgs, Cli, Command, ReplayArgs, ServeArgs};
+pub use cli::{
+    CheckArgs, Cli, Command, FixtureArgs, FixtureCommand, FixtureRunArgs, FixtureSaveArgs,
+    ReplayArgs, ServeArgs,
+};
+// 夹具的实现在 `hbot-replay::fixture`（与 IDE 的两条命令共用一份）；重导出理由同下一行。
+pub use hbot_replay::{FixtureEntry, FixtureError, FixtureRunReport, SavedFixture};
 // 回放的实现与报告类型都在 `hbot-replay`（与 IDE 的 `replay_run` 共用一份）；这里重导出是为了
 // 不改 `hbot-cli` 已有的公开面（`hbot_cli::ReplayReport` 这些路径继续可用）。
 pub use hbot_replay::{InboundReplay, ReplayOptions, ReplayReport, replay};
@@ -97,5 +103,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<Outcome> {
             Ok(Outcome::Success)
         }
         Command::Replay(args) => replay::run(args).await,
+        Command::Fixture(args) => fixture::run(args).await,
     }
 }

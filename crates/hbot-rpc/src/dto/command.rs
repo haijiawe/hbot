@@ -288,6 +288,45 @@ pub enum Command {
         limit: Option<u32>,
     },
 
+    /// 把一批历史入站存成夹具文件（JSON 数组），供以后不依赖库重跑。
+    ///
+    /// 只读数据库、只写这一个文件；**不联网、不动正在跑的 bot**。
+    /// `data` 是 [`SavedFixture`](super::SavedFixture)。
+    ///
+    /// 失败通道：没有可保存的历史 `-32001`、`limit: 0` 或路径为空 / 解析后落在项目外
+    /// `-32002`、写盘失败 `-32006`。路径按项目根解析：相对路径落在项目内，
+    /// **不允许**写到项目外（`-32002`）。
+    ///
+    /// 父目录**可以不存在**（连同父目录一起建，原子写：先写 `.<name>.tmp` 再 rename）：
+    /// UI 的默认路径 `.hbot/fixtures/<bot>-<时间>.json` 第一次保存时目录必然还不存在，
+    /// 若把它当参数错误，默认路径就永远存不下来。这条是 2026-11-17 与实现对齐后的口径
+    /// （此前文档写"父目录不存在 → `-32002`"，是错的）。
+    ReplaySaveFixture {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 时间下界（Unix 毫秒）；`null` 表示不限。
+        from: Option<i64>,
+        /// 最多导出多少条；`null` 表示全量。
+        limit: Option<u32>,
+        /// 目标文件（相对项目根，或项目内的绝对路径）。
+        path: String,
+    },
+
+    /// 把一份夹具从头跑一遍（不查库、不需要历史）。
+    ///
+    /// 用途：把 `ReplaySaveFixture` 导出的、或从别处拿到的夹具当回归用例跑，
+    /// 看当前代码会回什么。**不写库、不联网**。`data` 是
+    /// [`FixtureRunReport`](super::FixtureRunReport)。
+    ///
+    /// 失败通道：路径为空/绝对路径在项目外/文件不存在或不是 JSON 数组 `-32002`、
+    /// 编译当前代码失败或 isolate 起不来 `-32006`。
+    FixtureRun {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 夹具文件（相对项目根，或项目内的绝对路径）。
+        path: String,
+    },
+
     /// 设置断点（调试构建）。
     ///
     /// 断点是**按 bot 的沙箱**生效的：同一份源码在不同 bot 的 isolate 里可以是不同版本。
@@ -363,6 +402,8 @@ impl Command {
             Self::DeviceSettingsGet => "device_settings_get",
             Self::DeviceSettingsSet { .. } => "device_settings_set",
             Self::ReplayRun { .. } => "replay_run",
+            Self::ReplaySaveFixture { .. } => "replay_save_fixture",
+            Self::FixtureRun { .. } => "fixture_run",
             Self::DebugSetBreakpoints { .. } => "debug_set_breakpoints",
             Self::DebugResume { .. } => "debug_resume",
             Self::DebugStep { .. } => "debug_step",

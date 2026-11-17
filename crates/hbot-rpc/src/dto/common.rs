@@ -293,6 +293,21 @@ pub struct DebugBreakpoint {
     /// 副作用允许（那是用户自己的代码在自己的 isolate 里跑），但求值次数受命中点数量
     /// 限制：只有真的执行到这一行才会求值。
     pub condition: Option<String>,
+    /// 日志点消息模板；`null` 表示这是一个**断点**（会停下来）。
+    ///
+    /// 非 `null` 时这一行变成**日志点**：命中时**不暂停**，只发一条
+    /// [`Event::DebugLog`](crate::dto::Event::DebugLog)，然后照常往下跑。模板里可以写
+    /// `{表达式}`，由 isolate 在命中那一刻展开（例如 `"count={count}"`）——单个表达式
+    /// 求值失败就把**那一段**换成 `<错误>`（同一条消息的其余部分照常输出），模板本身
+    /// 编译失败（括号不配对等）则这个日志点静默（同一行只 warn 一次），两种情况都
+    /// 绝不打断 handler。
+    ///
+    /// **`log` 与 `condition` 不能在同一条条目上组合**：带非空 `log` 的条目一律按
+    /// "只打印、不停下"处理，它自己的 `condition` 会被丢弃（宿主不报错，因为 wire 上
+    /// 表达"带条件的日志点"还有另一条路）。要在某一行**既打印又停下**，就给该行发
+    /// **两条**条目：一条 `log: null`（可带 `condition`，命中并条件为真时停下），一条
+    /// `log: "..."`（无条件打印）。两路各记各的表，互不清除。
+    pub log: Option<String>,
 }
 
 /// `AppInfo` 命令的 data：应用与运行时信息。
@@ -462,6 +477,53 @@ pub struct ReplayReport {
     pub reordered: u32,
     /// 逐条明细。
     pub entries: Vec<ReplayEntry>,
+}
+
+/// `ReplaySaveFixture` 的返回：刚才那份夹具落到了哪里。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedFixture {
+    /// 实际写入的绝对路径（`path` 相对时按项目根解析后的结果）。
+    pub path: String,
+    /// 写进去的事件条数。
+    pub events: u32,
+}
+
+/// 夹具里的一条事件跑出来的结果（`FixtureRun` 的 data 元素）。
+///
+/// 与 [`ReplayEntry`] 的区别：夹具**没有历史出站**可对照，所以这里只报"这条事件
+/// 跑出了什么回复 / 有没有抛错"，不做 same/extra/missing 分类。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FixtureEntry {
+    /// 在夹具数组里的下标（0 起）。
+    pub index: u32,
+    /// 原始事件里的 `external_id`（缺失时为空串）。
+    pub external_id: String,
+    /// 原始事件里的文本（缺失或纯图片时为 `null`）。
+    pub text: Option<String>,
+    /// 这条事件跑出来的回复（按 `reply(...)` 调用顺序）。
+    pub replies: Vec<String>,
+    /// 这条事件抛错时的原因；没抛错为 `null`。
+    pub error: Option<String>,
+}
+
+/// `FixtureRun` 的返回：把一份夹具从头跑一遍的结果。
+///
+/// **不写库、不联网**：与回放一样另起一个全新 isolate 逐条 dispatch，回复只在内存里。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FixtureRunReport {
+    /// 夹具文件的绝对路径（原样回显）。
+    pub path: String,
+    /// 实际跑的事件条数。
+    pub events: u32,
+    /// 回复总条数。
+    pub replies: u32,
+    /// 抛错的事件条数。
+    pub errors: u32,
+    /// 逐条明细。
+    pub entries: Vec<FixtureEntry>,
 }
 
 /// 命令的返回结果。

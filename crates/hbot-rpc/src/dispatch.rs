@@ -158,7 +158,11 @@ impl Dispatcher {
             }
 
             // 回放：只读历史 + 用当前代码重跑，不写库不联网。
-            Command::ReplayRun { .. } => crate::app::commands::replay::handle(state, command).await,
+            Command::ReplayRun { .. }
+            | Command::ReplaySaveFixture { .. }
+            | Command::FixtureRun { .. } => {
+                crate::app::commands::replay::handle(state, command).await
+            }
         }
     }
 }
@@ -341,10 +345,12 @@ mod tests {
                     crate::dto::DebugBreakpoint {
                         line: 3,
                         condition: None,
+                        log: None,
                     },
                     crate::dto::DebugBreakpoint {
                         line: 7,
                         condition: Some("count > 3".to_owned()),
+                        log: None,
                     },
                 ],
             },
@@ -357,6 +363,16 @@ mod tests {
                 bot_id: Some(parse(BOT)),
                 limit: 50,
             },
+            Command::ReplaySaveFixture {
+                bot_id: parse(BOT),
+                from: None,
+                limit: Some(10),
+                path: ".hbot/fixtures/a.json".to_owned(),
+            },
+            Command::FixtureRun {
+                bot_id: parse(BOT),
+                path: ".hbot/fixtures/a.json".to_owned(),
+            },
         ]
     }
 
@@ -365,7 +381,7 @@ mod tests {
         let commands = sample_commands();
         assert_eq!(
             commands.len(),
-            33,
+            35,
             "命令数与 Command 变体数不一致：新增/删除命令时同步这张表"
         );
         for command in commands {

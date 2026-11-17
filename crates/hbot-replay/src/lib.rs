@@ -39,9 +39,11 @@
 //! 不做。
 //!
 //! 只读：本 crate 不写 inbound / outbound / logs，也不改项目文件（`--save-fixture` 是用户
-//! 显式指定的落点，例外）。
+//! 显式指定的落点，例外；[`fixture::save_fixture`] 写的也只是用户点名的那个夹具文件）。
 
 #![warn(missing_docs)]
+
+pub mod fixture;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -57,6 +59,11 @@ use hbot_code::{Sandbox, compile_project_with_entry};
 use hbot_core::ConversationKind;
 use hbot_core::{MessageId, Timestamp};
 use hbot_store::{BotId, InboundReplayRow, Store};
+
+pub use fixture::{
+    FixtureEntry, FixtureError, FixtureRunReport, SavedFixture, resolve_fixture_path, run_fixture,
+    run_fixture_compiled, save_fixture,
+};
 
 /// 项目库相对项目根的位置。
 const DATABASE_SUFFIX: &str = ".hbot/hbot.db";
@@ -321,6 +328,37 @@ fn conversation_kind_of(raw: &str) -> ConversationKind {
     }
 }
 
+/// 把一行历史入站还原成**生产链路同款**的事件 JSON。
+///
+/// 生产侧（`hbot-rpc` 的 sandbox handler）与回放/夹具侧都必须从这里出：这是"存下来的夹具"
+/// 与"回放时喂进去的事件"共用的唯一构造点，另造一份就等着两边形状漂移。
+pub(crate) fn event_of_row(row: &InboundReplayRow, bot_id: BotId, payload: &Value) -> Value {
+    event_json(&EventSource {
+        bot_id,
+        conversation_id: row.message.conversation_id,
+        message_id: MessageId::from_uuid(*row.message.id.as_uuid()),
+        external_id: row.message.external_id.as_str(),
+        sender_id: row.message.sender_id.as_str(),
+        text: payload.get("text").and_then(Value::as_str),
+        kind: conversation_kind_of(&row.conversation_kind),
+        conversation_external_id: row.conversation_external_id.as_str(),
+        received_at: Timestamp::from_unix_millis(row.message.received_at),
+        payload,
+    })
+}
+
+/// 面向人的路径文案：去掉 Windows `canonicalize` 带来的 `\\?\` 前缀。
+///
+/// 夹具路径会直接回显到 UI / 报告里，`\\?\C:\...` 只会让人以为路径坏了。
+pub(crate) fn display_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        raw
+    }
+}
+
 /// 选出这一批要回放的历史入站：`from`（含）之后、最多 `limit` 条。
 ///
 /// 单独抽出来是为了能在**不编译项目、不起 isolate** 的前提下钉住选批语义（见本文件测试）：
@@ -512,18 +550,7 @@ fn collect(
                 entry.error = Some(error.clone());
             }
             Ok(payload) => {
-                let event = event_json(&EventSource {
-                    bot_id,
-                    conversation_id: row.message.conversation_id,
-                    message_id: MessageId::from_uuid(*row.message.id.as_uuid()),
-                    external_id: row.message.external_id.as_str(),
-                    sender_id: row.message.sender_id.as_str(),
-                    text: payload.get("text").and_then(Value::as_str),
-                    kind: conversation_kind_of(&row.conversation_kind),
-                    conversation_external_id: row.conversation_external_id.as_str(),
-                    received_at: Timestamp::from_unix_millis(row.message.received_at),
-                    payload,
-                });
+                let event = event_of_row(row, bot_id, payload);
                 match sandbox.dispatch_collecting(&event) {
                     Ok(outcome) => entry.replayed = outcome.replies,
                     Err(failure) => {

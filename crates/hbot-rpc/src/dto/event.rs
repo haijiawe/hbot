@@ -154,6 +154,22 @@ pub enum Event {
         bot_id: BotId,
     },
 
+    /// 命中了**日志点**：不暂停，只是一条打印。
+    ///
+    /// 与 `debug.paused` 的区别是"它不会阻塞 handler"，所以这条事件**不是** critical
+    /// 通道：丢掉最多是少了一行调试输出。UI 应当把它当普通日志行处理（同一处排序、可清空）。
+    #[serde(rename = "debug.log")]
+    DebugLog {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 日志点所在的文件（项目内相对路径）。
+        file: String,
+        /// 行号（1-based）。
+        line: u32,
+        /// 展开后的消息（模板里的 `{表达式}` 已替换；展开失败则原样保留）。
+        message: String,
+    },
+
     /// 设备会话状态变了（开了 / 到期 / 被撤销 / 被拒）。
     ///
     /// **critical 通道**（`crates/hbot-rpc/src/ws.rs` 的 `classify`）：这条丢了，

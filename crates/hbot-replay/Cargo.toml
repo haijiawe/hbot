@@ -12,6 +12,9 @@ hbot-core = { path = "../hbot-core" }
 hbot-store = { path = "../hbot-store" }
 hbot-code = { path = "../hbot-code" }
 hbot-bot = { path = "../hbot-bot" }
+# 夹具文件的写路径守卫与原子写：复用 `Workspace`，不在这里另造一份路径判据
+# （见 `src/fixture.rs` 模块文档的"路径守卫"一节，以及 `xtask/src/deps.rs` 的登记）。
+hbot-workspace = { path = "../hbot-workspace" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

@@ -206,7 +206,31 @@ from: number | null,
 /**
  * 最多回放多少条；`null` 表示全量（`0` 是 `-32002`，不"等于全量"）。
  */
-limit: number | null, } | { "type": "debug_set_breakpoints", 
+limit: number | null, } | { "type": "replay_save_fixture", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 时间下界（Unix 毫秒）；`null` 表示不限。
+ */
+from: number | null, 
+/**
+ * 最多导出多少条；`null` 表示全量。
+ */
+limit: number | null, 
+/**
+ * 目标文件（相对项目根，或项目内的绝对路径）。
+ */
+path: string, } | { "type": "fixture_run", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 夹具文件（相对项目根，或项目内的绝对路径）。
+ */
+path: string, } | { "type": "debug_set_breakpoints", 
 /**
  * Bot ID。
  */

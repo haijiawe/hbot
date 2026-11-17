@@ -27,15 +27,33 @@
 //! 前两类是"参数/前置条件不对"，属于调用方的错；后两类是"这台机器上跑不起来"，
 //! 属于环境。把"没有历史"判成 `-32001` 而不是 `-32006`，是因为 UI 该提示"这个 bot 还没
 //! 跑过消息"，而不是"内部错误"。
+//!
+//! ## 夹具（`replay_save_fixture` / `fixture_run`）
+//!
+//! 两条命令的内核都在 `hbot_replay::fixture`（与回放共享同一份事件构造路径
+//! [`hbot_replay`] 里的 `event_of_row`），本文件只做校验与映射：
+//!
+//! | 情况 | 码 |
+//! |---|---|
+//! | `limit = Some(0)` / 空路径 / 路径落在项目外 / 夹具不是 JSON 数组 | `-32002` |
+//! | 存夹具时库里没有这个 bot、或没有历史入站 | `-32001` |
+//! | 写盘失败 / 编译失败 / isolate 起不来 | `-32006` |
+//!
+//! `fixture_run` **不查库**（夹具自带事件，历史不是必需的），所以它永远不会产出
+//! `-32001`；命令里的 `bot_id` 只用来在日志里标注"这是给哪个 bot 跑的"，不参与判定。
 
 use std::sync::Arc;
 
 use super::{failed, unimplemented};
 use crate::app::AppState;
-use crate::dto::{Command, ReplayEntry, ReplayReplyChange, ReplayReport as WireReport, Response};
+use crate::dto::{
+    Command, FixtureEntry as WireFixtureEntry, FixtureRunReport as WireFixtureRunReport,
+    ReplayEntry, ReplayReplyChange, ReplayReport as WireReport, Response,
+    SavedFixture as WireSavedFixture,
+};
 use hbot_core::{BotId, HbotError};
 
-/// `replay_run` 的入口。
+/// `replay_run` / `replay_save_fixture` / `fixture_run` 的入口。
 pub async fn handle(state: &AppState, command: Command) -> Response {
     match command {
         Command::ReplayRun {
@@ -43,6 +61,13 @@ pub async fn handle(state: &AppState, command: Command) -> Response {
             from,
             limit,
         } => run(state, bot_id, from, limit).await,
+        Command::ReplaySaveFixture {
+            bot_id,
+            from,
+            limit,
+            path,
+        } => save_fixture(state, bot_id, from, limit, path).await,
+        Command::FixtureRun { bot_id, path } => fixture_run(state, bot_id, path).await,
         other => unimplemented(other.kind()),
     }
 }
@@ -113,6 +138,150 @@ async fn run(state: &AppState, bot_id: BotId, from: Option<i64>, limit: Option<u
     match serde_json::to_value(wire(&report)) {
         Ok(data) => Response::with_data(data),
         Err(error) => failed(HbotError::internal(format!("回放报告序列化失败：{error}"))),
+    }
+}
+
+/// `replay_save_fixture`：把一批历史入站存成项目内的夹具文件。
+///
+/// 校验顺序与 [`run`] 对齐（参数 → 项目 → 路径守卫 → blocking），只多一道**路径守卫**：
+/// 写文件比读文件更该早挡住"逃出项目"的路径，所以它在进 blocking 之前就判一次
+/// （`hbot_replay::save_fixture` 内部还会再判一次 —— 两道，不是一道）。
+async fn save_fixture(
+    state: &AppState,
+    bot_id: BotId,
+    from: Option<i64>,
+    limit: Option<u32>,
+    path: String,
+) -> Response {
+    if limit == Some(0) {
+        return failed(HbotError::invalid(
+            "limit=0 会一条都不存；要全量就别给 limit",
+        ));
+    }
+    let Some(project_dir) = state.project_root() else {
+        return failed(HbotError::invalid(
+            "没有打开的项目：先发 project_open（存夹具要按项目根解析路径，而且只能写项目内）",
+        ));
+    };
+    // 相对路径按项目根解析；越界 / 空路径 / 非法前缀在这里就返回 `-32002`。
+    if let Err(error) = hbot_replay::resolve_fixture_path(&project_dir, &path) {
+        return failed(fixture_error(error));
+    }
+
+    let store = Arc::clone(state.store());
+    let options = hbot_replay::ReplayOptions {
+        database: state.data_dir().join("hbot.db"),
+        project_dir,
+        bot: bot_id.to_string(),
+        limit,
+        from,
+        // 历史遗留的 payload 落盘与这条命令无关：夹具走 `hbot_replay::save_fixture`。
+        save_fixture: None,
+    };
+    let saved = state
+        .blocking(move || -> Result<hbot_replay::SavedFixture, HbotError> {
+            if store
+                .get_bot(&bot_id)
+                .map_err(crate::app::store_failed)?
+                .is_none()
+            {
+                return Err(HbotError::not_found("bot", bot_id.to_string()));
+            }
+            let history = store
+                .list_inbound_history_for_bot(
+                    &bot_id,
+                    options.from,
+                    options.limit.unwrap_or(u32::MAX),
+                )
+                .map_err(crate::app::store_failed)?;
+            if history.is_empty() {
+                return Err(HbotError::not_found("inbound", bot_id.to_string()));
+            }
+            drop(history);
+
+            hbot_replay::save_fixture(&store, &options, &path).map_err(fixture_error)
+        })
+        .await;
+
+    let saved = match saved {
+        Ok(saved) => saved,
+        Err(error) => return failed(error),
+    };
+    match serde_json::to_value(WireSavedFixture {
+        path: saved.path,
+        events: saved.events,
+    }) {
+        Ok(data) => Response::with_data(data),
+        Err(error) => failed(HbotError::internal(format!(
+            "夹具保存结果序列化失败：{error}"
+        ))),
+    }
+}
+
+/// `fixture_run`：拿当前代码把夹具里每条事件重跑一遍。
+///
+/// **不查库**（不 `get_bot`、不读历史）：夹具自带事件，库里的历史不是前置条件，所以
+/// 这条命令不会产出 `-32001`。`bot_id` 只进日志，不参与判定 —— 事件里的 `botId`
+/// 才是 isolate 看到的身份。
+async fn fixture_run(state: &AppState, bot_id: BotId, path: String) -> Response {
+    let Some(project_dir) = state.project_root() else {
+        return failed(HbotError::invalid(
+            "没有打开的项目：先发 project_open（跑夹具要用项目根里的源码编译）",
+        ));
+    };
+    let resolved = match hbot_replay::resolve_fixture_path(&project_dir, &path) {
+        Ok(resolved) => resolved,
+        Err(error) => return failed(fixture_error(error)),
+    };
+    tracing::debug!(bot = %bot_id, fixture = %resolved.display(), "重跑夹具");
+
+    let report = state
+        .blocking(move || hbot_replay::run_fixture(&project_dir, &resolved).map_err(fixture_error))
+        .await;
+
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => return failed(error),
+    };
+    match serde_json::to_value(fixture_report(&report)) {
+        Ok(data) => Response::with_data(data),
+        Err(error) => failed(HbotError::internal(format!("夹具报告序列化失败：{error}"))),
+    }
+}
+
+/// `hbot_replay` 的夹具错误 → 领域错误（三个变体一一对应三个码）。
+fn fixture_error(error: hbot_replay::FixtureError) -> HbotError {
+    use hbot_replay::FixtureError;
+    match error {
+        FixtureError::Invalid(message) => HbotError::invalid(message),
+        // 保留内核写好的说明（它分得清"库里没有这个 bot"与"没有历史"），但码必须是
+        // `-32001`：UI 要提示"这个 bot 还没跑过消息"，而不是"内部错误"。
+        FixtureError::NotFound(message) => HbotError::NotFound {
+            entity: "inbound".to_owned(),
+            id: message,
+        },
+        FixtureError::Engine(message) => HbotError::internal(message),
+    }
+}
+
+/// 内部夹具报告 → wire 报告（字段一一对应）。
+fn fixture_report(report: &hbot_replay::FixtureRunReport) -> WireFixtureRunReport {
+    WireFixtureRunReport {
+        path: report.path.clone(),
+        events: report.events,
+        replies: report.replies,
+        errors: report.errors,
+        entries: report
+            .entries
+            .iter()
+            .map(|entry| WireFixtureEntry {
+                index: entry.index,
+                external_id: entry.external_id.clone(),
+                text: entry.text.clone(),
+                replies: entry.replies.clone(),
+                error: entry.error.clone(),
+            })
+            .collect(),
     }
 }
 

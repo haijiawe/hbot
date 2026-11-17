@@ -1986,6 +1986,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-registry",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2044,6 +2045,7 @@ dependencies = [
  "hbot-code",
  "hbot-core",
  "hbot-store",
+ "hbot-workspace",
  "serde",
  "serde_json",
  "tracing",

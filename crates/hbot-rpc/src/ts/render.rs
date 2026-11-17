@@ -16,9 +16,9 @@ use super::{GeneratedFile, HEADER, INDEX_FILE, TsGenError};
 use crate::dto::{
     ApiError, AppInfo, BotSummary, Command, ConversationSummary, DebugBreakpoint, DebugScope,
     DeviceSettings, DeviceStatus, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile,
-    Event, FileChangeKind, FileContent, LogLevel, ProjectOpenResult, ProjectSummary, ReplayEntry,
-    ReplayReplyChange, ReplayReport, Response, RiskLevel, RunLog, SearchMatch, StackFrame,
-    StepKind,
+    Event, FileChangeKind, FileContent, FixtureEntry, FixtureRunReport, LogLevel,
+    ProjectOpenResult, ProjectSummary, ReplayEntry, ReplayReplyChange, ReplayReport, Response,
+    RiskLevel, RunLog, SavedFixture, SearchMatch, StackFrame, StepKind,
 };
 
 /// 渲染结果：文件本身 + 它 import 的依赖（供悬空 import 检查）。
@@ -84,6 +84,8 @@ pub fn generated_files() -> Result<Vec<GeneratedFile>, TsGenError> {
     export!(DeviceSettings);
     // 回放报告（`replay_run` 的载荷）：UI 按 entries 渲染逐条对照。
     export!(ReplayReport, ReplayEntry, ReplayReplyChange);
+    // 夹具（replay_save_fixture / fixture_run 的载荷）：导出与重跑，不查库。
+    export!(SavedFixture, FixtureRunReport, FixtureEntry);
     // 领域类型：事件载荷里出现的枚举 / 结构。
     export!(
         BotStatus,
