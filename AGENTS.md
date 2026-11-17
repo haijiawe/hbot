@@ -238,6 +238,37 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     所以不记 denied 以免污染审批率、也不记 internal 以免误导排障）。`CommandOutput` 多了 `usage: ResourceUsage` 字段，
     加字段会打断所有测试字面量，改 core 公开结构后先 `cargo check --workspace --all-targets` 再报清单。
 
+53. **`Ctx<'js>` 不许存进 `Async` 闭包 —— 否则整个测试进程在退出时崩**（2026-11-18，代价 >30 分钟）。症状：所有
+    `hbot-code` 的 isolate 集成测试（连 `s3_device.rs`）在**进程退出那一刻**崩
+    `Assertion failed: list_empty(&rt->gc_obj_list), file …quickjs.c, line 2704`，退出码 `0xc0000409`
+    （`STATUS_STACK_BUFFER_OVERRUN`），加 `--test-threads=1` 也一样；单条跑、连跑三次全量都可能恰好全绿，所以会被误判成 flake。
+    原因：`let handle = ctx.clone();` 把这个 `Ctx` 存进闭包后，QuickJS 运行时的引用计数不归零，`JS_FreeRuntime` 撞断言。
+    做法：把 `Ctx<'js>` 作为 **`Async` 闭包的首参**取回来 —— `Async(move |handle: Ctx<'js>, key: Value<'js>, …| { … })`。
+    `FromParam for Ctx` 的 `param_requirement()` 是 `none()`，不占位置参数，所以 **JS 侧调用签名不变**。
+    新增任何 `Async` 宿主函数（`state_api.rs`、`device_api.rs`）时先照这个写法，别 `clone()` 进闭包。
+
+54. **`String(error)` 比 `error.message` 多一层 `Error: ` 前缀**（2026-11-18）。`Exception::throw_message` 造出来的是
+    `Error` 实例，JS 侧 `String(err)` 走 `Error.prototype.toString()` 得到 `"Error: " + message`，于是断言
+    `assert!(e.contains("HBOT_STATE_INVALID"))` 在 `startsWith` 口径下会红。所有 `HBOT_*` 前缀断言一律用
+    `error.message`（或先剥前缀）。同理 `hbot.d.ts` 里写的错误码要能在 `error.message` 里整条看到。
+
+55. **`Arc<具体类型>` 不能 `Arc::clone(&x)` 变成 `Arc<dyn Trait>`**（2026-11-18）。`fn new(state: Arc<dyn BotState>)`
+    收到 `Arc::clone(&counting)` 会报 `expected &Arc<dyn BotState>, found &Arc<CountingState>`。
+    做法：显式标注目标类型 —— `let backend: Arc<dyn BotState> = state.clone(); let history: Arc<dyn HistoryReader> = state;`。
+    同一个值要同时喂两个 trait 时别复制粘贴 `Arc::clone`，一次标注类型、一次直接 move。
+
+56. **新增 `Option<T>` 配置字段时，`new()` 必须从 `config` 取值**（2026-11-18，差点漏掉整条接线）。`SandboxHandler::new`
+    里照抄相邻 `device` 字段写成 `state: None`，把 `config.state` 整个丢掉 —— 结果状态能力永远是"宿主没装配"，
+    5 条端到端测试全报 `HBOT_STATE_UNAVAILABLE`。规则：builder 类构造里**每个字段的初值只能来自 `config.<同名字段>`**，
+    `None` 只允许出现在"这个字段在 config 里本来就没有"的地方；新增一个 `Option` 字段后，补一条"走真派发链路的测试"
+    （`crates/hbot-rpc/tests/state_capability.rs` 就是照这个理由写的：它钉的是 `AppState::start_bot` → config → worker → isolate 的接线，
+    别处覆盖不到）。
+
+57. **稳定版 clippy 的两个新口径**（2026-11-18）：`map_or(true, …)` → `Option::is_none_or`（`unnecessary_map_or`），
+    `map_or(false, …)` → `is_some_and`；`manual_strip`（`if raw.starts_with("\\\\?\\") { raw[4..].to_owned() }`）
+    要改 `strip_prefix`。`-D warnings` 下这两条会让**别人的 crate**也红，所以改完自己那侧先 `cargo clippy -p <your crate> --all-targets`，
+    再看一眼 `cargo clippy --workspace --all-targets` 的失败点是不是落在别人文件里（判读方法见坑 44）。
+
 ---
 
 ## 8. 新增 X 的步骤
@@ -262,6 +293,14 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 2. `dts.rs` 生成类型；跑 `cargo xtask gen`。
 3. `manifest.rs` 权限校验（默认拒绝）。
 4. 测试：无权限拒绝、超限中断、序列化往返。
+5. **四处必须同批改，少一处就红在别处**（`crates/hbot-code/src/dts.rs` 的漂移测试会逐处对上）：
+   `host_api.rs` 的 `HOST_BINDING_KEYS` → `install()` 里的 `host.set(...)` → `HOST_MODULE_SOURCE` 的 `export const X` + 末尾 `export default { …, X }`（**测试按逗号切这一行**，不许换行、不许在中间插注释）→ `HOST_DTS` 的 `MessageCtx` 属性与 `declare module 'hbot'` 里的模块级声明。
+   新绑定还要同时进 `crates/hbot-code/src/runtime/isolate.rs` 的 `build_event`（`event.set("X", …)`），否则 JS 侧拿不到。
+6. **给 `MessageCtx` 加对象属性时，名字必须含空格**（`readonly kv: KvApi;`、`readonly device: DeviceApi;`）。
+   两个扫描器（`dts.rs` 的 `message_ctx_properties` 与 `hbot-rpc/tests/event_shape_dts.rs`）靠"名字不是纯 alnum"把它跳过；
+   规范化成 `kv: KvApi;` 会被当成**入站字段**，两个 crate 同时红、而报错完全看不出是这个原因。
+7. `HOST_DTS` 的负向清单（`hbot_dts_does_not_promise_unimplemented_apis`）里，**宽泛条目（`"kv."`、`"fetch("`）在能力落地时要整条删**，
+   只有精确条目（`"history(conversationId"`、`"watch("`）才能留 —— 否则它会在能力实现后继续假装"这个没做"。
 
 ### 新增 Command / 表 / 页面
 
