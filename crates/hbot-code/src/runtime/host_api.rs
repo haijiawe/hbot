@@ -11,6 +11,8 @@
 //! | `sleep(ms)` | `(number) => Promise<void>` | `tokio::time::sleep` |
 //! | `http.get(url, options?)` | `(string, object?) => Promise<{status, body, headers}>` | [`crate::http::HttpConfig`] |
 //! | `device.*` | eight methods, all `Promise`-returning | [`crate::device`] |
+//! | `kv.*` | five methods, all `Promise`-returning | [`crate::state`] |
+//! | `history(n)` | `(number?) => Promise<HistoryEntry[]>` | [`crate::state`] |
 //!
 //! `sleep` and `http.get` are the important ones: they resolve (or reject) a
 //! JavaScript promise from a Rust async task. The task is spawned onto the
@@ -40,13 +42,15 @@ use crate::device::DeviceSlot;
 use crate::error::CodeError;
 use crate::http::{GetOptions, HttpConfig, HttpResponse};
 use crate::limits::Deadline;
+use crate::state::StateSlot;
 
 /// The keys [`install`] writes on `globalThis.__hbot`, in one place.
 ///
 /// This is data, not prose: `crate::dts`'s drift tests compare it with the
 /// exports of [`HOST_MODULE_SOURCE`] and with the declarations in `hbot.d.ts`,
 /// so a binding added here without its two declarations is a test failure.
-pub(crate) const HOST_BINDING_KEYS: &[&str] = &["log", "reply", "sleep", "http", "device"];
+pub(crate) const HOST_BINDING_KEYS: &[&str] =
+    &["log", "reply", "sleep", "http", "device", "kv", "history"];
 
 /// Upper bound on captured `log`/`reply` entries per event.
 ///
@@ -126,17 +130,20 @@ fn truncate(message: String) -> String {
     truncated
 }
 
-/// Install `globalThis.__hbot` (`log`, `reply`, `sleep`, `http.get`, `device`) into `ctx`.
+/// Install `globalThis.__hbot` (`log`, `reply`, `sleep`, `http.get`, `device`,
+/// `kv`, `history`) into `ctx`.
 ///
-/// `device` is the **replaceable** slot, not a snapshot: every `ctx.device.*` call
-/// re-reads it, so a revoked session takes effect on the very next call rather
-/// than on the next isolate (`docs/09` §4.2).
+/// `device` and `state` are **replaceable** slots, not snapshots: every
+/// `ctx.device.*` / `ctx.kv.*` call re-reads its slot, so a revoked session (or a
+/// host that only now assembled its state backend) takes effect on the very next
+/// call rather than on the next isolate (`docs/09` §4.2).
 pub(crate) fn install<'js>(
     ctx: &Ctx<'js>,
     output: Arc<Mutex<HostOutput>>,
     deadline: Arc<Deadline>,
     http: Arc<HttpConfig>,
     device: Arc<DeviceSlot>,
+    state: Arc<StateSlot>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -221,12 +228,16 @@ pub(crate) fn install<'js>(
     };
 
     let device_object = super::device_api::install(ctx, &device, &http, &deadline)?;
+    let (kv_object, history_function) = super::state_api::install(ctx, &state, &deadline)?;
 
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
     host.set("sleep", sleep).map_err(super::js_error)?;
     host.set("http", http_object).map_err(super::js_error)?;
     host.set("device", device_object).map_err(super::js_error)?;
+    host.set("kv", kv_object).map_err(super::js_error)?;
+    host.set("history", history_function)
+        .map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
             .filter_map(Result::ok)
@@ -423,7 +434,55 @@ export const device = {
   },
 };
 
-export default { defineBot, log, reply, sleep, http, device };
+/**
+ * State surface. **Every method returns a Promise and every failure is a
+ * rejection** whose message starts with `HBOT_STATE_*`.
+ *
+ * Presence is not authorization: `ctx.kv` being declared in `hbot.d.ts` only
+ * means this project's `hbot.json` said `capabilities.state.kv`. Whether a value
+ * may be read or written is decided when the host assembles its state backend,
+ * and a host that has not assembled one answers `HBOT_STATE_UNAVAILABLE`
+ * instead of quietly keeping the data in memory (which would make "your data
+ * disappeared after a restart" look like normal behaviour).
+ *
+ * `get()` resolves `null` for a missing **or expired** key — never `undefined`,
+ * so `value === null` stays a usable "not there" check. `set()`/`setMany()`
+ * reject on `undefined` rather than storing it, because "stored nothing" and
+ * "stored null" would otherwise be the same thing. `ttlMs` is a positive
+ * integer; it is validated, never silently clamped.
+ */
+export const kv = {
+  get(key) {
+    return host.kv.get(key);
+  },
+  set(key, value, options) {
+    return host.kv.set(key, value, options);
+  },
+  delete(key) {
+    return host.kv.delete(key);
+  },
+  list(prefix) {
+    return host.kv.list(prefix);
+  },
+  setMany(entries, options) {
+    return host.kv.setMany(entries, options);
+  },
+};
+
+/**
+ * The last `limit` messages of this conversation (bot's own included),
+ * oldest first. Defaults to 20 when `limit` is omitted.
+ *
+ * The conversation is the one this event belongs to: an event without a
+ * `conversationId` rejects with `HBOT_STATE_INVALID` rather than reading the
+ * previous event's conversation — a handler must never see another chat's
+ * history by accident.
+ */
+export function history(limit) {
+  return host.history(limit);
+}
+
+export default { defineBot, log, reply, sleep, http, device, kv, history };
 "#;
 
 #[cfg(test)]

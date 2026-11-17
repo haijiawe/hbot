@@ -76,6 +76,24 @@ declare module 'hbot' {
     /** 原始平台事件；形状随平台变化，别当契约用。 */
     payload: unknown;
 
+    /* 状态能力面。
+     *
+     * **存在不等于被授权。** `ctx.kv` 出现在这里只说明本项目 `hbot.json` 的
+     * `capabilities.state.kv` 声明了它；数据属于**哪个 bot** 由本次事件的
+     * `botId` 决定，不是由这个符号决定。
+     *
+     * 宿主没装配状态后端时抛 `HBOT_STATE_UNAVAILABLE`（**不**退回内存实现：
+     * 那会让"重启后数据没了"变成没人发现的静默行为）；清单声明了但落库层拒绝时
+     * 抛 `HBOT_STATE_NOT_DECLARED`。参数不合规一律 `HBOT_STATE_INVALID`，且
+     * **在后端被调用之前**就拒。
+     *
+     * 五个方法**都返回 Promise，失败一律是 rejection**，message 以
+     * `HBOT_STATE_` 开头。 */
+    readonly kv: KvApi;
+    /** 本会话最近 `limit` 条消息（含 bot 自己发的），时间升序。默认 20，上限 50（超过夹住不报错）。
+     *  会话来自本次事件的 `conversationId`；没有它则整次调用失败，绝不沿用上一个事件。 */
+    history(limit?: number): Promise<HistoryEntry[]>;
+
     /* 设备能力面。
      *
      * **存在不等于被授权。** 这一层能不能用，由运行时在**每次调用**时决定：
@@ -120,6 +138,50 @@ declare module 'hbot' {
     body: string;
     /** 响应头，名字已转小写。 */
     headers: Record<string, string>;
+  }
+
+  /** `ctx.kv.set` / `ctx.kv.setMany` 的可选参数。 */
+  export interface KvWriteOptions {
+    /** 过期时间（毫秒），必须是有限正整数；非正、非整数、非有限一律拒绝，超过 30 天也拒绝（不静默截断）。 */
+    ttlMs?: number;
+  }
+
+  /** `ctx.kv.setMany(entries)` 里的一条。 */
+  export interface KvEntry {
+    /** 键，1–128 字节的非空 UTF-8。 */
+    key: string;
+    /** 任意可 JSON 化的值；`undefined` 会被拒绝（不静默当 `null` 存）。 */
+    value: unknown;
+  }
+
+  /** `ctx.kv`：本 bot 的键值状态，值是 JSON。 */
+  export interface KvApi {
+    /** 读一个键。**不存在或已过期都解析成 `null`**，不是 `undefined`。 */
+    get(key: string): Promise<unknown | null>;
+    /** 写一个键。值先序列化成 JSON，再按落库后的字节数判上限。 */
+    set(key: string, value: unknown, options?: KvWriteOptions): Promise<void>;
+    /** 删一个键；解析成"这次是否真的删掉了一行"，本来就没有则是 `false`。 */
+    delete(key: string): Promise<boolean>;
+    /** 列出键名（最多 1000 个）。`prefix` 省略或空串表示全部。 */
+    list(prefix?: string): Promise<string[]>;
+    /** 一次写多条，要么整批成功要么整批失败；上限 100 条。 */
+    setMany(entries: KvEntry[], options?: KvWriteOptions): Promise<void>;
+  }
+
+  /** 一条会话历史。字段名是 camelCase，`at` 是 unix 毫秒。 */
+  export interface HistoryEntry {
+    /** 这条消息是用户发来的还是 bot 自己发的。 */
+    direction: 'inbound' | 'outbound';
+    /** 平台侧消息 id。 */
+    messageId: string;
+    /** 平台侧外部 id。 */
+    externalId: string;
+    /** 发送者 id。 */
+    senderId: string;
+    /** 消息文本。 */
+    text: string;
+    /** 发送时间，unix 毫秒。 */
+    at: number;
   }
 
   /** `ctx.device.screen(options)` 的可选参数。 */
@@ -216,6 +278,11 @@ declare module 'hbot' {
   /** 设备能力，与 `ctx.device` 是同一份实现，等价于在事件外调用。
    *  声明了不等于被授权：能不能用由运行时逐次判定，见 `MessageCtx.device`。 */
   export const device: DeviceApi;
+  /** 状态能力，与 `ctx.kv` 是同一份实现，等价于在事件外调用。
+   *  声明了不等于被授权：宿主没装配后端时 `HBOT_STATE_UNAVAILABLE`。 */
+  export const kv: KvApi;
+  /** 会话历史，与 `ctx.history` 是同一份实现。会话仍取自本次事件。 */
+  export function history(limit?: number): Promise<HistoryEntry[]>;
 }
 "#;
 
@@ -301,6 +368,7 @@ mod drift {
     use super::*;
     use crate::runtime::device_api::DEVICE_BINDING_KEYS;
     use crate::runtime::host_api::{HOST_BINDING_KEYS, HOST_MODULE_SOURCE};
+    use crate::runtime::state_api::KV_BINDING_KEYS;
 
     /// `export function <name>` declarations in a piece of source.
     fn function_exports(source: &str) -> BTreeSet<String> {
@@ -536,6 +604,47 @@ mod drift {
         block[..end].lines().filter_map(method_name).collect()
     }
 
+    /// The keys `runtime/state_api.rs` installs on the `ctx.kv` object.
+    ///
+    /// Same scan and same reason as [`installed_device_keys`]: the `entries`
+    /// literal is the one place a key sits next to its function, and rustfmt does
+    /// wrap long `object.set(..)` calls.
+    fn installed_kv_keys() -> BTreeSet<String> {
+        let source = include_str!("runtime/state_api.rs");
+        let start = source
+            .find("let entries: [(&str, Function<'js>);")
+            .expect("state_api.rs 应有 entries 表");
+        let block = &source[start..];
+        let end = block.find("\n    ]").expect("entries 表应有收尾 `]`");
+        block[..end]
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("(\""))
+            .filter_map(|rest| rest.split_once('"').map(|(name, _)| name.to_owned()))
+            .collect()
+    }
+
+    /// Method declarations inside `export interface KvApi {`.
+    fn dts_kv_methods() -> BTreeSet<String> {
+        let start = HOST_DTS
+            .find("export interface KvApi {")
+            .expect("hbot.d.ts 应有 KvApi");
+        let block = &HOST_DTS[start..];
+        let end = block.find("\n  }").expect("KvApi 应有收尾 `}`");
+        block[..end].lines().filter_map(method_name).collect()
+    }
+
+    /// Method keys of `export const kv = { … }` in the runtime module.
+    fn module_kv_methods() -> BTreeSet<String> {
+        let start = HOST_MODULE_SOURCE
+            .find("export const kv = {")
+            .expect("HOST_MODULE_SOURCE 应有 kv 命名空间");
+        let block = &HOST_MODULE_SOURCE[start..];
+        let end = block
+            .find("\n};")
+            .expect("HOST_MODULE_SOURCE 的 kv 对象应有收尾 `};`");
+        block[..end].lines().filter_map(method_name).collect()
+    }
+
     /// A `name(...)` line's name, when it is a plain identifier.
     fn method_name(line: &str) -> Option<String> {
         let (name, _) = line.trim().split_once('(')?;
@@ -697,6 +806,66 @@ mod drift {
     }
 
     #[test]
+    fn kv_surface_matches_the_runtime_object_and_the_module() {
+        // `ctx.kv` 的四方一致：state_api.rs 的 entries 表、手写的
+        // KV_BINDING_KEYS、`hbot` 模块的 kv 命名空间、hbot.d.ts 的 KvApi。
+        let installed = installed_kv_keys();
+        assert!(
+            !installed.is_empty(),
+            "state_api.rs 里没解析到 entries 表，扫描逻辑失效了"
+        );
+        assert_eq!(
+            installed,
+            KV_BINDING_KEYS
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect::<BTreeSet<String>>(),
+            "KV_BINDING_KEYS 与 state_api.rs 实际注入的键不一致"
+        );
+
+        let module = module_kv_methods();
+        assert_eq!(
+            installed, module,
+            "`ctx.kv` 的方法与 `hbot` 模块转发的方法不一致：运行时 {installed:?}，模块 {module:?}"
+        );
+
+        let declared = dts_kv_methods();
+        assert_eq!(
+            installed, declared,
+            "`ctx.kv` 的方法与 hbot.d.ts 的 KvApi 不一致：运行时 {installed:?}，类型 {declared:?}"
+        );
+    }
+
+    #[test]
+    fn the_state_surface_says_presence_is_not_authorization() {
+        // 与设备面同一条规矩：`ctx.kv` 出现在类型里只说明**声明了**能力，
+        // 不代表宿主装了后端、也不代表这份数据属于你。三种失败面都得写进 d.ts。
+        assert!(
+            HOST_DTS.contains("readonly kv: KvApi;"),
+            "MessageCtx 应声明 readonly kv"
+        );
+        assert!(
+            HOST_DTS.contains("export const kv: KvApi;"),
+            "hbot 模块应声明 kv"
+        );
+        for hint in [
+            "capabilities.state.kv",
+            "HBOT_STATE_NOT_DECLARED",
+            "HBOT_STATE_UNAVAILABLE",
+        ] {
+            assert!(
+                HOST_DTS.contains(hint),
+                "hbot.d.ts 没有说明状态能力的失败面，缺少 `{hint}`"
+            );
+        }
+        // 缺省条数与上限是契约值，写错一个数字就与 `history_limit` 脱钩。
+        assert!(
+            HOST_DTS.contains("默认 20，上限 50"),
+            "hbot.d.ts 应写明 history 的默认值 20 与上限 50"
+        );
+    }
+
+    #[test]
     fn ctx_carries_exactly_the_documented_inbound_fields() {
         // §6.3 的字段清单是声明侧的唯一真源；生产/回放真正输出的键由
         // `crates/hbot-rpc/tests/event_shape_dts.rs` 拿这份 d.ts 与
@@ -735,17 +904,26 @@ mod drift {
         // — it is the parts of HTTP that are still missing: POST, redirects, fetch
         // with an init bag. Keep this list precise; a broad entry would have to be
         // deleted instead of narrowed, and would take the whole check with it.
+        //
+        // `kv.` was removed for the same reason: `ctx.kv` shipped with C2, so
+        // "`kv.` must not appear" is now false by design. What is still missing is
+        // **cross-conversation** history and any streaming/watch API — those are
+        // the entries a broad "`history`" would have covered, so spell them out.
         for absent in [
             "onStart",
             "onStop",
             "onSchedule",
             "send(",
-            "kv.",
             "http.post",
             "http.fetch",
             "http.request",
             "fetch(",
             "schedule(",
+            // 跨会话历史（`history(conversationId)`）未实现：本次事件之外的历史读不到。
+            "history(conversationId",
+            // 状态能力没有 watch / subscribe；有的话得先解决"谁持有回调"的归属问题。
+            "watch(",
+            "subscribe(",
         ] {
             assert!(
                 !HOST_DTS.contains(absent),

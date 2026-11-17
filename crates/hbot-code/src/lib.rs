@@ -13,6 +13,11 @@
 //! * [`runtime`] — one QuickJS isolate (`rquickjs`, `!Send`) on its own thread,
 //!   with `log`/`reply`/`sleep`/`http.get` bridged through promises, plus memory
 //!   and wall-clock limits.
+//! * [`state`] — the bot's own state: the `ctx.kv.*` / `ctx.history(n)` assembly
+//!   slot and the `spawn_blocking` bridge onto `hbot_core::BotState`. The
+//!   contract, the limits and the parameter gate live in `hbot_core::bot_state`;
+//!   this module only holds the host side of the seam, and it never fabricates a
+//!   backend when the host has not assembled one.
 //! * [`permissions`] — the single authorization judgement for
 //!   `hbot.json`'s `permissions.http`; [`http`] holds the transport seam and the
 //!   `http.get` pipeline.
@@ -49,6 +54,7 @@ pub mod manifest;
 pub mod modules;
 pub mod permissions;
 pub mod runtime;
+pub mod state;
 
 pub use compile::{
     BuildMode, CompileStats, CompiledModule, CompiledProject, Compiler, DebugInfo, ENTRY_MODULE,
@@ -71,3 +77,7 @@ pub use manifest::{
 };
 pub use permissions::{PermissionError, authorize};
 pub use runtime::{EventOutcome, HostOutput, MemoryReport, Sandbox};
+pub use state::{
+    DEFAULT_TIMEOUT as STATE_DEFAULT_TIMEOUT, StateHandles,
+    UNAVAILABLE_CODE as STATE_UNAVAILABLE_CODE,
+};

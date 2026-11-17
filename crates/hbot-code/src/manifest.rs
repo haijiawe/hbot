@@ -72,6 +72,55 @@ pub struct Manifest {
     /// Sandbox budget. Absent means [`DEFAULT_HANDLER_MS`] / [`DEFAULT_HEAP_MB`].
     #[serde(default)]
     pub limits: ManifestLimits,
+    /// 能力声明（`docs/07-bot-runtime-blueprint.md` §3.2）。缺席 = 全关。
+    #[serde(default)]
+    pub capabilities: Capabilities,
+}
+
+/// 能力声明块。
+///
+/// **只列已经实现的能力。** 这份结构体带 `deny_unknown_fields`：把尚未实现的
+/// 块（`events` / `egress` / `ai`）写进 `hbot.json` 会让项目**加载失败**，报
+/// `unknown field`。这是故意的——一个"声明了但什么都不做"的字段会让人以为
+/// 能力已经打开，而它其实静默无效，等真去调 `ctx.timer` 才发现没有。宁可当场
+/// 拒绝，也不留一个看似生效的开关。
+///
+/// 与 `permissions` 的分工：`capabilities` 说"我要用哪一类能力"，
+/// `permissions` 说"用的时候允许碰哪些具体的对手"（hosts、应用名、设备子能力）。
+/// 两层都要过：声明了 `capabilities.state.kv` 不等于能读别人的数据，它只决定
+/// `ctx.kv` 这个符号会不会出现在 `hbot.d.ts` 里。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Capabilities {
+    /// 状态能力（C2）：`kv` / `history`。
+    #[serde(default)]
+    pub state: StateCapabilities,
+}
+
+/// 状态能力（`docs/07` §5）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateCapabilities {
+    /// `ctx.kv.*`：bot 级键值状态，走 SQLite，TTL 可选。
+    #[serde(default)]
+    pub kv: bool,
+    /// `ctx.history(n)`：读本会话最近 n 条（含自己发过的），只读。
+    #[serde(default)]
+    pub history: bool,
+}
+
+impl Capabilities {
+    /// `ctx.kv` 是否可用（声明层判据；宿主装配再判一道）。
+    #[must_use]
+    pub fn kv(&self) -> bool {
+        self.state.kv
+    }
+
+    /// `ctx.history` 是否可用（声明层判据；宿主装配再判一道）。
+    #[must_use]
+    pub fn history(&self) -> bool {
+        self.state.history
+    }
 }
 
 /// The platform identifier that needs a forward WebSocket address (`ws`).
@@ -514,6 +563,7 @@ fn manifest_skeleton(name: &str) -> Result<String, CodeError> {
         },
         permissions: Permissions::default(),
         limits: ManifestLimits::default(),
+        capabilities: Capabilities::default(),
     };
     let mut text =
         serde_json::to_string_pretty(&manifest).map_err(|error| CodeError::Scaffold {
