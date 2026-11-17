@@ -263,10 +263,12 @@ enum StoreOp {
     /// 合成 `inbound` / `outbound` 的会话历史，最近 `limit` 条、升序。
     ///
     /// **生产读路径不走这个变体**：历史只追加、不回读刚写的行，所以
-    /// [`Store::list_history`] 走只读连接池（见那边的注释）。这里保留 db 线程的孪生分支是
-    /// 为了"读写同序"这条路径随时可用（`crate::db::tests` 用它对拍两条路径的结果，
-    /// 防止只读池与写线程的读法漂移）。宁可留一个未构造的变体，也不让两条读路径各写一份
-    /// SQL —— SQL 只能出现在 `repositories/`（本 crate 的硬规则）。
+    /// [`Store::list_history`] 走只读连接池（见那边的注释）。这里保留 db 线程的孪生分支是因为
+    /// 两条路径必须给出同一答案，而 SQL 只能出现在 `repositories/`（本 crate 的硬规则）——
+    /// 所以孪生分支调的是同一个 `repositories::history::history`，
+    /// `crate::tests::history_reads_agree_on_both_paths` 对拍两条路径的结果。
+    /// 非测试构建里它不被构造，因此显式 `allow(dead_code)`：留着它是为了"读写同序"这条路
+    /// 随时可用，而不是忘了删。
     #[allow(dead_code)]
     ListHistory {
         bot_id: BotId,
@@ -945,6 +947,28 @@ impl Store {
         let conversation_id = *conversation_id;
         self.read(|connection| {
             repositories::history::history(connection, &bot_id, &conversation_id, limit)
+        })
+    }
+
+    /// [`Store::list_history`] 的 db 线程孪生路径（仅测试）。
+    ///
+    /// 存在的唯一目的是让 `crate::tests::history_reads_agree_on_both_paths` 对拍两条路径：
+    /// 生产读走只读池，但如果将来有人把 `list_history` 改成走 db 线程（"读写同序"那条路），
+    /// 结果必须一模一样。如果这里和只读池的结果出现差异，说明两条路径中间有人写了第二份 SQL。
+    #[cfg(test)]
+    pub(crate) fn list_history_via_writer(
+        &self,
+        bot_id: &BotId,
+        conversation_id: &ConversationId,
+        limit: u32,
+    ) -> Result<Vec<HistoryRow>> {
+        let bot_id = *bot_id;
+        let conversation_id = *conversation_id;
+        self.submit(|reply| StoreOp::ListHistory {
+            bot_id,
+            conversation_id,
+            limit,
+            reply,
         })
     }
 

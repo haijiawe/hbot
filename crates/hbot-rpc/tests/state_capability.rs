@@ -11,14 +11,15 @@
 //! 漏掉那句接线时，`ctx.kv` 会一路报 `HBOT_STATE_UNAVAILABLE`，而上面每一层的单元
 //! 测试都还是绿的 —— 所以这里必须走 `Dispatcher` 真派发，不能直接构造 handler。
 //!
-//! 四类断言：
+//! 五类断言：
 //!
 //! 1. **没声明就没得用**：`hbot.json` 不写 `capabilities.state` → `ctx.kv.get` 抛
 //!    `HBOT_STATE_NOT_DECLARED`；
 //! 2. **声明了真能用**：写上 `capabilities.state.kv` → 同一个 handler 写出后读回；
 //! 3. **状态跨 isolate 存活**：`bot_stop` → `bot_start`（换一个全新 isolate）后
 //!    上一次写进去的值还在（证明状态在 SQLite 里，不在 JS 堆上）；
-//! 4. **两个 bot 互不可见**：同一份 `Store`、同一个键名，第二个 bot 读到的是 `null`。
+//! 4. **状态跨宿主进程存活**：整个 `AppState` 重开、`Store` 换新，值仍在；
+//! 5. **两个 bot 互不可见**：同一份 `Store`、同一个键名，第二个 bot 读到的是 `null`。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -148,6 +149,10 @@ fn bot_id(value: &str) -> BotId {
 
 struct Harness {
     _dir: TempDir,
+    /// 数据库所在目录：`reopen` 要拿它重新 `AppState::open`（同一个库，新进程）。
+    data_dir: PathBuf,
+    project: PathBuf,
+    bots: Vec<BotId>,
     state: Arc<AppState>,
     dispatcher: Dispatcher,
     bot: BotId,
@@ -162,21 +167,42 @@ impl Harness {
         std::fs::write(project.join("hbot.json"), manifest_json).expect("写 hbot.json");
         std::fs::write(project.join("bots.json"), bots_json(bot_ids)).expect("写 bots.json");
 
-        let state = AppState::open(
-            dir.path().join("data"),
-            Arc::new(SystemClock),
-            Arc::new(UuidIds),
-        )
-        .expect("打开 AppState");
+        let data_dir = dir.path().join("data");
+        let state = AppState::open(data_dir.clone(), Arc::new(SystemClock), Arc::new(UuidIds))
+            .expect("打开 AppState");
         state.open_project(&project).await.expect("打开项目");
         let state = Arc::new(state);
         let dispatcher = Dispatcher::new().with_state(Arc::clone(&state));
         Self {
             _dir: dir,
+            data_dir,
+            project,
+            bots: bot_ids.iter().map(|id| bot_id(id)).collect(),
             state,
             dispatcher,
             bot: bot_id(bot_ids[0]),
         }
+    }
+
+    /// 模拟宿主进程重启：把这一份 `AppState`（连同它的 `Store`、所有 isolate）整个丢掉，
+    /// 在**同一个** `data_dir` 上重新 `AppState::open`，再用新的 `Dispatcher` 接管。
+    ///
+    /// 和 `bot_stop` → `bot_start` 的区别：那条只换 isolate，`Store` 与连接池还是同一份；
+    /// 这条连进程内缓存都换了，剩下的只有磁盘上的 `hbot.db`。
+    async fn reopen(&mut self) {
+        for bot in self.bots.clone() {
+            let _ = self.stop(bot).await;
+        }
+        let fresh = AppState::open(
+            self.data_dir.clone(),
+            Arc::new(SystemClock),
+            Arc::new(UuidIds),
+        )
+        .expect("重开 AppState");
+        fresh.open_project(&self.project).await.expect("重开项目");
+        let fresh = Arc::new(fresh);
+        self.dispatcher = Dispatcher::new().with_state(Arc::clone(&fresh));
+        self.state = fresh;
     }
 
     fn store(&self) -> &Arc<hbot_store::Store> {
@@ -386,6 +412,41 @@ async fn kv_survives_a_bot_restart() {
     assert_eq!(
         second, r#"kv:{"round":2}"#,
         "重启后应读到上一次写的值并 +1，实际：{second}"
+    );
+
+    assert_ok(&harness.stop(harness.bot).await, "bot_stop");
+}
+
+/// 宿主进程重启后值仍在：换掉整个 `AppState`（连 `Store` 一起），同一个 `data_dir` 重开。
+///
+/// 比上一条更硬：`bot_stop`/`bot_start` 只是换 isolate，`Store` 还是同一份对象；这里连
+/// 进程内的 sqlite 句柄都换了，能读回来只可能是真的落盘了。
+#[tokio::test]
+async fn kv_survives_a_host_restart() {
+    let mut harness = Harness::new(
+        "hostrestart",
+        &kv_handler(),
+        &manifest(true, false),
+        &[BOT_UUID],
+    )
+    .await;
+
+    let first = run_once(&harness, harness.bot, "重启前").await;
+    assert_eq!(first, r#"kv:{"round":1}"#);
+
+    harness.reopen().await;
+
+    // 换了一份 `Store`，直接读库确认值在磁盘上（不依赖 handler 是否跑得起来）。
+    assert_eq!(
+        harness.stored_probe(harness.bot).as_deref(),
+        Some(r#"{"round":1}"#),
+        "重开 AppState 后库里应该还有这一行"
+    );
+
+    let second = run_once(&harness, harness.bot, "重启后").await;
+    assert_eq!(
+        second, r#"kv:{"round":2}"#,
+        "宿主重启后应读到上一次写的值并 +1，实际：{second}"
     );
 
     assert_ok(&harness.stop(harness.bot).await, "bot_stop");

@@ -1326,6 +1326,46 @@ fn outbound_state_constants_are_distinct() {
     assert_ne!(OUTBOUND_STATE_FAILED, crate::OUTBOUND_STATE_PENDING);
 }
 
+/// 历史的两条读路径（只读池 / db 线程）必须给出**逐行相同**的结果。
+///
+/// `Store::list_history` 生产上走只读连接池（历史只追加、不回读刚写的行），但它有一个
+/// db 线程孪生分支（`StoreOp::ListHistory`）保持"读写同序"这条路随时可用。两条路径若各写
+/// 一份 SQL 就会漂移——所以孪生分支调的是同一个 `repositories::history::history`。
+/// 这条测试就是那句注释的证据：同一份数据、同一个 `limit`，两边结果必须完全相等
+/// （`HistoryRow` 是 `PartialEq`，比的是每个字段）。
+#[test]
+fn history_reads_agree_on_both_paths() {
+    let dir = TempDir::new("history-two-paths");
+    let store = open_store(&dir);
+
+    // 交错写三种时间 + 一条同毫秒，把 ORDER BY 的两个键都压到。
+    store
+        .insert_inbound_if_new(new_inbound_at(71, "ext-71", 1_000))
+        .expect("inbound 71");
+    store
+        .enqueue_outbound(new_outbound_at(72, "reply-72", 1_000))
+        .expect("outbound 72");
+    store
+        .enqueue_outbound(new_outbound_at(73, "reply-73", 900))
+        .expect("outbound 73");
+    store
+        .insert_inbound_if_new(new_inbound_at(74, "ext-74", 1_200))
+        .expect("inbound 74");
+
+    for limit in [0_u32, 1, 3, 10, 1_000] {
+        let via_pool = store
+            .list_history(&bot_id(), &conversation_id(), limit)
+            .expect("history via read pool");
+        let via_writer = store
+            .list_history_via_writer(&bot_id(), &conversation_id(), limit)
+            .expect("history via writer thread");
+        assert_eq!(
+            via_pool, via_writer,
+            "limit={limit}：两条读路径结果必须一致（否则说明有人在第二处写了 SQL）"
+        );
+    }
+}
+
 /// 0004 老库升级到 0005：`bot_kv` 建出来、旧数据一条不少、水位推到 5。
 ///
 /// 与 `upgrading_from_0001_…` / `upgrading_from_0002_…` 同一手法：手写一个只到 0004 的库
