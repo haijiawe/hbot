@@ -395,7 +395,8 @@ release build: 源码 → SWC 去类型 → 执行（无插桩）
 
 - `__hbot_trace` 是宿主 API，默认 O(1) 返回；命中 UI 下发的断点时才阻塞 worker 并发 `debug.paused`。
 - **运行时恒用 debug 构建，但只在有断点时 arm**（2026-11-16 落地）：`sandbox_handler` 调 `compile_project_debug`，而"arm"由 `__hbot_dbg` 这个全局标志决定 —— 该 bot 没有断点时走普通 `dispatch`，探针快路径退化成每条语句一次全局读（实测 10 文件 24µs vs release 27µs，噪声内）；有断点时才传 sink 并 arm（probe-dense handler 最坏 **4.64×**，上限 5×）。两种构建的**编译产物大小**差别很大（10 文件 1,480 B → 20,596 B），这是"用不用都先付一点"的代价，换掉"断点在 release 构建上静默永不命中"这个更坏的失败模式。
-- 断点支持**行断点**（条件断点未做：冻结的 `Breakpoints` 没有条件字段，要加得走 ADR）。
+- 断点支持**行断点与条件断点**（条件于 2026-11-17 落地）。条件是一段 **JS 表达式**，在 isolate 的 JS 侧求值 —— 只有那里同时有 `ctx`、局部变量与模块作用域。三条硬约束：① 编译失败、抛错、引用不存在的名字一律当作**没命中**，同一个 `file:line` 只 warn 一次，绝不打断 handler；② 求值只发生在探针判为候选命中之后，**无条件路径的探针形状没变**（4.64× 预算未动）；③ 不支持 `await`（`new Function` 里顶层 await 是语法错误）。
+  - 由此带来的两个可观察行为（都实测过，别当 bug）：条件里**能调用宿主函数**（`ctx.reply()` 会真发消息）；条件里**给名字赋值不生效**（scope 是快照），但改对象属性会真生效。
 - 步进**不靠 enter/exit 插桩**，而是在暂停那一刻读一次 `new Error().stack` 得到逻辑深度：`stepOver` = 下一条 `depth <= d`、`stepInto` = 下一条任意深度、`stepOut` = 下一条 `depth < d`。代价是"从一个长循环体里 StepOut"最坏可逼近 `handler_timeout`；好处是不用每个函数出口都插桩。
 - 暂停**不抵消** handler 超时：`handler_timeout` 照旧生效，用户挂太久也会 `HBOT_TIMEOUT`。
 - `Continue` 后同一 `(file, line)` 的后续语句会被抑制直到换行 —— 满足"不重复停在同一行"，代价是"整行写成的循环"一个事件只停一次。
@@ -413,13 +414,16 @@ release build: 源码 → SWC 去类型 → 执行（无插桩）
 
 ```rust
 // crates/hbot-core/src/debug.rs —— 冻结，改动必须走 ADR
-pub struct Breakpoints { /* files: BTreeMap<String, BTreeSet<u32>> */ }
+// 2026-11-17 起断点带可选的 JS 条件（ADR 记录在 02 §6.5 与 06 §6）
+pub struct Breakpoints { /* files: BTreeMap<String, BTreeMap<u32, Option<String>>> */ }
 impl Breakpoints {
     pub fn new() -> Self;
-    pub fn set(&mut self, file: &str, lines: BTreeSet<u32>); // 空集 = 移除该文件；行号 0 忽略
+    /// 空 map = 移除该文件；行号 0 忽略；`None` 表示无条件
+    pub fn set(&mut self, file: &str, lines: BTreeMap<u32, Option<String>>);
     pub fn clear(&mut self);
     pub fn is_empty(&self) -> bool;
-    pub fn lines_of(&self, file: &str) -> Option<&BTreeSet<u32>>;
+    pub fn lines_of(&self, file: &str) -> Option<&BTreeMap<u32, Option<String>>>;
+    pub fn condition_of(&self, file: &str, line: u32) -> Option<&str>;
     pub fn files(&self) -> impl Iterator<Item = &str>;
     pub fn hits(&self, file: &str, line: u32) -> bool;
 }
@@ -429,6 +433,8 @@ pub struct DebugFrame { pub name: String, pub file: String, pub line: u32, pub c
 pub struct PausedAt {
     pub file: String, pub line: u32, pub column: u32,
     pub scopes: Vec<DebugScope>, pub call_stack: Vec<DebugFrame>,
+    /// 非 `None` = 这次是条件算出为真才停（UI 用它解释"为什么停在这"）
+    pub condition: Option<String>,
 }
 pub enum DebugAction { Continue, StepOver, StepInto, StepOut }
 
@@ -441,7 +447,7 @@ pub trait DebugSink: Send + Sync { fn paused(&self, at: PausedAt) -> DebugAction
 | 侧 | 入口 | 约束 |
 |---|---|---|
 | `hbot-code` | `Sandbox::set_breakpoints(&self, Breakpoints)`、`Sandbox::dispatch_with_debug(&self, &Value, Option<&dyn DebugSink>)` | `DebugSink` 只能在 worker 线程里调用，绝不能在 reactor 线程阻塞 |
-| `hbot-rpc` | `Command::DebugSetBreakpoints{botId,file,lines}` / `DebugResume{botId}` / `DebugStep{botId,kind}` → `Event::DebugPaused{botId,file,line,scopes,callStack}` / `DebugResumed{botId}` | 调试单位是 **bot** 而不是 agent 会话：断点属于某个 bot 的 isolate |
+| `hbot-rpc` | `Command::DebugSetBreakpoints{botId,file,breakpoints:[{line,condition}]}` / `DebugResume{botId}` / `DebugStep{botId,kind}` → `Event::DebugPaused{botId,file,line,scopes,callStack,condition}` / `DebugResumed{botId}` | 调试单位是 **bot** 而不是 agent 会话：断点属于某个 bot 的 isolate。`breakpoints: []` 取消该文件全部断点（整份替换语义），条件按**字符**计上限 200（超了 -32002，且校验在 bot 状态检查之前） |
 
 为什么单位是 bot：同一份源码在两个 bot 的 isolate 里可以是不同版本（热重载时机不同），断点按会话走会串味。
 
@@ -562,10 +568,11 @@ pub enum Command {
     BotStop { bot_id: BotId },
     BotInject { bot_id: BotId, conversation_id: ConversationId, text: String },
     BotList,
-    DebugSetBreakpoints { file: String, lines: Vec<u32> },
-    DebugResume { session_id: SessionId },
-    DebugStep { session_id: SessionId, kind: StepKind },
+    DebugSetBreakpoints { bot_id: BotId, file: String, breakpoints: Vec<DebugBreakpoint> },
+    DebugResume { bot_id: BotId },
+    DebugStep { bot_id: BotId, kind: StepKind },
     LogsTail { bot_id: Option<BotId>, limit: usize }, // None = 全项目（含 Agent 行）
+    ReplayRun { bot_id: BotId, from: Option<i64>, limit: Option<u32> },
     // ...
 }
 ```
@@ -583,6 +590,7 @@ pub enum Command {
 | `search_start` | `null` | 结果走 `file.search` 事件；取消后不发假结果 |
 | `project_open` | `ProjectOpenResult{path}` | 返回核心规范化后的绝对路径；**只返回路径不返回 `name`/`entry`**，因为打开一个目录不要求它已经有 `hbot.json`（`project_create` 才会 scaffold） |
 | `project_create` | `ProjectSummary{path,name,entry}` | 新建成功后的项目摘要；`-32003` 表示目录非空或同路径已登记 |
+| `replay_run` | `ReplayReport{project,bot,from,limit,events,matchedEvents,differingEvents,failedEvents,same,extra,missing,reordered,entries[]}` | **只读、不联网**：用 `store.list_inbound_history_for_bot` 取历史事件，`dispatch_collecting` 收集回复，不写库也不调平台。`limit:0` 是 -32002；bot 或历史不存在是 -32001；编译/isolate 失败是 -32006。wire 里**没有** `database` 字段（IDE 不需要知道读的是哪份库） |
 
 - 桌面：Tauri `#[tauri::command] dispatch(cmd) -> Response`。
 - 后台/浏览器：JSON-RPC 2.0，唯一 method `dispatch`，`params = { command }`。

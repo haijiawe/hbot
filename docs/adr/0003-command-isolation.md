@@ -103,7 +103,7 @@ Linux 上 `reason` 会区分两种情形（`probe.rs::linux_write_confinement_re
 | 平台 | `Containment` | `WriteConfinement` | 拒绝时的返回 |
 |---|---|---|---|
 | Windows | **有**：Job Object，`KILL_ON_JOB_CLOSE` + `ACTIVE_PROCESS=64` + 单进程 2 GiB / 作业 4 GiB；超时用 `TerminateJobObject` | **无**（受限令牌未接） | `IsolationUnavailable{platform: Windows, reason: "Windows 的受限令牌 + write SID + 低完整性标签尚未接入（本原型只做了作业对象）"}` |
-| Linux | **有**：`pre_exec` 里 `setsid()`（失败退 `setpgid(0,0)`），超时 `kill(-pid, SIGKILL)` | **无**（Landlock 未接） | `IsolationUnavailable{reason: "内核未启用 landlock…" 或 "内核已启用 landlock，但本 crate 尚未接入写限制层"}` |
+| Linux | **有**：`pre_exec` 里 `setsid()`（失败退 `setpgid(0,0)`），超时 `kill(-pid, SIGKILL)` | **有**（Landlock，2026-11-17 接入） | `IsolationUnavailable{reason: "内核未启用 landlock…" 或 "landlock 装载失败: …"}` |
 | macOS | **无** | **无** | `IsolationUnavailable{reason: "macOS 上 sandbox-exec 已弃用，本 crate 不提供命令隔离实现"}` |
 | 其它 | 无 | 无 | `IsolationUnavailable{reason: "平台 Other 未提供命令隔离实现"}` |
 
@@ -111,6 +111,32 @@ Windows 侧用**手写 FFI**（`#[link(name = "kernel32")]`）而不是 `windows
 本次硬约束是"不许新增第三方依赖"，而用到的只有 5 个函数 + 1 个 `#[repr(C)]` 结构体
 （`JOBOBJECT_EXTENDED_LIMIT_INFORMATION`，x64 为 144 字节，已用单测钉死尺寸）。
 Linux 侧同理只声明 `setsid`/`setpgid`/`kill` 三个符号，不引入 `libc`。
+
+#### 2.5.1 Linux 写限制层（Landlock，2026-11-17）
+
+`crates/hbot-command/src/landlock.rs`（纯逻辑、跨平台可编译）+ `cache.rs`（私有可写缓存根）。
+**没有新增依赖**：三个系统调用用 `asm!` 之外最朴素的办法 —— `extern "C" { fn syscall(...) }`，
+`SYS_LANDLOCK_CREATE_RULESET = 444` / `ADD_RULE = 445` / `RESTRICT_SELF = 446`（x86_64 与 aarch64 同号）。
+
+| 点 | 做法 | 为什么 |
+|---|---|---|
+| ABI 探测 | 先 `create_ruleset(NULL, 0, VERSION)` 读版本；`handled_access_fs` 只申请本版本认识的位 | 申请不认识的位会 `EINVAL`，**整个限制层失效**；v4 的网络位不用，v5 的 `IOCTL_DEV` 刻意不 handle（理由见下） |
+| 权限位 | v1 十个写位；v2 加 `REFER`；v3 加 `TRUNCATE` | 缺 `REFER` 时 `rename`/`link` 跨目录会被拒（误伤正常 npm 安装）；缺 `TRUNCATE` 时截断文件能绕过 |
+| 规则 | `workspace_write` 放行工作区整棵子树 + `<tmpdir>/hbot-command-write-cache`；`read_only` 只放行私有 temp；`danger` 不套 | 两个可写根与 `npm_config_cache`/`COREPACK_HOME`/`PNPM_HOME`/`YARN_CACHE_FOLDER`/`XDG_CACHE_HOME` 由**同一个函数**导出，不可能漂移 |
+| 装载点 | `pre_exec`（`setsid()` 之后、`execve` 之前） | Landlock 无降级接口，必须在 exec 前一次性定死；在子进程里装才不影响宿主自己 |
+| 失败处理 | 往 stderr 写 `hbot-landlock: <errno>`，然后 `_exit(127)`；父进程**同时**看到 127 与标记才改判 `IsolationUnavailable` | fail-closed：装不上就不许跑；只判 exit code 会把"命令自己退 127"误判成隔离失败 |
+
+**踩过的坑（改这段前先读）**：`handled_access_fs = 0` 的意思是"什么都不管"，不是"什么都不许"。
+第一版把**放行掩码**当成了 handle 掩码，于是 `read_only` 变成了零规则集（等于不限制）。
+现在拆成两个函数：`write_permissions()`（要放行的位）与 `handled_write_bits()`（要接管的位），
+后者恒为全集、前者按档位收窄。
+
+**这层挡不住的**（ADR §5 已展开）：网络、设备 `ioctl`（v5 的 `IOCTL_DEV` 未 handle）、`/proc` 读取、
+`io_uring`、CPU/IO 限额。它只管"写到文件系统的哪里"。
+
+**证据的边界（必须说清）**：这台机器没有 Linux 内核（无 WSL distro），所以
+`cargo check --target x86_64-unknown-linux-gnu -p hbot-command` 通过、20 条纯逻辑单测通过，
+但**一次都没有真跑过**。真实内核上的行为仍未验证。
 
 ---
 

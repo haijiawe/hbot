@@ -206,6 +206,23 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 
 48. **网络授权判据只有一份：`hbot.json` 的 `permissions.http`**（策略 C，2026-11-16 定，见 `docs/02-architecture.md` §6.6）。判据在 `crates/hbot-code/src/permissions.rs`；适配层（`hbot-adapters`）**不再按地址位置**（回环/私网/云元数据）二次拒绝——`FetchOptions::allow_private` 默认 `false` 保留严格口径，而 `hbot-rpc` 的 `AdaptersHttpTransport::new()` 恒置 `true`，因为上游已经判过。别在适配层"顺手加一条 SSRF 检查"：那会立刻造成"清单写了 `127.0.0.1:11434` 却连不上"的两道判据打架，而且**最终解释权在第一道**，第二道只是让人困惑。要收紧就收紧清单。已验证的边界：`read-only` 档仍在授权之前拒（不建 socket）、`http://2130706433/` 这类歧义数字主机仍拒（解析歧义，非位置）。
 
+49. **Landlock 的 `handled_access_fs = 0` 意思是"什么都不管"，不是"什么都不许"**（2026-11-17）。
+   `crates/hbot-command/src/landlock.rs` 第一版把**放行掩码**当成了 handle 掩码，于是 `read_only`
+   档变成零规则集 —— 限制层装上了却等于没装，而所有测试都是绿的（因为没人从 Linux 内核那侧验）。
+   现在拆成两个函数：`write_permissions()`（要放行的位）与 `handled_write_bits()`（要接管的位，
+   恒为全集、按 ABI 版本收窄）。另一个同族坑：`pre_exec` 里装载失败要 `_exit(127)` **并**往 stderr
+   写标记，父进程必须**同时**看到 127 与标记才改判 `IsolationUnavailable` —— 只判 exit code 会把
+   "命令自己退 127"误判成隔离失败。**这台机器没有 Linux 内核（无 WSL distro），本层一次都没真跑过**，
+   所以它现在的证据只到"交叉编译 + 纯逻辑单测"，别在 README 或 ADR 里写成"已验证"。
+
+50. **条件断点在 JS 侧求值，因此它不是沙箱**（2026-11-17）。条件是一段真的 JS 表达式，在 isolate
+   里用 `new Function` + `with(scope)` 求值 —— 那里才有 `ctx`、局部变量与模块作用域。后果：
+   ① 条件里**能调宿主函数**（`ctx.reply()` 会真发消息、`ctx.device.ocr()` 会真截屏）；
+   ② 给名字赋值不生效（scope 是快照），但改对象属性会真生效。规则：条件永远只在
+   "探针判为候选命中且非单步" 时求值（否则又会撞 4.64× 的开销上限），坏条件/抛错/引用不存在的
+   名字**一律当没命中**、同一 `file:line` 只 warn 一次、绝不打断 handler。UI 要如实提示上面两条，
+   不要写"受限求值器"这种让人以为安全的描述。
+
 ---
 
 ## 8. 新增 X 的步骤
