@@ -27,6 +27,7 @@
 
 pub mod bot_ai;
 pub mod bot_jobs;
+pub mod bot_session;
 pub mod bot_state;
 pub mod bot_timer;
 pub mod command;
@@ -50,6 +51,13 @@ pub use bot_jobs::{
     MAX_JOB_RETRIES, MAX_JOB_TYPES, MAX_JOBS_PER_BOT, MAX_RETRY_DELAY_MS, MIN_JOB_BUDGET_MS,
     MIN_RETRY_DELAY_MS, retry_delay_ms, validate_idempotency_key, validate_job_name,
     validate_payload, validate_request, validate_specs,
+};
+pub use bot_session::{
+    DEFAULT_WAIT_TIMEOUT_MS, DueWait, MAX_WAIT_KEY_BYTES, MAX_WAIT_PROMPT_BYTES,
+    MAX_WAIT_TIMEOUT_MS, MAX_WAITS_PER_BOT, MAX_WAITS_PER_CONVERSATION, MIN_WAIT_TIMEOUT_MS,
+    SessionError, WaitHit, WaitScope, WaitSpec, WaitState, WaitStore,
+    validate_key as validate_wait_key, validate_prompt as validate_wait_prompt,
+    validate_spec as validate_wait_spec, validate_timeout as validate_wait_timeout,
 };
 pub use bot_state::{
     BotState, BotStateError, HistoryDirection, HistoryEntry, HistoryReader, KvEntry,
@@ -79,7 +87,7 @@ pub use domain::{
 pub use errors::HbotError;
 pub use ids::{
     ApprovalId, BotId, ConversationId, EditId, InboundId, JobId, MessageId, OutboundId, ProjectId,
-    SearchId, SessionId,
+    SearchId, SessionId, WaitId,
 };
 pub use paths::{APP_DIR, data_dir, data_dir_for};
 pub use ports::{Clock, CommandRunner, EventSink, IdGenerator, SystemClock};
