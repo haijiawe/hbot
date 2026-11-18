@@ -36,12 +36,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 
 use crate::error::{Result, StoreError};
-use crate::ids::{BotId, ConversationId, InboundId, OutboundId};
+use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId};
 use crate::migrations;
 use crate::models::{
     BOT_STATUSES, Bot, BotStatusRow, Conversation, DeviceAuditRow, DeviceSessionRow, HistoryRow,
-    InboundReplayRow, InboundRow, LogRow, NewAgentLog, NewDeviceAudit, NewDeviceSession,
-    NewInbound, NewKvEntry, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project,
+    InboundReplayRow, InboundRow, JobRow, LogRow, NewAgentLog, NewDeviceAudit, NewDeviceSession,
+    NewInbound, NewJob, NewKvEntry, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project,
     is_valid_bot_status,
 };
 use crate::repositories;
@@ -275,6 +275,67 @@ enum StoreOp {
         conversation_id: ConversationId,
         limit: u32,
         reply: Reply<Vec<HistoryRow>>,
+    },
+    /// 入队一条后台作业。命中 `(bot_id, idempotency_key)` 时返回 `None` —— 这不是错误。
+    EnqueueJob {
+        bot_id: BotId,
+        job: NewJob,
+        reply: Reply<Option<JobId>>,
+    },
+    /// 取到期作业、就地改成 `running` 并把 `attempts` 加一，返回改完的行（见
+    /// `repositories::jobs` 的模块文档：这是唯一关得掉"先查后改"窗口的形状）。
+    ClaimDueJobs {
+        now: i64,
+        limit: u32,
+        reply: Reply<Vec<JobRow>>,
+    },
+    /// 按主键读一条作业（排障 / 面板）。
+    GetJob {
+        id: JobId,
+        reply: Reply<Option<JobRow>>,
+    },
+    /// 标成功：落 `done` 终态并清掉 `last_error`。
+    MarkJobDone {
+        id: JobId,
+        now: i64,
+        reply: Reply<bool>,
+    },
+    /// 排下一次重试：回 `pending`、改 `next_at`、记 `last_error`（`attempts` 不动）。
+    RescheduleJob {
+        id: JobId,
+        next_at: i64,
+        error: String,
+        now: i64,
+        reply: Reply<bool>,
+    },
+    /// 落 `failed` 终态并写错误正文（行保留，不作删除）。
+    MarkJobFailed {
+        id: JobId,
+        error: String,
+        now: i64,
+        reply: Reply<bool>,
+    },
+    /// `bot_stop`：把这个 bot 的未完成作业全改成 `cancelled`，返回取消了几条。
+    CancelJobsForBot {
+        bot_id: BotId,
+        now: i64,
+        reply: Reply<u32>,
+    },
+    /// 进程启动时把残留的 `running` 退回 `pending`，返回恢复了几条。
+    ResumeInterruptedJobs {
+        now: i64,
+        reply: Reply<u32>,
+    },
+    /// 数一个 bot 的未完成作业（作业池上限的判据）。
+    CountActiveJobsForBot {
+        bot_id: BotId,
+        reply: Reply<u32>,
+    },
+    /// 列一个 bot 的作业行（按入队时刻升序）。
+    ListJobsForBot {
+        bot_id: BotId,
+        limit: u32,
+        reply: Reply<Vec<JobRow>>,
     },
 }
 
@@ -926,6 +987,103 @@ impl Store {
         })
     }
 
+    /// 入队一条后台作业；命中 `(bot_id, idempotency_key)` 时返回 `Ok(None)`。
+    ///
+    /// 返回 `None` **不是错误**：它表示"这个幂等键已经排过队了"。至少一次语义靠这条
+    /// 唯一约束落地，调用方据此记一条 debug 即可，不该把它当成失败。
+    ///
+    /// 走 db 线程而不是只读池：入队必须与"紧接着的 `claim_due_jobs`"同序，否则 tick
+    /// 会在下一次轮到它之前看不到刚排进来的作业（表现为"入队了但一分钟没动").
+    pub fn enqueue_job(&self, bot_id: &BotId, job: &NewJob) -> Result<Option<JobId>> {
+        let bot_id = *bot_id;
+        let job = job.clone();
+        self.submit(|reply| StoreOp::EnqueueJob { bot_id, job, reply })
+    }
+
+    /// 取到期作业（`state = 'pending' AND next_at <= now`），就地改成 `running` 并把
+    /// `attempts` 加一，返回改完的行；一次最多 `limit` 条。
+    ///
+    /// 一次 SQL 完成"挑 + 改"（理由见 `repositories::jobs` 模块文档）。`limit == 0`
+    /// 返回空表。
+    pub fn claim_due_jobs(&self, now: i64, limit: u32) -> Result<Vec<JobRow>> {
+        self.submit(|reply| StoreOp::ClaimDueJobs { now, limit, reply })
+    }
+
+    /// 按主键读一条作业；不存在返回 `Ok(None)`。
+    pub fn get_job(&self, id: &JobId) -> Result<Option<JobRow>> {
+        let id = *id;
+        self.submit(|reply| StoreOp::GetJob { id, reply })
+    }
+
+    /// 标成功：落 `done` 终态并清掉 `last_error`；返回是否命中一行。
+    pub fn mark_job_done(&self, id: &JobId, now: i64) -> Result<bool> {
+        let id = *id;
+        self.submit(|reply| StoreOp::MarkJobDone { id, now, reply })
+    }
+
+    /// 排下一次重试：回 `pending`、把 `next_at` 换成调用方算好的时刻、记下本次错误。
+    ///
+    /// `attempts` 不动：它在 `claim_due_jobs` 里已经加过了（"这一次跑过了"）。
+    /// 退避节奏不在这里算 —— 它是 `hbot_core::bot_jobs::retry_delay_ms` 的事。
+    pub fn reschedule_job(&self, id: &JobId, next_at: i64, error: &str, now: i64) -> Result<bool> {
+        let id = *id;
+        let error = error.to_owned();
+        self.submit(|reply| StoreOp::RescheduleJob {
+            id,
+            next_at,
+            error,
+            now,
+            reply,
+        })
+    }
+
+    /// 落 `failed` 终态并写错误正文；返回是否命中一行。
+    ///
+    /// 行保留不删：面板要看得到"哪条作业放弃了、为什么"，排障也需要原始载荷。
+    pub fn mark_job_failed(&self, id: &JobId, error: &str, now: i64) -> Result<bool> {
+        let id = *id;
+        let error = error.to_owned();
+        self.submit(|reply| StoreOp::MarkJobFailed {
+            id,
+            error,
+            now,
+            reply,
+        })
+    }
+
+    /// `bot_stop`：把这个 bot 的未完成作业（`pending` / `running`）全改成 `cancelled`，
+    /// 返回取消了几条。终态不动 —— 已经成功的不该被改写成"取消"。
+    pub fn cancel_jobs_for_bot(&self, bot_id: &BotId, now: i64) -> Result<u32> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::CancelJobsForBot { bot_id, now, reply })
+    }
+
+    /// 进程启动时调用：把库里残留的 `running` 行退回 `pending`（`next_at = now`），
+    /// 返回恢复了几条。
+    ///
+    /// 这是"至少一次"里 `running` 那一半：崩在一次执行中间时，没有任何东西能证明那次
+    /// 跑完了，所以退回待跑、由作业体自己的幂等兜住重复执行。跨 bot 生效（进程刚起，
+    /// 谁都没在跑）。
+    pub fn resume_interrupted_jobs(&self, now: i64) -> Result<u32> {
+        self.submit(|reply| StoreOp::ResumeInterruptedJobs { now, reply })
+    }
+
+    /// 数一个 bot 还有多少条未完成作业（`pending` / `running`）—— 作业池上限的判据。
+    pub fn count_active_jobs_for_bot(&self, bot_id: &BotId) -> Result<u32> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::CountActiveJobsForBot { bot_id, reply })
+    }
+
+    /// 列一个 bot 的作业行，按入队时刻升序，最多 `limit` 条（面板与排障用）。
+    pub fn list_jobs_for_bot(&self, bot_id: &BotId, limit: u32) -> Result<Vec<JobRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ListJobsForBot {
+            bot_id,
+            limit,
+            reply,
+        })
+    }
+
     /// 会话历史：把 `inbound` 与 `outbound` 合成一张表，返回最近的 `limit` 条，
     /// **时间升序、最老的在前**（聊天记录的自然阅读顺序）。`limit == 0` 返回空表。
     ///
@@ -1328,6 +1486,75 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::kv::set_many(&connection, &bot_id, &entries, now),
+                );
+            }
+            StoreOp::EnqueueJob { bot_id, job, reply } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::enqueue(&connection, &bot_id, &job),
+                );
+            }
+            StoreOp::ClaimDueJobs { now, limit, reply } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::claim_due(&connection, now, limit),
+                );
+            }
+            StoreOp::GetJob { id, reply } => {
+                reply_send(reply, repositories::jobs::get(&connection, &id));
+            }
+            StoreOp::MarkJobDone { id, now, reply } => {
+                reply_send(reply, repositories::jobs::mark_done(&connection, &id, now));
+            }
+            StoreOp::RescheduleJob {
+                id,
+                next_at,
+                error,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::reschedule(&connection, &id, next_at, &error, now),
+                );
+            }
+            StoreOp::MarkJobFailed {
+                id,
+                error,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::mark_failed(&connection, &id, &error, now),
+                );
+            }
+            StoreOp::CancelJobsForBot { bot_id, now, reply } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::cancel_pending_for_bot(&connection, &bot_id, now),
+                );
+            }
+            StoreOp::ResumeInterruptedJobs { now, reply } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::resume_interrupted(&connection, now),
+                );
+            }
+            StoreOp::CountActiveJobsForBot { bot_id, reply } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::count_active_for_bot(&connection, &bot_id),
+                );
+            }
+            StoreOp::ListJobsForBot {
+                bot_id,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::list_for_bot(&connection, &bot_id, limit),
                 );
             }
             StoreOp::ListHistory {

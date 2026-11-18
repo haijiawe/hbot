@@ -13,8 +13,10 @@ use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::Store;
-use crate::ids::{BotId, ConversationId, InboundId, OutboundId, ProjectId};
-use crate::models::{Bot, Conversation, NewInbound, NewLog, NewOutbound, OutboundTarget, Project};
+use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId};
+use crate::models::{
+    Bot, Conversation, NewInbound, NewJob, NewLog, NewOutbound, OutboundTarget, Project,
+};
 
 /// 种子项目 id 的 `u128` 值。
 pub(crate) const PROJECT_SEED: u128 = 1;
@@ -61,6 +63,25 @@ pub(crate) fn inbound_id(value: u128) -> InboundId {
 /// 任意出站行 ID。
 pub(crate) fn outbound_id(value: u128) -> OutboundId {
     OutboundId::from_uuid(fixed_uuid(value))
+}
+
+/// 任意作业 ID（同值可复现）。
+pub(crate) fn job_id(value: u128) -> JobId {
+    JobId::from_uuid(fixed_uuid(value))
+}
+
+/// 造一条指向种子 bot 的待入队作业：`next_at` 与 `created_at` 都取 `at`。
+pub(crate) fn new_job(id: u128, key: &str, at: i64) -> NewJob {
+    NewJob {
+        id: job_id(id),
+        name: "settle-war".to_owned(),
+        payload_json: "{\"warId\":\"w-1\"}".to_owned(),
+        idempotency_key: key.to_owned(),
+        budget_ms: 60_000,
+        conversation: None,
+        next_at: at,
+        created_at: at,
+    }
 }
 
 /// 一次测试独占的临时目录。
@@ -137,6 +158,23 @@ pub(crate) fn seed(store: &Store) {
             created_at: 3,
         })
         .expect("insert conversation");
+}
+
+/// 再写一只 bot（同一个项目下），用于跨 bot 隔离的断言。
+pub(crate) fn seed_extra_bot(store: &Store, value: u128) -> BotId {
+    let id = bot_id_at(value);
+    store
+        .insert_bot(&Bot {
+            id,
+            project_id: project_id(),
+            name: format!("extra-{value}"),
+            platform: "onebot".to_owned(),
+            config_json: "{}".to_owned(),
+            enabled: true,
+            created_at: 2,
+        })
+        .expect("insert extra bot");
+    id
 }
 
 /// 造一条指向种子 bot / 会话的入站消息。`id` 是固定 UUID 的小整数形式。

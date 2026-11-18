@@ -15,4 +15,4 @@
 //!   （`ctx.messageId`），与 [`InboundId`] 同值但概念不同，存储层的行主键只用
 //!   [`InboundId`] / [`OutboundId`]。
 
-pub use hbot_core::ids::{BotId, ConversationId, InboundId, OutboundId, ProjectId};
+pub use hbot_core::ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId};

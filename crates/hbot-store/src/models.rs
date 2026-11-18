@@ -11,7 +11,7 @@
 //! `row_to_domain` 映射由使用方做（`docs/03-directory.md` §1.10）：store 不认识 `Value`
 //! 语义，core 不认识 SQL。
 
-use crate::ids::{BotId, ConversationId, InboundId, OutboundId, ProjectId};
+use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId};
 
 /// `projects` 行。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,4 +367,62 @@ pub struct HistoryRow {
     pub text: String,
     /// `inbound.received_at` / `outbound.created_at`（Unix 毫秒）。
     pub at: i64,
+}
+
+/// 后台作业行（[`crate::Store::get_job`] / [`crate::Store::list_jobs_for_bot`] 的返回形状）。
+///
+/// 与表 `bot_jobs` 同列，但**不**解析载荷与状态：`payload_json` 是原样字符串，
+/// `state` 也是原样字符串（拼写真源在 `hbot_core::bot_jobs::JobState::as_str()`，
+/// 存储层不重复定义一份）。解析与状态判断在装配层做。
+///
+/// `attempts` 是"已经跑过几次"（含当前这一次）；`next_at` 是下一次可派发的时刻
+/// （Unix 毫秒，调用方注入）；`budget_ms` 是入队当时冻结的单次预算。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRow {
+    /// 作业行主键。
+    pub id: JobId,
+    /// 作业类型名。
+    pub name: String,
+    /// 不透明载荷的 JSON 文本（原样入队、原样回填）。
+    pub payload_json: String,
+    /// 幂等键（`(bot_id, idempotency_key)` 唯一）。
+    pub idempotency_key: String,
+    /// 状态原样字符串（`pending` / `running` / `done` / `failed` / `cancelled`）。
+    pub state: String,
+    /// 已经跑过几次（含当前这一次）。
+    pub attempts: u32,
+    /// 入队当时冻结的单次预算（毫秒）。
+    pub budget_ms: u64,
+    /// 回复目标的平台会话 `external_id`；`None` = 只能记日志。
+    pub conversation: Option<String>,
+    /// 下一次可派发的时刻（Unix 毫秒）。
+    pub next_at: i64,
+    /// 最近一次失败正文（没失败过或已成功为 `None`）。
+    pub last_error: Option<String>,
+    /// 入队时刻（Unix 毫秒）。
+    pub created_at: i64,
+}
+
+/// 待入队的一条后台作业（[`crate::Store::enqueue_job`] 的入参）。
+///
+/// `attempts` 不在这里：新行恒为 0。`updated_at` 也不在这里：入队那一刻
+/// 它等于 `created_at`，由存储层写，调用方不必重复传。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewJob {
+    /// 作业行主键（由 `IdGenerator::job_id()` 生成）。
+    pub id: JobId,
+    /// 作业类型名。
+    pub name: String,
+    /// 不透明载荷的 JSON 文本。
+    pub payload_json: String,
+    /// 幂等键。
+    pub idempotency_key: String,
+    /// 入队当时冻结的单次预算（毫秒）。
+    pub budget_ms: u64,
+    /// 回复目标的平台会话 `external_id`。
+    pub conversation: Option<String>,
+    /// 首次可派发的时刻（Unix 毫秒）。
+    pub next_at: i64,
+    /// 入队时刻（Unix 毫秒）。
+    pub created_at: i64,
 }

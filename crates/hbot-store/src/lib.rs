@@ -79,11 +79,12 @@ mod tests;
 
 pub use db::{BUSY_TIMEOUT_MS, Store};
 pub use error::{Result, StoreError};
-pub use ids::{BotId, ConversationId, InboundId, OutboundId, ProjectId};
+pub use ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId};
 pub use models::{
     BOT_STATUS_DEGRADED, BOT_STATUS_ERROR, BOT_STATUS_RUNNING, BOT_STATUS_STOPPED, BOT_STATUSES,
     Bot, BotStatusRow, Conversation, DeviceAuditRow, DeviceSessionRow, HistoryRow,
-    InboundReplayRow, InboundRow, KvRow, LogRow, NewAgentLog, NewDeviceAudit, NewDeviceSession,
-    NewInbound, NewKvEntry, NewLog, NewOutbound, OUTBOUND_STATE_FAILED, OUTBOUND_STATE_PENDING,
-    OUTBOUND_STATE_SENT, OutboundRow, OutboundTarget, Project, is_valid_bot_status,
+    InboundReplayRow, InboundRow, JobRow, KvRow, LogRow, NewAgentLog, NewDeviceAudit,
+    NewDeviceSession, NewInbound, NewJob, NewKvEntry, NewLog, NewOutbound, OUTBOUND_STATE_FAILED,
+    OUTBOUND_STATE_PENDING, OUTBOUND_STATE_SENT, OutboundRow, OutboundTarget, Project,
+    is_valid_bot_status,
 };

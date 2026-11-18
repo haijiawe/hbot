@@ -8,6 +8,7 @@ pub(crate) mod conversation;
 pub(crate) mod device;
 pub(crate) mod history;
 pub(crate) mod inbound;
+pub(crate) mod jobs;
 pub(crate) mod kv;
 pub(crate) mod log;
 pub(crate) mod outbound;
