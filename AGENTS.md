@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成**（1504 个 Rust 测试 / web 400 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–3 步（`kv`/`history`/`ai`/`timer`/`jobs`）全部落地**（1692 个 Rust 测试 / 115 个 target / web 400 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -337,6 +337,40 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     排空。顺序是**先 abort 辅助任务、再发停止信号**；`attach_aux` 返回 `false`（登记表里已没有这个 bot）时
     调度方要立刻 abort 自己。
 
+68. **作业队列只能按 bot 认领，全局 claim 会让 A 跑 B 的作业**（2026-11-19，`C4.jobs` 落地时发现）。
+    `crates/hbot-store` 的 `claim_due_jobs(now, limit)` 是**全局** SQL（没有 `bot_id` 条件）。
+    每个 bot 有自己的 tick 循环、各自 claim 一次 —— 用它就等于 A 的 tick 把 B 的作业抢走，
+    然后在 **A 的 isolate** 里跑。后果不是崩溃，而是跨 bot 隔离当场破：作业名对、载荷对、
+    只有上下文全错（B 的结算用了 A 的 `ctx.reply` 目标 / A 的清单预算），日志里完全看不出来。
+    所以派发只许走 `claim_due_jobs_for_bot`（同一份 SQL 判据，多一个 `bot_id` 条件；
+    全局那份留给排障与重放工具）。存储层有一条 `per_bot_claim_never_takes_another_bots_row` 钉住它。
+
+69. **作业 tick 不能复用定时器那条 `tick`**（2026-11-19）。`SandboxHandler::tick` 第一句是
+    `if declared_schedules(&root).is_empty() { return Ok(()) }` —— 复用给作业会让"只声明了
+    `capabilities.jobs`、没声明 `capabilities.timer`"的项目**永远派发不到作业**，而且症状是
+    "作业不跑"而不是"配置读错了"，排障方向会被带偏。所以作业独立成 `tick_jobs`，ticker 每拍先后调两个。
+    同一条纪律也说明：**每个"声明了才有"的能力都要自己第一句读清单**，别指望共享的循环替它判。
+
+70. **作业是先编译、后认领，不是先认领、后编译**（2026-11-19）。`claim_due_jobs_for_bot` 一步就把行
+    改成 `running` 且 `attempts + 1`。如果这一步发生在 `compiled()` 之前，编译失败的那一刻行已经在
+    `running` 里，下一拍 `state != 'pending'` 拿不到它 —— 作业白等一个进程重启（只有 `resume_interrupted_jobs`
+    能救）。同族的坑：**任何"先改状态、后做事"的队列都要先确认前置条件已满足**，否则失败会变成"卡住"。
+
+71. **`hbot_core::JobId` 与 `hbot_store::JobId` 是两个类型**（2026-11-19）。它们底层都是 `uuid::Uuid` 的
+    newtype、值也相同，但 `hbot-code` 的 `dispatch_job_collecting` 要 `hbot_core::JobId`，而
+    `JobRow.id` 是 `hbot_store::JobId`。转换走 `hbot_core::JobId::from_uuid(*row.id.as_uuid())`，
+    **不要** `to_string().parse()` 绕一圈 —— 主键是库里读出来的，多一次字符串往返就多一处可能悄悄变形的地方。
+
+72. **作业的预算按行冻结、重试次数按清单现读**（2026-11-19，`C4.jobs` 的设计决定）。两者方向相反是刻意的：
+    预算写进 `bot_jobs.budget_ms`（入队那一刻的类型快照），改清单不该让**已经排队**的那条作业换预算；
+    `retries` 每次失败时重读清单，因为它是"这个类型失败几次后放弃"的策略，不是这一次执行的快照。
+    反之（预算现读、重试冻结）= 一次改清单把所有在途作业的退避节奏全打乱，排障时极难解释。
+
+73. **`bot_stop` 取消作业只动 `pending` / `running`，终态一律不碰**（2026-11-19）。`cancel_jobs_for_bot`
+    的 `WHERE state IN ('pending','running')` 是硬约束：把 `done` 改写成 `cancelled` 会抹掉一条真实的成功
+    记录（面板上就看不到"这个作业跑过了"）。恢复路径同理：`resume_interrupted_jobs` 只退回 `running`，
+    `cancelled` 是终态，重启不会把它捡回来跑 —— 那是"用户按了停止"，不是"进程崩在中间"。
+
 ---
 
 ## 8. 新增 X 的步骤
@@ -381,7 +415,7 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 1. 在 `crates/hbot-core` 定义规则与参数闸（唯一一份），带单测；
 2. `Capabilities` 加字段（布尔用 `#[serde(default)]`，计划表这类用 `Vec<…>`）并让 `impl Capabilities` 暴露读取方法；
 3. `Manifest::validate` 里调 core 的校验（**别在 manifest 里再写一份规则**）；
-4. `hbot-code` 的槽位（`AiSlot`/`StateSlot`/`TimerSlot` 模式：`Mutex` 内的可替换端口 + `set_*`/`is_*_assembled`）；
+4. `hbot-code` 的槽位（`AiSlot`/`StateSlot`/`TimerSlot`/`JobSlot` 模式：`Mutex` 内的可替换端口 + `set_*`/`is_*_assembled`）；
 5. `hbot-rpc` 侧读清单决定装不装（`*Source` trait + `worker()` 里调 `set_*`，见坑 66）；
 6. 端到端测试：`NOT_DECLARED` / `UNAVAILABLE` / 参数非法 / 跨 bot 隔离 / 跨重启存活 各一条。
 

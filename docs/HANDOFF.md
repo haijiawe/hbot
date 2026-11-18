@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-18 14:16**（HEAD `fed58ae`，103 个 commit，工作树干净）。
+> 本快照时间：**2026-11-19 02:05**（HEAD `e66d4c7` + 本轮 4 个提交；工作树干净）。C4.jobs 已落地。
 
 ---
 
@@ -30,8 +30,8 @@ Agent-first 的 **bot IDE**：用户在 IDE 里让 Agent 写 TypeScript bot 代�
 - 技术栈（ADR-0002，状态仍 **Proposed**）：Rust 2024 + Tauri 2 同进程（无 sidecar）+
   React 19/TS 仅作 IDE 前端 + QuickJS（rquickjs）+ SQLite（rusqlite，单写者）+ SWC 去类型。
 - **产品运行时零 Node、零 Go**。Node 只出现在 `apps/web` 的构建/测试链（vite / vitest / pnpm）。
-- 规模：Rust **123,514 行**（16 crate + `xtask`）、web **22,667 行**；
-  契约 **35 条命令 / 16 个事件 / 9 个 Agent 工具**；迁移 `0001`–`0005`。
+- 规模：Rust 约 **124k 行**（16 crate + `xtask`）、web **22,667 行**；
+  契约 **35 条命令 / 16 个事件 / 9 个 Agent 工具**；迁移 `0001`–`0006`。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1647 passed / 0 failed / 114 target
+cargo test -j 2 --workspace              # 当前 1692 passed / 0 failed / 115 target
 pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 ```
 
-现状：**六道全绿**（2026-11-18 14:10 实测）。`apps/web/src/generated/*.ts` **要入库**；
+现状：**六道全绿**（2026-11-19 01:42 实测）。`apps/web/src/generated/*.ts` **要入库**；
 改 `dto` 后必须 `gen`（还要 `gen --check`）再提交。
 纯文档提交不需要跑全闸，但要在提交信息里说明"仅文档"。
 
@@ -79,7 +79,7 @@ pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 | crate | 职责 |
 |---|---|
 | `hbot-core` | 纯契约与端口（`bot_state.rs` / `bot_ai.rs` / `bot_timer.rs` / `device.rs` / `debug.rs` / `command.rs` / `ports.rs` / `redact.rs`） |
-| `hbot-store` | SQLite、迁移（`0001`–`0005`）、仓储（每条 SQL 只出现在 `repositories/`） |
+| `hbot-store` | SQLite、迁移（`0001`–`0006`）、仓储（每条 SQL 只出现在 `repositories/`） |
 | `hbot-workspace` | 项目文件、路径守卫、搜索、符号 |
 | `hbot-code` | SWC 编译、QuickJS isolate、沙箱、宿主 API（`runtime/{host,state,ai,device}_api.rs`）、插桩与调试 |
 | `hbot-bot` | 事件 JSON、会话、有界队列、supervisor |
@@ -107,15 +107,15 @@ pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 | `C5.ai`（`ctx.ai.complete`） | 已实现（2026-11-18，`docs/07` §3.3） |
 | `C1.timer`（`onTimer`） | 已实现（2026-11-18，`docs/07` §4.4） |
 | `C6.device` | 窄版已实现（Windows，`docs/09`） |
-| `C4.jobs` | **未开始** ← 下一步 |
-| `C2.session`（`bot_waits`） | **未开始**（依赖定时器，定时器已好） |
+| `C4.jobs`（`ctx.jobs` / `onJob`） | **已实现（2026-11-19，`docs/07` §4.5）** |
+| `C2.session`（`bot_waits`） | **未开始** ← 下一步（依赖定时器，定时器已好） |
 | `C1.webhook` / `C3.send` / `C3.notify` | **未开始** |
 | `onStart` / `onStop` / `onSchedule` | **未开始** |
 | `E1` npm 打包 / 云端宿主 | **未开始** |
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 67 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 73 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -164,25 +164,25 @@ pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 | C6 设备能力（窄版） | 完成 | 截屏 / 多显示器 / 原生 OCR（含中文）/ 输入 / 剪贴板 / 限时会话 / 一键撤销 / 审计 / 限速 / 每屏 DPI + Tauri 壳 PMv2 声明 |
 | M7 第 1 步 | 完成 | `ctx.kv` / `ctx.history`（`bot_kv` 表、三道判据、参数闸唯一一份） |
 | M7 第 2 步 | 完成 | `ctx.ai.complete`（四道判据、每事件 4 次 / 60 秒预算、等待抵账、key 不出核心） |
-| M7 第 3 步 | **一半** | `C1.timer` 完成；`C4.jobs` 未开始 |
+| M7 第 3 步 | 完成 | `C1.timer`（2026-11-18）+ `C4.jobs`（2026-11-19，`bot_jobs` 表 / `onJob` / 重试退避 / `bot_stop` 取消 / 重启恢复） |
 
 ---
 
 ## 7. 剩余工作（按建议顺序，A 最优先）
 
-### A. `C4.jobs` —— M7 第 3 步的另一半（**下一步就做这个**）
+### A. `C4.jobs` —— **已落地 2026-11-19**（不要再重做）
 
-`docs/07` §4.3 已定规则，`ctx.jobs` 目前零处引用。要做：
+落地形状与设计决定写在 `docs/07` §4.5；这里只记"下一轮碰它时别再踩的六件事"：
 
-- 契约先冻结（照 `bot_ai.rs`/`bot_timer.rs` 的形状）：`hbot-core/src/bot_jobs.rs` ——
-  作业声明（名字、预算、重试次数与退避、幂等键规则）、`JobError` 六码、参数闸；
-- 表 `0006_bot_jobs.sql`（`bot_jobs(id, bot_id, name, payload_json, idempotency_key, state, attempts, next_at, budget_ms, created_at, …)`，**至少一次语义必须靠幂等键而不是靠"不会重复执行"**）；
-- `hbot-code` 的 `JobSlot` + `ctx.jobs.enqueue(name, payload)`（先解析参数、后判装配，与 `state_api` 一致）；
-- `hbot-rpc` 侧：进程启动时恢复未完成作业、每 tick 取到期作业派发、`bot_stop` 取消；
-- 端到端测试：入队 → 落库 → 重启后仍会跑 → 幂等键重复入队只跑一次 → 超预算被杀 → `bot_stop` 后不再派发。
+- 派发**只许**走 `claim_due_jobs_for_bot`（全局 `claim_due_jobs` 会让 A 跑 B 的作业，见 `AGENTS.md` 坑 68）；
+- 作业 tick 是 `SandboxHandler::tick_jobs`，**不能**复用 `tick`（它第一句是"没有计划就 return"，坑 69）；
+- `tick_jobs` 里**先 `compiled()` 后 claim**（顺序反了，编译失败会把行钉在 `running` 里直到下次重启，坑 70）；
+- 预算按**行**冻结、`retries` 按清单现读（坑 72）；
+- `cancel_jobs_for_bot` 只动 `pending`/`running`，终态不碰（坑 73）；
+- `hbot_core::JobId` 与 `hbot_store::JobId` 是两个类型，转换用 `from_uuid(*id.as_uuid())`（坑 71）。
 
-**容易踩的**：作业没有入站 ctx（与定时器同类问题）—— `job` 的 ctx 要比消息 ctx 窄，
-且**不能用 `event.set` 写键**（会把 `name`/`payload` 混进消息 ctx 的函数集合，见坑 64）。
+**还没做的三件**（不阻塞主线）：宿主级预算上限（手机 30 秒"平台取小"仍在 `docs/08` 的设计里）；
+作业状态面板；作业池"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
 
 ### B. `C2.session`（`bot_waits`）—— M7 第 4 步
 

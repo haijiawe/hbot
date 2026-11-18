@@ -82,7 +82,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | | `notify` | 通知人（管理员/工单） | `设计` |
 | | `http` | 出站 HTTP（清单授权） | `已实现`（`ctx.http.get`） |
 | | `file` | 项目内读写（经宿主，不是裸 `fs`） | `部分`（Agent 有工具，bot 代码没有） |
-| **C4 计算** | `jobs` | 后台作业（脱离 handler 预算、持久化、崩溃恢复） | `设计` |
+| **C4 计算** | `jobs` | 后台作业（脱离 handler 预算、持久化、崩溃恢复） | `已实现`（2026-11-19，见 §4.5） |
 | | `wasm` | WASM 扩展（重计算/第三方算法） | `未做` |
 | **C5 智能** | `ai` | `ctx.ai.complete()`：用应用已配好的模型，key 不出核心 | `已实现`（2026-11-18，见 §3.3） |
 | **C6 设备** | `screen` / `ocr` / `input` / `window` / `clipboard` | 截图、OCR、键鼠注入、切窗口、剪贴板 | `已实现`（窄版：Windows、单机，2026-11-17；完整版与平台矩阵见 §9 / `docs/09`） |
@@ -193,11 +193,11 @@ export default defineBot({
 | 跨会话 | 并行，全局上限 64 | `已实现` |
 | handler 预算 | 默认 2 s，可在 `limits.handlerMs` 调（硬上限 2000 ms 目前写死） | `部分`（上限要随能力放宽） |
 | 会话队列 | 1024 条，满则背压（消息已落库，不丢） | `已实现` |
-| 取消 | `bot_stop` 取消进行中的 handler 与作业 | `部分`（handler 有，作业还没有） |
+| 取消 | `bot_stop` 取消进行中的 handler 与作业 | `已实现`（handler 由 `BotRegistry` 停 supervisor；作业由 `cancel_jobs_for_bot` 落 `cancelled`） |
 
 **handler 预算必须可按 bot 配**：游戏 bot 的"结算"要几十秒，客服 bot 的"检索知识库"要几秒。但**不要靠调大预算解决长任务**——那会让一条慢消息拖住整个会话。正确的做法是 §4.3。
 
-### 4.3 后台作业（C4.jobs）
+### 4.3 后台作业（C4.jobs）—— **已落地 2026-11-19**（落地细节见 §4.5）
 
 ```ts
 // 在 onMessage 里立刻返回，重活丢给作业
@@ -256,7 +256,66 @@ export default defineBot({
 5. **计划表按 isolate 各一份**：`due()` 必须在取到它的那个 isolate 上派发，否则另一个 isolate 的计划表没推进过。
 6. **tick 循环挂在 `BotRegistry::aux`**：`bot_stop` 先 abort 辅助任务再发停止信号（tick 可能正持槽位锁跑 handler，先停能避免拖住 supervisor 排空）。没声明计划时 tick 只是一秒一次的空转（一次读清单 + 一个长度判断）。
 
-**还没做**：`onSchedule`（`§4.1` 的第四个钩子，与 `onTimer` 不是同一件事）、`ctx.jobs`、定时器里的 `ctx.kv`（见第 1 条）、计划表的运行时增删（要改清单并等热重载）。
+**还没做**：`onSchedule`（`§4.1` 的第四个钩子，与 `onTimer` 不是同一件事）、定时器里的 `ctx.kv`（见第 1 条）、计划表的运行时增删（要改清单并等重载）。
+### 4.5 已落地：后台作业（`C4.jobs`，2026-11-19）
+
+```jsonc
+// hbot.json —— 声明"这个项目有哪些作业类型"，预算与重试次数写在声明里
+{
+  "capabilities": {
+    "jobs": [
+      { "name": "settle-war", "budgetMs": 120000, "retries": 2 },
+      { "name": "fan-out" }        // 省略 = 默认 60 秒 / 不重试
+    ]
+  }
+}
+```
+
+```ts
+export default defineBot({
+  async onMessage(ctx) {
+    // 入队**立刻返回**：这条消息的 2 秒预算不会被重活吃掉
+    await ctx.jobs.enqueue('settle-war', { warId: ctx.text }, {
+      conversation: ctx.conversationExternalId,  // 作业里 ctx.reply 的唯一目标
+      // idempotencyKey 省略 = 本条消息的 messageId（同一条消息重复处理只会有一个作业）
+    });
+    ctx.reply('已提交结算');
+  },
+  async onJob(ctx, name) {
+    // 只有 reply / log / sleep / ai + name / payload / idempotencyKey
+    ctx.log(`settle:${ctx.payload.warId} key=${ctx.idempotencyKey}`);
+    ctx.reply(`${name} 结算完成`);
+  },
+})
+```
+
+| 判据 | 位置 | 失败时 |
+|---|---|---|
+| 声明层 | 清单 `capabilities.jobs`（`JobSlot::set_specs` 每次入队现读） | 空表 → `HBOT_JOBS_NOT_DECLARED`；名字不在表里 → `HBOT_JOBS_INVALID` |
+| 参数层 | `hbot-core` 的 `validate_job_name` / `validate_payload` / `validate_idempotency_key` / `validate_request` / `validate_specs`（**唯一一份**） | `HBOT_JOBS_INVALID`，**在后端被调用之前**就拒 |
+| 装配层 | 宿主有没有 `set_jobs` | `HBOT_JOBS_UNAVAILABLE`（补救是"bot 没起来/存储没就绪"，不是改清单） |
+| 容量层 | `StoreJobQueue` 里 `count_active_jobs_for_bot` ≥ `MAX_JOBS_PER_BOT`(256) | `HBOT_JOBS_FULL`，不无限攒行 |
+| 预算层 | 行里冻结的 `budget_ms`（入队时按类型抄一份）；超预算被内核打断 | `HBOT_JOBS_TIMEOUT` → 按 `retries` 决定重试还是落 `failed` |
+| 目标层 | `build_job_event` 的 `reply` 闭包 | 没写 `options.conversation` → `HBOT_JOBS_NO_TARGET` |
+| 会话层 | `deliver_job_replies` 按 `(bot_id, external_id)` 查 `conversations` | 查不到 → error 行「这个会话从没收到过消息」，不猜群/私聊 |
+
+**七条设计决定与理由**：
+
+1. **至少一次，靠幂等键而不是"不会重复执行"**。`bot_jobs` 上有 `UNIQUE (bot_id, idempotency_key)`，重复入队命中唯一约束后返回 `Ok(None)` —— 那是**成功**，只记一条 debug。缺幂等键的入队直接失败（消息事件里缺省取 `ctx.messageId`；定时器/作业事件没有入站身份，缺省值被显式清空，所以那两种事件里必须自己写）。
+2. **预算按行冻结，重试次数按清单现读**。预算跟着**行**走：改清单不该让已经排队的那条作业换预算（换语义是最难排障的一类问题）。`retries` 反过来按清单现读 —— 它是"这个类型失败几次后放弃"的策略，不是这一次执行的快照。
+3. **认领是一步 SQL，不拆成"先查后改"**。`claim_due_for_bot` 用 `UPDATE … RETURNING` 同时完成"挑到期 + 改 `running` + `attempts + 1`"。拆开就有双派发窗口（tick 与重启恢复各拿一行），而且进程在两条语句之间被杀会留下 `attempts` 没加的 `pending` 行 —— 重试次数就封不了顶。
+4. **认领必须按 bot 过滤**。每个 bot 有自己的 tick；全局 `claim_due_jobs` 会让 A 把 B 的作业抢走并在 A 的 isolate 里跑 —— 跨 bot 隔离当场破，日志里还看不出异常（名字对、载荷对，只有上下文错）。
+5. **作业的 `ctx` 比消息 `ctx` 窄，且不挂 `ctx.jobs`**。只有 `reply` / `log` / `sleep` / `ai` + `name` / `payload` / `idempotencyKey`；`kv` / `history` / `device` 都不挂（作业没有入站身份，挂上去就是让它读上一条消息的会话），`ctx.jobs` 也不挂（作业不能无限套作业）。
+6. **tick 先编译、后认领**。反过来的话，编译失败那一刻行已经被改成 `running` 且 `attempts` 已加一，下一拍又因为 `state != pending` 拿不到它 —— 这条作业就卡在 `running`，只能等下次进程启动的 `resume_interrupted_jobs` 救。
+7. **作业不能用定时器那条 tick**。`SandboxHandler::tick` 第一句就是"没有计划就 return"；复用给作业会让"只声明 jobs、没声明 timer"的项目永远派发不到，而且看起来像"作业不跑"而不像配置问题。所以独立成 `tick_jobs`，ticker 每拍先后调两个。
+
+**存储形态**：`bot_jobs(id, bot_id, name, payload_json, idempotency_key, state, attempts, budget_ms, conversation, next_at, last_error, created_at, updated_at)`，`UNIQUE (bot_id, idempotency_key)`、索引 `(state, next_at)` 与 `(bot_id, state)`。状态五种拼写 `pending` / `running` / `done` / `failed` / `cancelled` 与 `hbot_core::bot_jobs::JobState::as_str()` 同值（存储层有对拍测试）。
+
+**恢复与取消**：进程启动时 `AppState::open` 调 `resume_interrupted_jobs(now)` 把残留的 `running` 退回 `pending`（"它可能跑过一半"，由作业体自己的幂等兜住重复执行）；`bot_stop` 调 `cancel_jobs_for_bot` 把 `pending` / `running` 落成 `cancelled`，终态（`done` / `failed` / `cancelled`）不动 —— 把成功记录改写成"取消"会抹掉真实结果。
+
+**实测**：`hbot-rpc` 的 `tests/jobs_capability.rs` 6 条，全走 `Dispatcher` 真派发 + 真 tick + 真库：没声明 → `NOT_DECLARED` 且**不落库**；声明后入队 → 落库 → 下一拍认领 → `onJob` 真跑 → `done` → 回复进 outbox；同幂等键入队两次只留一行、只跑一次；缺 `onJob` 时每次派发记一行点名钩子的 error；`bot_stop` 之后 `pending` 落 `cancelled` 且不再派发；作业体抛异常时 `retries: 0` 直接落 `failed` 并写 `last_error` + error 日志。存储层另有 12 条（含 per-bot claim 不越界、`resume` 退回 `pending`、级联删除）。
+
+**还没做**：`jobs` 的宿主级预算上限（手机上 30 秒这类"平台取小"还在 `docs/08` 的设计里，当前只有清单写的值）；作业状态的 UI 面板；作业池的"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
 
 ---
 
@@ -473,7 +532,7 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | V6 | `sql` 拒绝运行时 DDL | 断言 `CREATE TABLE` 被拒 |
 | V7 | `session.await` 只被归属键匹配的消息唤醒 | 群里 B 发言不唤醒 A（旧项目 P0-3 的回归） |
 | V8 | 等待在重启后恢复、超时由定时器结算 | 重启 + 不等新消息，断言超时触发 |
-| V9 | 作业重启后恢复、至少一次、幂等键生效 | 杀进程后重启，断言作业跑完且副作用只一次 |
+| V9 | 作业重启后恢复、至少一次、幂等键生效 | 杀进程后重启，断言作业跑完且副作用只一次（**已测**：`resume_interrupted_jobs` 把 `running` 退回 `pending`；`tests/jobs_capability.rs` 断言同幂等键只留一行只跑一次） |
 | V10 | 能力受限时返回 `HOST_LIMIT` 而非静默降级 | 手机上跑 `jobs`，断言错误码与上限值 |
 | V11 | 同一份 bot 代码在桌面与手机都能编译、`onMessage` 路径行为一致 | 两端各跑同一份 fixture |
 | V12 | 没在清单里声明 `device.input` 时，键鼠调用返回 `denied` 且 **approver 调用次数 = 0** | 断言错误码 + 计数 |
@@ -492,14 +551,14 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 |---|---|---|---|
 | 1 | `C2.kv` + `C2.history` | 多轮聊天、游戏存档（两类 bot 同时可用） | **已落地 2026-11-18**（§5.0） |
 | 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 | **已落地 2026-11-18**（§3.3） |
-| 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 | `C1.timer` **已落地 2026-11-18**（§4.4）；`C4.jobs` 未开始 |
+| 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 | `C1.timer` **已落地 2026-11-18**（§4.4）；`C4.jobs` **已落地 2026-11-19**（§4.5） |
 | 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 | 未开始（依赖第 3 步的定时器结算超时） |
 | 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | 未开始 |
 | 6 | `E1` npm 打包 | 生态接入（见 `docs/08` §5） | 未开始 |
 | 7 | `C6.device`（桌面三平台） | 玩游戏的 bot；见 §9，里程碑 `M10` | **窄版已落地 2026-11-17**（Windows，见 `docs/09`）；完整版未做 |
 | 8 | 云端执行宿主 | 见 `docs/08` §9 与 `ADR-0006`，里程碑 `M9` | 未开始 |
 
-> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 7 完成，第 3 步的 timer 完成但 jobs 未开始，4 → 5 → 6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
+> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 7 完成，4 → 5 → 6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
 
 ---
 
@@ -519,7 +578,7 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 
 1. `sql` 能力的 schema 由谁管：项目里的 `migrations/*.sql` 由 Agent 写，还是由宿主提供固定表？（倾向后者：Agent 只写查询，降低迁移风险）
 2. `kv` 与 `sql` 是否要合并成"一个能存东西的口子"？（分开更清楚，但 Agent 可能选错）
-3. `jobs` 的预算上限按平台还是按 bot 声明？（倾向两者取小）
+3. ~~`jobs` 的预算上限按平台还是按 bot 声明？~~ **2026-11-19 已定**：预算按**行**冻结（入队时抄一份 `budgetMs`），重试次数按清单现读；平台级上限（手机 30 秒）仍待 `docs/08` 落，届时在装配层与声明值取小。
 4. `history` 的窗口是条数还是 token 数？（聊天 bot 需要 token 口径）
 5. `webhook` 入口在手机上怎么到达（无公网 IP）——见 `docs/08` §4.4。
 6. `device.input` 的"前台窗口白名单"默认值：空（全拒，最安全但每次要用户配）还是"当前前台应用"（好用但等于默认放行一个）？
