@@ -52,7 +52,10 @@ pub(crate) fn install<'js>(
                 // `Ctx` 作为首参取回（`FromParam` + `ParamRequirement::none()`，不占
                 // 位置参数）。**不许**把 `ctx.clone()` 存进闭包：那会让 JS 函数对象
                 // 活多久、`Ctx` 就活多久，运行时释放时撞 `list_empty(&rt->gc_obj_list)`。
-                move |handle: Ctx<'js>, key: Value<'js>, text: Value<'js>, options: Opt<Value<'js>>| {
+                move |handle: Ctx<'js>,
+                      key: Value<'js>,
+                      text: Value<'js>,
+                      options: Opt<Value<'js>>| {
                     let prepared = parse_prompt(&handle, &key, &text, options.0.as_ref());
                     let slot = Arc::clone(&slot);
                     async move {
@@ -61,8 +64,7 @@ pub(crate) fn install<'js>(
                             Err(message) => return IdReply(Err(message)).into_js(&handle),
                         };
                         // 端口是阻塞的（写库），挪到阻塞线程池；isolate 线程只跑 JS。
-                        let outcome =
-                            tokio::task::spawn_blocking(move || slot.prompt(&spec)).await;
+                        let outcome = tokio::task::spawn_blocking(move || slot.prompt(&spec)).await;
                         let result = match outcome {
                             Ok(result) => result.map_err(|error| error.to_string()),
                             Err(error) => Err(format!("会话等待的任务没能跑完：{error}")),

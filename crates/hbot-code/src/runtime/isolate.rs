@@ -466,7 +466,6 @@ impl Sandbox {
             .map_err(|failure| *failure.error)
     }
 
-
     /// 一条消息命中了一个等待：跑 `onResume(ctx, message)`。
     ///
     /// **阻塞契约与 `dispatch_*_collecting` 相同**：从 `spawn_blocking` 里调，
@@ -510,11 +509,7 @@ impl Sandbox {
     /// 装（或替换）会话等待的声明开关与端口。
     ///
     /// 声明与端口**一起**装：只装端口会让「声明了才准开等待」变成「装配了就能开」。
-    pub fn set_session(
-        &self,
-        declared: bool,
-        queue: Arc<dyn crate::session::WaitQueue>,
-    ) {
+    pub fn set_session(&self, declared: bool, queue: Arc<dyn crate::session::WaitQueue>) {
         self.session.set_declared(declared);
         self.session.set_queue(queue);
     }
@@ -1414,7 +1409,8 @@ fn serve(
                 };
                 let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
                 let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
-            }        }
+            }
+        }
     }
 
     Ok(())
@@ -1596,7 +1592,10 @@ async fn run_event<'js>(
     let _ = ctx.globals().set(instrument::DEBUG_FLAG, instrumented);
 
     let started = Instant::now();
-    let result = invoke(ctx, payload, handler, project, device, state, ai, jobs, session).await;
+    let result = invoke(
+        ctx, payload, handler, project, device, state, ai, jobs, session,
+    )
+    .await;
     let duration = started.elapsed();
 
     control.end_event();
@@ -1840,7 +1839,6 @@ async fn invoke_job<'js>(
     .await;
     result.map_err(|error| describe(ctx, error, project))
 }
-
 
 /// 一次等待被唤醒：跑 `onResume(ctx, message)`。
 ///
@@ -2286,10 +2284,7 @@ fn build_event<'js>(
     // 会话等待的归属键同样取自这条事件：`prompt` 只能在消息事件里调用，而它要写
     // 「哪个会话、谁在等」。定时器 / 作业 / 恢复事件不经过这里，它们的槽位身份由
     // 各自的 build_*_event 显式清空（不写就报错，不继承上一条消息）。
-    session.set_current(
-        conversation_external_id_of(payload),
-        sender_id_of(payload),
-    );
+    session.set_current(conversation_external_id_of(payload), sender_id_of(payload));
 
     let host: Object<'js> = ctx.globals().get("__hbot")?;
     event.set("reply", host.get::<_, Function<'js>>("reply")?)?;

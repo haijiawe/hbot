@@ -156,7 +156,11 @@ impl SessionSlot {
     pub(crate) fn current(&self) -> Result<Option<WaitHit>, SessionError> {
         let (declared, queue, conversation) = {
             let state = self.lock();
-            (state.declared, state.queue.clone(), state.conversation.clone())
+            (
+                state.declared,
+                state.queue.clone(),
+                state.conversation.clone(),
+            )
         };
         if !declared {
             return Err(SessionError::NotDeclared {
@@ -184,7 +188,11 @@ impl SessionSlot {
     pub(crate) fn cancel(&self) -> Result<bool, SessionError> {
         let (declared, queue, conversation) = {
             let state = self.lock();
-            (state.declared, state.queue.clone(), state.conversation.clone())
+            (
+                state.declared,
+                state.queue.clone(),
+                state.conversation.clone(),
+            )
         };
         if !declared {
             return Err(SessionError::NotDeclared {
@@ -260,7 +268,12 @@ mod tests {
     }
 
     impl WaitQueue for Recording {
-        fn register(&self, spec: &WaitSpec, conversation: &str, owner: &str) -> Result<String, String> {
+        fn register(
+            &self,
+            spec: &WaitSpec,
+            conversation: &str,
+            owner: &str,
+        ) -> Result<String, String> {
             if let Some(message) = self.failure.lock().unwrap().clone() {
                 return Err(message);
             }

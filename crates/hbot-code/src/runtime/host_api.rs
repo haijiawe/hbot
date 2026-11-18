@@ -256,7 +256,8 @@ pub(crate) fn install<'js>(
         .map_err(super::js_error)?;
     host.set("ai", ai_object).map_err(super::js_error)?;
     host.set("jobs", jobs_object).map_err(super::js_error)?;
-    host.set("session", session_object).map_err(super::js_error)?;
+    host.set("session", session_object)
+        .map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
             .filter_map(Result::ok)
