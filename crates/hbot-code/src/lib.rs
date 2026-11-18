@@ -56,6 +56,7 @@ pub mod modules;
 pub mod permissions;
 pub mod runtime;
 pub mod state;
+pub mod timer;
 
 pub use ai::{CallCounter, DEFAULT_CALL_TIMEOUT as AI_DEFAULT_CALL_TIMEOUT};
 pub use compile::{

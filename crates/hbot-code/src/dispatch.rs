@@ -36,7 +36,12 @@ pub struct EventFailure {
 
 impl EventFailure {
     /// A failure raised before the handler could produce any output.
-    pub(crate) fn without_output(error: CodeError) -> Self {
+    ///
+    /// Public because hosts need it too: `hbot-rpc`'s timer tick can fail before any
+    /// isolate runs (a wedged slot, a dispatch task that panicked), and it reports
+    /// those on the same `Result<EventOutcome, EventFailure>` path as a handler
+    /// failure so one match handles both.
+    pub fn without_output(error: CodeError) -> Self {
         Self {
             logs: Vec::new(),
             error: Box::new(error),

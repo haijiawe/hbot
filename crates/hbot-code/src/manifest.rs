@@ -98,6 +98,12 @@ pub struct Capabilities {
     /// 智能能力（C5）：`ctx.ai.complete`。
     #[serde(default)]
     pub ai: bool,
+    /// 事件能力（C1）：`onTimer(ctx, name)` 的具名计划表。
+    ///
+    /// 与 `ai` / `state.kv` 不同，这里不是布尔而是**数组**：定时器必须有名字与规则，
+    /// "true" 无法回答"几点触发"。空数组 = 没声明。
+    #[serde(default)]
+    pub timer: Vec<hbot_core::ScheduleSpec>,
 }
 
 /// 状态能力（`docs/07` §5）。
@@ -133,6 +139,15 @@ impl Capabilities {
     #[must_use]
     pub fn ai(&self) -> bool {
         self.ai
+    }
+
+    /// 定时器计划表（`onTimer` 的 `name` 从这里来）。
+    ///
+    /// 返回空切片表示"没声明"——与 `state.kv` 那个布尔同一个语义：声明层只回答
+    /// "项目要不要用定时器"，不回答"宿主能不能调度"（后者由 `TimerSlot` 装配回答）。
+    #[must_use]
+    pub fn timer(&self) -> &[hbot_core::ScheduleSpec] {
+        &self.timer
     }
 }
 
@@ -320,6 +335,15 @@ impl Manifest {
         }
 
         self.limits.validate(&manifest_path)?;
+
+        // 定时器计划：声明写错在**加载时**就报，不等到第一次触发才静默不动。
+        // 校验逻辑只有一份，在 `hbot-core::bot_timer::validate_schedules`。
+        hbot_core::validate_schedules(&self.capabilities.timer).map_err(|error| {
+            invalid(
+                &manifest_path,
+                format!("`capabilities.timer` 不合法：{error}"),
+            )
+        })?;
 
         // The entry is a module id inside the project, never a path on the host.
         // Rejecting components rather than canonicalizing keeps this a pure

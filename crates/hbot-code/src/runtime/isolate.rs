@@ -40,6 +40,7 @@ use crate::instrument;
 use crate::limits::{Deadline, Limits};
 use crate::modules;
 use crate::state::StateSlot;
+use crate::timer::TimerSlot;
 use hbot_core::debug::{Breakpoints, DebugSink};
 use hbot_core::{AiClient, BotState, DeviceBackend, DeviceGate, HistoryReader};
 
@@ -136,6 +137,13 @@ pub struct Sandbox {
     /// capturing a client at spawn. Replacing it therefore points the very next
     /// `ctx.ai.complete` at the new model without restarting the bot.
     ai: Arc<AiSlot>,
+    /// The timer slot: the declared schedule table, replaceable at any time.
+    ///
+    /// Same reason as the other slots, plus one of its own: the host asks this
+    /// slot "what is due" once per tick, so the clock lives in the owner thread
+    /// and the isolate itself never needs a JS `setTimeout` (which the sandbox
+    /// does not expose anyway).
+    timer: Arc<TimerSlot>,
 }
 
 /// Mutable debug state shared with the worker thread.
@@ -209,6 +217,7 @@ impl Sandbox {
         let device = Arc::new(DeviceSlot::new());
         let state = Arc::new(StateSlot::new());
         let ai = Arc::new(AiSlot::new());
+        let timer = Arc::new(TimerSlot::new());
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
         let worker_http = Arc::clone(&http);
@@ -246,6 +255,7 @@ impl Sandbox {
             device,
             state,
             ai,
+            timer,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -342,6 +352,97 @@ impl Sandbox {
     /// Whether [`Sandbox::set_ai`] has been called on this sandbox.
     pub fn is_ai_assembled(&self) -> bool {
         self.ai.is_assembled()
+    }
+
+    /// Replace the declared schedule table.
+    ///
+    /// `schedules` comes from `hbot.json`'s `capabilities.timer`; `now` is the
+    /// moment the table is installed, so the first fire is strictly after it.
+    /// Empty is valid and means "no timers" — that is also the state right after
+    /// [`Sandbox::spawn`], before the host has read the manifest.
+    ///
+    /// Safe to call while a dispatch is in flight: `due()` is a separate tick,
+    /// and the worker never reads this slot on the handler path.
+    pub fn set_schedules(&self, schedules: &[hbot_core::ScheduleSpec], now: hbot_core::Timestamp) {
+        self.timer.set_schedules(schedules, now);
+    }
+
+    /// How many schedules are installed (0 before assembly).
+    #[must_use]
+    pub fn schedule_count(&self) -> usize {
+        self.timer.len()
+    }
+
+    /// The schedules due at `now`, advancing each one's grid.
+    ///
+    /// The host calls this once per tick and dispatches one
+    /// [`Sandbox::dispatch_timer`] per entry. It mutates the table, so a name
+    /// comes back at most once per grid point.
+    ///
+    /// Returns [`hbot_core::DueSchedule`] rather than a bare name because the
+    /// host also needs to know **which conversation** the plan replies to: a
+    /// timer has no inbound message, so without a declared target the only
+    /// honest thing `ctx.reply` can do is refuse (`HBOT_TIMER_NO_TARGET`).
+    #[must_use]
+    pub fn due(&self, now: hbot_core::Timestamp) -> Vec<hbot_core::DueSchedule> {
+        self.timer.due(now)
+    }
+
+    /// The earliest pending fire, or `None` with no schedules.
+    ///
+    /// Lets a host sleep until the next fire instead of polling, without
+    /// duplicating the schedule arithmetic.
+    #[must_use]
+    pub fn next_fire(&self) -> Option<hbot_core::Timestamp> {
+        self.timer.next_at()
+    }
+
+    /// Run `onTimer(ctx, name)` for one schedule.
+    ///
+    /// Same blocking contract, deadline handling, log collection and failure
+    /// shape as [`Sandbox::dispatch_collecting`]: a timer that throws must
+    /// produce a log the user can see, not silently vanish into the tick.
+    ///
+    /// # Errors
+    ///
+    /// [`EventFailure`] carrying the same [`CodeError`] classes as a message
+    /// event — plus one of its own: a project whose default export has no
+    /// `onTimer` reports a [`CodeError::JsException`] naming the missing hook,
+    /// rather than pretending the timer fired successfully.
+    pub fn dispatch_timer_collecting(
+        &self,
+        due: &hbot_core::DueSchedule,
+    ) -> Result<EventOutcome, EventFailure> {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.send(Command::Timer {
+            name: due.name.clone(),
+            conversation: due.conversation.clone(),
+            reply,
+        })
+        .map_err(EventFailure::without_output)?;
+
+        match result.recv_timeout(self.backstop()) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => {
+                Err(EventFailure::without_output(CodeError::SandboxDead {
+                    message: format!(
+                        "isolate did not answer within {:?}; the worker thread is wedged",
+                        self.backstop()
+                    ),
+                }))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(EventFailure::without_output(self.dead())),
+        }
+    }
+
+    /// [`Sandbox::dispatch_timer_collecting`] without the collected logs.
+    ///
+    /// # Errors
+    ///
+    /// Same as the collecting form, minus [`EventFailure`].
+    pub fn dispatch_timer(&self, due: &hbot_core::DueSchedule) -> Result<EventOutcome, CodeError> {
+        self.dispatch_timer_collecting(due)
+            .map_err(|failure| *failure.error)
     }
 
     /// Run `onMessage` for one JSON event.
@@ -734,6 +835,22 @@ enum Command {
     Memory {
         reply: Sender<Result<MemoryReport, CodeError>>,
     },
+    /// Run `onTimer(ctx, name)` for one schedule and answer on `reply`.
+    ///
+    /// A separate command rather than a synthesised `Event`: a timer has no
+    /// inbound message, so it must not go through `build_event` (which would
+    /// clear the device/state identity and hand the handler a fake payload).
+    ///
+    /// `conversation` is the plan's declared reply target, straight from
+    /// [`hbot_core::DueSchedule`]. `None` means the plan named none, and then
+    /// `ctx.reply` throws `HBOT_TIMER_NO_TARGET` instead of letting the host
+    /// guess a destination: guessing wrong means posting into a stranger's
+    /// group.
+    Timer {
+        name: String,
+        conversation: Option<String>,
+        reply: Sender<Result<EventOutcome, EventFailure>>,
+    },
     /// Stop the worker loop.
     Shutdown,
 }
@@ -797,6 +914,11 @@ fn reject(command: Command, failure: &CodeError) {
         }
         Command::Memory { reply } => {
             let _ = reply.send(Err(CodeError::SandboxDead { message }));
+        }
+        Command::Timer { reply, .. } => {
+            let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
+                message,
+            })));
         }
         Command::Shutdown => {}
     }
@@ -887,7 +1009,8 @@ fn serve(
                 .await
         })
     };
-    let handler = boot?;
+    let hooks = boot?;
+    let handler = hooks.message;
 
     // Only now is the bot callable; unblock `Sandbox::spawn`.
     let _ = started.send(Ok(()));
@@ -939,6 +1062,47 @@ fn serve(
                 let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
                 let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
             }
+            Command::Timer {
+                name,
+                conversation,
+                reply,
+            } => {
+                let raw = {
+                    let context = &context;
+                    let timer_handler = &hooks.timer;
+                    let output = &output;
+                    let deadline = &deadline;
+                    let project = &project;
+                    let control = &control;
+                    let device = &device;
+                    let state = &state;
+                    let ai = &ai;
+                    let conversation = conversation.as_deref();
+                    local.block_on(&runtime, async move {
+                        context
+                            .async_with(async |ctx| {
+                                run_timer(
+                                    &ctx,
+                                    &name,
+                                    conversation,
+                                    timer_handler,
+                                    output,
+                                    deadline,
+                                    project,
+                                    control,
+                                    device,
+                                    state,
+                                    ai,
+                                    limits,
+                                )
+                                .await
+                            })
+                            .await
+                    })
+                };
+                let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
+                let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
+            }
         }
     }
 
@@ -957,7 +1121,16 @@ fn memory_report(usage: rquickjs::qjs::JSMemoryUsage, limits: Limits) -> MemoryR
     }
 }
 
-/// Evaluate `src/main.ts` and capture its `onMessage` function.
+/// The hooks a project's default export provides, saved across dispatches.
+struct Hooks {
+    /// `onMessage`, always required.
+    message: Persistent<Function<'static>>,
+    /// `onTimer`, optional: a project with no `capabilities.timer` has no
+    /// reason to define one, and a table installed later must not need a restart.
+    timer: Option<Persistent<Function<'static>>>,
+}
+
+/// Evaluate `src/main.ts` and capture its hooks.
 #[allow(clippy::too_many_arguments)]
 async fn bootstrap<'js>(
     ctx: &Ctx<'js>,
@@ -972,7 +1145,7 @@ async fn bootstrap<'js>(
     state: &Arc<StateSlot>,
     ai: &Arc<AiSlot>,
     limits: Limits,
-) -> Result<Persistent<Function<'static>>, CodeError> {
+) -> Result<Hooks, CodeError> {
     deadline.reset();
     deadline.arm(limits.handler_timeout);
 
@@ -1030,8 +1203,19 @@ async fn bootstrap<'js>(
                 message: format!("{entry}: defineBot({{ ... }}) has no `onMessage` function"),
                 stack: None,
             })?;
+        // Optional, and validated here rather than in `defineBot`: a project may
+        // declare `capabilities.timer` and define `onTimer` in either order, and
+        // an `onTimer` that is not callable is a programming error worth naming
+        // at boot, not a TypeError deep inside the first tick.
+        let timer = config
+            .get::<_, Option<Function<'js>>>("onTimer")
+            .map_err(js_error)?
+            .map(|function| Persistent::save(ctx, function));
 
-        Ok::<_, CodeError>(Persistent::save(ctx, handler))
+        Ok::<_, CodeError>(Hooks {
+            message: Persistent::save(ctx, handler),
+            timer,
+        })
     }
     .await;
 
@@ -1102,6 +1286,186 @@ async fn invoke<'js>(
         Ok(()) => Ok(()),
         Err(error) => Err(describe(ctx, error, project)),
     }
+}
+
+/// One timer fire, with the deadline armed and host output captured.
+///
+/// Deliberately the same shape as [`run_event`]: the whole point of arming the
+/// deadline is that a runaway `onTimer` is stopped by the same interrupt
+/// handler, and the point of collecting output is that `ctx.log` inside a timer
+/// still reaches the run log instead of vanishing into the tick.
+#[allow(clippy::too_many_arguments)]
+async fn run_timer<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    conversation: Option<&str>,
+    handler: &Option<Persistent<Function<'static>>>,
+    output: &Arc<Mutex<HostOutput>>,
+    deadline: &Arc<Deadline>,
+    project: &CompiledProject,
+    control: &Arc<DebugControl>,
+    device: &Arc<DeviceSlot>,
+    state: &Arc<StateSlot>,
+    ai: &Arc<AiSlot>,
+    limits: Limits,
+) -> RawEvent {
+    let started = Instant::now();
+    let Some(handler) = handler else {
+        // Not a timeout and not a runtime crash: the project simply has no timer
+        // hook while its manifest declared a schedule. Naming that plainly is
+        // the difference between "your schedule is fine, your code is missing
+        // the hook" and a mute tick the user can never diagnose.
+        let error = CodeError::JsException {
+            message: format!(
+                "定时器 `{name}` 到点了，但项目的默认导出没有 `onTimer` 函数（defineBot 里要写 `async onTimer(ctx, name)`）"
+            ),
+            stack: None,
+        };
+        return RawEvent {
+            logs: Vec::new(),
+            replies: Vec::new(),
+            duration: started.elapsed(),
+            interrupted: false,
+            result: Err(error),
+        };
+    };
+
+    deadline.reset();
+    deadline.arm(limits.handler_timeout);
+    output
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    control.begin_event(true);
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, true);
+
+    let result = invoke_timer(
+        ctx,
+        name,
+        conversation,
+        handler,
+        output,
+        project,
+        device,
+        state,
+        ai,
+    )
+    .await;
+    let duration = started.elapsed();
+
+    control.end_event();
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+    deadline.disarm();
+    let interrupted = deadline.take_interrupted();
+    let (logs, replies) = output.lock().unwrap_or_else(PoisonError::into_inner).take();
+
+    RawEvent {
+        logs,
+        replies,
+        duration,
+        interrupted,
+        result,
+    }
+}
+
+// Nine arguments like its siblings above: they are the same slot set (device / state /
+// ai) threaded down from `serve`, and bundling them into a struct would only move the
+// noise to every call site while making the ordering invisible.
+#[allow(clippy::too_many_arguments)]
+async fn invoke_timer<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    conversation: Option<&str>,
+    handler: &Persistent<Function<'static>>,
+    output: &Arc<Mutex<HostOutput>>,
+    project: &CompiledProject,
+    device: &DeviceSlot,
+    state: &StateSlot,
+    ai: &AiSlot,
+) -> Result<(), CodeError> {
+    let result = async {
+        let event = build_timer_event(ctx, name, conversation, output, device, state, ai)?;
+        let function = handler.clone().restore(ctx)?;
+        let pending: MaybePromise<'js> = function.call((event, name))?;
+        pending.into_future::<Value<'js>>().await?;
+        Ok::<(), rquickjs::Error>(())
+    }
+    .await;
+    result.map_err(|error| describe(ctx, error, project))
+}
+
+/// The context handed to `onTimer`, plus the timer's name as the second
+/// argument.
+///
+/// Deliberately **narrower** than a message event: `reply`, `log`, `sleep` and
+/// `ai` are there, while `kv`, `history` and `device` are not. Those three are
+/// per-bot-identity surfaces, and a timer carries no conversation, so exposing
+/// them would either fail at call time (a confusing `HBOT_STATE_INVALID` from a
+/// hook that looked declared) or, worse, silently reuse the previous event's
+/// identity and let a schedule read someone else's messages. A schedule that
+/// needs persistent state has to model it as a message-triggered action — that
+/// is what `bot_jobs` will be for.
+fn build_timer_event<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    conversation: Option<&str>,
+    output: &Arc<Mutex<HostOutput>>,
+    device: &DeviceSlot,
+    state: &StateSlot,
+    ai: &AiSlot,
+) -> rquickjs::Result<Object<'js>> {
+    let timer_event = Object::new(ctx.clone())?;
+    // Also on the object, so `ctx.name` works whether a project reads the second
+    // argument or the event itself.
+    timer_event.set("name", name)?;
+    // Clear the identity anyway: nothing on this context can use it, and leaving
+    // the previous event's bot parked on the slots is how a later refactor grows
+    // an accidental cross-event read.
+    device.set_current_bot(None);
+    state.set_current_bot(None, None);
+    ai.reset_event();
+
+    let host: Object<'js> = ctx.globals().get("__hbot")?;
+    // `reply` is **not** the message-event one: a timer has no inbound message,
+    // so the destination can only come from the plan's declared conversation.
+    //
+    // With a target, this pushes onto the same `HostOutput::replies` list the
+    // message path uses (the host routes it from `DueSchedule::conversation`).
+    // Without one, it throws `HBOT_TIMER_NO_TARGET` rather than letting the
+    // message path's reply silently pick a conversation — guessing means posting
+    // into a stranger's group.
+    let reply = {
+        let output = Arc::clone(output);
+        let has_target = conversation.is_some();
+        Function::new(
+            ctx.clone(),
+            move |handle: Ctx<'js>, message: String| -> rquickjs::Result<()> {
+                if !has_target {
+                    return Err(Exception::throw_message(
+                        &handle,
+                        &format!(
+                            "{}: 这个定时器没有声明回复目标，ctx.reply 不知道发给谁。\
+                             在 hbot.json 的 capabilities.timer 里给这条计划写 `conversation`\
+                             （群或私聊的 externalId），只想记日志就用 ctx.log",
+                            crate::timer::NO_TARGET_CODE
+                        ),
+                    ));
+                }
+                output
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push_reply(message);
+                Ok(())
+            },
+        )
+        .and_then(|function| function.with_name("reply"))?
+    };
+    timer_event.set("reply", reply)?;
+    timer_event.set("log", host.get::<_, Function<'js>>("log")?)?;
+    timer_event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
+    timer_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
+    Ok(timer_event)
 }
 
 async fn invoke_inner<'js>(

@@ -130,10 +130,38 @@ declare module 'hbot' {
     sleep(ms: number): Promise<void>;
   }
 
-  /** 入口配置。当前只认 onMessage；生命周期钩子与定时器尚未实现，故不声明。 */
+  /**
+   * 入口配置。
+   *
+   * `onMessage` 必填。`onTimer` 可选：只有在 `hbot.json` 的
+   * `capabilities.timer` 里声明了计划、并且确实定义了它，定时器到点才会调到你；
+   * 声明了却没定义的话，每次到点都会记一条说明缺钩子的错误日志。
+   * 生命周期钩子仍未实现，故不声明（见 docs/07 §4.1 的顺序表）。
+   */
   export interface BotConfig {
     /** 收到消息时调用；可以返回 Promise。 */
     onMessage(ctx: MessageCtx): void | Promise<void>;
+    /**
+     * 定时器到点时调用，`name` 是 `hbot.json` 里那条计划的 `name`。
+     *
+     * 与消息事件共用 `ctx.reply` / `ctx.log` / `ctx.sleep` / `ctx.kv` / `ctx.ai`，
+     * 但**没有**入站字段（没有 `text`、没有 `conversationId`）：定时器背后没有
+     * 会话。因此 `ctx.device.*` 与 `ctx.history()` 在定时器里一律被拒
+     * （`HBOT_DEVICE_FAILED` / `HBOT_STATE_INVALID`），不会去读上一条消息的会话。
+     */
+    onTimer(ctx: TimerCtx, name: string): void | Promise<void>;
+  }
+
+  /** 定时器事件的上下文：只有宿主能力，没有入站字段。 */
+  export interface TimerCtx {
+    /** 本次计划的 `name`，与第二个参数相同。 */
+    readonly name: string;
+    /** 往当前会话发一条回复。定时器没有入站消息，所以这是唯一能主动开口的口子。 */
+    reply(text: string): void;
+    /** 写一行运行日志。 */
+    log(message: string): void;
+    /** 让出 `ms` 毫秒；超过 600000 按 600000 算，并且会被定时器预算截断。 */
+    sleep(ms: number): Promise<void>;
   }
 
   /** `http.get` 的可选参数。 */

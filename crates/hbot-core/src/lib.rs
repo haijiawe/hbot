@@ -27,6 +27,7 @@
 
 pub mod bot_ai;
 pub mod bot_state;
+pub mod bot_timer;
 pub mod command;
 pub mod debug;
 pub mod device;
@@ -46,6 +47,11 @@ pub use bot_state::{
     BotState, BotStateError, HistoryDirection, HistoryEntry, HistoryReader, KvEntry,
     KvWriteOptions, MAX_HISTORY, MAX_KV_BATCH, MAX_KV_KEY_BYTES, MAX_KV_LIST, MAX_KV_TTL,
     MAX_KV_VALUE_BYTES, history_limit, validate_batch, validate_key, validate_ttl, validate_value,
+};
+pub use bot_timer::{
+    DAY_MS, DueSchedule, MAX_INTERVAL_MS, MAX_SCHEDULE_NAME_BYTES, MAX_SCHEDULES,
+    MAX_UTC_OFFSET_MINUTES, MIN_INTERVAL_MS, MIN_UTC_OFFSET_MINUTES, ScheduleSpec, ScheduleWhen,
+    TimerError, validate_name, validate_schedules, validate_when,
 };
 pub use command::{
     CommandDenied, CommandOutput, CommandSpec, CommandStatus, IoDirection, OutputStream, Platform,

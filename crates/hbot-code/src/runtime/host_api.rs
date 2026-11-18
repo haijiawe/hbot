@@ -367,6 +367,9 @@ export function defineBot(config) {
   if (typeof config.onMessage !== 'function') {
     throw new TypeError('defineBot(config): config.onMessage must be a function');
   }
+  if (config.onTimer !== undefined && typeof config.onTimer !== 'function') {
+    throw new TypeError('defineBot(config): config.onTimer must be a function when given');
+  }
   return config;
 }
 
