@@ -133,7 +133,8 @@ if !FIRST_DISPATCH.swap(true, std::sync::atomic::Ordering::Relaxed) {
 
 **保留它的理由**：预取确实把核心就绪与 `setup` 之后的装配重叠了，属净收益（省掉 `setup` 里的串行 28 ms），因此**保留**，不要当成无效代码删掉。但**不要指望它救 800 ms**：桌面侧的 760 ms 是 Tauri runtime + WebView2 初始化 + 窗口创建，属于宿主成本，Rust 侧无从优化。要真压到 800 ms 以内只有两条路——换原生 UI，或让 WebView2 预热常驻——都不在本轮范围。
 
-复测命令与原始日志：`E:\hbot-target\prefetch-check.log`（3 次）；探针脚本 `scripts/startup-probe.ps1`。
+复测命令与原始日志：`E:\hbot-target\_evidence\S2-prefetch-check.log`（3 次）；探针脚本 `scripts/startup-probe.ps1`。
+（2026-11-18 清理构建缓存时，这份日志被搬到 `_evidence\`；`hbot-target` 下除 `_evidence`、`qqdemo-data`、`secb\backup`、`napcat` 之外都删了。）
 
 > 待确认：`CorePrefetchPlugin` 目前没有断言它的测试（`startup_trace` 只在 `HBOT_STARTUP_TRACE=1` 时产生可见证据）。若将来重构 `run()` 的插件注册顺序，需要重新跑一次上面的探针确认 `core_ready` 仍早于 `setup_exit`。
 

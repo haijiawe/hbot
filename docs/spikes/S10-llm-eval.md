@@ -35,7 +35,8 @@ cargo test -j 2 -p hbot-agent --test real_llm_eval -- --ignored --nocapture *> E
 | 1 | `openai` | **20/20** | 20 | 105,797 | 13,507 | 119,304 | 194.54 s | 0 |
 | 2 | `anthropic` | **20/20** | 20 | 19,039 | 11,216 | 30,255 | 155.10 s | 0 |
 
-两轮日志：`E:\hbot-target\eval3\openai.log`、`E:\hbot-target\eval3\anthropic.log`（本地，不入库）。
+两轮日志：`E:\hbot-target\_evidence\S10-eval3-openai.log`、`E:\hbot-target\_evidence\S10-eval3-anthropic.log`（本地，不入库）。
+（2026-11-18 清理构建缓存时从这里标出的 `eval3\` / `eval4\` 目录搬出；`hbot-target` 下现在只剩 `_evidence`、`qqdemo-data`、`secb\backup`、`napcat`。）
 
 ## 3. 每条任务（两轮都 PASS，逐条对齐）
 
