@@ -30,6 +30,7 @@ use rquickjs::{
     AsyncContext, AsyncRuntime, Ctx, Exception, Function, Module, Object, Persistent, Value,
 };
 
+use crate::ai::AiSlot;
 use crate::compile::CompiledProject;
 use crate::device::DeviceSlot;
 use crate::dispatch::EventFailure;
@@ -40,7 +41,7 @@ use crate::limits::{Deadline, Limits};
 use crate::modules;
 use crate::state::StateSlot;
 use hbot_core::debug::{Breakpoints, DebugSink};
-use hbot_core::{BotState, DeviceBackend, DeviceGate, HistoryReader};
+use hbot_core::{AiClient, BotState, DeviceBackend, DeviceGate, HistoryReader};
 
 use super::debug_host::{DebugControl, DebugRuntime};
 use super::host_api::{self, HostOutput};
@@ -127,6 +128,14 @@ pub struct Sandbox {
     /// `conversationId`) lives here too, because the isolate is reused across
     /// events and `ctx.kv`/`ctx.history` are installed once at bootstrap.
     state: Arc<StateSlot>,
+    /// The intelligence slot: the model client and this event's call budget,
+    /// replaceable at any time.
+    ///
+    /// Same reason as [`Sandbox::device`] and [`Sandbox::state`]: spawn
+    /// signatures are frozen, so the worker re-reads the slot per call instead of
+    /// capturing a client at spawn. Replacing it therefore points the very next
+    /// `ctx.ai.complete` at the new model without restarting the bot.
+    ai: Arc<AiSlot>,
 }
 
 /// Mutable debug state shared with the worker thread.
@@ -199,11 +208,13 @@ impl Sandbox {
         let control = Arc::new(DebugControl::new());
         let device = Arc::new(DeviceSlot::new());
         let state = Arc::new(StateSlot::new());
+        let ai = Arc::new(AiSlot::new());
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
         let worker_http = Arc::clone(&http);
         let worker_device = Arc::clone(&device);
         let worker_state = Arc::clone(&state);
+        let worker_ai = Arc::clone(&ai);
         let worker = std::thread::Builder::new()
             .name("hbot-isolate".to_owned())
             .spawn(move || {
@@ -216,6 +227,7 @@ impl Sandbox {
                     worker_http,
                     worker_device,
                     worker_state,
+                    worker_ai,
                     &started_tx,
                     &finished_tx,
                 )
@@ -233,6 +245,7 @@ impl Sandbox {
             control,
             device,
             state,
+            ai,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -307,6 +320,28 @@ impl Sandbox {
     /// Whether [`Sandbox::set_state`] has been called on this sandbox.
     pub fn is_state_assembled(&self) -> bool {
         self.state.is_assembled()
+    }
+
+    /// Assemble (or replace) the model client used by `ctx.ai.complete`.
+    ///
+    /// The argument is a **port** (`hbot_core::AiClient`); the host owns the
+    /// implementation (`hbot-agent`'s provider, injected by `hbot-rpc`). Nothing
+    /// is judged here: whether the project may call it at all is a manifest
+    /// question answered by the implementation, and a sandbox that was never
+    /// assembled answers `HBOT_AI_UNAVAILABLE` rather than inventing a reply.
+    ///
+    /// Safe to call at any time, including between two dispatches: the isolate
+    /// re-reads the slot per call, so switching models in the IDE takes effect on
+    /// the *next* call without restarting the bot. Same constraint as
+    /// [`Sandbox::set_device`]: the spawn signatures are frozen, so a slot is the
+    /// only way in.
+    pub fn set_ai(&self, client: Arc<dyn AiClient>) {
+        self.ai.set(client);
+    }
+
+    /// Whether [`Sandbox::set_ai`] has been called on this sandbox.
+    pub fn is_ai_assembled(&self) -> bool {
+        self.ai.is_assembled()
     }
 
     /// Run `onMessage` for one JSON event.
@@ -714,11 +749,12 @@ fn worker(
     http: Arc<HttpConfig>,
     device: Arc<DeviceSlot>,
     state: Arc<StateSlot>,
+    ai: Arc<AiSlot>,
     started: &Sender<Result<(), CodeError>>,
     finished: &Sender<()>,
 ) {
     if let Err(error) = serve(
-        inbox, project, limits, debug, control, http, device, state, started,
+        inbox, project, limits, debug, control, http, device, state, ai, started,
     ) {
         tracing::error!(
             code = error.code(),
@@ -782,6 +818,7 @@ fn serve(
     http: Arc<HttpConfig>,
     device: Arc<DeviceSlot>,
     state: Arc<StateSlot>,
+    ai: Arc<AiSlot>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -837,12 +874,13 @@ fn serve(
         let http = &http;
         let device = &device;
         let state = &state;
+        let ai = &ai;
         local.block_on(&runtime, async move {
             context
                 .async_with(async |ctx| {
                     bootstrap(
                         &ctx, &entry, output, deadline, project, debug, control, http, device,
-                        state, limits,
+                        state, ai, limits,
                     )
                     .await
                 })
@@ -875,6 +913,7 @@ fn serve(
                     let control = &control;
                     let device = &device;
                     let state = &state;
+                    let ai = &ai;
                     local.block_on(&runtime, async move {
                         context
                             .async_with(async |ctx| {
@@ -888,6 +927,7 @@ fn serve(
                                     control,
                                     device,
                                     state,
+                                    ai,
                                     instrumented,
                                     limits,
                                 )
@@ -930,6 +970,7 @@ async fn bootstrap<'js>(
     http: &Arc<HttpConfig>,
     device: &Arc<DeviceSlot>,
     state: &Arc<StateSlot>,
+    ai: &Arc<AiSlot>,
     limits: Limits,
 ) -> Result<Persistent<Function<'static>>, CodeError> {
     deadline.reset();
@@ -943,6 +984,7 @@ async fn bootstrap<'js>(
             Arc::clone(http),
             Arc::clone(device),
             Arc::clone(state),
+            Arc::clone(ai),
         )?;
         // The probe functions exist in both builds so the loader never has to
         // care, but `__hbot_dbg` starts `false`: a release build never emits a
@@ -1010,6 +1052,7 @@ async fn run_event<'js>(
     control: &Arc<DebugControl>,
     device: &Arc<DeviceSlot>,
     state: &Arc<StateSlot>,
+    ai: &Arc<AiSlot>,
     instrumented: bool,
     limits: Limits,
 ) -> RawEvent {
@@ -1027,7 +1070,7 @@ async fn run_event<'js>(
     let _ = ctx.globals().set(instrument::DEBUG_FLAG, instrumented);
 
     let started = Instant::now();
-    let result = invoke(ctx, payload, handler, project, device, state).await;
+    let result = invoke(ctx, payload, handler, project, device, state, ai).await;
     let duration = started.elapsed();
 
     control.end_event();
@@ -1053,8 +1096,9 @@ async fn invoke<'js>(
     project: &CompiledProject,
     device: &DeviceSlot,
     state: &StateSlot,
+    ai: &AiSlot,
 ) -> Result<(), CodeError> {
-    match invoke_inner(ctx, payload, handler, device, state).await {
+    match invoke_inner(ctx, payload, handler, device, state, ai).await {
         Ok(()) => Ok(()),
         Err(error) => Err(describe(ctx, error, project)),
     }
@@ -1066,8 +1110,9 @@ async fn invoke_inner<'js>(
     handler: &Persistent<Function<'static>>,
     device: &DeviceSlot,
     state: &StateSlot,
+    ai: &AiSlot,
 ) -> rquickjs::Result<()> {
-    let event = build_event(ctx, payload, device, state)?;
+    let event = build_event(ctx, payload, device, state, ai)?;
     let function = handler.clone().restore(ctx)?;
     // `MaybePromise` accepts both `onMessage(ctx) {}` and
     // `async onMessage(ctx) {}`; awaiting it is also what drives any
@@ -1097,6 +1142,7 @@ fn build_event<'js>(
     payload: &str,
     device: &DeviceSlot,
     state: &StateSlot,
+    ai: &AiSlot,
 ) -> rquickjs::Result<Object<'js>> {
     let parsed: Value<'js> = ctx.json_parse(payload.to_owned())?;
     let event = match Object::from_value(parsed.clone()) {
@@ -1112,6 +1158,8 @@ fn build_event<'js>(
 
     device.set_current_bot(bot_id_of(payload));
     state.set_current_bot(bot_id_of(payload), conversation_id_of(payload));
+    // 每事件清零调用额度：isolate 跨事件复用，不清零就等于按 isolate 计。
+    ai.reset_event();
 
     let host: Object<'js> = ctx.globals().get("__hbot")?;
     event.set("reply", host.get::<_, Function<'js>>("reply")?)?;
@@ -1120,6 +1168,7 @@ fn build_event<'js>(
     event.set("device", host.get::<_, Object<'js>>("device")?)?;
     event.set("kv", host.get::<_, Object<'js>>("kv")?)?;
     event.set("history", host.get::<_, Function<'js>>("history")?)?;
+    event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
     Ok(event)
 }
 

@@ -9,11 +9,15 @@
 //!   virtual `hbot` module;
 //! * [`device_api`] — the `ctx.device` methods themselves (parsing, the gate call,
 //!   `spawn_blocking` around the backend);
+//! * [`ai_api`] — the `ctx.ai.complete` method (parameter gate first, then the
+//!   assembly slot, then the model call whose wait is charged against the
+//!   handler budget);
 //! * [`state_api`] — the `ctx.kv.*` / `ctx.history` methods (parameter gate first,
 //!   then the assembly slot, then `spawn_blocking` around the state backend).
 //!
 //! Limits live in [`crate::limits`]; compile-time work in [`crate::compile`].
 
+pub(crate) mod ai_api;
 pub(crate) mod debug_host;
 pub(crate) mod device_api;
 pub(crate) mod host_api;

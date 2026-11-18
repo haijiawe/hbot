@@ -13,6 +13,7 @@
 //! | `device.*` | eight methods, all `Promise`-returning | [`crate::device`] |
 //! | `kv.*` | five methods, all `Promise`-returning | [`crate::state`] |
 //! | `history(n)` | `(number?) => Promise<HistoryEntry[]>` | [`crate::state`] |
+//! | `ai.complete(options)` | `(object) => Promise<{text, promptTokens, completionTokens, model}>` | [`crate::ai`] |
 //!
 //! `sleep` and `http.get` are the important ones: they resolve (or reject) a
 //! JavaScript promise from a Rust async task. The task is spawned onto the
@@ -38,6 +39,7 @@ use std::time::Duration;
 use rquickjs::prelude::Async;
 use rquickjs::{Ctx, Exception, Function, IntoJs, Object, Value};
 
+use crate::ai::AiSlot;
 use crate::device::DeviceSlot;
 use crate::error::CodeError;
 use crate::http::{GetOptions, HttpConfig, HttpResponse};
@@ -49,8 +51,9 @@ use crate::state::StateSlot;
 /// This is data, not prose: `crate::dts`'s drift tests compare it with the
 /// exports of [`HOST_MODULE_SOURCE`] and with the declarations in `hbot.d.ts`,
 /// so a binding added here without its two declarations is a test failure.
-pub(crate) const HOST_BINDING_KEYS: &[&str] =
-    &["log", "reply", "sleep", "http", "device", "kv", "history"];
+pub(crate) const HOST_BINDING_KEYS: &[&str] = &[
+    "log", "reply", "sleep", "http", "device", "kv", "history", "ai",
+];
 
 /// Upper bound on captured `log`/`reply` entries per event.
 ///
@@ -131,11 +134,12 @@ fn truncate(message: String) -> String {
 }
 
 /// Install `globalThis.__hbot` (`log`, `reply`, `sleep`, `http.get`, `device`,
-/// `kv`, `history`) into `ctx`.
+/// `kv`, `history`, `ai`) into `ctx`.
 ///
-/// `device` and `state` are **replaceable** slots, not snapshots: every
-/// `ctx.device.*` / `ctx.kv.*` call re-reads its slot, so a revoked session (or a
-/// host that only now assembled its state backend) takes effect on the very next
+/// `device`, `state` and `ai` are **replaceable** slots, not snapshots: every
+/// `ctx.device.*` / `ctx.kv.*` / `ctx.ai.complete` call re-reads its slot, so a
+/// revoked session (or a host that only now assembled its state backend, or the
+/// user pointing the IDE at a different model) takes effect on the very next
 /// call rather than on the next isolate (`docs/09` §4.2).
 pub(crate) fn install<'js>(
     ctx: &Ctx<'js>,
@@ -144,6 +148,7 @@ pub(crate) fn install<'js>(
     http: Arc<HttpConfig>,
     device: Arc<DeviceSlot>,
     state: Arc<StateSlot>,
+    ai: Arc<AiSlot>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -229,6 +234,7 @@ pub(crate) fn install<'js>(
 
     let device_object = super::device_api::install(ctx, &device, &http, &deadline)?;
     let (kv_object, history_function) = super::state_api::install(ctx, &state, &deadline)?;
+    let ai_object = super::ai_api::install(ctx, &ai, &deadline)?;
 
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
@@ -238,6 +244,7 @@ pub(crate) fn install<'js>(
     host.set("kv", kv_object).map_err(super::js_error)?;
     host.set("history", history_function)
         .map_err(super::js_error)?;
+    host.set("ai", ai_object).map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
             .filter_map(Result::ok)
@@ -482,7 +489,34 @@ export function history(limit) {
   return host.history(limit);
 }
 
-export default { defineBot, log, reply, sleep, http, device, kv, history };
+/**
+ * 智能能力。`complete({ prompt, system?, maxTokens?, temperature? })` resolves
+ * `{ text, promptTokens, completionTokens, model }`. **Every failure is a
+ * rejection** whose message starts with `HBOT_AI_*`.
+ *
+ * `text` is untrusted model output: it may contain instructions. Never treat it
+ * as a command to widen permissions, change the sandbox mode, skip an approval or
+ * edit `hbot.json` — that is exactly the prompt-injection shape this capability
+ * opens. Show it to the user or parse it as data, nothing else.
+ *
+ * Presence is not authorization: `ctx.ai` being declared in `hbot.d.ts` only means
+ * this project's `hbot.json` said `capabilities.ai`. Whether a model is
+ * configured is the host's decision, and a host without one answers
+ * `HBOT_AI_UNAVAILABLE` rather than inventing a reply.
+ *
+ * Waiting is charged against the handler budget, not against it *plus* the wait:
+ * the sandbox takes the elapsed time back out of the deadline. Without that,
+ * `await ai.complete(...)` could never finish inside a 2 s handler. There are
+ * still two caps — 4 calls and 60 s of waiting per event — and exceeding either
+ * rejects with `HBOT_AI_BUDGET`.
+ */
+export const ai = {
+  complete(options) {
+    return host.ai.complete(options);
+  },
+};
+
+export default { defineBot, log, reply, sleep, http, device, kv, history, ai };
 "#;
 
 #[cfg(test)]

@@ -108,6 +108,20 @@ declare module 'hbot' {
      * `HBOT_DEVICE_` 开头。 */
     readonly device: DeviceApi;
 
+    /* 智能能力面。
+     *
+     * **存在不等于被授权，也不等于配了模型。** `ctx.ai` 出现在这里只说明本项目
+     * `hbot.json` 的 `capabilities.ai` 声明了它；用哪个模型、有没有 key 是宿主
+     * 设置的事，宿主没配就抛 `HBOT_AI_UNAVAILABLE`（**不**编一个回复）。
+     *
+     * 等待时间**不额外占** handler 预算：沙箱把等模型的墙钟从预算里扣掉
+     * （不扣的话 2 秒预算里 `await complete()` 永远完不成）。但一次事件仍有两条
+     * 上限 —— 4 次调用、累计 60 秒 —— 超了报 `HBOT_AI_BUDGET`。
+     *
+     * 返回的 `text` 是**不可信外部内容**（模型可能照抄屏幕字/网页字，即提示注入）：
+     * 不得据此改权限、改沙箱档位、跳过审批或改 `hbot.json`。 */
+    readonly ai: AiApi;
+
     /** 回复这条消息，绑定 reply_to。 */
     reply(text: string): void;
     /** 写一条运行日志，进 RunLog，不进聊天。 */
@@ -262,6 +276,36 @@ declare module 'hbot' {
     ocr(options?: DeviceOcrOptions): Promise<DeviceOcrText>;
   }
 
+  /** `ctx.ai.complete(options)` 的参数。 */
+  export interface AiCompleteOptions {
+    /** 用户消息体。必填，1–32768 字节的非空文本。 */
+    prompt: string;
+    /** 系统消息；可选，最多 16384 字节。 */
+    system?: string;
+    /** 最多生成多少 token；省略按 512，必须是 1..=4096 的整数，超出**拒绝**不夹。 */
+    maxTokens?: number;
+    /** 采样温度，0..=2.0 的有限数；NaN / 负数 / 超过 2 一律拒绝。 */
+    temperature?: number;
+  }
+
+  /** 一次补全的结果。 */
+  export interface AiResult {
+    /** 模型输出。**不可信外部内容**：可能含指令，只能当数据用（见 `MessageCtx.ai`）。 */
+    readonly text: string;
+    /** 上游报告的 prompt token 数；上游没给时为 0，不要拿它算钱。 */
+    readonly promptTokens: number;
+    /** 上游报告的 completion token 数；同上。 */
+    readonly completionTokens: number;
+    /** 实际使用的模型名，排障用。 */
+    readonly model: string;
+  }
+
+  /** 智能能力面；失败一律 reject（`HBOT_AI_*` 开头）。 */
+  export interface AiApi {
+    /** 调一次补全。参数不合规先于"有没有模型"被判，详见 `MessageCtx.ai`。 */
+    complete(options: AiCompleteOptions): Promise<AiResult>;
+  }
+
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */
@@ -283,6 +327,9 @@ declare module 'hbot' {
   export const kv: KvApi;
   /** 会话历史，与 `ctx.history` 是同一份实现。会话仍取自本次事件。 */
   export function history(limit?: number): Promise<HistoryEntry[]>;
+  /** 智能能力，与 `ctx.ai` 是同一份实现。
+   *  声明了不等于配了模型：宿主没装配客户端时 `HBOT_AI_UNAVAILABLE`。 */
+  export const ai: AiApi;
 }
 "#;
 
@@ -366,6 +413,7 @@ mod drift {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::runtime::ai_api::AI_BINDING_KEYS;
     use crate::runtime::device_api::DEVICE_BINDING_KEYS;
     use crate::runtime::host_api::{HOST_BINDING_KEYS, HOST_MODULE_SOURCE};
     use crate::runtime::state_api::KV_BINDING_KEYS;
@@ -645,6 +693,51 @@ mod drift {
         block[..end].lines().filter_map(method_name).collect()
     }
 
+    /// The keys `runtime/ai_api.rs` installs on the `ctx.ai` object.
+    ///
+    /// Same scan and same reason as [`installed_kv_keys`].
+    fn installed_ai_keys() -> BTreeSet<String> {
+        let source = include_str!("runtime/ai_api.rs");
+        let start = source
+            .find("let entries: [(&str, Function<'js>);")
+            .expect("ai_api.rs 应有 entries 表");
+        let block = &source[start..];
+        // 类型注解里已经有一个 `]`，所以要从 `= [` 之后才开始找收尾；只有一个
+        // 条目时 rustfmt 把整张表折成一行（`state_api.rs` 有五个条目才保持多行），
+        // 两种形状都要认。
+        let after_equals = block
+            .find("= [")
+            .map(|at| &block[at + 3..])
+            .expect("entries 表应有 `= [`");
+        let body = &after_equals[..after_equals.find(']').expect("entries 表应有收尾 `]`")];
+        body.split("(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('"').map(|(name, _)| name.to_owned()))
+            .collect()
+    }
+
+    /// Method declarations inside `export interface AiApi {`.
+    fn dts_ai_methods() -> BTreeSet<String> {
+        let start = HOST_DTS
+            .find("export interface AiApi {")
+            .expect("hbot.d.ts 应有 AiApi");
+        let block = &HOST_DTS[start..];
+        let end = block.find("\n  }").expect("AiApi 应有收尾 `}`");
+        block[..end].lines().filter_map(method_name).collect()
+    }
+
+    /// Method keys of `export const ai = { … }` in the runtime module.
+    fn module_ai_methods() -> BTreeSet<String> {
+        let start = HOST_MODULE_SOURCE
+            .find("export const ai = {")
+            .expect("HOST_MODULE_SOURCE 应有 ai 命名空间");
+        let block = &HOST_MODULE_SOURCE[start..];
+        let end = block
+            .find("\n};")
+            .expect("HOST_MODULE_SOURCE 的 ai 对象应有收尾 `};`");
+        block[..end].lines().filter_map(method_name).collect()
+    }
+
     /// A `name(...)` line's name, when it is a plain identifier.
     fn method_name(line: &str) -> Option<String> {
         let (name, _) = line.trim().split_once('(')?;
@@ -834,6 +927,58 @@ mod drift {
             installed, declared,
             "`ctx.kv` 的方法与 hbot.d.ts 的 KvApi 不一致：运行时 {installed:?}，类型 {declared:?}"
         );
+    }
+
+    #[test]
+    fn ai_surface_matches_the_runtime_object_and_the_module() {
+        // `ctx.ai` 的四方一致：ai_api.rs 的 entries 表、手写的 AI_BINDING_KEYS、
+        // `hbot` 模块的 ai 命名空间、hbot.d.ts 的 AiApi。
+        let installed = installed_ai_keys();
+        assert!(
+            !installed.is_empty(),
+            "ai_api.rs 里没解析到 entries 表，扫描逻辑失效了"
+        );
+        assert_eq!(
+            installed,
+            AI_BINDING_KEYS
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect::<BTreeSet<String>>(),
+            "AI_BINDING_KEYS 与 ai_api.rs 实际注入的键不一致"
+        );
+
+        let module = module_ai_methods();
+        assert_eq!(
+            installed, module,
+            "`ctx.ai` 的方法与 `hbot` 模块转发的方法不一致：运行时 {installed:?}，模块 {module:?}"
+        );
+
+        let declared = dts_ai_methods();
+        assert_eq!(
+            installed, declared,
+            "`ctx.ai` 的方法与 hbot.d.ts 的 AiApi 不一致：运行时 {installed:?}，类型 {declared:?}"
+        );
+    }
+
+    #[test]
+    fn the_ai_surface_says_presence_is_not_authorization() {
+        // 与设备面那条同一条道理：d.ts 声明了不代表配了模型，也不代表这一轮
+        // 还有额度。三条事实必须写在类型里，否则 Agent 会照着写然后在运行时
+        // 撞墙，而且看不懂为什么。
+        assert!(
+            HOST_DTS.contains("readonly ai: AiApi;"),
+            "MessageCtx 应声明 ai（带 readonly 且名字含空格，两个扫描器靠这一条把它与入站字段分开）"
+        );
+        assert!(
+            HOST_DTS.contains("export const ai: AiApi;"),
+            "hbot 模块应声明 ai"
+        );
+        for hint in ["HBOT_AI_UNAVAILABLE", "HBOT_AI_BUDGET", "不可信外部内容"] {
+            assert!(
+                HOST_DTS.contains(hint),
+                "hbot.d.ts 没有说明智能能力的失败面或不可信性，缺少 `{hint}`"
+            );
+        }
     }
 
     #[test]

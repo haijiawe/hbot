@@ -42,6 +42,7 @@
 //! `docs/spikes/S1-quickjs.md`). `hbot.d.ts` declares exactly what the runtime
 //! implements — nothing more (`docs/02-architecture.md` §6.1 status table).
 
+pub mod ai;
 pub mod compile;
 pub mod device;
 mod dispatch;
@@ -56,6 +57,7 @@ pub mod permissions;
 pub mod runtime;
 pub mod state;
 
+pub use ai::{CallCounter, DEFAULT_CALL_TIMEOUT as AI_DEFAULT_CALL_TIMEOUT};
 pub use compile::{
     BuildMode, CompileStats, CompiledModule, CompiledProject, Compiler, DebugInfo, ENTRY_MODULE,
     LineMapping, compile_project, compile_project_debug, compile_project_with_entry,

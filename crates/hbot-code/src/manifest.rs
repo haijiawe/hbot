@@ -95,6 +95,9 @@ pub struct Capabilities {
     /// 状态能力（C2）：`kv` / `history`。
     #[serde(default)]
     pub state: StateCapabilities,
+    /// 智能能力（C5）：`ctx.ai.complete`。
+    #[serde(default)]
+    pub ai: bool,
 }
 
 /// 状态能力（`docs/07` §5）。
@@ -120,6 +123,16 @@ impl Capabilities {
     #[must_use]
     pub fn history(&self) -> bool {
         self.state.history
+    }
+
+    /// `ctx.ai.complete` 是否可用（声明层判据；宿主装配再判一道）。
+    ///
+    /// 注意这一层只回答"项目声明了要用模型"，不回答"宿主配了模型"：
+    /// 没配就抛 `HBOT_AI_UNAVAILABLE`，两者分开报是为了让排障方向不同
+    /// （改清单 还是 去设置里填 key）。
+    #[must_use]
+    pub fn ai(&self) -> bool {
+        self.ai
     }
 }
 
