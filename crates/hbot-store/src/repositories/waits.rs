@@ -204,6 +204,19 @@ pub(crate) fn cancel_for_bot(conn: &Connection, bot_id: &BotId, now: i64) -> Res
     Ok(u32::try_from(changed).unwrap_or(u32::MAX))
 }
 
+/// 数一个 bot 还有多少条未结等待（`bot_stop` 之外的容量闸判据）。
+pub(crate) fn count_pending_for_bot(conn: &Connection, bot_id: &BotId) -> Result<u32> {
+    let count: i64 = conn.query_row(
+        COUNT_SQL,
+        params![bot_id.to_string(), STATE_PENDING],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// 数未结等待。
+const COUNT_SQL: &str = "SELECT COUNT(*) FROM bot_waits WHERE bot_id = ?1 AND state = ?2";
+
 fn select_all(where_clause: &str) -> String {
     format!("{SELECT_COLUMNS} {where_clause}")
 }

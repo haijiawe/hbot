@@ -371,6 +371,11 @@ enum StoreOp {
         now: i64,
         reply: Reply<bool>,
     },
+    /// 数一个 bot 的未结等待（容量闸的判据）。
+    CountPendingWaitsForBot {
+        bot_id: BotId,
+        reply: Reply<u32>,
+    },
     /// `bot_stop`：取消这个 bot 的全部未结等待，返回取消了几条。
     CancelWaitsForBot {
         bot_id: BotId,
@@ -1122,6 +1127,12 @@ impl Store {
         })
     }
 
+    /// 数一个 bot 的未结等待（`ctx.session.prompt` 的容量闸判据）。
+    pub fn count_active_waits_for_bot(&self, bot_id: &BotId) -> Result<u32> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::CountPendingWaitsForBot { bot_id, reply })
+    }
+
     /// `bot_stop`：取消这个 bot 的全部未结等待，返回取消了几条。
     pub fn cancel_waits_for_bot(&self, bot_id: &BotId, now: i64) -> Result<u32> {
         let bot_id = *bot_id;
@@ -1774,6 +1785,12 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::waits::cancel(&connection, &bot_id, &conversation_id, now),
+                );
+            }
+            StoreOp::CountPendingWaitsForBot { bot_id, reply } => {
+                reply_send(
+                    reply,
+                    repositories::waits::count_pending_for_bot(&connection, &bot_id),
                 );
             }
             StoreOp::CancelWaitsForBot { bot_id, now, reply } => {

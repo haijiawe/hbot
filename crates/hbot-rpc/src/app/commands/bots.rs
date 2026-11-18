@@ -53,6 +53,7 @@ use crate::app::runtime::outbox_source::StorePendingOutbox;
 use crate::app::runtime::sandbox_handler::{
     REPLY_CAPACITY, SandboxHandler, SandboxHandlerConfig, TICK_INTERVAL,
 };
+use crate::app::runtime::waits::StoreWaitQueue;
 use crate::app::runtime::{AdapterPorts, conversation_kind_from_str, conversation_kind_str};
 use crate::app::store_failed;
 use crate::dto::{BotSummary, Command, ConversationSummary, Event, LogLevel, Response, RunLog};
@@ -173,6 +174,13 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
                 Arc::clone(state.ids()),
                 Arc::clone(state.clock()),
             ))),
+            // 会话等待：`ctx.session.prompt` 落 `bot_waits`；声明闸在沙箱侧现读清单。
+            waits: Some(Arc::new(StoreWaitQueue::new(
+                bot_id,
+                Arc::clone(state.store()),
+                Arc::clone(state.ids()),
+                Arc::clone(state.clock()),
+            ))),
         })
         // 设备能力：闸是 `AppState` 那一份（唯一判据），后端是当前平台的那一个。
         // 生产装配只有这一处 —— 别的路径（测试/bench）不装，`ctx.device.*` 会明确报
@@ -276,6 +284,9 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
             if let Err(error) = ticker_handler.tick_jobs(now).await {
                 tracing::warn!(bot = %bot_id, error = %error, "作业 tick 失败");
             }
+            if let Err(error) = ticker_handler.tick_waits(now).await {
+                tracing::warn!(bot = %bot_id, error = %error, "等待 tick 失败");
+            }
         }
     });
     if !state.bots().attach_aux(&bot_id, ticker) {
@@ -377,6 +388,23 @@ pub async fn stop(state: &AppState, bot_id: BotId) -> Response {
         Ok(Ok(0)) => {}
         Ok(Ok(cancelled)) => {
             tracing::info!(bot = %bot_id, cancelled, "bot_stop 取消了未完成的作业");
+        }
+    }
+
+    // 未结等待跟着停：`cancelled` 是终态，重启也不会再把它们捡回来。
+    // 这里**不**发通知消息 —— 那需要一条 outgoing，而 bot 已经停了。
+    let store = Arc::clone(state.store());
+    let at = state.clock().now().unix_millis();
+    match tokio::task::spawn_blocking(move || store.cancel_waits_for_bot(&bot_id, at)).await {
+        Err(error) => {
+            tracing::error!(bot = %bot_id, error = %error, "取消等待任务失败");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(bot = %bot_id, error = %store_failed(error), "取消等待失败");
+        }
+        Ok(Ok(0)) => {}
+        Ok(Ok(cancelled)) => {
+            tracing::info!(bot = %bot_id, cancelled, "bot_stop 取消了未结等待");
         }
     }
 

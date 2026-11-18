@@ -54,6 +54,7 @@ use crate::app::debug::{BreakpointTarget, DebugRegistry};
 use crate::app::runtime::fingerprint_cache::FingerprintCache;
 use crate::app::runtime::jobs::declared_jobs;
 use crate::app::runtime::net::http_config;
+use crate::app::runtime::waits::declared_session;
 use crate::app::{EventBus, store_failed};
 use crate::dto::{Event, LogLevel};
 
@@ -89,6 +90,12 @@ pub const TICK_INTERVAL: Duration = hbot_code::timer::TICK;
 /// 每认领一条就占住一个 isolate 跑一路（最长 10 分钟），所以一拍最多取
 /// [`MAX_ISOLATES`] 条 —— 再多也只是排队等下一拍，而不是把 isolate 队列撑爆。
 pub const JOB_CLAIM_LIMIT: u32 = MAX_ISOLATES as u32;
+
+/// 一次等待 tick 最多结算几条超时。
+///
+/// 与 `JOB_CLAIM_LIMIT` 不同，这里**不**受 isolate 数限制：结算一条超时只是改一行并
+/// 写一行日志，不占 isolate。取 32 是为了让「一秒内能记完的日志行」有个上界。
+pub const WAIT_EXPIRE_LIMIT: u32 = 32;
 
 /// 沙箱执行器的装配参数（字段全公开：`bot_start` 处一眼能看到都接了什么）。
 pub struct SandboxHandlerConfig {
@@ -135,6 +142,13 @@ pub struct SandboxHandlerConfig {
     ///
     /// 装的是端口而不是"队列"：真正排在哪由 store 决定，沙箱不留第二份队列。
     pub jobs: Option<Arc<crate::app::runtime::jobs::StoreJobQueue>>,
+
+    /// 会话等待端口（`ctx.session.prompt` 落到 `bot_waits` 表）。
+    ///
+    /// `None` = 这台宿主没有装配等待后端（测试、`hbot-bench`、以及任何没走
+    /// `AppState::start_bot` 的路径），此时 `ctx.session.prompt` 报
+    /// `HBOT_SESSION_UNAVAILABLE`，**不是**把等待收进内存（那样重启后消失会像正常行为）。
+    pub waits: Option<Arc<crate::app::runtime::waits::StoreWaitQueue>>,
 }
 
 /// 一个 worker 槽位：指纹一致就复用，不一致说明代码变了，换新 isolate。
@@ -342,6 +356,11 @@ pub struct SandboxHandler {
     /// 与 [`Self::state`] 同一条纪律：**每次新建 isolate 时**才 `set_jobs`，所以清单里
     /// `capabilities.jobs` 的改动会在热重载后生效。
     jobs: Option<Arc<crate::app::runtime::jobs::StoreJobQueue>>,
+    /// 会话等待端口（`None` = 未装配，`ctx.session.*` 报 `HBOT_SESSION_UNAVAILABLE`）。
+    ///
+    /// 与其它能力同一条纪律：**每次新建 isolate 时**才 `set_session`，所以清单里
+    /// `capabilities.state.session` 的改动会在热重载后生效。
+    waits: Option<Arc<crate::app::runtime::waits::StoreWaitQueue>>,
 }
 
 /// 设备能力的两个端口 + 装配时刻。
@@ -379,6 +398,7 @@ impl SandboxHandler {
             state: config.state,
             ai: config.ai,
             jobs: config.jobs,
+            waits: config.waits,
         }
     }
 
@@ -435,6 +455,15 @@ impl SandboxHandler {
     /// isolate 时现读（见 [`Self::worker`]），这里只负责"把端口装进去"。
     pub fn with_jobs(mut self, queue: Arc<crate::app::runtime::jobs::StoreJobQueue>) -> Self {
         self.jobs = Some(queue);
+        self
+    }
+
+    /// 装配会话等待能力（`ctx.session.*` + `onResume` 的端口）。在 [`Self::new`] 之后立刻调。
+    ///
+    /// 不调用本方法 = `ctx.session.prompt` 每次回 `HBOT_SESSION_UNAVAILABLE`，明确失败，
+    /// 不是把等待收进内存（旧项目 `wait_input` 的失败形状，见 `docs/00` P0-3）。
+    pub fn with_waits(mut self, queue: Arc<crate::app::runtime::waits::StoreWaitQueue>) -> Self {
+        self.waits = Some(queue);
         self
     }
 
@@ -703,6 +732,14 @@ impl SandboxHandler {
                 sandbox.set_jobs(
                     &declared_jobs(&self.project_root),
                     Arc::clone(queue) as Arc<dyn hbot_code::jobs::JobQueue>,
+                );
+            }
+            // 会话等待：声明开关与端口一起装（每个新 isolate 装一次）。只装端口会让
+            // "声明了才准开等待"变成"装配了就能开"。
+            if let Some(queue) = &self.waits {
+                sandbox.set_session(
+                    declared_session(&self.project_root),
+                    Arc::clone(queue) as Arc<dyn hbot_code::session::WaitQueue>,
                 );
             }
             tracing::debug!(
@@ -1052,6 +1089,59 @@ impl SandboxHandler {
     /// 是 `pending，下一拍自然重试。
     ///
     /// 单条作业失败不影响同批其它作业：每条独立结算（重试 / 落 `failed）。
+    /// 跑一轮等待 tick：结算到期的等待，把超时写进日志。
+    ///
+    /// 与 `tick` / `tick_jobs` 是**第三条**独立循环，理由同坑 69：每个「声明了才有」
+    /// 的能力都要自己第一句读清单，不能指望共享的循环替它判。
+    ///
+    /// 超时**不派发 handler**：等待过期没有「该跑什么代码」的答案（用户没回话）。
+    /// 所以这里只落一行 error 日志 —— 一行日志是超时唯一的痕迹，等待没有 handler。
+    pub async fn tick_waits(&self, now: hbot_core::Timestamp) -> Result<(), HbotError> {
+        if !declared_session(&self.project_root) {
+            return Ok(());
+        }
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
+        let at = now.unix_millis();
+        let expired = tokio::task::spawn_blocking(move || {
+            store.expire_due_waits(&bot_id, at, WAIT_EXPIRE_LIMIT)
+        })
+        .await
+        .map_err(|error| {
+            HbotError::internal(format!(
+                "结算到期等待的任务失败（bot {}）：{error}",
+                self.bot_id
+            ))
+        })?;
+        let expired = expired.map_err(store_failed)?;
+        for row in expired {
+            self.record_error_line(format!(
+                "等待 `{}` 超时了：{} 秒内没有{}回答（提示是「{}」，目标会话 `{}`）。\
+                 超时不会重发提示；要继续就再问用户一次 ctx.session.prompt",
+                row.key,
+                row.deadline / 1000,
+                if row.scope == "conversation" {
+                    "任何人"
+                } else {
+                    "匹配的人"
+                },
+                row.prompt,
+                row.conversation
+            ))
+            .await;
+        }
+        Ok(())
+    }
+
+    /// 跑一轮作业 tick：认领本 bot 的到期作业，逐条派发、落日志、发回复、结算终态。
+    ///
+    /// 与 `tick` 是**两条独立的循环**，不能合并成一条：定时器那条第一句就是「没声明
+    /// 计划就 return」，把它复用给作业会让「只声明了 jobs、没声明 timer」的项目永远
+    /// 派发不到作业（而且看起来像「作业不跑」，不像配置问题）。
+    ///
+    /// **顺序是先编译、后认领**：反过来的话，编译失败那一刻行已经被改成 `running` 且
+    /// `attempts` 已加一，下一拍又因为 `state != 'pending'` 拿不到它 —— 这条作业就卡在
+    /// `running` 里，只能等下一次进程启动的 `resume_interrupted_jobs` 救回来。
     pub async fn tick_jobs(&self, now: hbot_core::Timestamp) -> Result<(), HbotError> {
         // 没声明作业类型就直接走：与定时器同一条理由（别给每个 bot 加一份每秒一次的
         // 编译 + isolate 开销）。
@@ -1435,6 +1525,125 @@ impl HandlerExecutor for SandboxHandler {
 }
 
 impl SandboxHandler {
+    /// 这条消息是否唤醒了一个等待；命中就返回它（`claim` 是一条 SQL，改状态与返回同一句）。
+    ///
+    /// 没装配等待端口、或清单没声明 `state.session` 时直接返回 `None`：那是「这个项目
+    /// 不用等待」，不是错误。
+    async fn claim_wait(&self, ctx: &MessageCtx) -> Result<Option<hbot_core::WaitHit>, HbotError> {
+        if self.waits.is_none() && !declared_session(&self.project_root) {
+            return Ok(None);
+        }
+        if !declared_session(&self.project_root) {
+            return Ok(None);
+        }
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
+        let conversation_id = ctx.conversation_id();
+        let sender_id = ctx.message.sender_id.clone();
+        let message_id = ctx.message_id().to_string();
+        let at = self.clock.now().unix_millis();
+        let hit = tokio::task::spawn_blocking(move || {
+            store.claim_wait(&bot_id, &conversation_id, &sender_id, &message_id, at)
+        })
+        .await
+        .map_err(|error| {
+            HbotError::internal(format!(
+                "唤醒等待的任务失败（bot {}）：{error}",
+                self.bot_id
+            ))
+        })?;
+        let hit = hit.map_err(store_failed)?;
+        Ok(hit.map(|row| hbot_core::WaitHit {
+            id: row.id,
+            key: row.key,
+            prompt: row.prompt,
+            owner: row.owner,
+        }))
+    }
+
+    /// 跑一次 `onResume(ctx, message)`：等待被这条消息唤醒之后的路。
+    ///
+    /// 与 `on_message` 的差别只有钩子和 ctx：预算、日志落库、回复交付、崩溃预算都走
+    /// 同一套（回复同样经 `replies` 通道进 outbox，`reply_to` 恒为 `None` —— 主动
+    /// 消息不得冒用旧事件）。
+    async fn resume(
+        &self,
+        ctx: &MessageCtx,
+        event: &serde_json::Value,
+        hit: hbot_core::WaitHit,
+    ) -> Result<(), HbotError> {
+        let payload = event.to_string();
+        let conversation = ctx.conversation.external_id.clone();
+        let (fingerprint, project) = self.compiled().await?;
+        let index = stable_index(&ctx.conversation_id().to_string(), self.workers.len());
+        let mut guard = self.worker(index, &fingerprint, &project).await?;
+        let sandbox = guard
+            .as_ref()
+            .map(|worker| Arc::clone(&worker.sandbox))
+            .ok_or_else(|| HbotError::internal("worker 槽位在持有期间被清空"))?;
+        let wait_key = hit.key.clone();
+        let dispatched = tokio::task::spawn_blocking(move || {
+            sandbox.dispatch_resume_collecting(&payload, &hit.key, &hit.prompt, Some(conversation))
+        })
+        .await
+        .map_err(|error| {
+            HbotError::internal(format!("恢复派发任务失败（bot {}）：{error}", self.bot_id))
+        })?;
+
+        match dispatched {
+            Ok(outcome) => {
+                lock(&self.hot).crashes.record_success();
+                self.record_logs(outcome.logs).await;
+                // 恢复事件的 `reply_to` 恒为 `None`：这条回复回答的是**之前**那次提问，
+                // 冒用当前消息的 ID 会把它绑到一条错误的引用上。
+                self.deliver_resume_replies(ctx, outcome.replies).await?;
+                Ok(())
+            }
+            Err(failure) => {
+                let mapped = remap_error(&failure.error, &project);
+                let crash = is_crash_class(&failure.error);
+                // 崩溃类的 isolate 已经不可用：清空槽位后再去阻塞线程里 drop。
+                let dead = if crash { guard.take() } else { None };
+                drop(guard);
+                self.record_logs(failure.logs).await;
+                if let Some(dead) = dead {
+                    release_isolate(dead).await;
+                }
+                if crash {
+                    self.record_crash(&fingerprint).await;
+                }
+                tracing::warn!(
+                    bot = %self.bot_id,
+                    wait = %wait_key,
+                    error = %mapped,
+                    "恢复钩子执行失败"
+                );
+                Err(mapped)
+            }
+        }
+    }
+
+    /// 把恢复产出的回复交给 outbox（`reply_to = None`）。
+    async fn deliver_resume_replies(
+        &self,
+        ctx: &MessageCtx,
+        replies: Vec<String>,
+    ) -> Result<(), HbotError> {
+        for text in replies {
+            let request = OutboundRequest {
+                conversation: ctx.conversation.clone(),
+                text,
+                reply_to: None,
+            };
+            self.replies.send(request).await.map_err(|_| {
+                HbotError::internal(format!(
+                    "回复通道已关闭（bot {}）：supervisor 已停止，这条恢复回复没有进入 outbox",
+                    self.bot_id
+                ))
+            })?;
+        }
+        Ok(())
+    }
     /// 一条消息的完整处理：编译 → 取 worker → dispatch → 日志 → 回复。
     async fn run(&self, ctx: &MessageCtx) -> Result<(), HbotError> {
         // 事件对象的唯一拼装在 `hbot-bot::event_json`（生产与回放共用）。
@@ -1450,6 +1659,14 @@ impl SandboxHandler {
             received_at: ctx.received_at(),
             payload: ctx.payload(),
         });
+        // **唤醒优先于 onMessage**：这条消息可能正是某个等待在等的那一句。
+        //
+        // 顺序不能反：先跑 `onMessage` 会让「用户在回答一个提问」与「用户发起新话题」
+        // 走同一条路，而这两件事该做的事通常相反。命中之后就**不再**叫 `onMessage` ——
+        // 一次唤醒只该唤醒一次（`claim_wait` 是一条 SQL，所以重投的消息也不会双唤醒）。
+        if let Some(hit) = self.claim_wait(ctx).await? {
+            return self.resume(ctx, &event, hit).await;
+        }
         let conversation_id = ctx.conversation_id();
         let worker_index = stable_index(&conversation_id.to_string(), self.workers.len());
 
@@ -1819,6 +2036,7 @@ mod tests {
                     // 本文件的用例都不依赖 `ctx.jobs`；不装端口时入队报
                     // `HBOT_JOBS_UNAVAILABLE`（明确的失败，不是静默收下）。
                     jobs: None,
+                    waits: None,
                 })
                 .with_debounce(debounce)
                 .with_fingerprint_ttls(metadata_ttl, content_floor),
