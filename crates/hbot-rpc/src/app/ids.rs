@@ -8,7 +8,7 @@
 //! 方法返回具体 newtype**，泛型收窄一次，`BotId` 塞进 `ProjectId` 就会重新变成可能。
 
 use hbot_core::{
-    ApprovalId, BotId, Clock, ConversationId, EditId, IdGenerator, InboundId, MessageId,
+    ApprovalId, BotId, Clock, ConversationId, EditId, IdGenerator, InboundId, JobId, MessageId,
     OutboundId, ProjectId, SearchId, SessionId, Timestamp,
 };
 
@@ -55,6 +55,10 @@ impl IdGenerator for UuidIds {
 
     fn search_id(&self) -> SearchId {
         SearchId::from_uuid(uuid::Uuid::new_v4())
+    }
+
+    fn job_id(&self) -> JobId {
+        JobId::from_uuid(uuid::Uuid::new_v4())
     }
 }
 

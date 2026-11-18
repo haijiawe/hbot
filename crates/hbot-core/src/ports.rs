@@ -11,7 +11,7 @@
 use crate::command::{CommandDenied, CommandOutput, CommandSpec};
 use crate::domain::Timestamp;
 use crate::ids::{
-    ApprovalId, BotId, ConversationId, EditId, InboundId, MessageId, OutboundId, ProjectId,
+    ApprovalId, BotId, ConversationId, EditId, InboundId, JobId, MessageId, OutboundId, ProjectId,
     SearchId, SessionId,
 };
 
@@ -70,6 +70,9 @@ pub trait IdGenerator: Send + Sync {
 
     /// 新的搜索会话 ID（见 [`crate::ids::SearchId`]）。
     fn search_id(&self) -> SearchId;
+
+    /// 新的后台作业行 ID（见 [`crate::ids::JobId`]）。
+    fn job_id(&self) -> JobId;
 }
 
 /// 受控命令执行。

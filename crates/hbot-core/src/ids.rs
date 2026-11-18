@@ -144,3 +144,11 @@ define_id!(
     /// 一次 `SearchStart` 对应一个 ID，所有增量结果共用它；取消后不得再发结果。
     SearchId
 );
+
+define_id!(
+    /// 后台作业行 ID；`bot_jobs.id` 的主键。
+    ///
+    /// 一个 ID 对应一次的**入队**，而不是一次执行：重试会让同一行多跑几遍
+    /// （见 `crate::bot_jobs` 的"至少一次"一节）。
+    JobId
+);

@@ -26,6 +26,7 @@
 #![warn(missing_docs)]
 
 pub mod bot_ai;
+pub mod bot_jobs;
 pub mod bot_state;
 pub mod bot_timer;
 pub mod command;
@@ -42,6 +43,13 @@ pub use bot_ai::{
     AiClient, AiError, AiRequest, AiText, AiUsage, DEFAULT_OUTPUT_TOKENS, MAX_CALLS_PER_EVENT,
     MAX_OUTPUT_TOKENS, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES, MAX_TEMPERATURE, MAX_TIME_PER_EVENT,
     validate_max_tokens, validate_prompt, validate_system, validate_temperature,
+};
+pub use bot_jobs::{
+    DEFAULT_JOB_BUDGET_MS, DEFAULT_JOB_RETRIES, JobError, JobRequest, JobSpec, JobState,
+    MAX_JOB_BUDGET_MS, MAX_JOB_IDEMPOTENCY_KEY_BYTES, MAX_JOB_NAME_BYTES, MAX_JOB_PAYLOAD_BYTES,
+    MAX_JOB_RETRIES, MAX_JOB_TYPES, MAX_JOBS_PER_BOT, MAX_RETRY_DELAY_MS, MIN_JOB_BUDGET_MS,
+    MIN_RETRY_DELAY_MS, retry_delay_ms, validate_idempotency_key, validate_job_name,
+    validate_payload, validate_request, validate_specs,
 };
 pub use bot_state::{
     BotState, BotStateError, HistoryDirection, HistoryEntry, HistoryReader, KvEntry,
@@ -70,7 +78,7 @@ pub use domain::{
 };
 pub use errors::HbotError;
 pub use ids::{
-    ApprovalId, BotId, ConversationId, EditId, InboundId, MessageId, OutboundId, ProjectId,
+    ApprovalId, BotId, ConversationId, EditId, InboundId, JobId, MessageId, OutboundId, ProjectId,
     SearchId, SessionId,
 };
 pub use paths::{APP_DIR, data_dir, data_dir_for};

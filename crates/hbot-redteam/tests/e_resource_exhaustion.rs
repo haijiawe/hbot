@@ -203,6 +203,9 @@ impl IdGenerator for CountingIds {
     fn search_id(&self) -> SearchId {
         SearchId::from_uuid(self.take())
     }
+    fn job_id(&self) -> JobId {
+        JobId::from_uuid(self.take())
+    }
 }
 
 fn msg_ctx(bot: BotId, conversation: ConversationId, ext: &str) -> MessageCtx {
