@@ -351,8 +351,12 @@ export default defineBot({
   | `reply(text)` | 已实现 | 被动回复；`injected` 标记存在时按主动消息发送（`sandbox_handler.rs:621-634`） |
   | `sleep(ms)` | 已实现 | 会被 handler 预算截断：`await sleep(60000)` 在 2s handler 里约 2s 后由中断处理器判超时 |
   | `http.get(url, options?)` | 已实现 | 受 `permissions.http` 约束：默认拒绝（空表 = 全禁）、只 GET、不跟随 3xx 重定向、不支持 gzip；单次超时默认 10s（上限 60s，且被 handler 剩余预算截断）、响应体上限 256 KiB；`read-only` 档**在授权判断之前**就拒绝（不建 socket）。失败以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 前缀 reject，异常消息里的 query 抹成 `?<redacted>`。返回 `{ status, body, headers }`（headers 名小写）。**传输层由 `hbot-rpc` 注入**（`crates/hbot-rpc/src/app/runtime/net.rs` 的 `AdaptersHttpTransport`，在 `sandbox_handler.rs` 建 isolate 时按 `hbot.json` 装进沙箱），它转调 `hbot-adapters` 的 HTTP/1.1 客户端；**授权只有一份判据**（`hbot-code` 的 `permissions.rs`），适配层不按地址位置二次拒绝，所以清单写 `127.0.0.1:11434` 就真能连本机（策略 C，见 §6.6）。清单缺失/非法时退回 `HttpConfig::deny_all()`，沙箱照常启动 |
-  | `ctx.send` / `ctx.kv` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
-  | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage`（`isolate.rs:504-510`）；清单里的 `onSchedule` 字段同样未接 |
+  | `ctx.kv.*` | 已实现（2026-11-18） | `get` / `set` / `delete` / `list` / `setMany`，值都是 JSON；每 bot 一个命名空间、走 store 单写者线程。三道判据：清单 `capabilities.state.kv`（`HBOT_STATE_NOT_DECLARED`）→ 宿主装配（`HBOT_STATE_UNAVAILABLE`）→ 参数闸（键 128B / 值 64KiB / 批量 100 / TTL 30 天 / list 1000，`HBOT_STATE_INVALID`）。`set` 返回后紧接的 `get` 必须看得见（所以读也走写线程）。细节见 `docs/07` §5.0 |
+  | `ctx.history(n)` | 已实现（2026-11-18） | 最近 n 条（时间升序、含 outbound、**不含 `payload`**），默认 20、上限 50（超了夹住不报错）。清单 `capabilities.state.history` 独立声明 |
+  | `ctx.device.*` | 已实现（2026-11-17，Windows 窄版） | `screen` / `ocr` / `windows` / `click` / `key` / `keyCombo` / `clipboardRead` / `clipboardWrite`，全 Promise。三道闸：清单 `permissions.device.sub` → 运行时会话（限时/可撤销/应用白名单）→ 参数；另有 20 次/秒、2 帧/秒限速。`read-only` 档连闸都不问。细节见 `docs/09` |
+  | `ctx.ai.complete({prompt, system?, maxTokens?, temperature?})` | 已实现（2026-11-18） | 返回 `{ text, promptTokens, completionTokens, model }`，全 Promise。四道判据：清单 `capabilities.ai`（`HBOT_AI_NOT_DECLARED`）→ 宿主有没有配模型（`HBOT_AI_UNAVAILABLE`）→ 参数闸（prompt 32KiB / system 16KiB / maxTokens 1..=4096 / temperature 0..=2.0）→ 预算（每事件 4 次、累计 60 秒，`HBOT_AI_BUDGET`）。**等模型的墙钟从 handler 预算里抵掉**（否则 2s handler 下这个能力等于不存在）。参数里没有 baseUrl/apiKey/model（key 不出核心）。模型文本是不可信外部内容。细节见 `docs/07` §3.3 |
+  | `ctx.send` / `ctx.schedule` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
+  | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage`（`isolate.rs:504-510`）；清单里的 `onSchedule` 字段同样未接；`C1.timer` 是 M7 第 3 步 |
 
 - **`onMessage(ctx)` 的 `ctx` 真实形状**（由 `hbot-bot/src/event_json.rs` 的 `EventSource` / `event_json` **唯一拼装**，生产 `sandbox_handler` 与 `hbot replay` 共用这一份实现；`isolate.rs:924-942` 只追加宿主函数）：入站字段**平铺**在 ctx 上，不是嵌套在 `ctx.message` 里。
 
@@ -365,6 +369,14 @@ export default defineBot({
   | `receivedAt` | `number` | unix 毫秒 |
   | `payload` | `unknown` | 原始平台事件（各平台不同，别当契约用） |
   | `reply` / `log` / `sleep` | 函数 | 与模块导出的同名函数等价 |
+  | `kv` | 对象 | `ctx.kv.get/set/delete/list/setMany`；未声明或未装配时每个方法都 reject（`HBOT_STATE_NOT_DECLARED` / `HBOT_STATE_UNAVAILABLE`），不会返回 `undefined` 假装成功 |
+  | `history` | 函数 | `ctx.history(n)`；同样有声明/装配两道失败码 |
+  | `device` | 对象 | `ctx.device.*` 七个方法 + `ocr`；未声明/未装配/超限/限速各有独立错误码（`docs/09`） |
+  | `ai` | 对象 | `ctx.ai.complete(options)`；同上 |
+
+  > `kv` / `history` / `device` / `ai` 这几个在 `MessageCtx` 里**必须写成 `readonly X: YApi;`（名字含空格）**：
+  > 两个 d.ts 扫描器（`dts.rs` 的 `message_ctx_properties` 与 `hbot-rpc/tests/event_shape_dts.rs`）靠
+  > "名字不是纯 alnum"把它们与入站字段区分开；写成 `kv: KvApi;` 会被当成入站字段，两个 crate 同时红。
 
   新增**入站字段**的顺序（硬）：先 `hbot-bot/src/event_json.rs` 的 `EventSource` / `event_json` → 再 `dts.rs` 的 `HOST_DTS` 声明 → 最后本表与 `dts.rs` 测试里的字段清单；`crates/hbot-rpc/tests/event_shape_dts.rs` 会把 d.ts 声明的字段名集合与 `event_json` 的真实输出逐键比对，漏一处就红。
   新增宿主 API 的顺序（硬）：先 `HOST_MODULE_SOURCE` 注入 → 再 `build_event` 挂到 ctx（模块级导出如 `defineBot` / `http` **不挂 ctx**，`build_event` 只挂 ctx 上的函数）→ 再 `dts.rs` 声明 → 最后文档这张表，四处同一批改，缺一处就红。

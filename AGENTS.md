@@ -269,6 +269,49 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     要改 `strip_prefix`。`-D warnings` 下这两条会让**别人的 crate**也红，所以改完自己那侧先 `cargo clippy -p <your crate> --all-targets`，
     再看一眼 `cargo clippy --workspace --all-targets` 的失败点是不是落在别人文件里（判读方法见坑 44）。
 
+58. **"等模型"必须从 handler 预算里抵账，否则这个能力在默认配置下等于不存在**（2026-11-18）。handler 预算是
+    `limits.handlerMs`，上限 2000ms；真实补全 3–30 秒。`crates/hbot-code/src/ai.rs` 的 `call()` 在等完模型后
+    重新 `deadline.arm(left)`（`Deadline::arm` 语义是"从此刻起给预算"，所以这等于把墙钟抹掉），代价是必须有
+    上限 —— 每事件 4 次 / 累计 60 秒，`build_event` 里每事件 `reset_event()`（不清零就变成"每 isolate 4 次"，
+    一个活着的 bot 只能补全四次，第二次事件立刻报 `HBOT_AI_BUDGET`）。
+    **测这条必须用忙等，不能用 `ctx.sleep`**：`sleep` 自己也会被夹到剩余预算，用它测不出抵账
+    （`crates/hbot-code/tests/s2_ai.rs` 的 4 条正是这样：1.2 s 补全后 1.2 s 忙等必须成功，反向对照
+    "同样 2.4 s 忙等但不调模型"必须超时）。
+
+59. **宿主状态/模型/设备三类能力都有"声明层 vs 装配层"两个码，别混用**（2026-11-18）。
+    `HBOT_*_NOT_DECLARED` = 项目清单里没写（补救动作是改 `hbot.json`）；`HBOT_*_UNAVAILABLE` = 宿主没装配
+    （补救动作是去 IDE 设置里配）。把它们混成一个码，用户会在错误的文件里找问题
+    （`kv` 是 `StoreBotState` 每次重读清单 + `StateSlot::handles()`；`ai` 是 `ProviderAiClient` 每次重读 +
+    `AiSlot::client()`；`device` 是 `ManifestCapabilityGate` + `SessionScopedBackend`）。**声明层一律每次重读、
+    不许构造时快照** —— 缓存声明会让"改了清单但 isolate 没换"变成静默失效。
+
+60. **清单（`hbot.json`）参与热重载指纹**（2026-11-18，`crates/hbot-rpc/src/app/runtime/fingerprint_cache.rs` 的
+    `source_files`）。isolate 出生时按清单装配设备/状态/模型能力，只算 `src/**` 会留下「改清单不改源码 →
+    指纹不变 → isolate 不换 → 新声明永不生效」的洞。代价：**任何清单改动（包括只调设备白名单）都会触发一次
+    全量 isolate 重建**，这是正确性优先的取舍；真嫌频繁应该给清单单独做一层"只比 `capabilities`/`permissions`
+    子集"的指纹，而不是把清单移出指纹。相关测试的两条形态：单测
+    `manifest_change_alone_changes_the_fingerprint`、端到端
+    `declaring_kv_in_the_manifest_only_takes_effect_without_touching_sources`（生产 TTL 2s/5s 不能注入，
+    所以它要轮询 ≤80×100ms，单条 8–11 秒）。
+
+61. **用 PowerShell 数组按下标增删 Rust 源码里的行会静默漂移**（2026-11-18，改 `sandbox_handler.rs` 时踩了
+    五次）。`(Get-Content).LineNumber` 只要一次 `Select-String` 命中多处（或返回 `Object[]`），索引就错，
+    后果是把 `pub mod bots;` 覆盖成 `pub mod ai;`、整行删掉 `pub mod debug;`、`Self { … }` 丢掉
+    `root`/`store`/`events` 三行、字面量里插出重复的 `ai: None,` 与重复的 `.with_fingerprint_ttls(...)`。
+    规则：① 改前先确认"这个模式真的只匹配一处"（`-List` 或先打印命中数）；② 每次改完立刻
+    `git diff <file>` 逐 hunk 复查，再读一遍目标区域；③ 多行结构（结构体字面量、模块表、builder 链）
+    优先整块重写而不是逐行插删；④ 大规模改动改用 `edit` 工具（它按字面量匹配，不会下标漂移）。
+
+62. **`cargo fmt`/`cargo check` 报 `unexpected closing delimiter … src/app/mod.rs:2:1` 是文件被结构化编辑
+    交错坏了**（2026-11-18）。症状：`git diff` 只显示文档注释被削短，fmt 却在第 2 行报语法错。
+    原因：对同一文件做结构化编辑时把 `//!` 文档块与 `pub mod` 列表插在了一起。**别试图 fmt 修复**（解析就
+    失败），按"文档块 :1-N / 模块表之后"两段重建。同族：`#[must_use]` 加在返回 `Result`/`Option` 的函数上
+    会触发 `clippy::double_must_use`（删属性，改成 `#[must_use = "…"]` 同样触发）。
+
+63. **清单类结构的构造一律 `..Default::default()`**（2026-11-18）。`Capabilities` 在 `state` 之后又长了 `ai`
+    字段，所有写 `Capabilities { state: … }` 字面量的地方立刻 `E0063`。清单还会继续长（`timer`/`jobs`/`session`），
+    写 `..Capabilities::default()` 只写关心的字段就不会每加一个能力都要改一遍下游。
+
 ---
 
 ## 8. 新增 X 的步骤
@@ -329,6 +372,11 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 3. `onSchedule` 是否进 MVP。
 4. 多项目并发打开策略。
 5. 关窗继续跑的默认值。
+6. **`ctx.ai` 的形态**：现在只支持"一次请求一段文本"（无多轮历史、无流式、无 tool calling）；
+   要不要做 `ctx.ai.chat(messages)` / 流式 / 结构化输出，以及每 bot 独立模型设置（现在只有宿主级一份
+   `agent.json`），都还没定。
+7. **`ctx.ai` 的成本可见性**：`promptTokens`/`completionTokens` 只回到 handler，宿主不落库、UI 不显示，
+   所以用户看不到一个项目累计花了多少。要不要进 run log / 成本面板另说。
 
 遇到这些，先看 `docs/04-implementation-plan.md` §10 与 ADR-0002 §7；仍不确定就问，不要默默选一个。
 
