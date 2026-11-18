@@ -137,6 +137,21 @@ declare module 'hbot' {
      * 重启后作业没了变成正常现象）。 */
     readonly jobs: JobApi;
 
+    /* 会话等待面（C2.session）。
+     *
+     * **存在不等于被授权。** `ctx.session` 出现在这里只说明本项目 `hbot.json` 的
+     * `capabilities.state.session` 声明了它；宿主没装配等待后端时抛
+     * `HBOT_SESSION_UNAVAILABLE`。
+     *
+     * 它解决的是「跨消息的多轮对话」：handler 只有 2 秒预算、而且同一个会话严格
+     * 串行 —— **阻塞等下一句会把队列锁死**（要等的正是排在队尾的那条消息）。
+     * 所以 `prompt` 是**注册**而不是阻塞：写一行等待、把提示发出去，然后 handler
+     * 正常返回；下一条匹配的消息交给 `onResume`。
+     *
+     * 同一个会话同时只允许一条未结等待（第二个 `prompt` 报
+     * `HBOT_SESSION_PENDING` 并点名挡路的那条）。等待落库，进程重启后仍然有效。 */
+    readonly session: SessionApi;
+
     /** 回复这条消息，绑定 reply_to。 */
     reply(text: string): void;
     /** 写一条运行日志，进 RunLog，不进聊天。 */
@@ -177,6 +192,16 @@ declare module 'hbot' {
      * 而不是悄悄当成跑成功。
      */
     onJob(ctx: JobCtx, name: string): void | Promise<void>;
+    /**
+     * 一条消息命中了 `ctx.session.prompt` 注册的等待时调用（而不是 `onMessage`）。
+     *
+     * 第一个参数是恢复上下文（带 `waitKey` / `waitPrompt` 与唤醒它的那条消息的字段），
+     * 第二个参数是那条消息本身 —— 两者指向同一份数据。
+     *
+     * 声明了 `capabilities.state.session` 却没定义它时，每次唤醒都会记一条点名
+     * `onResume` 的错误日志，而不是悄悄当成处理成功。
+     */
+    onResume(ctx: ResumeCtx, message: InboundMessage): void | Promise<void>;
   }
 
   /** 定时器事件的上下文：只有宿主能力，没有入站字段。 */
@@ -398,6 +423,71 @@ declare module 'hbot' {
     /** 智能能力面，与消息事件同一份实现。 */
     readonly ai: AiApi;
   }
+
+  /** `ctx.session.prompt` 的可选参数。 */
+  export interface SessionPromptOptions {
+    /** 谁能回答：`'sender'`（缺省，只认开等待的那个人）或 `'conversation'`
+     *  （这个会话里任何人都算）。后者是**放宽授权面**的动作，想清楚再写。 */
+    scope?: 'sender' | 'conversation';
+    /** 超时毫秒，1000–86400000；省略按 300000（5 分钟）。越界**拒绝**不夹。
+     *  超时由宿主结算，不依赖「下一条消息到达」—— 没人回也会到点结束。 */
+    timeoutMs?: number;
+  }
+
+  /** 一条还没被回答的等待（`ctx.session.current()` 的返回）。 */
+  export interface PendingWait {
+    /** 等待行 id，排障用。 */
+    readonly id: string;
+    /** 等待键。 */
+    readonly key: string;
+    /** 注册时发给用户的提示文本。 */
+    readonly prompt: string;
+    /** 开等待的那个人（`senderId`）。 */
+    readonly owner: string;
+  }
+
+  /** `ctx.session`：跨消息的等待。`prompt` 是**注册**，不是阻塞。 */
+  export interface SessionApi {
+    /** 注册一条等待并把 `text` 作为提示发给用户，返回行 id。
+     *
+     * **它不等待**：函数一返回 handler 就继续走完，下一条匹配的消息会交给
+     * `onResume`。同一个会话已有一条未结等待时抛 `HBOT_SESSION_PENDING`
+     * （message 里点名挡路的那条）。只能在消息事件里调用 —— 定时器 / 作业 /
+     * 恢复事件没有入站身份，调用会抛 `HBOT_SESSION_INVALID`。 */
+    prompt(key: string, text: string, options?: SessionPromptOptions): Promise<string>;
+    /** 这个会话当前未结的等待；没有返回 `null`。 */
+    current(): Promise<PendingWait | null>;
+    /** 取消这个会话未结的等待；返回是否真的取消了一条（已终态时为 `false`）。 */
+    cancel(): Promise<boolean>;
+  }
+
+  /** 恢复事件的上下文：等待信息 + 唤醒它的那条消息的字段。 */
+  export interface ResumeCtx {
+    /** 被唤醒的那条等待的键（`ctx.session.prompt` 的第一个参数）。 */
+    readonly waitKey: string;
+    /** 注册等待时发给用户的提示文本 —— 用户可能已经忘了自己被问过什么。 */
+    readonly waitPrompt: string;
+    /** 唤醒它的那条消息的完整字段。 */
+    readonly message: unknown;
+    /** 那条消息的文本。 */
+    readonly text: string;
+    /** 发送者平台 id。 */
+    readonly senderId: string;
+    /** 发送者显示名（平台没给时是空串）。 */
+    readonly senderName: string;
+    /** 会话的平台 side id（回复目标就是它）。 */
+    readonly conversationExternalId: string;
+    /** 那条消息的平台 id。 */
+    readonly messageId: string;
+    /** 往等待声明的会话发一条回复；没有目标时抛 `HBOT_SESSION_NO_TARGET`。 */
+    reply(text: string): void;
+    /** 写一行运行日志。 */
+    log(message: string): void;
+    /** 让出 `ms` 毫秒；会被本次事件的预算截断。 */
+    sleep(ms: number): Promise<void>;
+    /** 智能能力面，与消息事件同一份实现。 */
+    readonly ai: AiApi;
+  }
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */
@@ -425,6 +515,8 @@ declare module 'hbot' {
   /** 后台作业，与 `ctx.jobs` 是同一份实现，等价于在事件外调用。
    *  声明了不等于被授权：作业队列没装配时 `HBOT_JOBS_UNAVAILABLE`。 */
   export const jobs: JobApi;
+  /** 会话等待面，与 `ctx.session` 是同一份实现。 */
+  export const session: SessionApi;
 }
 "#;
 

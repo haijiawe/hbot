@@ -53,7 +53,7 @@ use crate::state::StateSlot;
 /// exports of [`HOST_MODULE_SOURCE`] and with the declarations in `hbot.d.ts`,
 /// so a binding added here without its two declarations is a test failure.
 pub(crate) const HOST_BINDING_KEYS: &[&str] = &[
-    "log", "reply", "sleep", "http", "device", "kv", "history", "ai", "jobs",
+    "log", "reply", "sleep", "http", "device", "kv", "history", "ai", "jobs", "session",
 ];
 
 /// Upper bound on captured `log`/`reply` entries per event.
@@ -152,6 +152,7 @@ pub(crate) fn install<'js>(
     state: Arc<StateSlot>,
     ai: Arc<AiSlot>,
     jobs: Arc<JobSlot>,
+    session: Arc<crate::session::SessionSlot>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -241,6 +242,9 @@ pub(crate) fn install<'js>(
     // 作业不需要预算参数：入队是一次库写，不是一次 JS 等待 —— 它的墙钟由
     // `spawn_blocking` 的调用方等，而 handler 的预算本来就只是 handler 的。
     let jobs_object = super::jobs_api::install(ctx, &jobs)?;
+    // 会话等待同样不需要预算参数：`prompt` 是一次库写（`spawn_blocking` 里等），
+    // 不是一次模型调用 —— 它没有可抵账的墙钟。
+    let session_object = super::session_api::install(ctx, &session)?;
 
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
@@ -252,6 +256,7 @@ pub(crate) fn install<'js>(
         .map_err(super::js_error)?;
     host.set("ai", ai_object).map_err(super::js_error)?;
     host.set("jobs", jobs_object).map_err(super::js_error)?;
+    host.set("session", session_object).map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
             .filter_map(Result::ok)
@@ -549,7 +554,37 @@ export const jobs = {
   },
 };
 
-export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs };
+/**
+ * 会话等待（C2）。`session.prompt(key, text, options)` 注册一条等待、把提示发出去，
+ * 然后**立刻返回** —— 下一条匹配的消息会唤醒它，交给 `onResume(ctx, message)`。
+ *
+ * 三个事实：
+ * ① 必须在 `hbot.json` 的 `capabilities.state.session` 里声明过，否则报
+ *   `HBOT_SESSION_NOT_DECLARED`；
+ * ② 只能**在消息事件里**调用 —— 等待要有归属（哪个会话、谁在等），而定时器 /
+ *   作业 / 恢复事件没有入站身份；
+ * ③ `options.scope` 缺省是 `'sender'`（只认开等待的那个人）。改成 `'conversation'`
+ *   意味着这个会话**任何人**都能回答 —— 那是一个放宽授权面的动作，想清楚再写。
+ *
+ * Presence is not authorization: `ctx.session` being declared in `hbot.d.ts` only
+ * means this project said `capabilities.state.session`. A host that has not
+ * assembled its wait backend answers `HBOT_SESSION_UNAVAILABLE` rather than keeping
+ * the wait in memory (which would make it vanish on restart — the exact failure
+ * shape `C2.session` exists to kill).
+ */
+export const session = {
+  prompt(key, text, options) {
+    return host.session.prompt(key, text, options);
+  },
+  current() {
+    return host.session.current();
+  },
+  cancel() {
+    return host.session.cancel();
+  },
+};
+
+export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session };
 "#;
 
 #[cfg(test)]

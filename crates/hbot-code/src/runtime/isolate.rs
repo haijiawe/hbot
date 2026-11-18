@@ -152,6 +152,11 @@ pub struct Sandbox {
     /// messageId」与声明表，两样都在 worker 侧。宿主线程只用它装配与读
     /// [`Sandbox::is_jobs_assembled`]。
     jobs: Arc<JobSlot>,
+    /// 会话等待槽：声明开关 + 等待端口 + 本事件的身份，随事件替换。
+    ///
+    /// 与 [`Sandbox::jobs`] 同一理由 clone 给 worker：`ctx.session.prompt` 是在 handler
+    /// 体内被调用的，它要读「本事件属于哪个会话、谁在说话」，两样都在 worker 侧。
+    session: Arc<crate::session::SessionSlot>,
 }
 
 /// Mutable debug state shared with the worker thread.
@@ -228,6 +233,8 @@ impl Sandbox {
         let timer = Arc::new(TimerSlot::new());
         let jobs = Arc::new(JobSlot::new());
         let worker_jobs = Arc::clone(&jobs);
+        let session = Arc::new(crate::session::SessionSlot::new());
+        let worker_session = Arc::clone(&session);
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
         let worker_http = Arc::clone(&http);
@@ -248,6 +255,7 @@ impl Sandbox {
                     worker_state,
                     worker_ai,
                     worker_jobs,
+                    worker_session,
                     &started_tx,
                     &finished_tx,
                 )
@@ -268,6 +276,7 @@ impl Sandbox {
             ai,
             timer,
             jobs,
+            session,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -457,6 +466,64 @@ impl Sandbox {
             .map_err(|failure| *failure.error)
     }
 
+
+    /// 一条消息命中了一个等待：跑 `onResume(ctx, message)`。
+    ///
+    /// **阻塞契约与 `dispatch_*_collecting` 相同**：从 `spawn_blocking` 里调，
+    /// 失败路径带回 `ctx.log` 已经写出的行（与 `dispatch_timer_collecting` 同形）。
+    ///
+    /// # Errors
+    ///
+    /// 项目的默认导出没有 `onResume` 时报 [`CodeError::JsException`] 并点名缺的钩子
+    /// 与等待键 —— 与缺 `onJob` 同一处理，不静默成功。
+    pub fn dispatch_resume_collecting(
+        &self,
+        message_payload: &str,
+        wait_key: &str,
+        wait_prompt: &str,
+        conversation: Option<String>,
+    ) -> Result<EventOutcome, EventFailure> {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.send(Command::Resume {
+            message_payload: message_payload.to_owned(),
+            wait_key: wait_key.to_owned(),
+            wait_prompt: wait_prompt.to_owned(),
+            conversation,
+            reply,
+        })
+        .map_err(EventFailure::without_output)?;
+
+        match result.recv_timeout(self.backstop()) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => {
+                Err(EventFailure::without_output(CodeError::SandboxDead {
+                    message: format!(
+                        "isolate did not answer within {:?}; the worker thread is wedged",
+                        self.backstop()
+                    ),
+                }))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(EventFailure::without_output(self.dead())),
+        }
+    }
+
+    /// 装（或替换）会话等待的声明开关与端口。
+    ///
+    /// 声明与端口**一起**装：只装端口会让「声明了才准开等待」变成「装配了就能开」。
+    pub fn set_session(
+        &self,
+        declared: bool,
+        queue: Arc<dyn crate::session::WaitQueue>,
+    ) {
+        self.session.set_declared(declared);
+        self.session.set_queue(queue);
+    }
+
+    /// 会话等待端口是否装上了（声明开关可以独立为假）。
+    #[must_use]
+    pub fn is_session_assembled(&self) -> bool {
+        self.session.is_assembled()
+    }
     /// 装（或替换）作业声明表与入队端口。
     ///
     /// `specs` 来自 `hbot.json` 的 `capabilities.jobs`，`queue` 是宿主实现的端口
@@ -954,6 +1021,22 @@ enum Command {
         conversation: Option<String>,
         reply: Sender<Result<EventOutcome, EventFailure>>,
     },
+
+    /// 跑一次 `onResume(ctx, message)`：一条消息命中了一个等待，宿主把这条消息交给
+    /// 恢复钩子而不是 `onMessage`。
+    ///
+    /// 与 `Timer` / `Job` 同理是独立变体：恢复事件既有入站消息（`message`），又没有
+    /// 「这个 handler 在回答当前消息」这层语义 —— 它回答的是**之前**那次提问。走
+    /// `build_event` 会让 `ctx.session.prompt` 挂到这条消息自己身上，形成自唤醒。
+    Resume {
+        /// 唤醒它的那条消息的完整事件 JSON（`event_json` 的产物）。
+        message_payload: String,
+        wait_key: String,
+        wait_prompt: String,
+        /// 回复目标（等待行里的 `conversation_external_id`）。
+        conversation: Option<String>,
+        reply: Sender<Result<EventOutcome, EventFailure>>,
+    },
     /// Stop the worker loop.
     Shutdown,
 }
@@ -971,11 +1054,12 @@ fn worker(
     state: Arc<StateSlot>,
     ai: Arc<AiSlot>,
     jobs: Arc<JobSlot>,
+    session: Arc<crate::session::SessionSlot>,
     started: &Sender<Result<(), CodeError>>,
     finished: &Sender<()>,
 ) {
     if let Err(error) = serve(
-        inbox, project, limits, debug, control, http, device, state, ai, jobs, started,
+        inbox, project, limits, debug, control, http, device, state, ai, jobs, session, started,
     ) {
         tracing::error!(
             code = error.code(),
@@ -1024,6 +1108,11 @@ fn reject(command: Command, failure: &CodeError) {
                 message,
             })));
         }
+        Command::Resume { reply, .. } => {
+            let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
+                message: message.clone(),
+            })));
+        }
         Command::Job { reply, .. } => {
             // 作业体没跑：宿主按失败计入 attempts，并按声明的重试次数退避。
             let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
@@ -1052,6 +1141,7 @@ fn serve(
     state: Arc<StateSlot>,
     ai: Arc<AiSlot>,
     jobs: Arc<JobSlot>,
+    session: Arc<crate::session::SessionSlot>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1109,12 +1199,13 @@ fn serve(
         let state = &state;
         let ai = &ai;
         let jobs = &jobs;
+        let session = &session;
         local.block_on(&runtime, async move {
             context
                 .async_with(async |ctx| {
                     bootstrap(
                         &ctx, &entry, output, deadline, project, debug, control, http, device,
-                        state, ai, jobs, limits,
+                        state, ai, jobs, session, limits,
                     )
                     .await
                 })
@@ -1150,6 +1241,7 @@ fn serve(
                     let state = &state;
                     let ai = &ai;
                     let jobs = &jobs;
+                    let session = &session;
                     local.block_on(&runtime, async move {
                         context
                             .async_with(async |ctx| {
@@ -1165,6 +1257,7 @@ fn serve(
                                     state,
                                     ai,
                                     jobs,
+                                    session,
                                     instrumented,
                                     limits,
                                 )
@@ -1270,7 +1363,58 @@ fn serve(
                 let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
                 let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
             }
-        }
+            Command::Resume {
+                message_payload,
+                wait_key,
+                wait_prompt,
+                conversation,
+                reply,
+            } => {
+                let raw = {
+                    let context = &context;
+                    let resume_handler = &hooks.resume;
+                    let output = &output;
+                    let deadline = &deadline;
+                    let project = &project;
+                    let control = &control;
+                    let device = &device;
+                    let state = &state;
+                    let ai = &ai;
+                    let jobs = &jobs;
+                    let session = &session;
+                    let conversation = conversation.as_deref();
+                    let message_payload = message_payload.as_str();
+                    let wait_key = wait_key.as_str();
+                    let wait_prompt = wait_prompt.as_str();
+                    local.block_on(&runtime, async move {
+                        context
+                            .async_with(async |ctx| {
+                                run_resume(
+                                    &ctx,
+                                    message_payload,
+                                    wait_key,
+                                    wait_prompt,
+                                    conversation,
+                                    resume_handler,
+                                    output,
+                                    deadline,
+                                    project,
+                                    control,
+                                    device,
+                                    state,
+                                    ai,
+                                    jobs,
+                                    session,
+                                    limits,
+                                )
+                                .await
+                            })
+                            .await
+                    })
+                };
+                let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
+                let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
+            }        }
     }
 
     Ok(())
@@ -1301,6 +1445,11 @@ struct Hooks {
     /// 可以任一方先到，而一个不是函数的 `onJob` 值得在开机时点名，
     /// 而不是留到第一条作业才 TypeError。
     job: Option<Persistent<Function<'static>>>,
+    /// `onResume`，可选：没声明 `capabilities.state.session` 的项目没有理由定义它。
+    ///
+    /// 缺它时不是开机错误：与 `onJob` 同一处理 —— 第一次唤醒会报一条点名
+    /// `onResume` 的错（见 `run_resume`）。
+    resume: Option<Persistent<Function<'static>>>,
 }
 
 /// Evaluate `src/main.ts` and capture its hooks.
@@ -1318,6 +1467,7 @@ async fn bootstrap<'js>(
     state: &Arc<StateSlot>,
     ai: &Arc<AiSlot>,
     jobs: &Arc<JobSlot>,
+    session: &Arc<crate::session::SessionSlot>,
     limits: Limits,
 ) -> Result<Hooks, CodeError> {
     deadline.reset();
@@ -1333,6 +1483,7 @@ async fn bootstrap<'js>(
             Arc::clone(state),
             Arc::clone(ai),
             Arc::clone(jobs),
+            Arc::clone(session),
         )?;
         // The probe functions exist in both builds so the loader never has to
         // care, but `__hbot_dbg` starts `false`: a release build never emits a
@@ -1393,10 +1544,17 @@ async fn bootstrap<'js>(
             .map_err(js_error)?
             .map(|function| Persistent::save(ctx, function));
 
+        // 同上：恢复钩子也是可选的。缺它时第一次唤醒会点名报错，不静默成功。
+        let resume = config
+            .get::<_, Option<Function<'js>>>("onResume")
+            .map_err(js_error)?
+            .map(|function| Persistent::save(ctx, function));
+
         Ok::<_, CodeError>(Hooks {
             message: Persistent::save(ctx, handler),
             timer,
             job,
+            resume,
         })
     }
     .await;
@@ -1420,6 +1578,7 @@ async fn run_event<'js>(
     state: &Arc<StateSlot>,
     ai: &Arc<AiSlot>,
     jobs: &Arc<JobSlot>,
+    session: &Arc<crate::session::SessionSlot>,
     instrumented: bool,
     limits: Limits,
 ) -> RawEvent {
@@ -1437,7 +1596,7 @@ async fn run_event<'js>(
     let _ = ctx.globals().set(instrument::DEBUG_FLAG, instrumented);
 
     let started = Instant::now();
-    let result = invoke(ctx, payload, handler, project, device, state, ai, jobs).await;
+    let result = invoke(ctx, payload, handler, project, device, state, ai, jobs, session).await;
     let duration = started.elapsed();
 
     control.end_event();
@@ -1466,8 +1625,9 @@ async fn invoke<'js>(
     state: &StateSlot,
     ai: &AiSlot,
     jobs: &JobSlot,
+    session: &crate::session::SessionSlot,
 ) -> Result<(), CodeError> {
-    match invoke_inner(ctx, payload, handler, device, state, ai, jobs).await {
+    match invoke_inner(ctx, payload, handler, device, state, ai, jobs, session).await {
         Ok(()) => Ok(()),
         Err(error) => Err(describe(ctx, error, project)),
     }
@@ -1681,6 +1841,227 @@ async fn invoke_job<'js>(
     result.map_err(|error| describe(ctx, error, project))
 }
 
+
+/// 一次等待被唤醒：跑 `onResume(ctx, message)`。
+///
+/// 与 [`run_timer`] / [`run_job`] 同一个形状（预算、日志收集、失败形状都一致），
+/// 区别只在 ctx：恢复事件**有**入站消息，所以它比作业 ctx 宽 —— 挂 `ctx.message`
+/// （唤醒它的那条）与 `ctx.waitKey` / `ctx.waitPrompt`，但**仍然不挂** `kv` /
+/// `history` / `device` / `jobs` / `session`：
+///
+/// * 不挂 `kv`/`history`/`device`：恢复上下文里的「当前会话」是等待行声明的那个，
+///   而不是这条消息自己的会话（用户可以换一个人来答 `scope: conversation`）；
+/// * 不挂 `jobs`/`session`：一次唤醒不该再开新等待或新作业 —— 那会让「谁在等谁」
+///   变成一棵树，而重建它需要读整张表。
+#[allow(clippy::too_many_arguments)]
+async fn run_resume<'js>(
+    ctx: &Ctx<'js>,
+    message_payload: &str,
+    wait_key: &str,
+    wait_prompt: &str,
+    conversation: Option<&str>,
+    handler: &Option<Persistent<Function<'static>>>,
+    output: &Arc<Mutex<HostOutput>>,
+    deadline: &Arc<Deadline>,
+    project: &CompiledProject,
+    control: &Arc<DebugControl>,
+    device: &Arc<DeviceSlot>,
+    state: &Arc<StateSlot>,
+    ai: &Arc<AiSlot>,
+    jobs: &Arc<JobSlot>,
+    session: &Arc<crate::session::SessionSlot>,
+    limits: Limits,
+) -> RawEvent {
+    let started = Instant::now();
+    let Some(handler) = handler else {
+        // 与缺 `onJob` 同一处理：项目声明了 session 却没人实现钩子，要点名说清楚，
+        // 而不是让这次唤醒静默成功（那样用户会以为「我回的话 bot 收到了」）。
+        let error = CodeError::JsException {
+            message: format!(
+                "等待 `{wait_key}` 被一条消息唤醒了，但项目的默认导出没有 `onResume` 函数（defineBot 里要写 `async onResume(ctx, message)`）"
+            ),
+            stack: None,
+        };
+        return RawEvent {
+            logs: Vec::new(),
+            replies: Vec::new(),
+            duration: started.elapsed(),
+            interrupted: false,
+            result: Err(error),
+        };
+    };
+
+    deadline.reset();
+    deadline.arm(limits.handler_timeout);
+    output
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    control.begin_event(false);
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+
+    let result = invoke_resume(
+        ctx,
+        message_payload,
+        wait_key,
+        wait_prompt,
+        conversation,
+        handler,
+        output,
+        project,
+        device,
+        state,
+        ai,
+        jobs,
+        session,
+    )
+    .await;
+    let duration = started.elapsed();
+
+    control.end_event();
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+    deadline.disarm();
+    let interrupted = deadline.take_interrupted();
+    let (logs, replies) = output.lock().unwrap_or_else(PoisonError::into_inner).take();
+
+    RawEvent {
+        logs,
+        replies,
+        duration,
+        interrupted,
+        result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn invoke_resume<'js>(
+    ctx: &Ctx<'js>,
+    message_payload: &str,
+    wait_key: &str,
+    wait_prompt: &str,
+    conversation: Option<&str>,
+    handler: &Persistent<Function<'static>>,
+    output: &Arc<Mutex<HostOutput>>,
+    project: &CompiledProject,
+    device: &DeviceSlot,
+    state: &StateSlot,
+    ai: &AiSlot,
+    jobs: &JobSlot,
+    session: &crate::session::SessionSlot,
+) -> Result<(), CodeError> {
+    let result = async {
+        let event = build_resume_event(
+            ctx,
+            message_payload,
+            wait_key,
+            wait_prompt,
+            conversation,
+            output,
+            device,
+            state,
+            ai,
+            jobs,
+            session,
+        )?;
+        let function = handler.clone().restore(ctx)?;
+        let message = event.get::<_, Value<'js>>("message")?;
+        let pending: MaybePromise<'js> = function.call((event, message))?;
+        pending.into_future::<Value<'js>>().await?;
+        Ok::<(), rquickjs::Error>(())
+    }
+    .await;
+    result.map_err(|error| describe(ctx, error, project))
+}
+
+/// 交给 `onResume(ctx, message)` 的 ctx。
+///
+/// 两个参数是**同一条消息**（`ctx` 是它的宿主面，`message` 是它的原始字段）：模板里
+/// `ctx.text` 与 `message.text` 都能写，读的是同一份数据。
+///
+/// 身份仍然显式清空：恢复上下文里的「当前会话」是等待行声明的那个（可能不是这条
+/// 消息的会话 —— `scope: conversation` 时任何人答都算），所以 `device` / `state` 的
+/// 身份不能借自这条消息。
+#[allow(clippy::too_many_arguments)]
+fn build_resume_event<'js>(
+    ctx: &Ctx<'js>,
+    message_payload: &str,
+    wait_key: &str,
+    wait_prompt: &str,
+    conversation: Option<&str>,
+    output: &Arc<Mutex<HostOutput>>,
+    device: &DeviceSlot,
+    state: &StateSlot,
+    ai: &AiSlot,
+    jobs: &JobSlot,
+    session: &crate::session::SessionSlot,
+) -> rquickjs::Result<Object<'js>> {
+    let parsed: Value<'js> = ctx.json_parse(message_payload.to_owned())?;
+    let message = match Object::from_value(parsed.clone()) {
+        Ok(object) => object,
+        Err(_) => {
+            let wrapper = Object::new(ctx.clone())?;
+            wrapper.set("payload", parsed)?;
+            wrapper
+        }
+    };
+
+    let resume_event = Object::new(ctx.clone())?;
+    resume_event.set("waitKey", wait_key)?;
+    resume_event.set("waitPrompt", wait_prompt)?;
+    resume_event.set("message", message.clone())?;
+    // 把这条消息的常用字段平铺到 ctx 上：模板里写 `ctx.text` 比 `ctx.message.text` 顺，
+    // 而两者指向同一份数据（不是两份可以各自过期的拷贝）。
+    for field in [
+        "text",
+        "senderId",
+        "senderName",
+        "conversationExternalId",
+        "messageId",
+    ] {
+        if let Some(value) = message.get::<_, Option<Value<'js>>>(field)? {
+            resume_event.set(field, value)?;
+        }
+    }
+
+    // 每次显式清空：恢复事件的身份是等待行的那个会话，不是这条消息的。
+    device.set_current_bot(None);
+    state.set_current_bot(None, None);
+    ai.reset_event();
+    jobs.set_current_message(None);
+    session.set_current(conversation.map(str::to_owned), None);
+
+    let host: Object<'js> = ctx.globals().get("__hbot")?;
+    let has_target = conversation.is_some();
+    let reply = {
+        let output = Arc::clone(output);
+        Function::new(
+            ctx.clone(),
+            move |handle: Ctx<'js>, text: String| -> rquickjs::Result<()> {
+                if !has_target {
+                    return Err(Exception::throw_message(
+                        &handle,
+                        &format!(
+                            "{}: 这次恢复没有声明回复目标，ctx.reply 不知道发给谁",
+                            crate::session::NO_TARGET_CODE
+                        ),
+                    ));
+                }
+                output
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push_reply(text);
+                Ok(())
+            },
+        )
+        .and_then(|function| function.with_name("reply"))?
+    };
+    resume_event.set("reply", reply)?;
+    resume_event.set("log", host.get::<_, Function<'js>>("log")?)?;
+    resume_event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
+    resume_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
+    Ok(resume_event)
+}
 /// 交给 `onJob` 的 ctx，作业名同时作为第二个参数。
 ///
 /// 比消息 ctx 还窄（`kv` / `history` / `device` / `jobs` 都没有），与 `onTimer` 同一套
@@ -1838,6 +2219,7 @@ fn build_timer_event<'js>(
     Ok(timer_event)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn invoke_inner<'js>(
     ctx: &Ctx<'js>,
     payload: &str,
@@ -1846,8 +2228,9 @@ async fn invoke_inner<'js>(
     state: &StateSlot,
     ai: &AiSlot,
     jobs: &JobSlot,
+    session: &crate::session::SessionSlot,
 ) -> rquickjs::Result<()> {
-    let event = build_event(ctx, payload, device, state, ai, jobs)?;
+    let event = build_event(ctx, payload, device, state, ai, jobs, session)?;
     let function = handler.clone().restore(ctx)?;
     // `MaybePromise` accepts both `onMessage(ctx) {}` and
     // `async onMessage(ctx) {}`; awaiting it is also what drives any
@@ -1879,6 +2262,7 @@ fn build_event<'js>(
     state: &StateSlot,
     ai: &AiSlot,
     jobs: &JobSlot,
+    session: &crate::session::SessionSlot,
 ) -> rquickjs::Result<Object<'js>> {
     let parsed: Value<'js> = ctx.json_parse(payload.to_owned())?;
     let event = match Object::from_value(parsed.clone()) {
@@ -1899,6 +2283,13 @@ fn build_event<'js>(
     // 缺省幂等键取本条消息的 messageId（[crate::jobs] 模块文档承诺的那条判据）：
     // 没有它就退化成「每次 enqueue 都要显式写 key」，而漏写就是重复干活。
     jobs.set_current_message(message_id_of(payload));
+    // 会话等待的归属键同样取自这条事件：`prompt` 只能在消息事件里调用，而它要写
+    // 「哪个会话、谁在等」。定时器 / 作业 / 恢复事件不经过这里，它们的槽位身份由
+    // 各自的 build_*_event 显式清空（不写就报错，不继承上一条消息）。
+    session.set_current(
+        conversation_external_id_of(payload),
+        sender_id_of(payload),
+    );
 
     let host: Object<'js> = ctx.globals().get("__hbot")?;
     event.set("reply", host.get::<_, Function<'js>>("reply")?)?;
@@ -1909,6 +2300,7 @@ fn build_event<'js>(
     event.set("history", host.get::<_, Function<'js>>("history")?)?;
     event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
     event.set("jobs", host.get::<_, Object<'js>>("jobs")?)?;
+    event.set("session", host.get::<_, Object<'js>>("session")?)?;
     Ok(event)
 }
 
@@ -1931,6 +2323,30 @@ fn bot_id_of(payload: &str) -> Option<hbot_core::BotId> {
 /// a second identity to keep in sync. Missing or non-string yields `None`,
 /// which makes `ctx.jobs.enqueue` demand an explicit `idempotencyKey` instead
 /// of silently reusing a previous event's.
+/// 这条事件属于哪个会话（平台 `externalId`，不是本地 `ConversationId`）。
+///
+/// 等待的归属与回复目标都用平台 ID：会话行可能还没建（第一条消息正在处理它），
+/// 而 `externalId` 在那之前就已经有了。缺失或非字符串返回 `None`，槽位据此拒绝
+/// `prompt`（而不是挂到一个空会话上）。
+fn conversation_external_id_of(payload: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
+    parsed
+        .get("conversationExternalId")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+/// 这条事件的发送者（平台 `senderId`）。
+///
+/// 与 [`conversation_external_id_of`] 同一口径：缺失时返回 `None`，槽位拒绝 `prompt`。
+/// 一个没有发送者的消息事件不可能是「有人在等回话」。
+fn sender_id_of(payload: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
+    parsed
+        .get("senderId")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
 fn message_id_of(payload: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
     parsed.get("messageId")?.as_str().map(str::to_owned)

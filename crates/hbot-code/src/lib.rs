@@ -56,6 +56,7 @@ pub mod manifest;
 pub mod modules;
 pub mod permissions;
 pub mod runtime;
+pub mod session;
 pub mod state;
 pub mod timer;
 
