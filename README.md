@@ -69,10 +69,10 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | 旧项目代码体检 | 完成（`docs/00-assessment.md`） |
 | 技术栈 ADR | Proposed（`0002`；转 Accepted 还差 QuickJS 长跑、真 OneBot 网关、macOS 隔离） |
 | 架构 / 目录 / 计划 / 闸门 / IDE | Draft，已按实现回填实测口径（`02`–`06`） |
-| 代码 | **已落地 M0–M2 主体 + M3/M4/M5 绝大部分 + C6 设备能力窄版（Windows）+ M7 第 1–3 步全部（`ctx.kv` / `ctx.history` / `ctx.ai` / `onTimer` / `ctx.jobs`）**（`crates/` 下 16 个 crate + `xtask`，`apps/web` 可构建） |
-| 测试 | 最近一次 `cargo test --workspace`：**1692 passed / 0 failed**（115 个 target）；`apps/web`：45 文件 400 用例 |
+| 代码 | **已落地 M0–M2 主体 + M3/M4/M5 绝大部分 + C6 设备能力窄版（Windows）+ M7 第 1–4 步全部（`ctx.kv` / `ctx.history` / `ctx.ai` / `onTimer` / `ctx.jobs` / `ctx.session`）**（`crates/` 下 16 个 crate + `xtask`，`apps/web` 可构建） |
+| 测试 | 最近一次 `cargo test --workspace`：**1736 passed / 0 failed**（116 个 target）；`apps/web`：45 文件 400 用例 |
 | 真机验证 | QQ 官方群/私聊被动回复已端到端跑通（`docs/spikes/S9-e2e-qq-official.md`）；Windows NSIS 安装包 9.14 MiB、安装冒烟 11/11；Windows 设备能力（截屏/原生 OCR/输入/多显示器）真机验证；DPI 声明 `unaware → per-monitor-v2` 实测 |
-| 未完成 | M6 迁移/影子（缺测试账号）、M7 第 4–5 步（`session`/`webhook`/`send`/`notify`）、真 NapCat 登录（需扫码且二维码会过期）、Linux/macOS 运行（Landlock 只交叉编译过、一次没真跑）、CI 从未执行（无 remote）、设备混合 DPI 跨屏拼图/按窗口截图（部分已做）/中文以外的 OCR 语言包 |
+| 未完成 | M6 迁移/影子（缺测试账号）、M7 第 5 步（`webhook`/`send`/`notify`）、真 NapCat 登录（需扫码且二维码会过期）、Linux/macOS 运行（Landlock 只交叉编译过、一次没真跑）、CI 从未执行（无 remote）、设备混合 DPI 跨屏拼图/按窗口截图（部分已做）/中文以外的 OCR 语言包 |
 
 > 本仓库**没有任何 Go 代码**（0 个 `.go` 文件、0 个 `go.mod`）。Go 只出现在 ADR 的候选对比表里，且未被采用；当前实现是 Rust（核心）+ TypeScript（仅 IDE 前端）。
 

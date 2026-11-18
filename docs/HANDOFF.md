@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-19 02:05**（HEAD `e66d4c7` + 本轮 4 个提交；工作树干净）。C4.jobs 已落地。
+> 本快照时间：**2026-11-19 05:35**（工作树干净）。`C4.jobs` 与 `C2.session` 都已落地。
 
 ---
 
@@ -31,7 +31,7 @@ Agent-first 的 **bot IDE**：用户在 IDE 里让 Agent 写 TypeScript bot 代�
   React 19/TS 仅作 IDE 前端 + QuickJS（rquickjs）+ SQLite（rusqlite，单写者）+ SWC 去类型。
 - **产品运行时零 Node、零 Go**。Node 只出现在 `apps/web` 的构建/测试链（vite / vitest / pnpm）。
 - 规模：Rust 约 **124k 行**（16 crate + `xtask`）、web **22,667 行**；
-  契约 **35 条命令 / 16 个事件 / 9 个 Agent 工具**；迁移 `0001`–`0006`。
+  契约 **35 条命令 / 16 个事件 / 9 个 Agent 工具**；迁移 `0001`–`0007`。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1692 passed / 0 failed / 115 target
+cargo test -j 2 --workspace              # 当前 1736 passed / 0 failed / 116 target
 pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 ```
 
-现状：**六道全绿**（2026-11-19 01:42 实测）。`apps/web/src/generated/*.ts` **要入库**；
+现状：**六道全绿**（2026-11-19 05:30 实测）。`apps/web/src/generated/*.ts` **要入库**；
 改 `dto` 后必须 `gen`（还要 `gen --check`）再提交。
 纯文档提交不需要跑全闸，但要在提交信息里说明"仅文档"。
 
@@ -79,7 +79,7 @@ pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 | crate | 职责 |
 |---|---|
 | `hbot-core` | 纯契约与端口（`bot_state.rs` / `bot_ai.rs` / `bot_timer.rs` / `device.rs` / `debug.rs` / `command.rs` / `ports.rs` / `redact.rs`） |
-| `hbot-store` | SQLite、迁移（`0001`–`0006`）、仓储（每条 SQL 只出现在 `repositories/`） |
+| `hbot-store` | SQLite、迁移（`0001`–`0007`）、仓储（每条 SQL 只出现在 `repositories/`） |
 | `hbot-workspace` | 项目文件、路径守卫、搜索、符号 |
 | `hbot-code` | SWC 编译、QuickJS isolate、沙箱、宿主 API（`runtime/{host,state,ai,device}_api.rs`）、插桩与调试 |
 | `hbot-bot` | 事件 JSON、会话、有界队列、supervisor |
@@ -108,14 +108,14 @@ pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 | `C1.timer`（`onTimer`） | 已实现（2026-11-18，`docs/07` §4.4） |
 | `C6.device` | 窄版已实现（Windows，`docs/09`） |
 | `C4.jobs`（`ctx.jobs` / `onJob`） | **已实现（2026-11-19，`docs/07` §4.5）** |
-| `C2.session`（`bot_waits`） | **未开始** ← 下一步（依赖定时器，定时器已好） |
-| `C1.webhook` / `C3.send` / `C3.notify` | **未开始** |
+| `C2.session`（`bot_waits`） | **已实现（2026-11-19，`docs/07` §5.2）** |
+| `C1.webhook` / `C3.send` / `C3.notify` | **未开始** ← 下一步 |
 | `onStart` / `onStop` / `onSchedule` | **未开始** |
 | `E1` npm 打包 / 云端宿主 | **未开始** |
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 73 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 78 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -165,6 +165,7 @@ pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 | M7 第 1 步 | 完成 | `ctx.kv` / `ctx.history`（`bot_kv` 表、三道判据、参数闸唯一一份） |
 | M7 第 2 步 | 完成 | `ctx.ai.complete`（四道判据、每事件 4 次 / 60 秒预算、等待抵账、key 不出核心） |
 | M7 第 3 步 | 完成 | `C1.timer`（2026-11-18）+ `C4.jobs`（2026-11-19，`bot_jobs` 表 / `onJob` / 重试退避 / `bot_stop` 取消 / 重启恢复） |
+| M7 第 4 步 | 完成 | `C2.session`（2026-11-19，`bot_waits` 表 / `ctx.session.prompt` / `onResume` / 超时结算 / `bot_stop` 取消） |
 
 ---
 
@@ -184,13 +185,19 @@ pnpm --dir apps/web run check            # 当前 45 文件 / 400 用例
 **还没做的三件**（不阻塞主线）：宿主级预算上限（手机 30 秒"平台取小"仍在 `docs/08` 的设计里）；
 作业状态面板；作业池"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
 
-### B. `C2.session`（`bot_waits`）—— M7 第 4 步
+### B. `C2.session` —— **已落地 2026-11-19**（不要再重做）
 
-`docs/07` §5.1 的四条硬规则已定：归属键 `(bot_id, conversation_id, sender_id)` 三元组、
-等待落库、**超时由定时器结算**（定时器已落地，这条前置条件已具备）、同会话同时只允许一个未结等待。
-这是旧项目 P0-3 的直接教训（`wait_input` 跨用户唤醒），别退回"等下一个事件"。
+落地形状与设计决定写在 `docs/07` §5.2。下一轮碰它时先记住这五条：
 
-### C. `C1.webhook` + `C3.send` + `C3.notify` —— M7 第 5 步
+- **`prompt` 是注册不是阻塞**（按字面的 `await` 写会把同会话队列死锁，坑 74）；
+- 唯一性靠 `0007` 的**部分唯一索引**（坑 75）；
+- `claim` / `expire` 各一条 `UPDATE … RETURNING`（坑 76）；
+- `onResume` 的 ctx 是第三个上下文，不挂 `kv`/`history`/`device`/`jobs`/`session`（坑 77）；
+- `IdGenerator` 加了 `wait_id`，三处测试替身要一起改（坑 78）。
+
+**还没做的三件**：超时**重发提示**（现在只落一行 error）；等待状态面板；把等待转交给别的 bot。
+
+### C. `C1.webhook` + `C3.send` + `C3.notify` —— M7 第 5 步（**下一步就做这个**）
 
 客服形态的缺口。`C3.send` 与 `C1.webhook` 是"主动出口"与"外部入口"，与 `timer` 的
 `reply` 是不同判据（`send` 没有 `conversation` 声明也能发，但必须显式给目标）。

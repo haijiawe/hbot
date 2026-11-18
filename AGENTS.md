@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–3 步（`kv`/`history`/`ai`/`timer`/`jobs`）全部落地**（1692 个 Rust 测试 / 115 个 target / web 400 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–4 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`）全部落地**（1736 个 Rust 测试 / 116 个 target / web 400 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -370,6 +370,37 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     的 `WHERE state IN ('pending','running')` 是硬约束：把 `done` 改写成 `cancelled` 会抹掉一条真实的成功
     记录（面板上就看不到"这个作业跑过了"）。恢复路径同理：`resume_interrupted_jobs` 只退回 `running`，
     `cancelled` 是终态，重启不会把它捡回来跑 —— 那是"用户按了停止"，不是"进程崩在中间"。
+
+74. **`await ctx.session.prompt(...)` 不能真的「等」—— 那会把同会话队列死锁**（2026-11-19，`C2.session` 落地）。
+    同会话队列严格 FIFO、一次只跑一个 handler（§4.2），而等待要等的**正是这个会话的下一条消息**：
+    那条消息排在队尾，正等着 handler 把队列还给它。按字面实现会死锁，而症状是「bot 突然不回这个会话的
+    任何消息」，日志里一句错都没有。正确形状是**注册**：`prompt` 写一行等待 + 发提示 + 返回，
+    下一条匹配的消息由宿主在 `run()` 里先 `claim_wait` 拦下来交给 `onResume`。
+    任何「在 handler 里等某个外部事件」的新能力（未来的 `webhook` 应答）都要先过这一关。
+
+75. **等待的唯一性必须交给数据库的部分唯一索引，不是「先查后插」**（2026-11-19）。
+    `0007` 的 `CREATE UNIQUE INDEX bot_waits_conv_pending ON bot_waits (bot_id, conversation_id) WHERE state = 'pending'`
+    是「同会话只允许一个未结等待」的唯一落地判据。先查后插在并发下两次都会读到「没有」，然后都去插。
+    部分索引（只覆盖 `pending`）而非普通唯一索引：同一会话**历史上**的等待（超时的、被回答的）必须能共存。
+    冲突要翻译成可区分的业务错误（`StoreError::WaitPending { key }` → `HBOT_SESSION_PENDING`），
+    否则用户只看到一条裸的约束失败，不知道该先回哪个。
+
+76. **`claim`（唤醒）与 `expire`（超时）各必须是一条 SQL**（2026-11-19）。拆成「先查后改」时：
+    前者会让重投的消息**唤醒两次**（用户发一句、bot 回两遍，第二次时等待已经 `fulfilled`）；
+    后者会让两轮 tick 各自结算同一批行。`claim` 的 SQL 里有四个条件缺一不可：会话匹配、仍 `pending`、
+    `deadline > now`（过了点的等待不能被一句迟到的消息救活）、`scope = 'conversation' OR owner = ?sender`
+    （与 `WaitScope::accepts` 同义 —— 判据写进 SQL 才能与「改 fulfilled」同一条语句完成）。
+
+77. **恢复钩子的 ctx 是「第三个上下文」：比消息窄、比作业宽**（2026-11-19）。`onResume` 拿得到
+    `waitKey` / `waitPrompt` / `message` 与那条消息的平铺字段（`ctx.text` 等），但**不挂**
+    `kv` / `history` / `device` / `jobs` / `session`。理由：恢复上下文里的「当前会话」是**等待行**声明的那个，
+    而 `scope: conversation` 时回答者可能来自别的会话 —— 借这条消息的身份去读状态就会读错人。
+    `build_resume_event` 里四个身份槽（device / state / ai / jobs）每次都显式清空。
+
+78. **`IdGenerator` 加一个方法会让所有测试替身一起红**（2026-11-19）。`wait_id` 加进 trait 后，
+    `hbot-rpc/src/app/ids.rs`、`hbot-bot/tests/common/mod.rs`、`hbot-redteam/tests/e_resource_exhaustion.rs`
+    三处 `IdGenerator` 实现全部 `E0046`。这是**好事**（类型安全逼着每个替身表态），但要在加方法那一批里
+    一起改完，别等末轮 `cargo test --workspace` 才发现。判读方法：`cargo check --workspace --all-targets` 一次看全。
 
 ---
 

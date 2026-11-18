@@ -326,7 +326,7 @@ export default defineBot({
 | `kv` | `ctx.kv.get/set/delete/list`，值为 JSON，可选 TTL | 每 bot 一个命名空间；`setMany` 要原子；并发写要串行（走 store 的单 writer 线程） |
 | `sql` | `ctx.sql.query/exec`，只允许参数化语句 | schema 由项目里的 `migrations/*.sql` 定义，**运行时不许 DDL**；每 bot 独立 schema 前缀 |
 | `history` | `ctx.history(n)` 返回最近 n 条（含自己发过的） | 只读；由 supervisor 维护，来自 `inbound`/`outbound` 表 |
-| `session` | `ctx.session.get/set` + `await(predicate, timeoutMs)` | **归属键必须是 `(bot_id, conversation_id, sender_id)`**，且落库 |
+| `session` | `ctx.session.prompt(key, text, options)` + `onResume`（**注册而非阻塞**，见 §5.2） | **归属键必须是 `(bot_id, conversation_id, sender_id)`**，且落库；同会话只允许一个未结等待 |
 
 ### 5.0 已落地：`kv` 与 `history`（2026-11-18）
 
@@ -369,7 +369,85 @@ export default defineBot({
 3. 超时由**定时器**结算，不依赖"下一条消息到达"。
 4. 同一个会话同时只允许一个未结等待（否则语义不可推理），第二个直接报错。
 
-状态：`设计`（`bot_waits` 表不存在）。定时器已落地（§4.4），所以第 3 条规则的前置条件已经具备。
+状态：**已落地 2026-11-19**（`bot_waits` 表 + `ctx.session.prompt` + `onResume`，见 §5.2）。
+### 5.2 已落地：会话等待（`C2.session`，2026-11-19）
+
+```jsonc
+// hbot.json —— 开这项能力
+{ "capabilities": { "state": { "session": true } } }
+```
+
+```ts
+export default defineBot({
+  async onMessage(ctx) {
+    // 注册一条等待并把提示发出去，**立刻返回**（不占 2 秒预算，也不锁队列）
+    await ctx.session.prompt('order-no', '请把订单号发给我', {
+      // scope 缺省 'sender'：只认开等待的这个人；'conversation' = 这个会话谁都能答
+      timeoutMs: 300_000,
+    });
+  },
+  // 下一条匹配的消息交给它，而不是 onMessage
+  async onResume(ctx, message) {
+    ctx.log(`resume:${ctx.waitKey}`);
+    ctx.reply(`收到：${message.text}`);
+  },
+})
+```
+
+**为什么 `await(ctx.session.prompt())` 不是阻塞等待**：同一个会话的队列是严格 FIFO、
+一次只跑一个 handler（§4.2 硬约束），而等待要等的**恰恰是这个会话的下一条消息** ——
+那条消息排在队尾，正等着 handler 把队列还给它。所以 `prompt` 只能是**注册**：
+写一行等待、发提示、返回；下一条匹配的消息由宿主拦下来交给 `onResume`。
+这样白拿两件事：等待天然持久（行在库里），崩溃恢复与「重启后继续等」是同一段代码。
+
+| 判据 | 位置 | 失败时 |
+|---|---|---|
+| 声明层 | 清单 `capabilities.state.session`（`SessionSlot::prompt` 每次调用现读） | `HBOT_SESSION_NOT_DECLARED` |
+| 装配层 | 宿主有没有 `set_session` | `HBOT_SESSION_UNAVAILABLE`（补救是「bot 没起来/存储没就绪」） |
+| 参数层 | `hbot-core::bot_session` 的 `validate_key` / `validate_prompt` / `validate_timeout` / `validate_spec`（**唯一一份**） | `HBOT_SESSION_INVALID`（超时越界**报错不夹取**） |
+| 身份层 | `prompt` 只能在消息事件里调（槽位里没有会话/发送者就拒） | `HBOT_SESSION_INVALID`，定时器/作业/恢复事件里调用会明说原因 |
+| 唯一层 | `0007` 的部分唯一索引 `bot_waits_conv_pending`（只覆盖 `pending`） | `HBOT_SESSION_PENDING`，message 里点名挡路的那条 |
+| 匹配层 | `claim` 那一条 `UPDATE … RETURNING` 的 `scope = 'conversation' OR owner = ?sender` | 不匹配就不唤醒（群里 B 说一句不会填掉 A 的等待） |
+| 目标层 | `build_resume_event` 的 `reply` 闭包 | 等待行没有会话 → `HBOT_SESSION_NO_TARGET` |
+
+**六条设计决定与理由**：
+
+1. **`prompt` 不阻塞 isolate**（见上）。这是整项能力最重要的一个决定：按字面的
+   `await` 写会死锁，而且死锁的形状是「bot 突然不回这个会话的任何消息」，
+   日志里一句错都没有。
+2. **归属键是三元组，缺省只认开等待的那个人**。「任何人可答」必须显式
+   `.for_conversation()` —— 它是**放宽授权面**的动作，调用点要能被 grep 出来。
+   这一条直接对应 `docs/00` P0-3：旧项目 `any_in_group` 让群里 B 填掉了 A 的等待。
+3. **唯一性交给数据库**（部分唯一索引），不是「调用方先查一遍」。先查后插在并发下
+   两次都会读到「没有」，然后都去插。
+4. **`claim` 与 `expire` 各是一条 SQL**（`UPDATE … RETURNING`）。拆开时前者会让重投的
+   消息**唤醒两次**（用户发一句、bot 回两遍），后者会让两轮 tick 各结算同一批行。
+5. **恢复钩子的 ctx 比消息窄、比作业宽**：有 `waitKey` / `waitPrompt` / `message` 与那条
+   消息的平铺字段，但**不挂** `kv` / `history` / `device` / `jobs` / `session` —— 恢复上下文
+   里的「当前会话」是等待行声明的那个（`scope: conversation` 时回答者可能换了会话），
+   借这条消息的身份去读状态就会读错人。
+6. **超时不派发 handler，只落一行 error**。等待过期没有「该跑什么代码」的答案
+   （用户没回话），把它塞进 `onResume` 会把「回话了」与「没回话」压成同一个钩子，
+   而这两件事该做的事通常相反。
+
+**存储形态**：`bot_waits(id, bot_id, conversation_id, conversation_external_id, owner,
+key, prompt, scope, state, deadline, fulfilled_message_id, created_at, updated_at)`；
+部分唯一索引 `(bot_id, conversation_id) WHERE state = 'pending'`；`(state, deadline)` 给超时
+结算、`(bot_id, state)` 给 `bot_stop` 整批取消。状态四种拼写 `pending` / `fulfilled` /
+`expired` / `cancelled` 与 `WaitState::as_str()` 同值（存储层有对拍测试）。
+
+**生命周期**：`bot_stop` 把 `pending` 落成 `cancelled`（终态不动）；`deadline` 到期由
+`tick_waits` 结算成 `expired`。两条都是终态，重启不会把它们捡回来 —— 只有 `pending`
+会被下一条消息唤醒。
+
+**实测**：`hbot-rpc` 的 `tests/session_capability.rs` 4 条（全走 `Dispatcher` 真派发 +
+真 tick + 真库）：没声明 → `NOT_DECLARED` 且**不落库**；声明后 `prompt` 落库且 `key` /
+`state` / `scope` / `owner` 都对；下一条消息走 `onResume`（`waitKey` 与文本都对）而不是
+`onMessage`，回复进 outbox，等待转 `fulfilled`；同会话第二个 `prompt` 报 `HBOT_SESSION_PENDING`
+并点名挡路键。存储层另有 13 条（含「同一消息不能唤醒两次」「别人不能回答 sender-scope」）。
+
+**还没做**：`ctx.session.prompt` 的超时**重发提示**（现在只落一行 error，要继续得再问一次）；
+等待状态的 UI 面板；跨会话的「转人工」这类需要把等待交给另一个 bot 的形态。
 
 ---
 
@@ -530,8 +608,8 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | V4 | 每会话队列满时背压且消息不丢 | 已有 parity #13 覆盖 |
 | V5 | `kv` 的 `setMany` 原子 | 中途失败后旧值不变 |
 | V6 | `sql` 拒绝运行时 DDL | 断言 `CREATE TABLE` 被拒 |
-| V7 | `session.await` 只被归属键匹配的消息唤醒 | 群里 B 发言不唤醒 A（旧项目 P0-3 的回归） |
-| V8 | 等待在重启后恢复、超时由定时器结算 | 重启 + 不等新消息，断言超时触发 |
+| V7 | 会话等待只被归属键匹配的消息唤醒 | 群里 B 发言不唤醒 A（旧项目 P0-3 的回归）：**已测**，`repositories::waits` 的 `a_different_sender_cannot_answer_a_sender_scoped_wait` |
+| V8 | 等待在重启后恢复、超时由定时器结算 | 等待落库（`bot_waits`），重启后仍是 `pending`；超时由 `tick_waits` 用绝对 `deadline` 结算，**不等新消息**（存储层 `expire_due_marks_only_the_waits_that_are_past_their_deadline`） |
 | V9 | 作业重启后恢复、至少一次、幂等键生效 | 杀进程后重启，断言作业跑完且副作用只一次（**已测**：`resume_interrupted_jobs` 把 `running` 退回 `pending`；`tests/jobs_capability.rs` 断言同幂等键只留一行只跑一次） |
 | V10 | 能力受限时返回 `HOST_LIMIT` 而非静默降级 | 手机上跑 `jobs`，断言错误码与上限值 |
 | V11 | 同一份 bot 代码在桌面与手机都能编译、`onMessage` 路径行为一致 | 两端各跑同一份 fixture |
@@ -552,13 +630,13 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | 1 | `C2.kv` + `C2.history` | 多轮聊天、游戏存档（两类 bot 同时可用） | **已落地 2026-11-18**（§5.0） |
 | 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 | **已落地 2026-11-18**（§3.3） |
 | 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 | `C1.timer` **已落地 2026-11-18**（§4.4）；`C4.jobs` **已落地 2026-11-19**（§4.5） |
-| 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 | 未开始（依赖第 3 步的定时器结算超时） |
+| 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 | **已落地 2026-11-19**（§5.2） |
 | 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | 未开始 |
 | 6 | `E1` npm 打包 | 生态接入（见 `docs/08` §5） | 未开始 |
 | 7 | `C6.device`（桌面三平台） | 玩游戏的 bot；见 §9，里程碑 `M10` | **窄版已落地 2026-11-17**（Windows，见 `docs/09`）；完整版未做 |
 | 8 | 云端执行宿主 | 见 `docs/08` §9 与 `ADR-0006`，里程碑 `M9` | 未开始 |
 
-> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 7 完成，4 → 5 → 6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
+> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 4 → 7 完成，5 → 6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
 
 ---
 
