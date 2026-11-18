@@ -106,6 +106,46 @@ pub(crate) fn claim_due(conn: &Connection, now: i64, limit: u32) -> Result<Vec<J
     Ok(rows)
 }
 
+/// 取某个 bot 的到期作业并就地改成 running（attempts 加一），返回改完的行。
+///
+/// 与 [`claim_due`] **同一份判据**，唯一区别是多一个 `bot_id` 条件。为什么必须按 bot 过滤：
+/// 每个 bot 有自己的 tick 循环，它们各自 claim 一次。如果 claim 是全局的，A 的 tick 会
+/// 把 B 的作业抢走，然后在 A 的 isolate 里跑 —— 跨 bot 隔离（`docs/07` §3 的硬规则）
+/// 当场就破了，而且从日志上看不出来（作业名字对，只是上下文全错）。
+///
+/// 全局那一份仍然保留：进程级排障、重放工具、以及"没有 bot 在跑时"的恢复路径要它。
+pub(crate) fn claim_due_for_bot(
+    conn: &Connection,
+    bot_id: &BotId,
+    now: i64,
+    limit: u32,
+) -> Result<Vec<JobRow>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let transaction = conn.unchecked_transaction()?;
+    let rows = {
+        let mut statement = transaction.prepare(CLAIM_FOR_BOT_SQL)?;
+        let mapped = statement.query_map(
+            params![
+                STATE_PENDING,
+                STATE_RUNNING,
+                now,
+                i64::from(limit),
+                bot_id.to_string()
+            ],
+            row_to_job,
+        )?;
+        let mut jobs = Vec::new();
+        for row in mapped {
+            jobs.push(row?);
+        }
+        jobs
+    };
+    transaction.commit()?;
+    Ok(rows)
+}
+
 /// 按主键读一条作业；不存在返回 None。
 pub(crate) fn get(conn: &Connection, id: &JobId) -> Result<Option<JobRow>> {
     Ok(conn
@@ -206,6 +246,9 @@ const INSERT_SQL: &str = "INSERT INTO bot_jobs (id, bot_id, name, payload_json, 
 
 /// 取到期 + 改状态 + 加 attempts，一条语句完成（见模块文档第一节）。
 const CLAIM_SQL: &str = "UPDATE bot_jobs SET state = ?2, attempts = attempts + 1, updated_at = ?3 WHERE id IN (SELECT id FROM bot_jobs WHERE state = ?1 AND next_at <= ?3 ORDER BY next_at, created_at LIMIT ?4) RETURNING id, name, payload_json, idempotency_key, state, attempts, budget_ms, conversation, next_at, last_error, created_at";
+
+/// 取某个 bot 的到期 + 改状态 + 加 attempts（与 `CLAIM_SQL` 同形，多一个 bot_id 条件）。
+const CLAIM_FOR_BOT_SQL: &str = "UPDATE bot_jobs SET state = ?2, attempts = attempts + 1, updated_at = ?3 WHERE id IN (SELECT id FROM bot_jobs WHERE bot_id = ?5 AND state = ?1 AND next_at <= ?3 ORDER BY next_at, created_at LIMIT ?4) RETURNING id, name, payload_json, idempotency_key, state, attempts, budget_ms, conversation, next_at, last_error, created_at";
 
 /// 标成功。
 const MARK_DONE_SQL: &str =
@@ -606,6 +649,66 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM bot_jobs", [], |row| row.get(0))
             .expect("count");
         assert_eq!(left, 0, "bot 行删掉后作业行必须级联消失");
+    }
+
+    /// per-bot claim 只取自己那一行：跨 bot 隔离的存储层证据。
+    ///
+    /// 没有这条判据时，每个 bot 的 tick 各自做全局 claim → A 抢走 B 的作业并在 A 的
+    /// isolate 里跑。日志上完全看不出来（名字对、载荷对，只是上下文全错），所以这条
+    /// 必须在存储层钉住。
+    #[test]
+    fn per_bot_claim_never_takes_another_bots_rows() {
+        let dir = TempDir::new("jobs-claim-bot");
+        let store = open_store(&dir);
+        store
+            .enqueue_job(&bot_id(), &new_job(7, "a", 1_000))
+            .expect("enqueue mine");
+        let other = seed_extra_bot(&store, 99);
+        store
+            .enqueue_job(&other, &new_job(8, "b", 1_000))
+            .expect("enqueue other");
+
+        let mine = store
+            .claim_due_jobs_for_bot(&bot_id(), 1_000, 10)
+            .expect("claim mine");
+        assert_eq!(mine.len(), 1, "只该取到自己那一条");
+        assert_eq!(mine[0].id, job_id(7));
+        api_assertions(&store, &other);
+
+        // 已经被自己 claim 走的那条不会第二次出现（attempts 只在 claim 里加）。
+        assert!(
+            store
+                .claim_due_jobs_for_bot(&bot_id(), 1_000, 10)
+                .expect("claim again")
+                .is_empty(),
+            "同一个 bot 的第二次 claim 不许再取回 running 的行"
+        );
+    }
+
+    /// 上一条的断言后半段（拆出来只为让主流程读得清）。
+    fn api_assertions(store: &crate::Store, other: &BotId) {
+        let theirs = store
+            .claim_due_jobs_for_bot(other, 1_000, 10)
+            .expect("claim other");
+        assert_eq!(theirs.len(), 1, "另一只 bot 的那条仍在它自己名下");
+        assert_eq!(theirs[0].id, job_id(8));
+        assert_eq!(
+            store
+                .get_job(&job_id(8))
+                .expect("get 8")
+                .expect("row")
+                .state,
+            STATE_RUNNING,
+            "claim 立刻改状态（拆成先查后改会留双派发窗口）"
+        );
+        assert_eq!(
+            store
+                .get_job(&job_id(7))
+                .expect("get 7")
+                .expect("row")
+                .state,
+            STATE_RUNNING
+        );
     }
 
     /// 迁移 0006 真的应用了：`schema_version` 到 6，表也查得到。

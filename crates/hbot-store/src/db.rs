@@ -289,6 +289,16 @@ enum StoreOp {
         limit: u32,
         reply: Reply<Vec<JobRow>>,
     },
+    /// 取**某个 bot** 的到期作业（`update_jobs` / `bot_stop` 之外的第三种用法：per-bot tick）。
+    ///
+    /// 与 `ClaimDueJobs` 同一份 SQL 判据，只多一个 `bot_id` 条件 —— 没有它，per-bot 的
+    /// tick 会互相抢作业，然后在错的 bot 的 isolate 里跑。
+    ClaimDueJobsForBot {
+        bot_id: BotId,
+        now: i64,
+        limit: u32,
+        reply: Reply<Vec<JobRow>>,
+    },
     /// 按主键读一条作业（排障 / 面板）。
     GetJob {
         id: JobId,
@@ -1009,6 +1019,27 @@ impl Store {
         self.submit(|reply| StoreOp::ClaimDueJobs { now, limit, reply })
     }
 
+    /// 取**这个 bot** 的到期作业（`state = 'pending' AND next_at <= now`），就地改成
+    /// `running` 并把 `attempts` 加一，返回改完的行；一次最多 `limit` 条。
+    ///
+    /// 与 [`Self::claim_due_jobs`] 同一份 SQL 判据，唯一区别是多一个 `bot_id` 条件。
+    /// 作业派发**只能**走这一个：每个 bot 有自己的 tick 循环，全局 claim 会让 A 把 B 的
+    /// 作业抢走并在 A 的 isolate 里跑（跨 bot 隔离当场破，而且日志里看不出来）。
+    pub fn claim_due_jobs_for_bot(
+        &self,
+        bot_id: &BotId,
+        now: i64,
+        limit: u32,
+    ) -> Result<Vec<JobRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ClaimDueJobsForBot {
+            bot_id,
+            now,
+            limit,
+            reply,
+        })
+    }
+
     /// 按主键读一条作业；不存在返回 `Ok(None)`。
     pub fn get_job(&self, id: &JobId) -> Result<Option<JobRow>> {
         let id = *id;
@@ -1498,6 +1529,17 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::jobs::claim_due(&connection, now, limit),
+                );
+            }
+            StoreOp::ClaimDueJobsForBot {
+                bot_id,
+                now,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::claim_due_for_bot(&connection, &bot_id, now, limit),
                 );
             }
             StoreOp::GetJob { id, reply } => {
