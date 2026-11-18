@@ -49,7 +49,9 @@ use crate::app::runtime::config::{BotConfig, read_bot_config};
 use crate::app::runtime::local;
 use crate::app::runtime::onebot::PLATFORM;
 use crate::app::runtime::outbox_source::StorePendingOutbox;
-use crate::app::runtime::sandbox_handler::{REPLY_CAPACITY, SandboxHandler, SandboxHandlerConfig};
+use crate::app::runtime::sandbox_handler::{
+    REPLY_CAPACITY, SandboxHandler, SandboxHandlerConfig, TICK_INTERVAL,
+};
 use crate::app::runtime::{AdapterPorts, conversation_kind_from_str, conversation_kind_str};
 use crate::app::store_failed;
 use crate::dto::{BotSummary, Command, ConversationSummary, Event, LogLevel, Response, RunLog};
@@ -170,12 +172,17 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
         ),
     );
 
+    // 执行器要给两处：supervisor（跑 handler）和下面的定时器 tick 循环。
+    // 这里显式把具体类型转成 trait object —— 直接写 `Arc::clone(&executor)` 会得到
+    // `Arc<SandboxHandler>`，而 `SupervisorDeps::new` 要的是 `Arc<dyn HandlerExecutor>`。
+    let handler: Arc<dyn hbot_bot::HandlerExecutor> = executor.clone();
+
     let mut deps = SupervisorDeps::new(
         Arc::clone(state.store()),
         Arc::clone(state.ids()),
         Arc::clone(state.clock()),
         adapter,
-        executor,
+        handler,
     );
     // 续发来源：上次崩溃/关停留下的 pending outbound（按 bot 过滤，见 outbox_source）。
     deps.pending_outbox = Arc::new(StorePendingOutbox::new(Arc::clone(state.store())));
@@ -231,6 +238,32 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
         bot_id,
         running_bot(bot.platform.clone(), started_at, supervisor),
     );
+
+    // 定时器 tick：每 `TICK_INTERVAL` 问执行器一次"有没有计划到点"。
+    //
+    // 只有在清单里声明了计划时才会真编译、真起 isolate —— 没声明时 `tick` 第一句就返回，
+    // 所以这个循环对不声明 timer 的项目只是一秒一次的空转（一次读清单 + 一个长度判断）。
+    //
+    // 循环必须能被 `bot_stop` 停住：句柄登记进 `BotRegistry` 的 `aux`，`stop()` 会 abort。
+    // 登记失败说明这个 bot 已经不在表里（停止与登记赛跑），此时立刻 abort 自己。
+    let ticker_handler = Arc::clone(&executor);
+    let ticker_clock = Arc::clone(state.clock());
+    let ticker = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(TICK_INTERVAL);
+        // 丢弃错过的节拍：休眠后醒来不该补发一串 tick（补发的次数由计划表自己决定）。
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = ticker_handler.tick(ticker_clock.now()).await {
+                // 一秒一次的错误不刷屏：记一行 warn，下一拍再试。
+                tracing::warn!(bot = %bot_id, error = %error, "定时器 tick 失败");
+            }
+        }
+    });
+    if !state.bots().attach_aux(&bot_id, ticker) {
+        tracing::warn!(bot = %bot_id, "bot 已不在登记表里，定时器循环立即停止");
+    }
+
     state.events().emit(Event::BotStatus {
         bot_id,
         status: BotStatus::Running,

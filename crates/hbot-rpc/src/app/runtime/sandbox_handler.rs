@@ -75,6 +75,13 @@ pub const HOT_RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 /// 同一指纹允许的连续 isolate 崩溃次数（§6.4：连续 3 次就停止自动重启）。
 pub const CRASH_BUDGET_LIMIT: u32 = 3;
 
+/// 定时器 tick 的宿主侧周期（1 秒）。
+///
+/// 与 `hbot-code` 的 [`hbot_code::timer::TICK`] 是**同一个值**：那边是计划表最小间隔
+/// （`MIN_INTERVAL_MS`）的地板价，这边是宿主的轮询周期。轮询周期比最小间隔大，就等于
+/// 让所有小间隔计划系统性迟到，所以两者必须相等；取值只在这里定义一次。
+pub const TICK_INTERVAL: Duration = hbot_code::timer::TICK;
+
 /// 沙箱执行器的装配参数（字段全公开：`bot_start` 处一眼能看到都接了什么）。
 pub struct SandboxHandlerConfig {
     /// 这个执行器属于哪个 bot（写日志行时要用）。
@@ -646,6 +653,15 @@ impl SandboxHandler {
                     sandbox.set_ai(client);
                 }
             }
+
+            // 定时计划：清单里 `capabilities.timer` 现读一遍装进槽位（每个新 isolate 装一次）。
+            //
+            // 用 `clock.now()` 而不是"进程启动时刻"：热重载换版本时计划重新对齐到当前
+            // 时刻，不会因为 isolate 换了就把"下一次触发"倒退回去。
+            let schedules = declared_schedules(&self.project_root);
+            if !schedules.is_empty() {
+                sandbox.set_schedules(&schedules, self.clock.now());
+            }
             tracing::debug!(
                 bot = %self.bot_id,
                 worker = index,
@@ -793,6 +809,186 @@ impl SandboxHandler {
             self.replies.send(request).await.map_err(|_| {
                 HbotError::internal(format!(
                     "回复通道已关闭（bot {}）：supervisor 已停止，这条回复没有进入 outbox",
+                    self.bot_id
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// 跑一轮定时器 tick：把到点的计划逐个派发，并把日志/回复接到同一条通道。
+    ///
+    /// `now` 由调用方（tick 任务）给，**不在这里读时钟**：这样"现在几点"只有一个来源，
+    /// 测试也能用固定值复现。
+    ///
+    /// ## 回复发往哪里
+    ///
+    /// 定时器没有入站消息，`ReplyTarget` 只能来自计划自己声明的 `conversation`。所以：
+    ///
+    /// * 计划写了 `conversation`：按 `(bot_id, external_id)` 在库里找会话行，找到就按
+    ///   它的 `kind` 组 `ConversationRef`，`reply_to` 恒为 `None`（主动消息，没有可引用
+    ///   的历史事件 —— 冒用旧 ID 会被平台判参数非法）；
+    /// * 会话行还不存在（这个会话从没收到过消息）：**不猜类型**，记一行 error 日志说明
+    ///   原因，这条回复丢掉。猜成 `private` 发群号、或猜成 `group` 发私聊，都是发错人。
+    /// * 计划没写 `conversation`：`ctx.reply` 在 sandbox 里已经抛 `HBOT_TIMER_NO_TARGET`
+    ///   （见 `hbot-code` 的 `build_timer_event`），所以这里拿不到回复，只有日志。
+    ///
+    /// 单条计划失败不影响其它计划：一次 tick 里每条独立结算，失败的那条写 error 日志。
+    pub async fn tick(&self, now: hbot_core::Timestamp) -> Result<(), HbotError> {
+        // 什么都没声明就先走：定时器是"声明了才有"的能力，让它在没声明时去编译项目、
+        // 起 isolate，等于给每个 bot 加一份**每秒一次**的常态开销。
+        if declared_schedules(&self.project_root).is_empty() {
+            return Ok(());
+        }
+        // 没装表就不刷指纹、不编译、不建 isolate。
+        let (fingerprint, project) = match self.compiled().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                // 编译失败时 tick 不重试：下一次 tick 会再走一遍，用户改代码即恢复。
+                tracing::warn!(bot = %self.bot_id, error = %error, "定时器 tick 无法取到项目");
+                return Ok(());
+            }
+        };
+        let mut schedules: Vec<(usize, hbot_core::DueSchedule)> = Vec::new();
+        for index in 0..self.workers.len() {
+            let mut guard = self.worker(index, &fingerprint, &project).await?;
+            let Some(worker) = guard.as_mut() else {
+                continue;
+            };
+            for due in worker.sandbox.due(now) {
+                schedules.push((index, due));
+            }
+        }
+        if schedules.is_empty() {
+            return Ok(());
+        }
+
+        for (index, due) in schedules {
+            let name = due.name.clone();
+            let outcome = self
+                .dispatch_timer_on(index, &fingerprint, &project, due.clone())
+                .await;
+            match outcome {
+                Ok(outcome) => {
+                    self.record_logs(outcome.logs).await;
+                    if let Err(error) = self.deliver_timer_replies(&due, outcome.replies).await {
+                        // 回复没进 outbox 等于丢了：留痕，不静默吞。
+                        tracing::warn!(
+                            bot = %self.bot_id,
+                            timer = %name,
+                            error = %error,
+                            "定时器回复未能进入 outbox"
+                        );
+                        self.record_error_line(format!(
+                            "定时器 `{name}` 的回复没有发出去：{error}"
+                        ))
+                        .await;
+                    }
+                }
+                Err(failure) => {
+                    // 失败路径也要落日志：`ctx.log` 在抛出前写的那几行是排障的唯一线索。
+                    let mapped = remap_error(&failure.error, &project);
+                    self.record_logs(failure.logs).await;
+                    self.record_error_line(format!("定时器 `{name}` 执行失败：{mapped}"))
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 在**指定的** worker 上派发一条到点计划。
+    ///
+    /// `index` 来自 [`SandboxHandler::tick`] 里 `due()` 的调用位置：计划表是每个 isolate
+    /// 各一份，在 A 上取到的到点条目必须在 A 上跑，否则 B 的计划表根本没推进过。
+    async fn dispatch_timer_on(
+        &self,
+        index: usize,
+        fingerprint: &str,
+        project: &Arc<CompiledProject>,
+        due: hbot_core::DueSchedule,
+    ) -> Result<hbot_code::EventOutcome, hbot_code::EventFailure> {
+        let mut guard = self
+            .worker(index, fingerprint, project)
+            .await
+            .map_err(|error| {
+                hbot_code::EventFailure::without_output(hbot_code::CodeError::SandboxDead {
+                    message: error.to_string(),
+                })
+            })?;
+        let Some(worker) = guard.as_mut() else {
+            return Err(hbot_code::EventFailure::without_output(
+                hbot_code::CodeError::SandboxDead {
+                    message: format!(
+                        "定时器 `{}` 的 isolate 槽位 {index} 在派发前被清空（bot {}）",
+                        due.name, self.bot_id
+                    ),
+                },
+            ));
+        };
+        // 已由 `tick` 的 `due()` 取过，这里不再判断"到没到点"：到点条目是**一次性**的，
+        // 同一个 `DueSchedule` 派发两次就是两次执行。
+        let sandbox = Arc::clone(&worker.sandbox);
+        tokio::task::spawn_blocking(move || sandbox.dispatch_timer_collecting(&due))
+            .await
+            .map_err(|error| {
+                hbot_code::EventFailure::without_output(hbot_code::CodeError::SandboxDead {
+                    message: format!("定时器派发任务失败：{error}"),
+                })
+            })?
+    }
+
+    /// 把定时器产出的回复交给 supervisor 的 outbox 通道。
+    ///
+    /// 目标会话从库里按 `(bot_id, external_id)` 查：**会话类型不猜**，`kind` 取那一行的
+    /// 值（见 [`SandboxHandler::tick`] 的说明）。查不到就报错，由调用方写成用户能读的
+    /// 一行日志 —— 静默丢弃会让用户以为"定时器发了但没人收到"。
+    async fn deliver_timer_replies(
+        &self,
+        due: &hbot_core::DueSchedule,
+        replies: Vec<String>,
+    ) -> Result<(), HbotError> {
+        if replies.is_empty() {
+            return Ok(());
+        }
+        let Some(external_id) = due.conversation.clone() else {
+            return Err(HbotError::invalid(format!(
+                "定时器 `{}` 产出了 {} 条回复，但计划没有声明 `conversation`：\
+                 没有目标会话就不发（猜一个群发出去收不回来）",
+                due.name,
+                replies.len()
+            )));
+        };
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
+        let lookup = external_id.clone();
+        let conversation = tokio::task::spawn_blocking(move || {
+            store.get_conversation_by_external(&bot_id, &lookup)
+        })
+        .await
+        .map_err(|error| HbotError::internal(format!("查定时器目标会话的任务失败：{error}")))?
+        .map_err(store_failed)?;
+        let Some(row) = conversation else {
+            return Err(HbotError::invalid(format!(
+                "定时器 `{}` 的目标会话 `{external_id}` 还不存在（这个会话从没收到过消息）：\
+                 先让它收到一条消息，或在对话列表里确认 externalId 写对了",
+                due.name
+            )));
+        };
+        let target = hbot_bot::ConversationRef::new(
+            row.external_id.clone(),
+            crate::app::runtime::conversation_kind_from_str(&row.kind),
+        );
+        for text in replies {
+            let request = OutboundRequest {
+                conversation: target.clone(),
+                text,
+                // 主动消息：没有可引用的历史事件，**不得**冒用旧 ID。
+                reply_to: None,
+            };
+            self.replies.send(request).await.map_err(|_| {
+                HbotError::internal(format!(
+                    "回复通道已关闭（bot {}）：supervisor 已停止，这条定时器回复没有进入 outbox",
                     self.bot_id
                 ))
             })?;
@@ -1034,6 +1230,17 @@ fn device_apps(root: &std::path::Path) -> Vec<String> {
         out.push(app);
     }
     out
+}
+
+/// 清单里声明的定时计划（`capabilities.timer`），读不到就是空表。
+///
+/// 与 [`device_apps`] 同一口径：清单是项目文件，改它除了指纹没有别的信号，所以每次
+/// 起 isolate 时现读一遍。空表 = 没有定时器，tick 循环据此**不编译、不建 isolate**。
+fn declared_schedules(root: &std::path::Path) -> Vec<hbot_core::ScheduleSpec> {
+    let Ok(manifest) = hbot_code::manifest::load(root) else {
+        return Vec::new();
+    };
+    manifest.capabilities.timer().to_vec()
 }
 
 /// 会话 → worker 的稳定映射（FNV-1a，非加密；只要求同会话恒定）。

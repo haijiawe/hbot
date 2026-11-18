@@ -48,6 +48,11 @@ pub struct RunningBot {
     stop: oneshot::Sender<()>,
     /// 等待停止信号并调用 `supervisor.stop()` 的后台任务。
     task: JoinHandle<()>,
+    /// 跟着这个 bot 一起起的辅助任务（目前只有定时器 tick 循环）。
+    ///
+    /// 与 `task` 分开存：`task` 是优雅停止（等 supervisor 排空），辅助任务只需要在
+    /// 停止时被 abort —— 它们的循环体每轮都从零开始，没有要收尾的状态。
+    aux: Vec<JoinHandle<()>>,
 }
 
 /// 登记表。
@@ -136,9 +141,20 @@ impl BotRegistry {
     ///
     /// 返回 `false` 表示这个 bot 本来就没在跑（幂等：`bot_stop` 因此可以直接成功）。
     pub async fn stop(&self, bot_id: &BotId) -> bool {
-        let Some(RunningBot { mut task, stop, .. }) = self.lock().remove(bot_id) else {
+        let Some(RunningBot {
+            mut task,
+            stop,
+            aux,
+            ..
+        }) = self.lock().remove(bot_id)
+        else {
             return false;
         };
+        // 辅助任务先 abort：tick 循环每轮都可能持有槽位锁，让它先停下，
+        // supervisor 的排空才不会被"定时器正在跑 handler"拖住。
+        for handle in aux {
+            handle.abort();
+        }
         let _ = stop.send(());
         if tokio::time::timeout(STOP_GRACE, &mut task).await.is_err() {
             tracing::warn!(bot = %bot_id, "supervisor 未在宽限期内退出，abort");
@@ -153,6 +169,19 @@ impl BotRegistry {
         for id in ids {
             self.stop(&id).await;
         }
+    }
+
+    /// 给已登记的 bot 挂一个辅助任务（目前只有定时器 tick 循环）。
+    ///
+    /// 返回 `false` 表示这个 bot 已经不在登记表里（停止与挂载赛跑）：调用方应当立刻
+    /// abort 自己的循环，否则会留下一个永远没人停的任务。
+    pub fn attach_aux(&self, bot_id: &BotId, handle: JoinHandle<()>) -> bool {
+        let mut bots = self.lock();
+        let Some(bot) = bots.get_mut(bot_id) else {
+            return false;
+        };
+        bot.aux.push(handle);
+        true
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<BotId, RunningBot>> {
@@ -203,5 +232,6 @@ pub fn running_bot(
         supervisor,
         stop,
         task,
+        aux: Vec::new(),
     }
 }
