@@ -312,6 +312,31 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     字段，所有写 `Capabilities { state: … }` 字面量的地方立刻 `E0063`。清单还会继续长（`timer`/`jobs`/`session`），
     写 `..Capabilities::default()` 只写关心的字段就不会每加一个能力都要改一遍下游。
 
+64. **条件/日志点之外，`isolate.rs` 里还有第二个"事件上下文"**（2026-11-18）。`onTimer` 的 ctx 由
+    `build_timer_event` 造，**刻意比消息 ctx 窄**（只有 `name`/`reply`/`log`/`sleep`/`ai`）。两个坑：
+    ① 那个函数的局部变量**不能叫 `event`** —— `dts.rs` 的 `ctx_function_keys` 扫描器按 `event.set(` 行首
+    收集"消息 ctx 上的宿主函数"，叫 `event` 会把 `name`/`ai` 混进去，`message_ctx_functions_match_the_event_object` 红；
+    ② timer 的 `reply` 必须是**独立函数**（不是消息路径那个），否则"计划没声明 `conversation`"就无从判、只能
+    猜一个会话发出去。定时器没有入站身份，所以 `device.set_current_bot(None)` / `state.set_current_bot(None, None)`
+    每次都显式清空 —— 别为了"省几行"让定时器沿用上一个事件的身份。
+
+65. **负向清单测试是按字符串匹配的，注释里也不能出现被禁名字**（2026-11-18）。`dts.rs` 的
+    `hbot_dts_does_not_promise_unimplemented_apis` 断言 `HOST_DTS` 不含 `"onStart"` 等，而 `HOST_DTS` 里那句
+    "`onStart` / `onStop` / `onSchedule` 仍未实现"本身就让它红。要说明"还没实现"就换个说法（"生命周期钩子
+    仍未实现，见 docs/07 §4.1"），别把被禁字符串写进 d.ts 文本。
+
+66. **给 `SandboxHandler` 加能力时要加三处，缺一处就"看着能用、其实没接上"**（2026-11-18，`ai`/`state`/`timer`
+    /`device` 各踩过一次同名坑）。① `SandboxHandlerConfig` 字段；② **`new()` 里从 `config` 取**（写 `None`
+    会静默丢掉整个能力）；③ `worker()` 里在 `spawn_with_http` 之后调对应的 `set_*`。再补 ④ `start_bot` 的
+    字面量、⑤ `hbot-parity/tests/support/mod.rs` 的字面量（否则 `--all-targets` 编译红）。
+    **判据**：每个能力都要有一条"没声明 → 报 `NOT_DECLARED` 而不是 `UNAVAILABLE`"的 dispatch 级测试，
+    它同时证明"接线真的发生了"。
+
+67. **`BotRegistry` 里的后台循环必须登记进 `aux`**（2026-11-18）。`bot_stop` 只发停止信号给 supervisor 并等
+    它的 task，别的循环（tick 等）不会自己停 —— 不登记就是泄漏，而且它每轮可能正持有槽位锁，拖住 supervisor
+    排空。顺序是**先 abort 辅助任务、再发停止信号**；`attach_aux` 返回 `false`（登记表里已没有这个 bot）时
+    调度方要立刻 abort 自己。
+
 ---
 
 ## 8. 新增 X 的步骤
@@ -344,6 +369,21 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
    规范化成 `kv: KvApi;` 会被当成**入站字段**，两个 crate 同时红、而报错完全看不出是这个原因。
 7. `HOST_DTS` 的负向清单（`hbot_dts_does_not_promise_unimplemented_apis`）里，**宽泛条目（`"kv."`、`"fetch("`）在能力落地时要整条删**，
    只有精确条目（`"history(conversationId"`、`"watch("`）才能留 —— 否则它会在能力实现后继续假装"这个没做"。
+8. **新绑定的错误码必须能在 d.ts 里点出来**：`the_*_surface_says_presence_is_not_authorization` 这类测试要求
+   `HOST_DTS` 的注释里写明该能力的码（`HBOT_STATE_NOT_DECLARED`、`HBOT_AI_UNAVAILABLE`、`HBOT_TIMER_NO_TARGET`…），
+   并写清"存在不等于授权"。这不是装饰：模板与 Agent 都照着 d.ts 写代码。
+
+### 新增清单能力（`hbot.json` 的 `capabilities`）
+
+`crates/hbot-code/src/manifest.rs` 的 `Capabilities` 是 `deny_unknown_fields` 的 —— **不认识的字段会让整个项目
+加载失败**（这是故意的：一个"声明了但什么都不做"的布尔会让人以为能力已打开）。加一项能力的顺序：
+
+1. 在 `crates/hbot-core` 定义规则与参数闸（唯一一份），带单测；
+2. `Capabilities` 加字段（布尔用 `#[serde(default)]`，计划表这类用 `Vec<…>`）并让 `impl Capabilities` 暴露读取方法；
+3. `Manifest::validate` 里调 core 的校验（**别在 manifest 里再写一份规则**）；
+4. `hbot-code` 的槽位（`AiSlot`/`StateSlot`/`TimerSlot` 模式：`Mutex` 内的可替换端口 + `set_*`/`is_*_assembled`）；
+5. `hbot-rpc` 侧读清单决定装不装（`*Source` trait + `worker()` 里调 `set_*`，见坑 66）；
+6. 端到端测试：`NOT_DECLARED` / `UNAVAILABLE` / 参数非法 / 跨 bot 隔离 / 跨重启存活 各一条。
 
 ### 新增 Command / 表 / 页面
 

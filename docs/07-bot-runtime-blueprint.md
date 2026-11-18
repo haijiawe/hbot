@@ -69,7 +69,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | 组 | 能力 | 给什么 | 状态 |
 |---|---|---|---|
 | **C1 事件** | `message` | 收到消息（已归一化） | `已实现` |
-| | `timer` | cron / 固定间隔 / 延时一次 | `设计` |
+| | `timer` | 固定间隔 / 每天某时刻（`onTimer(ctx, name)`） | `已实现`（2026-11-18，见 §4.4） |
 | | `webhook` | 外部系统打进来（HTTP 入口） | `设计` |
 | | `lifecycle` | `onStart` / `onStop` | `设计` |
 | | `device` | 屏幕变化、输入事件（预留，见 §9） | `未做` |
@@ -92,11 +92,11 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | 形态 | 触发 | 状态 | 出口 | 还需要 | 今天能做吗 |
 |---|---|---|---|---|---|
 | **聊天**（人设/多轮/情感） | `message` | `history` `kv` | `reply` | `ai` | **能**：`history`/`kv`/`ai` 都已落地 |
-| **游戏性**（签到/抽卡/排行榜/国战） | `message` `timer` | `kv` `sql` | `reply` `send` | `jobs`（长结算） | **不能**：没有定时、没有 `send` |
+| **游戏性**（签到/抽卡/排行榜/国战） | `message` `timer` | `kv` `sql` | `reply` `send` | `jobs`（长结算） | **一半**：定时已落地，缺 `sql` 与主动 `send` |
 | **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **不能**：缺 webhook / `sql` / `session` / `notify` |
-| **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **不能**：设备面有了，但缺定时（`timer`） |
+| **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面与定时都有，缺 `sql` 与长作业 |
 
-> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C3.reply + C3.http + C2.kv/history + C5.ai + C6.device 这几个口子**，缺的那几格在 §11 的落地顺序里。
+> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C3.reply + C3.http + C2.kv/history + C5.ai + C6.device 这几个口子**，缺的那几格在 §11 的落地顺序里。
 
 ### 3.2 能力怎么声明
 
@@ -181,7 +181,7 @@ export default defineBot({
 })
 ```
 
-现状：只有 `onMessage`（`crates/hbot-code/src/runtime/debug_host.rs` 与 `host_api.rs` 只取 `default.onMessage`）。`onStart`/`onStop`/`onTimer` 是 `设计`。
+现状：`onMessage` 与 `onTimer` 已实现；`onStart`/`onStop` 是 `设计`。定时器的落地细节见 §4.4。
 
 **为什么钩子要少而固定**：每多一个钩子，宿主就多一条执行路径、多一份超时与取消语义。四个够覆盖四类 bot；不够再加要写 ADR。
 
@@ -214,6 +214,49 @@ ctx.jobs.enqueue('settle-war', { warId })
 | 取消 | `bot_stop` 取消未完成的作业 |
 
 **为什么必须做这一层**：现在的"每会话串行 + 2 s 预算"决定了**写不出任何跨分钟的业务**（国战结算、批量推送、抓取+分析）。这不是性能问题，是能力缺失。
+
+### 4.4 已落地：定时器（`C1.timer`，2026-11-18）
+
+```jsonc
+// hbot.json
+{
+  "capabilities": {
+    "timer": [
+      { "name": "daily-reset", "when": { "kind": "daily", "atMsOfDay": 0, "utcOffsetMinutes": 480 },
+        "conversation": "123456789" },
+      { "name": "heartbeat",  "when": { "kind": "every", "everyMs": 1000 } }
+    ]
+  }
+}
+```
+
+```ts
+export default defineBot({
+  async onTimer(ctx, name) {           // name = 上面声明的名字
+    ctx.log(`tick ${name}`);           // 定时器里可用的只有 name / reply / log / sleep / ai
+    ctx.reply('到点了');                // 只有计划声明了 conversation 才允许
+  },
+})
+```
+
+| 判据 | 位置 | 失败时 |
+|---|---|---|
+| 声明层 | `SandboxHandler::tick` 先读清单 `capabilities.timer`，空表直接 `Ok` | 不触发（**不编译、不起 isolate**） |
+| 钩子层 | `bootstrap` 取 `default.onTimer`（可选） | 每次到点记一行 error 说明缺钩子，**不静默成功** |
+| 目标层 | `build_timer_event` 里的 `reply` 闭包 | 没声明 `conversation` → 抛 `HBOT_TIMER_NO_TARGET` |
+| 会话层 | `deliver_timer_replies` 按 `(bot_id, external_id)` 查 `conversations` | 查不到 → error 行「这个会话从没收到过消息」，不猜群/私聊 |
+| 参数层 | `hbot-core` 的 `validate_schedules`（清单加载时） | 名字/间隔/UTC 偏移/重名/空会话名非法 → 项目加载失败 |
+
+**六条设计决定与理由**：
+
+1. **`onTimer` 的上下文比消息上下文窄**：只挂 `name` / `reply` / `log` / `sleep` / `ai`，**不挂 `kv` / `history` / `device`**。定时器背后没有会话，暴露那三者只会得到"声明了却每次 `HBOT_STATE_INVALID`"的困惑，或者更糟——复用上一个事件的身份读别人的消息。要持久状态的计划应该建模成消息驱动的动作，那是 `C4.jobs` 的事。
+2. **回复目标必须在清单里显式声明**：宿主没有任何依据猜该发给谁，猜错就是往陌生群发消息。**会话类型也不猜**（取 `conversations` 表那一行的 `kind`）。
+3. **`every` 对齐到时间网格，不是"上次触发 + 间隔"**：重启/休眠不累积漂移，同配置的多 bot 同一秒触发。**休眠三小时只补触发一次**（推进用 `next_after(now)` 而不是 `next_after(next_at)`），否则队列会被补发瞬间打满。
+4. **不做 `once`/`cron`**：延时一次需要跨重启的状态，那是 `C4.jobs` 的问题；cron 表达式要引入日期库与完整时区表，当前只支持**固定 UTC 偏移**（不做夏令时/IANA 名称）。
+5. **计划表按 isolate 各一份**：`due()` 必须在取到它的那个 isolate 上派发，否则另一个 isolate 的计划表没推进过。
+6. **tick 循环挂在 `BotRegistry::aux`**：`bot_stop` 先 abort 辅助任务再发停止信号（tick 可能正持槽位锁跑 handler，先停能避免拖住 supervisor 排空）。没声明计划时 tick 只是一秒一次的空转（一次读清单 + 一个长度判断）。
+
+**还没做**：`onSchedule`（`§4.1` 的第四个钩子，与 `onTimer` 不是同一件事）、`ctx.jobs`、定时器里的 `ctx.kv`（见第 1 条）、计划表的运行时增删（要改清单并等热重载）。
 
 ---
 
@@ -267,7 +310,7 @@ ctx.jobs.enqueue('settle-war', { warId })
 3. 超时由**定时器**结算，不依赖"下一条消息到达"。
 4. 同一个会话同时只允许一个未结等待（否则语义不可推理），第二个直接报错。
 
-状态：`设计`（`bot_waits` 表不存在，定时器也不存在 → 这条依赖 §4 C1.timer）。
+状态：`设计`（`bot_waits` 表不存在）。定时器已落地（§4.4），所以第 3 条规则的前置条件已经具备。
 
 ---
 
@@ -449,14 +492,14 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 |---|---|---|---|
 | 1 | `C2.kv` + `C2.history` | 多轮聊天、游戏存档（两类 bot 同时可用） | **已落地 2026-11-18**（§5.0） |
 | 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 | **已落地 2026-11-18**（§3.3） |
-| 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 | 未开始（下一步） |
+| 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 | `C1.timer` **已落地 2026-11-18**（§4.4）；`C4.jobs` 未开始 |
 | 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 | 未开始（依赖第 3 步的定时器结算超时） |
 | 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | 未开始 |
 | 6 | `E1` npm 打包 | 生态接入（见 `docs/08` §5） | 未开始 |
 | 7 | `C6.device`（桌面三平台） | 玩游戏的 bot；见 §9，里程碑 `M10` | **窄版已落地 2026-11-17**（Windows，见 `docs/09`）；完整版未做 |
 | 8 | 云端执行宿主 | 见 `docs/08` §9 与 `ADR-0006`，里程碑 `M9` | 未开始 |
 
-> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 7 完成，3 → 4 → 5 → 6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），没有 `C1.timer` 就只能退回「等下一条消息」那个旧项目的缺陷。
+> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 7 完成，第 3 步的 timer 完成但 jobs 未开始，4 → 5 → 6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
 
 ---
 
