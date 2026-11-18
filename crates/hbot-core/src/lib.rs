@@ -25,6 +25,7 @@
 
 #![warn(missing_docs)]
 
+pub mod bot_ai;
 pub mod bot_state;
 pub mod command;
 pub mod debug;
@@ -36,6 +37,11 @@ pub mod paths;
 pub mod ports;
 pub mod redact;
 
+pub use bot_ai::{
+    AiClient, AiError, AiRequest, AiText, AiUsage, DEFAULT_OUTPUT_TOKENS, MAX_CALLS_PER_EVENT,
+    MAX_OUTPUT_TOKENS, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES, MAX_TEMPERATURE, MAX_TIME_PER_EVENT,
+    validate_max_tokens, validate_prompt, validate_system, validate_temperature,
+};
 pub use bot_state::{
     BotState, BotStateError, HistoryDirection, HistoryEntry, HistoryReader, KvEntry,
     KvWriteOptions, MAX_HISTORY, MAX_KV_BATCH, MAX_KV_KEY_BYTES, MAX_KV_LIST, MAX_KV_TTL,
