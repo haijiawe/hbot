@@ -36,13 +36,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 
 use crate::error::{Result, StoreError};
-use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId};
+use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId, WaitId};
 use crate::migrations;
 use crate::models::{
     BOT_STATUSES, Bot, BotStatusRow, Conversation, DeviceAuditRow, DeviceSessionRow, HistoryRow,
     InboundReplayRow, InboundRow, JobRow, LogRow, NewAgentLog, NewDeviceAudit, NewDeviceSession,
-    NewInbound, NewJob, NewKvEntry, NewLog, NewOutbound, OutboundRow, OutboundTarget, Project,
-    is_valid_bot_status,
+    NewInbound, NewJob, NewKvEntry, NewLog, NewOutbound, NewWait, OutboundRow, OutboundTarget,
+    Project, WaitRow, is_valid_bot_status,
 };
 use crate::repositories;
 use crate::startup_trace;
@@ -333,6 +333,47 @@ enum StoreOp {
     },
     /// 进程启动时把残留的 `running` 退回 `pending`，返回恢复了几条。
     ResumeInterruptedJobs {
+        now: i64,
+        reply: Reply<u32>,
+    },
+    /// 注册一条会话等待；撞「同会话已有 pending」时返回 `StoreError::WaitPending`。
+    RegisterWait {
+        bot_id: BotId,
+        wait: NewWait,
+        reply: Reply<WaitId>,
+    },
+    /// 一条消息唤醒唯一那个等待（挑 + 改 `fulfilled` + 返回，一条 SQL）。
+    ClaimWait {
+        bot_id: BotId,
+        conversation_id: ConversationId,
+        sender_id: String,
+        message_id: String,
+        now: i64,
+        reply: Reply<Option<WaitRow>>,
+    },
+    /// 超时结算：把到期的 `pending` 改成 `expired` 并返回。
+    ExpireDueWaits {
+        bot_id: BotId,
+        now: i64,
+        limit: u32,
+        reply: Reply<Vec<WaitRow>>,
+    },
+    /// 读这个会话当前未结的那条等待。
+    CurrentWait {
+        bot_id: BotId,
+        conversation_id: ConversationId,
+        reply: Reply<Option<WaitRow>>,
+    },
+    /// 取消这个会话未结的那条等待（返回是否命中）。
+    CancelWait {
+        bot_id: BotId,
+        conversation_id: ConversationId,
+        now: i64,
+        reply: Reply<bool>,
+    },
+    /// `bot_stop`：取消这个 bot 的全部未结等待，返回取消了几条。
+    CancelWaitsForBot {
+        bot_id: BotId,
         now: i64,
         reply: Reply<u32>,
     },
@@ -997,6 +1038,96 @@ impl Store {
         })
     }
 
+    /// 注册一条会话等待（`ctx.session.prompt` 的落库动作）。
+    ///
+    /// 同一个 `(bot_id, conversation_id)` 已有 `pending` 行时返回
+    /// [`StoreError::WaitPending`]（带挡路那条的键）—— 判据是 `0007` 的部分唯一索引，
+    /// 不是这里先查一遍（先查后插在并发下两次都会查到「没有」）。
+    pub fn register_wait(&self, bot_id: &BotId, wait: &NewWait) -> Result<WaitId> {
+        let bot_id = *bot_id;
+        let wait = wait.clone();
+        self.submit(|reply| StoreOp::RegisterWait {
+            bot_id,
+            wait,
+            reply,
+        })
+    }
+
+    /// 一条消息唤醒唯一那个等待：挑 + 改 `fulfilled` + 返回，一条 SQL。
+    ///
+    /// `Ok(None)` = 这条消息不回答任何等待（正常路径）。已过期的等待不会被唤醒
+    /// （`deadline > now` 条件在 SQL 里）。
+    pub fn claim_wait(
+        &self,
+        bot_id: &BotId,
+        conversation_id: &ConversationId,
+        sender_id: &str,
+        message_id: &str,
+        now: i64,
+    ) -> Result<Option<WaitRow>> {
+        let bot_id = *bot_id;
+        let conversation_id = *conversation_id;
+        let sender_id = sender_id.to_owned();
+        let message_id = message_id.to_owned();
+        self.submit(|reply| StoreOp::ClaimWait {
+            bot_id,
+            conversation_id,
+            sender_id,
+            message_id,
+            now,
+            reply,
+        })
+    }
+
+    /// 超时结算：把 `deadline <= now` 的 `pending` 行改成 `expired` 并返回它们。
+    pub fn expire_due_waits(&self, bot_id: &BotId, now: i64, limit: u32) -> Result<Vec<WaitRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ExpireDueWaits {
+            bot_id,
+            now,
+            limit,
+            reply,
+        })
+    }
+
+    /// 读这个会话当前未结的那条等待；没有返回 `Ok(None)`。
+    pub fn current_wait(
+        &self,
+        bot_id: &BotId,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<WaitRow>> {
+        let bot_id = *bot_id;
+        let conversation_id = *conversation_id;
+        self.submit(|reply| StoreOp::CurrentWait {
+            bot_id,
+            conversation_id,
+            reply,
+        })
+    }
+
+    /// 取消这个会话未结的那条等待；返回是否命中一行（终态时 `false`，不报错）。
+    pub fn cancel_wait(
+        &self,
+        bot_id: &BotId,
+        conversation_id: &ConversationId,
+        now: i64,
+    ) -> Result<bool> {
+        let bot_id = *bot_id;
+        let conversation_id = *conversation_id;
+        self.submit(|reply| StoreOp::CancelWait {
+            bot_id,
+            conversation_id,
+            now,
+            reply,
+        })
+    }
+
+    /// `bot_stop`：取消这个 bot 的全部未结等待，返回取消了几条。
+    pub fn cancel_waits_for_bot(&self, bot_id: &BotId, now: i64) -> Result<u32> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::CancelWaitsForBot { bot_id, now, reply })
+    }
+
     /// 入队一条后台作业；命中 `(bot_id, idempotency_key)` 时返回 `Ok(None)`。
     ///
     /// 返回 `None` **不是错误**：它表示"这个幂等键已经排过队了"。至少一次语义靠这条
@@ -1581,6 +1712,74 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::jobs::resume_interrupted(&connection, now),
+                );
+            }
+            StoreOp::RegisterWait {
+                bot_id,
+                wait,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::waits::register(&connection, &bot_id, &wait),
+                );
+            }
+            StoreOp::ClaimWait {
+                bot_id,
+                conversation_id,
+                sender_id,
+                message_id,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::waits::claim(
+                        &connection,
+                        &bot_id,
+                        &conversation_id,
+                        &sender_id,
+                        &message_id,
+                        now,
+                    ),
+                );
+            }
+            StoreOp::ExpireDueWaits {
+                bot_id,
+                now,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::waits::expire_due(&connection, &bot_id, now, limit),
+                );
+            }
+            StoreOp::CurrentWait {
+                bot_id,
+                conversation_id,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::waits::current(&connection, &bot_id, &conversation_id),
+                );
+            }
+            StoreOp::CancelWait {
+                bot_id,
+                conversation_id,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::waits::cancel(&connection, &bot_id, &conversation_id, now),
+                );
+            }
+            StoreOp::CancelWaitsForBot { bot_id, now, reply } => {
+                reply_send(
+                    reply,
+                    repositories::waits::cancel_for_bot(&connection, &bot_id, now),
                 );
             }
             StoreOp::CountActiveJobsForBot { bot_id, reply } => {

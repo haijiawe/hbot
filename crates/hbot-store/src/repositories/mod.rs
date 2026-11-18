@@ -13,3 +13,4 @@ pub(crate) mod kv;
 pub(crate) mod log;
 pub(crate) mod outbound;
 pub(crate) mod project;
+pub(crate) mod waits;

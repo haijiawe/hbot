@@ -58,6 +58,16 @@ pub enum StoreError {
         allowed: &'static [&'static str],
     },
 
+    /// 这个会话已经有一条未结等待（`bot_waits_conv_pending` 部分唯一索引拒了这次注册）。
+    ///
+    /// **不是 SQL 错误**：它是 §5.1 规则 4 的业务判据，装配层要据此报 `HBOT_SESSION_PENDING`
+    /// 并把挡路那条的键写给用户（否则用户只知道「开不了新的」，不知道该先回哪个）。
+    #[error("conversation already has a pending wait ({key:?})")]
+    WaitPending {
+        /// 挡路那条等待的键。
+        key: String,
+    },
+
     /// 内部 Mutex 中毒（持有者 panic）。恢复后继续用会读到不一致状态，因此直接上报。
     #[error("store lock poisoned: {0}")]
     Poisoned(&'static str),

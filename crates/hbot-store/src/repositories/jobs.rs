@@ -711,12 +711,16 @@ mod tests {
         );
     }
 
-    /// 迁移 0006 真的应用了：`schema_version` 到 6，表也查得到。
+    /// 迁移 0006 真的应用了：表查得到（版本水位由 `tests.rs` 的升级用例统一断言，
+    /// 那里写的是「最新一版」，加新迁移时只改一处）。
     #[test]
     fn the_bot_jobs_migration_is_applied() {
         let dir = TempDir::new("jobs-migration");
         let store = open_store(&dir);
-        assert_eq!(store.schema_version().expect("schema version"), 6);
+        assert!(
+            store.schema_version().expect("schema version") >= 6,
+            "0006 必须已应用（水位可能更高）"
+        );
         drop(store);
         let conn = raw(&dir);
         let count: i64 = conn

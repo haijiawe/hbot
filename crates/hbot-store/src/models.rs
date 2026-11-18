@@ -11,7 +11,7 @@
 //! `row_to_domain` 映射由使用方做（`docs/03-directory.md` §1.10）：store 不认识 `Value`
 //! 语义，core 不认识 SQL。
 
-use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId};
+use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId, WaitId};
 
 /// `projects` 行。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,5 +424,64 @@ pub struct NewJob {
     /// 首次可派发的时刻（Unix 毫秒）。
     pub next_at: i64,
     /// 入队时刻（Unix 毫秒）。
+    pub created_at: i64,
+}
+
+/// 等待行（`bot_waits` 一行；[`crate::Store::current_wait`] 等的返回形状）。
+///
+/// 与表同列，**不**解析 `scope` / `state`：两者是原样字符串（拼写真源在
+/// `hbot_core::bot_session` 的 `WaitScope::as_str()` / `WaitState::as_str()`，
+/// 存储层不重复定义一份）。解析与状态判断在装配层做。
+///
+/// `deadline` 是「到这个时刻还没人回答就算超时」（Unix 毫秒，调用方注入）；
+/// `fulfilled_message_id` 只有被唤醒的行才非空 —— 它把「谁回答了哪个等待」写进
+/// 库里，排障时不必翻日志。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitRow {
+    /// 等待行主键。
+    pub id: WaitId,
+    /// 等待键（`onResume` 的 `ctx.waitKey`）。
+    pub key: String,
+    /// 注册时发给用户的提示文本。
+    pub prompt: String,
+    /// 开等待的人（`sender_id`）；`scope = sender` 时只有他能回答。
+    pub owner: String,
+    /// 谁可以回答：`sender` / `conversation`。
+    pub scope: String,
+    /// 状态原样字符串：`pending` / `fulfilled` / `expired` / `cancelled`。
+    pub state: String,
+    /// 会话的平台外部 ID（回复目标，也是 `onResume` 里 `ctx.conversationExternalId`）。
+    pub conversation: String,
+    /// 到这个时刻还没人回答就算超时（Unix 毫秒）。
+    pub deadline: i64,
+    /// 唤醒它的那条消息 id；未唤醒为 `None`。
+    pub fulfilled_message_id: Option<String>,
+    /// 注册时刻（Unix 毫秒）。
+    pub created_at: i64,
+}
+
+/// 待注册的一条等待（[`crate::Store::register_wait`] 的入参）。
+///
+/// `state` / `updated_at` 不在这里：新行恒为 `pending`、`updated_at = created_at`，
+/// 由存储层写（与 [`NewJob`] 同一纪律）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewWait {
+    /// 等待行主键（由 `IdGenerator::wait_id()` 生成）。
+    pub id: WaitId,
+    /// 会话行主键。
+    pub conversation_id: ConversationId,
+    /// 会话的平台外部 ID。
+    pub conversation_external_id: String,
+    /// 开等待的人。
+    pub owner: String,
+    /// 等待键。
+    pub key: String,
+    /// 提示文本。
+    pub prompt: String,
+    /// 谁可以回答：`sender` / `conversation`。
+    pub scope: String,
+    /// 超时时刻（Unix 毫秒）。
+    pub deadline: i64,
+    /// 注册时刻（Unix 毫秒）。
     pub created_at: i64,
 }

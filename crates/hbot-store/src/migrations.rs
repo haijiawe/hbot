@@ -56,6 +56,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0006_bot_jobs",
         sql: include_str!("migrations/0006_bot_jobs.sql"),
     },
+    Migration {
+        version: 7,
+        name: "0007_bot_waits",
+        sql: include_str!("migrations/0007_bot_waits.sql"),
+    },
 ];
 
 /// 本二进制支持的最新版本。

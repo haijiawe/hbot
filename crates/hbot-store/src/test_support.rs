@@ -13,9 +13,9 @@ use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::Store;
-use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId};
+use crate::ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId, WaitId};
 use crate::models::{
-    Bot, Conversation, NewInbound, NewJob, NewLog, NewOutbound, OutboundTarget, Project,
+    Bot, Conversation, NewInbound, NewJob, NewLog, NewOutbound, NewWait, OutboundTarget, Project,
 };
 
 /// 种子项目 id 的 `u128` 值。
@@ -84,6 +84,25 @@ pub(crate) fn new_job(id: u128, key: &str, at: i64) -> NewJob {
     }
 }
 
+/// 任意等待 ID（同值可复现）。
+pub(crate) fn wait_id(value: u128) -> WaitId {
+    WaitId::from_uuid(fixed_uuid(value))
+}
+
+/// 造一条指向种子 bot + 种子会话的待注册等待：`deadline` 取 `at + 60_000`。
+pub(crate) fn new_wait(id: u128, key: &str, owner: &str, at: i64) -> NewWait {
+    NewWait {
+        id: wait_id(id),
+        conversation_id: conversation_id(),
+        conversation_external_id: "local:default".to_owned(),
+        owner: owner.to_owned(),
+        key: key.to_owned(),
+        prompt: "请把订单号发给我".to_owned(),
+        scope: "sender".to_owned(),
+        deadline: at + 60_000,
+        created_at: at,
+    }
+}
 /// 一次测试独占的临时目录。
 pub(crate) struct TempDir {
     path: PathBuf,
