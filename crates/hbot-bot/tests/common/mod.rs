@@ -17,7 +17,7 @@ use hbot_bot::handler::{HandlerExecutor, MessageCtx};
 use hbot_bot::supervisor::{BotSpec, Supervisor, SupervisorDeps};
 use hbot_core::{
     ApprovalId, BotId, Clock, ConversationId, ConversationKind, EditId, HbotError, IdGenerator,
-    InboundId, JobId, MessageId, OutboundId, ProjectId, SearchId, SessionId, Timestamp,
+    InboundId, JobId, MessageId, OutboundId, ProjectId, SearchId, SessionId, Timestamp, WaitId,
 };
 use hbot_store::{Project, Store};
 use tokio::sync::{Semaphore, mpsc};
@@ -130,6 +130,10 @@ impl IdGenerator for TestIds {
 
     fn job_id(&self) -> JobId {
         JobId::from_uuid(self.uuid())
+    }
+
+    fn wait_id(&self) -> WaitId {
+        WaitId::from_uuid(self.uuid())
     }
 }
 

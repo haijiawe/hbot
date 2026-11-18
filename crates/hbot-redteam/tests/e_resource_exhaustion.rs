@@ -20,7 +20,7 @@ use hbot_bot::{
 use hbot_code::{CodeError, Limits, Sandbox, compile_project};
 use hbot_core::{
     BotId, ConversationId, ConversationKind, HbotError, IdGenerator, InboundMessage, MessageId,
-    Timestamp, ids::*,
+    Timestamp, WaitId, ids::*,
 };
 use hbot_redteam::TempTree;
 use hbot_store::Store;
@@ -205,6 +205,10 @@ impl IdGenerator for CountingIds {
     }
     fn job_id(&self) -> JobId {
         JobId::from_uuid(self.take())
+    }
+
+    fn wait_id(&self) -> WaitId {
+        WaitId::from_uuid(self.take())
     }
 }
 

@@ -9,7 +9,7 @@
 
 use hbot_core::{
     ApprovalId, BotId, Clock, ConversationId, EditId, IdGenerator, InboundId, JobId, MessageId,
-    OutboundId, ProjectId, SearchId, SessionId, Timestamp,
+    OutboundId, ProjectId, SearchId, SessionId, Timestamp, WaitId,
 };
 
 /// UUID v4 生成器。
@@ -59,6 +59,10 @@ impl IdGenerator for UuidIds {
 
     fn job_id(&self) -> JobId {
         JobId::from_uuid(uuid::Uuid::new_v4())
+    }
+
+    fn wait_id(&self) -> WaitId {
+        WaitId::from_uuid(uuid::Uuid::new_v4())
     }
 }
 

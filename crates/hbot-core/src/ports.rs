@@ -12,7 +12,7 @@ use crate::command::{CommandDenied, CommandOutput, CommandSpec};
 use crate::domain::Timestamp;
 use crate::ids::{
     ApprovalId, BotId, ConversationId, EditId, InboundId, JobId, MessageId, OutboundId, ProjectId,
-    SearchId, SessionId,
+    SearchId, SessionId, WaitId,
 };
 
 /// 时钟端口。领域层不直接读系统时间。
@@ -73,6 +73,9 @@ pub trait IdGenerator: Send + Sync {
 
     /// 新的后台作业行 ID（见 [`crate::ids::JobId`]）。
     fn job_id(&self) -> JobId;
+
+    /// 新的会话等待行 ID（见 [`crate::ids::WaitId`]）。
+    fn wait_id(&self) -> WaitId;
 }
 
 /// 受控命令执行。
