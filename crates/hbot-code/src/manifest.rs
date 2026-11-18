@@ -104,6 +104,14 @@ pub struct Capabilities {
     /// "true" 无法回答"几点触发"。空数组 = 没声明。
     #[serde(default)]
     pub timer: Vec<hbot_core::ScheduleSpec>,
+    /// 后台作业（C4）：`ctx.jobs.enqueue(name, …)` 的具名作业类型表。
+    ///
+    /// 与 `timer` 同一个形状、同一个理由：作业类型必须有名字，还把预算与重试
+    /// 次数一起写在这里，"true" 无法回答"跑多久、失败了还试不试"。
+    /// 空数组 = 没声明 —— `ctx.jobs.enqueue` 会直接报 `HBOT_JOBS_NOT_DECLARED`，
+    /// 而不是收下一个跑不起来的作业。
+    #[serde(default)]
+    pub jobs: Vec<hbot_core::JobSpec>,
 }
 
 /// 状态能力（`docs/07` §5）。
@@ -148,6 +156,16 @@ impl Capabilities {
     #[must_use]
     pub fn timer(&self) -> &[hbot_core::ScheduleSpec] {
         &self.timer
+    }
+
+    /// 作业类型表（`ctx.jobs.enqueue` 的 `name` 从这里来）。
+    ///
+    /// 与 [`Self::timer`] 同一条分工：声明层只回答"项目要不要用后台作业"，
+    /// 不回答"宿主能不能跑"（后者由 `hbot-code::jobs::JobSlot` 的装配回答，
+    /// 再后面由 `hbot-rpc` 的作业循环回答）。
+    #[must_use]
+    pub fn jobs(&self) -> &[hbot_core::JobSpec] {
+        &self.jobs
     }
 }
 
@@ -342,6 +360,16 @@ impl Manifest {
             invalid(
                 &manifest_path,
                 format!("`capabilities.timer` 不合法：{error}"),
+            )
+        })?;
+
+        // 作业类型表：与定时器同一个判据顺序、同一个理由（写错就在加载时报，
+        // 不等到第一次入队才静默不动）。校验只有一份，在
+        // `hbot-core::bot_jobs::validate_specs`。
+        hbot_core::validate_specs(&self.capabilities.jobs).map_err(|error| {
+            invalid(
+                &manifest_path,
+                format!("`capabilities.jobs` 不合法：{error}"),
             )
         })?;
 
@@ -1041,5 +1069,64 @@ mod tests {
             "{}\n",
             "既有文件不能被改"
         );
+    }
+
+    #[test]
+    fn declared_job_types_carry_their_budget_and_retries() {
+        let scratch = Scratch::new("jobs-declared");
+        scratch.write(ENTRY_MODULE, "export default {};\n");
+        scratch.write(
+            MANIFEST_FILE,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":"ws://h"},
+               "capabilities":{"jobs":[
+                 {"name":"settle-war","budgetMs":120000,"retries":2},
+                 {"name":"fan-out"}
+               ]}}"#,
+        );
+
+        let manifest = load(&scratch.0).expect("应能加载");
+        let jobs = manifest.capabilities.jobs();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].name, "settle-war");
+        assert_eq!(jobs[0].budget_ms, 120_000);
+        assert_eq!(jobs[0].retries, 2);
+        // 省略的字段走契约缺省值，不是 0 预算；否则每种作业都得把 60000 抄一遍。
+        assert_eq!(jobs[1].budget_ms, hbot_core::DEFAULT_JOB_BUDGET_MS);
+        assert_eq!(jobs[1].retries, hbot_core::DEFAULT_JOB_RETRIES);
+    }
+
+    #[test]
+    fn a_job_type_table_that_breaks_the_contract_fails_the_load() {
+        let scratch = Scratch::new("jobs-invalid");
+        scratch.write(ENTRY_MODULE, "export default {};\n");
+
+        // 预算超上限：加载就报，不等到第一次入队。
+        let too_long = format!(
+            r#"{{"name":"d","platform":{{"kind":"onebot11","ws":"ws://h"}},
+               "capabilities":{{"jobs":[{{"name":"settle-war","budgetMs":{}}}]}}}}"#,
+            hbot_core::MAX_JOB_BUDGET_MS + 1
+        );
+        scratch.write(MANIFEST_FILE, &too_long);
+        let error = load(&scratch.0).expect_err("超上限预算必须拒绝");
+        assert_eq!(error.code(), "HBOT_MANIFEST_INVALID", "{error}");
+        assert!(error.to_string().contains("capabilities.jobs"), "{error}");
+
+        // 重名。
+        scratch.write(
+            MANIFEST_FILE,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":"ws://h"},
+               "capabilities":{"jobs":[{"name":"a"},{"name":"a"}]}}"#,
+        );
+        let error = load(&scratch.0).expect_err("重名必须拒绝");
+        assert!(error.to_string().contains("重复声明"), "{error}");
+
+        // 名字为空。
+        scratch.write(
+            MANIFEST_FILE,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":"ws://h"},
+               "capabilities":{"jobs":[{"name":"  "}]}}"#,
+        );
+        let error = load(&scratch.0).expect_err("空名字必须拒绝");
+        assert!(error.to_string().contains("作业名"), "{error}");
     }
 }

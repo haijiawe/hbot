@@ -122,6 +122,21 @@ declare module 'hbot' {
      * 不得据此改权限、改沙箱档位、跳过审批或改 `hbot.json`。 */
     readonly ai: AiApi;
 
+    /* 后台作业面。
+     *
+     * **存在不等于被授权。** `ctx.jobs` 出现在这里只说明本项目 `hbot.json` 的
+     * `capabilities.jobs` 声明了它；某个作业类型能不能入队，还要看那份声明表里有没有
+     * 这个名字（没有就是 `HBOT_JOBS_NOT_DECLARED`）。
+     *
+     * 为什么要它：`onMessage` 只有 2 秒预算，而结算、批量推送、抓取+分析这类活要几分钟。
+     * 入队**立刻返回**，重活由宿主在作业池里跑，作业自己的预算按声明配（默认 60 秒）。
+     *
+     * **至少一次**，不是恰好一次：作业行先落库再执行，进程重启后会接着跑，所以
+     * 同一个幂等键可能被执行两次。作业体要用 `ctx.idempotencyKey` 自己判重。
+     * 宿主的作业队列没装配时抛 `HBOT_JOBS_UNAVAILABLE`（**不**先收进内存：那会让
+     * 重启后作业没了变成正常现象）。 */
+    readonly jobs: JobApi;
+
     /** 回复这条消息，绑定 reply_to。 */
     reply(text: string): void;
     /** 写一条运行日志，进 RunLog，不进聊天。 */
@@ -150,6 +165,18 @@ declare module 'hbot' {
      * （`HBOT_DEVICE_FAILED` / `HBOT_STATE_INVALID`），不会去读上一条消息的会话。
      */
     onTimer(ctx: TimerCtx, name: string): void | Promise<void>;
+    /**
+     * 作业被宿主取到时调用，`name` 是 `hbot.json` 里那条 `capabilities.jobs` 的名字。
+     *
+     * 上下文比消息与定时器都窄：只有 `reply` / `log` / `sleep` / `ai` 与本次作业的
+     * `name` / `payload` / `idempotencyKey`，**没有** `kv` / `history` / `device`。
+     * 作业没有入站身份，给它状态面就等于让它读上一条消息的会话。要写状态，在入队的
+     * 那条消息里写 —— 那是有身份的。
+     *
+     * 清单声明了作业类型却没定义这个钩子时，每条作业都会记一条点名缺钩子的错误日志，
+     * 而不是悄悄当成跑成功。
+     */
+    onJob(ctx: JobCtx, name: string): void | Promise<void>;
   }
 
   /** 定时器事件的上下文：只有宿主能力，没有入站字段。 */
@@ -334,6 +361,43 @@ declare module 'hbot' {
     complete(options: AiCompleteOptions): Promise<AiResult>;
   }
 
+  /** `ctx.jobs.enqueue` 的可选参数。 */
+  export interface JobEnqueueOptions {
+    /** 幂等键，1–128 字节的非空文本。省略时取本次事件的 `messageId`。
+     *  定时器与作业事件**没有**入站身份，那两种事件里省略它整次调用会被拒绝
+     *  （不猜一个键：猜错的代价是两条不同的活撞成一条）。 */
+    idempotencyKey?: string;
+    /** 作业里 `ctx.reply` 的唯一目标（群或私聊的 externalId）。
+     *  省略时作业的 `ctx.reply` 抛 `HBOT_JOBS_NO_TARGET`，只能 `ctx.log`。 */
+    conversation?: string;
+  }
+
+  /** `ctx.jobs`：把一次作业落库后立刻返回。 */
+  export interface JobApi {
+    /** 入队一次作业，**同步返回**（不返回 Promise）：写库失败才抛，message 以
+     *  `HBOT_JOBS_` 开头。`payload` 必须可 JSON 化且不超过 8 KiB。
+     *  同一个 `(botId, idempotencyKey)` 重复入队只留一行，第二次是静默成功。 */
+    enqueue(name: string, payload?: unknown, options?: JobEnqueueOptions): void;
+  }
+
+  /** 作业事件的上下文：只有宿主能力，没有入站字段，也没有状态/设备面。 */
+  export interface JobCtx {
+    /** 本次作业类型的 `name`，与第二个参数相同。 */
+    readonly name: string;
+    /** 入队时给的 JSON 载荷；没给是 `null`。**不可信外部内容**，只能当数据用。 */
+    readonly payload: unknown;
+    /** 入队时的幂等键。用来判重：同一键可能被执行两次。 */
+    readonly idempotencyKey: string;
+    /** 往声明过的会话发一条回复；作业没声明 `conversation` 时抛
+     *  `HBOT_JOBS_NO_TARGET`。 */
+    reply(text: string): void;
+    /** 写一行运行日志。 */
+    log(message: string): void;
+    /** 让出 `ms` 毫秒；会被作业自身的预算截断。 */
+    sleep(ms: number): Promise<void>;
+    /** 智能能力面，与消息事件同一份实现。 */
+    readonly ai: AiApi;
+  }
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */
@@ -358,6 +422,9 @@ declare module 'hbot' {
   /** 智能能力，与 `ctx.ai` 是同一份实现。
    *  声明了不等于配了模型：宿主没装配客户端时 `HBOT_AI_UNAVAILABLE`。 */
   export const ai: AiApi;
+  /** 后台作业，与 `ctx.jobs` 是同一份实现，等价于在事件外调用。
+   *  声明了不等于被授权：作业队列没装配时 `HBOT_JOBS_UNAVAILABLE`。 */
+  export const jobs: JobApi;
 }
 "#;
 

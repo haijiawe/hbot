@@ -43,6 +43,7 @@ use crate::ai::AiSlot;
 use crate::device::DeviceSlot;
 use crate::error::CodeError;
 use crate::http::{GetOptions, HttpConfig, HttpResponse};
+use crate::jobs::JobSlot;
 use crate::limits::Deadline;
 use crate::state::StateSlot;
 
@@ -52,7 +53,7 @@ use crate::state::StateSlot;
 /// exports of [`HOST_MODULE_SOURCE`] and with the declarations in `hbot.d.ts`,
 /// so a binding added here without its two declarations is a test failure.
 pub(crate) const HOST_BINDING_KEYS: &[&str] = &[
-    "log", "reply", "sleep", "http", "device", "kv", "history", "ai",
+    "log", "reply", "sleep", "http", "device", "kv", "history", "ai", "jobs",
 ];
 
 /// Upper bound on captured `log`/`reply` entries per event.
@@ -141,6 +142,7 @@ fn truncate(message: String) -> String {
 /// revoked session (or a host that only now assembled its state backend, or the
 /// user pointing the IDE at a different model) takes effect on the very next
 /// call rather than on the next isolate (`docs/09` §4.2).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install<'js>(
     ctx: &Ctx<'js>,
     output: Arc<Mutex<HostOutput>>,
@@ -149,6 +151,7 @@ pub(crate) fn install<'js>(
     device: Arc<DeviceSlot>,
     state: Arc<StateSlot>,
     ai: Arc<AiSlot>,
+    jobs: Arc<JobSlot>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -235,6 +238,9 @@ pub(crate) fn install<'js>(
     let device_object = super::device_api::install(ctx, &device, &http, &deadline)?;
     let (kv_object, history_function) = super::state_api::install(ctx, &state, &deadline)?;
     let ai_object = super::ai_api::install(ctx, &ai, &deadline)?;
+    // 作业不需要预算参数：入队是一次库写，不是一次 JS 等待 —— 它的墙钟由
+    // `spawn_blocking` 的调用方等，而 handler 的预算本来就只是 handler 的。
+    let jobs_object = super::jobs_api::install(ctx, &jobs)?;
 
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
@@ -245,6 +251,7 @@ pub(crate) fn install<'js>(
     host.set("history", history_function)
         .map_err(super::js_error)?;
     host.set("ai", ai_object).map_err(super::js_error)?;
+    host.set("jobs", jobs_object).map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
             .filter_map(Result::ok)
@@ -519,7 +526,30 @@ export const ai = {
   },
 };
 
-export default { defineBot, log, reply, sleep, http, device, kv, history, ai };
+
+/**
+ * 后台作业（C4）。`jobs.enqueue(name, payload, options)` 把一次作业**落库**后立刻
+ * 返回；重活由宿主的作业循环在单独的 isolate 里跑，不占 handler 的 2 秒预算。
+ *
+ * 三个事实：
+ * ① `name` 必须先在 `hbot.json` 的 `capabilities.jobs` 里声明过，否则报
+ *   `HBOT_JOBS_NOT_DECLARED` —— 没有声明表就收下作业，等于收下一个跑不起来的东西；
+ * ② 幂等键默认取本次事件的 `ctx.messageId`，也可以自己传 `options.idempotencyKey`；
+ *   **定时器与作业事件没有入站身份**，那两种事件里不传 key 会直接失败；
+ * ③ `options.conversation` 是作业里 `ctx.reply` 的唯一目标，不写就只能 `log`。
+ *
+ * Presence is not authorization: `ctx.jobs` being declared in `hbot.d.ts` only
+ * means this project said `capabilities.jobs`. A host that has not assembled its
+ * job queue answers `HBOT_JOBS_UNAVAILABLE` rather than keeping the job in memory
+ * (which would make the job-with-vanished-on-restart look like normal behaviour).
+ */
+export const jobs = {
+  enqueue(name, payload, options) {
+    return host.jobs.enqueue(name, payload, options);
+  },
+};
+
+export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs };
 "#;
 
 #[cfg(test)]

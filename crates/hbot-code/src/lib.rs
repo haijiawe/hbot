@@ -50,6 +50,7 @@ pub mod dts;
 pub mod error;
 pub mod http;
 mod instrument;
+pub mod jobs;
 pub mod limits;
 pub mod manifest;
 pub mod modules;
@@ -74,6 +75,7 @@ pub use hbot_core::debug::{
     Breakpoints, DebugAction, DebugFrame, DebugScope, DebugSink, LoggedAt, PausedAt,
 };
 pub use http::{HttpConfig, HttpRequest, HttpResponse, HttpTransport, TransportError};
+pub use jobs::MAX_DECLARED_JOBS;
 pub use limits::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MEMORY_BYTES, Limits};
 pub use manifest::{
     DevicePermissions, Manifest, ManifestLimits, Permissions, PlatformSpec, ScaffoldReport,

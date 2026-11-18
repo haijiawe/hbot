@@ -37,6 +37,7 @@ use crate::dispatch::EventFailure;
 use crate::error::CodeError;
 use crate::http::HttpConfig;
 use crate::instrument;
+use crate::jobs::JobSlot;
 use crate::limits::{Deadline, Limits};
 use crate::modules;
 use crate::state::StateSlot;
@@ -144,6 +145,13 @@ pub struct Sandbox {
     /// and the isolate itself never needs a JS `setTimeout` (which the sandbox
     /// does not expose anyway).
     timer: Arc<TimerSlot>,
+    /// 作业槽：声明表 + 入队端口，随事件替换。
+    ///
+    /// 与 [`Sandbox::timer`] 相反，这个槽**必须** clone 给 worker 线程：`ctx.jobs`
+    /// 是在 handler 体内被调用的（`onMessage` 里入队），而入队要读到「本事件的
+    /// messageId」与声明表，两样都在 worker 侧。宿主线程只用它装配与读
+    /// [`Sandbox::is_jobs_assembled`]。
+    jobs: Arc<JobSlot>,
 }
 
 /// Mutable debug state shared with the worker thread.
@@ -218,6 +226,8 @@ impl Sandbox {
         let state = Arc::new(StateSlot::new());
         let ai = Arc::new(AiSlot::new());
         let timer = Arc::new(TimerSlot::new());
+        let jobs = Arc::new(JobSlot::new());
+        let worker_jobs = Arc::clone(&jobs);
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
         let worker_http = Arc::clone(&http);
@@ -237,6 +247,7 @@ impl Sandbox {
                     worker_device,
                     worker_state,
                     worker_ai,
+                    worker_jobs,
                     &started_tx,
                     &finished_tx,
                 )
@@ -256,6 +267,7 @@ impl Sandbox {
             state,
             ai,
             timer,
+            jobs,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -443,6 +455,78 @@ impl Sandbox {
     pub fn dispatch_timer(&self, due: &hbot_core::DueSchedule) -> Result<EventOutcome, CodeError> {
         self.dispatch_timer_collecting(due)
             .map_err(|failure| *failure.error)
+    }
+
+    /// 装（或替换）作业声明表与入队端口。
+    ///
+    /// `specs` 来自 `hbot.json` 的 `capabilities.jobs`，`queue` 是宿主实现的端口
+    /// （`hbot-rpc` 那边落到 `bot_jobs` 表）。这里不判断任何规则：能不能入队由
+    /// [`hbot_core::validate_request`] 与声明表在 [`crate::jobs::JobSlot`] 里判，
+    /// 落不落库由端口决定。**没装配就入队**会得到 `HBOT_JOBS_UNAVAILABLE`，
+    /// 而不是悄悄把作业收进内存（那样重启后消失会像正常行为）。
+    ///
+    /// 与其它槽位一样，可以在任何时刻替换：worker 每次 `ctx.jobs.enqueue` 都重读
+    /// 这个槽，改清单后下一次入队就按新表判，不需要重启 bot。
+    pub fn set_jobs(&self, specs: &[hbot_core::JobSpec], queue: Arc<dyn crate::jobs::JobQueue>) {
+        self.jobs.set_specs(specs);
+        self.jobs.set_queue(queue);
+    }
+
+    /// 作业端口是否装上了（声明表可以独立为空）。
+    #[must_use]
+    pub fn is_jobs_assembled(&self) -> bool {
+        self.jobs.is_assembled()
+    }
+
+    /// 已声明的作业类型数（0 表示清单没写 `capabilities.jobs`）。
+    #[must_use]
+    pub fn job_count(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// 跑一次 `onJob(ctx, name)`：宿主的作业循环取到一条到期作业后调它。
+    ///
+    /// 阻塞契约、预算、日志收集与失败形状都与 [`Sandbox::dispatch_timer_collecting`]
+    /// 相同。区别在参数：作业带 `payload` 与幂等键，两者都要出现在 ctx 上，否则
+    /// 作业体只能靠全局状态猜自己该做什么。
+    ///
+    /// # Errors
+    ///
+    /// [`EventFailure`]：项目的默认导出没有 `onJob` 时报 [`CodeError::JsException`]
+    /// 并点名缺的钩子与作业名 —— 与缺 `onTimer` 同一处理，不静默成功。
+    pub fn dispatch_job_collecting(
+        &self,
+        job_id: hbot_core::JobId,
+        budget_ms: u64,
+        name: &str,
+        payload: serde_json::Value,
+        idempotency_key: &str,
+        conversation: Option<String>,
+    ) -> Result<EventOutcome, EventFailure> {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.send(Command::Job {
+            job_id,
+            budget_ms,
+            name: name.to_owned(),
+            payload,
+            idempotency_key: idempotency_key.to_owned(),
+            conversation,
+            reply,
+        })
+        .map_err(EventFailure::without_output)?;
+
+        match result.recv_timeout(self.backstop()) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => {
+                Err(EventFailure::without_output(CodeError::SandboxDead {
+                    message: format!(
+                        "isolate did not answer within {:?}; the worker thread is wedged",
+                        self.backstop()
+                    ),
+                }))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(EventFailure::without_output(self.dead())),
+        }
     }
 
     /// Run `onMessage` for one JSON event.
@@ -851,6 +935,25 @@ enum Command {
         conversation: Option<String>,
         reply: Sender<Result<EventOutcome, EventFailure>>,
     },
+    /// 跑一次 `onJob(ctx, name)`：宿主取到一条到期作业后派发，答案回 `reply`。
+    ///
+    /// 与 `Timer` 同理，是独立变体而不是合成的 `Event`：作业没有入站消息，
+    /// 走 `build_event` 会清空设备/状态身份并给作业一个假 payload。
+    ///
+    /// `idempotency_key` 是落库时用的那一个（默认取原消息的 messageId）：作业体
+    /// 拿它做自己的幂等判断，因为**宿主保证的是至少一次**，不是恰好一次。
+    Job {
+        job_id: hbot_core::JobId,
+        /// 该作业类型的预算（毫秒），来自入队时那一行的 `budget_ms`。
+        ///
+        /// 跟着行走而不是跟着清单走：改清单不该让已经排队的那条作业换一个预算。
+        budget_ms: u64,
+        name: String,
+        payload: serde_json::Value,
+        idempotency_key: String,
+        conversation: Option<String>,
+        reply: Sender<Result<EventOutcome, EventFailure>>,
+    },
     /// Stop the worker loop.
     Shutdown,
 }
@@ -867,11 +970,12 @@ fn worker(
     device: Arc<DeviceSlot>,
     state: Arc<StateSlot>,
     ai: Arc<AiSlot>,
+    jobs: Arc<JobSlot>,
     started: &Sender<Result<(), CodeError>>,
     finished: &Sender<()>,
 ) {
     if let Err(error) = serve(
-        inbox, project, limits, debug, control, http, device, state, ai, started,
+        inbox, project, limits, debug, control, http, device, state, ai, jobs, started,
     ) {
         tracing::error!(
             code = error.code(),
@@ -920,6 +1024,12 @@ fn reject(command: Command, failure: &CodeError) {
                 message,
             })));
         }
+        Command::Job { reply, .. } => {
+            // 作业体没跑：宿主按失败计入 attempts，并按声明的重试次数退避。
+            let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
+                message,
+            })));
+        }
         Command::Shutdown => {}
     }
 }
@@ -941,6 +1051,7 @@ fn serve(
     device: Arc<DeviceSlot>,
     state: Arc<StateSlot>,
     ai: Arc<AiSlot>,
+    jobs: Arc<JobSlot>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -997,12 +1108,13 @@ fn serve(
         let device = &device;
         let state = &state;
         let ai = &ai;
+        let jobs = &jobs;
         local.block_on(&runtime, async move {
             context
                 .async_with(async |ctx| {
                     bootstrap(
                         &ctx, &entry, output, deadline, project, debug, control, http, device,
-                        state, ai, limits,
+                        state, ai, jobs, limits,
                     )
                     .await
                 })
@@ -1037,6 +1149,7 @@ fn serve(
                     let device = &device;
                     let state = &state;
                     let ai = &ai;
+                    let jobs = &jobs;
                     local.block_on(&runtime, async move {
                         context
                             .async_with(async |ctx| {
@@ -1051,6 +1164,7 @@ fn serve(
                                     device,
                                     state,
                                     ai,
+                                    jobs,
                                     instrumented,
                                     limits,
                                 )
@@ -1103,6 +1217,59 @@ fn serve(
                 let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
                 let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
             }
+            Command::Job {
+                job_id,
+                budget_ms,
+                name,
+                payload,
+                idempotency_key,
+                conversation,
+                reply,
+            } => {
+                let raw = {
+                    let context = &context;
+                    let job_handler = &hooks.job;
+                    let output = &output;
+                    let deadline = &deadline;
+                    let project = &project;
+                    let control = &control;
+                    let device = &device;
+                    let state = &state;
+                    let ai = &ai;
+                    let jobs = &jobs;
+                    let conversation = conversation.as_deref();
+                    let payload = &payload;
+                    let idempotency_key = idempotency_key.as_str();
+                    let budget = Duration::from_millis(budget_ms);
+                    local.block_on(&runtime, async move {
+                        context
+                            .async_with(async |ctx| {
+                                run_job(
+                                    &ctx,
+                                    job_id,
+                                    &name,
+                                    payload,
+                                    idempotency_key,
+                                    conversation,
+                                    budget,
+                                    job_handler,
+                                    output,
+                                    deadline,
+                                    project,
+                                    control,
+                                    device,
+                                    state,
+                                    ai,
+                                    jobs,
+                                )
+                                .await
+                            })
+                            .await
+                    })
+                };
+                let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
+                let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
+            }
         }
     }
 
@@ -1128,6 +1295,12 @@ struct Hooks {
     /// `onTimer`, optional: a project with no `capabilities.timer` has no
     /// reason to define one, and a table installed later must not need a restart.
     timer: Option<Persistent<Function<'static>>>,
+    /// `onJob`，可选：没声明 `capabilities.jobs` 的项目没有理由定义它。
+    ///
+    /// 与 `onTimer` 一样在 boot 时保存，不在 `defineBot` 里校验：清单与钩子
+    /// 可以任一方先到，而一个不是函数的 `onJob` 值得在开机时点名，
+    /// 而不是留到第一条作业才 TypeError。
+    job: Option<Persistent<Function<'static>>>,
 }
 
 /// Evaluate `src/main.ts` and capture its hooks.
@@ -1144,6 +1317,7 @@ async fn bootstrap<'js>(
     device: &Arc<DeviceSlot>,
     state: &Arc<StateSlot>,
     ai: &Arc<AiSlot>,
+    jobs: &Arc<JobSlot>,
     limits: Limits,
 ) -> Result<Hooks, CodeError> {
     deadline.reset();
@@ -1158,6 +1332,7 @@ async fn bootstrap<'js>(
             Arc::clone(device),
             Arc::clone(state),
             Arc::clone(ai),
+            Arc::clone(jobs),
         )?;
         // The probe functions exist in both builds so the loader never has to
         // care, but `__hbot_dbg` starts `false`: a release build never emits a
@@ -1211,10 +1386,17 @@ async fn bootstrap<'js>(
             .get::<_, Option<Function<'js>>>("onTimer")
             .map_err(js_error)?
             .map(|function| Persistent::save(ctx, function));
+        // 同上，作业钩子也是可选的。缺它时不是开机错误：清单可能先声明了作业类型
+        // 而代码还没写钩子，那时第一次派发会报一条点名 `onJob` 的错（见 run_job）。
+        let job = config
+            .get::<_, Option<Function<'js>>>("onJob")
+            .map_err(js_error)?
+            .map(|function| Persistent::save(ctx, function));
 
         Ok::<_, CodeError>(Hooks {
             message: Persistent::save(ctx, handler),
             timer,
+            job,
         })
     }
     .await;
@@ -1237,6 +1419,7 @@ async fn run_event<'js>(
     device: &Arc<DeviceSlot>,
     state: &Arc<StateSlot>,
     ai: &Arc<AiSlot>,
+    jobs: &Arc<JobSlot>,
     instrumented: bool,
     limits: Limits,
 ) -> RawEvent {
@@ -1254,7 +1437,7 @@ async fn run_event<'js>(
     let _ = ctx.globals().set(instrument::DEBUG_FLAG, instrumented);
 
     let started = Instant::now();
-    let result = invoke(ctx, payload, handler, project, device, state, ai).await;
+    let result = invoke(ctx, payload, handler, project, device, state, ai, jobs).await;
     let duration = started.elapsed();
 
     control.end_event();
@@ -1273,6 +1456,7 @@ async fn run_event<'js>(
 }
 
 /// Call `onMessage(event)` and drive the returned value to completion.
+#[allow(clippy::too_many_arguments)]
 async fn invoke<'js>(
     ctx: &Ctx<'js>,
     payload: &str,
@@ -1281,8 +1465,9 @@ async fn invoke<'js>(
     device: &DeviceSlot,
     state: &StateSlot,
     ai: &AiSlot,
+    jobs: &JobSlot,
 ) -> Result<(), CodeError> {
-    match invoke_inner(ctx, payload, handler, device, state, ai).await {
+    match invoke_inner(ctx, payload, handler, device, state, ai, jobs).await {
         Ok(()) => Ok(()),
         Err(error) => Err(describe(ctx, error, project)),
     }
@@ -1369,6 +1554,191 @@ async fn run_timer<'js>(
     }
 }
 
+/// 一次作业执行：预算来自作业行，日志收集与失败形状照 `run_timer`。
+///
+/// 与定时器的三处不同：
+/// ① 预算来自**作业类型**（`JobSpec::budget_ms`，核心契约最长 10 分钟），不是 handler
+///   的 2 秒。这正是 C4 存在的理由：`onMessage` 里入队后立刻返回，重活在别处跑。
+///   仍然用同一个 deadline 槽与同一个 interrupt 处理器 —— 超预算的作业要被内核打断，
+///   而不是把 isolate 线程占住到宿主关停。
+/// ② 作业带 `payload` 与幂等键，两者都挂到 ctx 上；作业体拿它们决定自己做什么，
+///   而不是靠全局状态去猜。
+/// ③ 作业**不是**调试会话的一部分：调用方没有 sink，探针恒关（`instrumented=false`）。
+#[allow(clippy::too_many_arguments)]
+async fn run_job<'js>(
+    ctx: &Ctx<'js>,
+    job_id: hbot_core::JobId,
+    name: &str,
+    payload: &serde_json::Value,
+    idempotency_key: &str,
+    conversation: Option<&str>,
+    budget: Duration,
+    handler: &Option<Persistent<Function<'static>>>,
+    output: &Arc<Mutex<HostOutput>>,
+    deadline: &Arc<Deadline>,
+    project: &CompiledProject,
+    control: &Arc<DebugControl>,
+    device: &Arc<DeviceSlot>,
+    state: &Arc<StateSlot>,
+    ai: &Arc<AiSlot>,
+    jobs: &Arc<JobSlot>,
+) -> RawEvent {
+    let started = Instant::now();
+    let Some(handler) = handler else {
+        // 与缺 `onTimer` 同一处理：清单声明了作业类型、代码没写钩子，要点名说清楚，
+        // 而不是让作业循环把它当成「跑成功了」然后标 done。
+        let error = CodeError::JsException {
+            message: format!(
+                "作业 `{name}`（{job_id}）要跑了，但项目的默认导出没有 `onJob` 函数（defineBot 里要写 `async onJob(ctx, name)`）"
+            ),
+            stack: None,
+        };
+        return RawEvent {
+            logs: Vec::new(),
+            replies: Vec::new(),
+            duration: started.elapsed(),
+            interrupted: false,
+            result: Err(error),
+        };
+    };
+
+    deadline.reset();
+    deadline.arm(budget);
+    output
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    control.begin_event(false);
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+
+    let result = invoke_job(
+        ctx,
+        name,
+        payload,
+        idempotency_key,
+        conversation,
+        handler,
+        output,
+        project,
+        device,
+        state,
+        ai,
+        jobs,
+    )
+    .await;
+    let duration = started.elapsed();
+
+    control.end_event();
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+    deadline.disarm();
+    let interrupted = deadline.take_interrupted();
+    let (logs, replies) = output.lock().unwrap_or_else(PoisonError::into_inner).take();
+
+    RawEvent {
+        logs,
+        replies,
+        duration,
+        interrupted,
+        result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn invoke_job<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    payload: &serde_json::Value,
+    idempotency_key: &str,
+    conversation: Option<&str>,
+    handler: &Persistent<Function<'static>>,
+    output: &Arc<Mutex<HostOutput>>,
+    project: &CompiledProject,
+    device: &DeviceSlot,
+    state: &StateSlot,
+    ai: &AiSlot,
+    jobs: &JobSlot,
+) -> Result<(), CodeError> {
+    let result = async {
+        let event = build_job_event(
+            ctx,
+            name,
+            payload,
+            idempotency_key,
+            conversation,
+            output,
+            device,
+            state,
+            ai,
+            jobs,
+        )?;
+        let function = handler.clone().restore(ctx)?;
+        let pending: MaybePromise<'js> = function.call((event, name))?;
+        pending.into_future::<Value<'js>>().await?;
+        Ok::<(), rquickjs::Error>(())
+    }
+    .await;
+    result.map_err(|error| describe(ctx, error, project))
+}
+
+/// 交给 `onJob` 的 ctx，作业名同时作为第二个参数。
+///
+/// 比消息 ctx 还窄（`kv` / `history` / `device` / `jobs` 都没有），与 `onTimer` 同一套
+/// 理由：作业没有入站身份，挂上这三个面就等于让它沿用上一个事件的人。作业要写状态，
+/// 由它入队时那条消息去写 —— 那是有身份的。
+#[allow(clippy::too_many_arguments)]
+fn build_job_event<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    payload: &serde_json::Value,
+    idempotency_key: &str,
+    conversation: Option<&str>,
+    output: &Arc<Mutex<HostOutput>>,
+    device: &DeviceSlot,
+    state: &StateSlot,
+    ai: &AiSlot,
+    jobs: &JobSlot,
+) -> rquickjs::Result<Object<'js>> {
+    let job_event = Object::new(ctx.clone())?;
+    job_event.set("name", name)?;
+    job_event.set("payload", ctx.json_parse(payload.to_string())?)?;
+    job_event.set("idempotencyKey", idempotency_key)?;
+    // 每次显式清空：作业没有身份，任何残留都会变成「读到上一个人的东西」。
+    device.set_current_bot(None);
+    state.set_current_bot(None, None);
+    ai.reset_event();
+    // 幂等键也清掉：作业事件里 `ctx.jobs.enqueue` 没有消息 id 可兜底，
+    // 不显式清就会拿上一条消息的 messageId 当新作业的幂等键（两条不同的活撞成一条）。
+    jobs.set_current_message(None);
+
+    let host: Object<'js> = ctx.globals().get("__hbot")?;
+    let reply = {
+        let output = Arc::clone(output);
+        let has_target = conversation.is_some();
+        Function::new(
+            ctx.clone(),
+            move |handle: Ctx<'js>, message: String| -> rquickjs::Result<()> {
+                if !has_target {
+                    return Err(Exception::throw_message(
+                        &handle,
+                        &format!("{}: 这条作业没有声明回复目标，ctx.reply 不知道发给谁。入队时写 options.conversation（群或私聊的 externalId），只想记日志就用 ctx.log", crate::jobs::NO_TARGET_CODE),
+                    ));
+                }
+                output
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push_reply(message);
+                Ok(())
+            },
+        )
+        .and_then(|function| function.with_name("reply"))?
+    };
+    job_event.set("reply", reply)?;
+    job_event.set("log", host.get::<_, Function<'js>>("log")?)?;
+    job_event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
+    job_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
+    Ok(job_event)
+}
 // Nine arguments like its siblings above: they are the same slot set (device / state /
 // ai) threaded down from `serve`, and bundling them into a struct would only move the
 // noise to every call site while making the ordering invisible.
@@ -1475,8 +1845,9 @@ async fn invoke_inner<'js>(
     device: &DeviceSlot,
     state: &StateSlot,
     ai: &AiSlot,
+    jobs: &JobSlot,
 ) -> rquickjs::Result<()> {
-    let event = build_event(ctx, payload, device, state, ai)?;
+    let event = build_event(ctx, payload, device, state, ai, jobs)?;
     let function = handler.clone().restore(ctx)?;
     // `MaybePromise` accepts both `onMessage(ctx) {}` and
     // `async onMessage(ctx) {}`; awaiting it is also what drives any
@@ -1507,6 +1878,7 @@ fn build_event<'js>(
     device: &DeviceSlot,
     state: &StateSlot,
     ai: &AiSlot,
+    jobs: &JobSlot,
 ) -> rquickjs::Result<Object<'js>> {
     let parsed: Value<'js> = ctx.json_parse(payload.to_owned())?;
     let event = match Object::from_value(parsed.clone()) {
@@ -1524,6 +1896,9 @@ fn build_event<'js>(
     state.set_current_bot(bot_id_of(payload), conversation_id_of(payload));
     // 每事件清零调用额度：isolate 跨事件复用，不清零就等于按 isolate 计。
     ai.reset_event();
+    // 缺省幂等键取本条消息的 messageId（[crate::jobs] 模块文档承诺的那条判据）：
+    // 没有它就退化成「每次 enqueue 都要显式写 key」，而漏写就是重复干活。
+    jobs.set_current_message(message_id_of(payload));
 
     let host: Object<'js> = ctx.globals().get("__hbot")?;
     event.set("reply", host.get::<_, Function<'js>>("reply")?)?;
@@ -1533,6 +1908,7 @@ fn build_event<'js>(
     event.set("kv", host.get::<_, Object<'js>>("kv")?)?;
     event.set("history", host.get::<_, Function<'js>>("history")?)?;
     event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
+    event.set("jobs", host.get::<_, Object<'js>>("jobs")?)?;
     Ok(event)
 }
 
@@ -1546,6 +1922,18 @@ fn bot_id_of(payload: &str) -> Option<hbot_core::BotId> {
     let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
     let raw = parsed.get("botId")?.as_str()?;
     raw.parse().ok()
+}
+
+/// The `messageId` the event JSON carries, verbatim.
+///
+/// No parsing: the queue's idempotency key is opaque text (1–128 bytes) and the
+/// platform's message id is already unique, so re-encoding it would only invent
+/// a second identity to keep in sync. Missing or non-string yields `None`,
+/// which makes `ctx.jobs.enqueue` demand an explicit `idempotencyKey` instead
+/// of silently reusing a previous event's.
+fn message_id_of(payload: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
+    parsed.get("messageId")?.as_str().map(str::to_owned)
 }
 
 /// The `conversationId` the event JSON carries, if it parses as a
