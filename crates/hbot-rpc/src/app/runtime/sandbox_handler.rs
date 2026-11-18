@@ -101,6 +101,16 @@ pub struct SandboxHandlerConfig {
     /// isolate 时现调一次，这样清单被 Agent 改过之后热重载能读到新声明
     /// （见 `crate::app::state` 的模块文档）。
     pub state: Option<Arc<dyn crate::app::state::StateSource>>,
+
+    /// 智能能力（`ctx.ai.complete`）的装配工厂。
+    ///
+    /// `None` = 这台宿主没有装配模型客户端（测试、`hbot-bench`、以及任何没走
+    /// `AppState::start_bot` 的路径），此时生成代码里 `ctx.ai.complete` 每次调用都回
+    /// `HBOT_AI_UNAVAILABLE`，**不是**静默返回一段假文本。
+    ///
+    /// 存工厂而不是现成实例：清单的 `capabilities.ai` 会被 Agent 改，每次新建
+    /// isolate 时现读一遍（与 [`Self::state`] 同一理由）。
+    pub ai: Option<Arc<dyn crate::app::ai::AiSource>>,
 }
 
 /// 一个 worker 槽位：指纹一致就复用，不一致说明代码变了，换新 isolate。
@@ -298,6 +308,11 @@ pub struct SandboxHandler {
     /// 在**每次新建 isolate 时**才调 `handles()` 并 `set_state`（下面 `worker` 那段），
     /// 所以清单里 `capabilities.state` 的改动会在热重载后生效。
     state: Option<Arc<dyn crate::app::state::StateSource>>,
+    /// 智能能力（`ctx.ai.complete`）的装配工厂（`None` = 未装配）。
+    ///
+    /// 与 [`Self::state`] 同一条纪律：在**每次新建 isolate 时**才调 `client()` 并
+    /// `set_ai`，所以清单里 `capabilities.ai` 的改动会在热重载后生效。
+    ai: Option<Arc<dyn crate::app::ai::AiSource>>,
 }
 
 /// 设备能力的两个端口 + 装配时刻。
@@ -333,6 +348,7 @@ impl SandboxHandler {
             debug: crate::app::debug::registry(),
             device: None,
             state: config.state,
+            ai: config.ai,
         }
     }
 
@@ -367,6 +383,18 @@ impl SandboxHandler {
     /// （唯一一份），这里只负责"把工厂装进去"。
     pub fn with_state(mut self, source: Arc<dyn crate::app::state::StateSource>) -> Self {
         self.state = Some(source);
+        self
+    }
+
+    /// 装配智能能力（`ctx.ai.complete` 的工厂）。在 [`Self::new`] 之后立刻调。
+    ///
+    /// 不调用本方法 = `ctx.ai.complete` 每次回 `HBOT_AI_UNAVAILABLE`，明确失败，
+    /// 不是静默返回一段假文本。
+    ///
+    /// 声明闸不在这里：清单的 `capabilities.ai` 由工厂现读（每个新 isolate 一次），
+    /// 这里只负责"把工厂装进去"。
+    pub fn with_ai(mut self, source: Arc<dyn crate::app::ai::AiSource>) -> Self {
+        self.ai = Some(source);
         self
     }
 
@@ -609,6 +637,14 @@ impl SandboxHandler {
             if let Some(source) = &self.state {
                 let (state, history) = source.handles(&self.project_root);
                 sandbox.set_state(state, history);
+            }
+
+            // 智能能力：工厂现读一次清单，把模型客户端装进沙箱（每个新 isolate 装一次）。
+            // 漏掉这一步只会让 `ctx.ai.complete` 报"尚未装配"，是明确的失败，不是静默放行。
+            if let Some(source) = &self.ai {
+                if let Some(client) = source.client(&self.project_root) {
+                    sandbox.set_ai(client);
+                }
             }
             tracing::debug!(
                 bot = %self.bot_id,
@@ -1213,6 +1249,8 @@ mod tests {
                     replies: reply_tx,
                     // 测试夹具不装状态能力：`ctx.kv.*` 一律回 `HBOT_STATE_UNAVAILABLE`。
                     state: None,
+                    // 同上：`ctx.ai.complete` 一律回 `HBOT_AI_UNAVAILABLE`。
+                    ai: None,
                 })
                 .with_debounce(debounce)
                 .with_fingerprint_ttls(metadata_ttl, content_floor),

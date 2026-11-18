@@ -29,6 +29,15 @@
 //! ——即陈旧窗口有上界（默认 5s），不会永久漏掉。编辑器保存通常还会改长度或 mtime；
 //! 真漏了，代价也只是“延迟几秒生效”，不是“永远不生效”。
 //!
+//! ## 清单（`hbot.json`）也参与指纹
+//!
+//! 指纹决定“要不要换 isolate”，而 isolate 出生时按**清单**装配设备能力
+//! （`SandboxHandler::worker` 的 `device_apps`）与状态能力（`source.handles(root)`）。
+//! 所以只把 `src/**` 算进指纹会留下一个洞：**改清单不改源码 → 指纹不变 → isolate 不换 →
+//! 新声明永远不生效**（`capabilities.state.kv` 从 false 改成 true 也一样）。
+//! 于是清单文件本身也进指纹（[`MANIFEST_FILE`]），清单里的 `capabilities` / `permissions`
+//! 才能像源码一样“保存即生效”。
+//!
 //! ## 测试缝
 //!
 //! 时间从参数注入（[`FingerprintCache::current_at`]），内容读数用
@@ -249,9 +258,17 @@ pub fn project_fingerprint(root: &Path) -> Result<String, HbotError> {
 }
 
 /// 枚举参与指纹的源文件，按相对路径排序（顺序稳定，否则指纹会随目录遍历顺序抖动）。
+///
+/// 清单（`hbot.json`）也在这里：manifest 里的 `capabilities` / `permissions` 决定 isolate
+/// 出生时装哪些端口，所以它必须能单独触发一次 isolate 更换（见模块文档「清单也参与指纹」）。
+/// 清单不存在时不入列（项目可能还没写清单，`manifest::load` 会退回"全不声明"）。
 fn source_files(root: &Path) -> Result<Vec<(String, PathBuf)>, HbotError> {
     let mut files = Vec::new();
     collect_sources(&root.join("src"), root, &mut files)?;
+    let manifest = root.join(hbot_code::manifest::MANIFEST_FILE);
+    if manifest.is_file() {
+        files.push((hbot_code::manifest::MANIFEST_FILE.to_owned(), manifest));
+    }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
 }
@@ -534,5 +551,35 @@ mod tests {
         let before = project_fingerprint(dir.path()).expect("首次");
         std::fs::write(dir.path().join("hbot.d.ts"), "declare const x: 2;").expect("改写声明");
         assert_eq!(before, project_fingerprint(dir.path()).expect("改写声明后"));
+    }
+
+    /// 清单（`hbot.json`）单独进指纹：只改清单、一个源码字节都不动，也必须换指纹。
+    ///
+    /// 这是「把 `capabilities.state.kv` 从 `false` 改成 `true` 却不改任何 `.ts`」那条路径的
+    /// 最小证据：isolate 只在指纹变化时重建，而设备/状态能力是**重建时**按清单装配的。
+    /// 不把清单算进指纹，用户改了声明就得等下一次改源码才生效。
+    #[test]
+    fn manifest_change_alone_changes_the_fingerprint() {
+        let dir = project("fp-manifest", &[("src/main.ts", "export default {};")]);
+        let manifest = dir.path().join(hbot_code::manifest::MANIFEST_FILE);
+        std::fs::write(&manifest, r#"{"name":"d","platform":{"kind":"local"}}"#).expect("写清单");
+        let cache = FingerprintCache::with_ttls(
+            dir.to_path_buf(),
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        );
+        let start = Instant::now();
+        let before = cache.current_at(start).expect("首次指纹");
+
+        // 只改清单里的能力声明，`src/main.ts` 一个字节都不动。
+        std::fs::write(
+            &manifest,
+            r#"{"name":"d","platform":{"kind":"local"},"capabilities":{"state":{"kv":true}}}"#,
+        )
+        .expect("改写清单");
+        let after = cache
+            .current_at(start + Duration::from_millis(50))
+            .expect("改清单后的指纹");
+        assert_ne!(after, before, "只改清单也必须换指纹，否则新声明永远不生效");
     }
 }

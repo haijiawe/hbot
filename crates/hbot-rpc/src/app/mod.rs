@@ -34,6 +34,7 @@
 //! [`AppState::blocking`] 把这个包装成一句，避免每个命令各写一遍。
 
 pub mod agent;
+pub mod ai;
 pub mod bots;
 pub mod commands;
 pub mod debug;

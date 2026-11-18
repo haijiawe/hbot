@@ -352,8 +352,11 @@ mod tests {
     const START_MS: i64 = 1_000_000;
 
     fn declared(kv: bool, history: bool) -> Capabilities {
+        // 用 `..Default::default()` 而不是列全字段：清单的 `capabilities` 还会长
+        // （C5 加了 `ai` 就把这个字面量红过），而这里只关心 `state` 那两位。
         Capabilities {
             state: hbot_code::manifest::StateCapabilities { kv, history },
+            ..Capabilities::default()
         }
     }
 

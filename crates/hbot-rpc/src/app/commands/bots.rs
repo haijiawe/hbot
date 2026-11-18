@@ -155,6 +155,11 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
                 Arc::clone(state.store()),
                 Arc::clone(state.clock()),
             ))),
+            // 智能能力：声明闸在 `ProviderAiClient` 里（每次调用重读），工厂每次起
+            // isolate 现读清单与 `agent.json`；没配模型时沙箱侧报 `HBOT_AI_UNAVAILABLE`。
+            ai: Some(Arc::new(crate::app::ai::HostAiSource::new(
+                state.data_dir(),
+            ))),
         })
         // 设备能力：闸是 `AppState` 那一份（唯一判据），后端是当前平台的那一个。
         // 生产装配只有这一处 —— 别的路径（测试/bench）不装，`ctx.device.*` 会明确报

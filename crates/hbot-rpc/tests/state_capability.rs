@@ -11,7 +11,7 @@
 //! 漏掉那句接线时，`ctx.kv` 会一路报 `HBOT_STATE_UNAVAILABLE`，而上面每一层的单元
 //! 测试都还是绿的 —— 所以这里必须走 `Dispatcher` 真派发，不能直接构造 handler。
 //!
-//! 五类断言：
+//! 六类断言：
 //!
 //! 1. **没声明就没得用**：`hbot.json` 不写 `capabilities.state` → `ctx.kv.get` 抛
 //!    `HBOT_STATE_NOT_DECLARED`；
@@ -19,7 +19,9 @@
 //! 3. **状态跨 isolate 存活**：`bot_stop` → `bot_start`（换一个全新 isolate）后
 //!    上一次写进去的值还在（证明状态在 SQLite 里，不在 JS 堆上）；
 //! 4. **状态跨宿主进程存活**：整个 `AppState` 重开、`Store` 换新，值仍在；
-//! 5. **两个 bot 互不可见**：同一份 `Store`、同一个键名，第二个 bot 读到的是 `null`。
+//! 5. **只改清单也生效**：不动任何 `.ts`，只把 `capabilities.state.kv` 改成 `true`，
+//!    新声明也会被用上（清单参与热重载指纹）；
+//! 6. **两个 bot 互不可见**：同一份 `Store`、同一个键名，第二个 bot 读到的是 `null`。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -152,6 +154,8 @@ struct Harness {
     /// 数据库所在目录：`reopen` 要拿它重新 `AppState::open`（同一个库，新进程）。
     data_dir: PathBuf,
     project: PathBuf,
+    /// 清单的绝对路径：热重载测试要像用户那样直接改它。
+    manifest: PathBuf,
     bots: Vec<BotId>,
     state: Arc<AppState>,
     dispatcher: Dispatcher,
@@ -176,12 +180,18 @@ impl Harness {
         Self {
             _dir: dir,
             data_dir,
+            manifest: project.join("hbot.json"),
             project,
             bots: bot_ids.iter().map(|id| bot_id(id)).collect(),
             state,
             dispatcher,
             bot: bot_id(bot_ids[0]),
         }
+    }
+
+    /// 像用户在 IDE 里那样只改清单（一个 `.ts` 字节都不动）。
+    fn write_manifest(&self, manifest_json: &str) {
+        std::fs::write(&self.manifest, manifest_json).expect("改写 hbot.json");
     }
 
     /// 模拟宿主进程重启：把这一份 `AppState`（连同它的 `Store`、所有 isolate）整个丢掉，
@@ -284,6 +294,13 @@ async fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
 /// 启动 → 注入一条 → 等到一条新回复 → 返回这条回复。
 async fn run_once(harness: &Harness, bot: BotId, text: &str) -> String {
     assert_ok(&harness.start(bot).await, "bot_start");
+    deliver(harness, bot, text).await
+}
+
+/// 给**已启动**的 bot 投一条消息并等回复。
+///
+/// 不能再调 `bot_start`：重复启动会撞 `-32003`（`commands::bots::start` 用占位挡并发）。
+async fn deliver(harness: &Harness, bot: BotId, text: &str) -> String {
     let conversation = harness.local_conversation(bot);
     let before = harness.replies(bot).len();
     assert_ok(&harness.inject(bot, conversation, text).await, "bot_inject");
@@ -453,7 +470,62 @@ async fn kv_survives_a_host_restart() {
 }
 
 // ---------------------------------------------------------------------------
-// ④ 两个 bot 互不可见
+// ⑤ 只改清单（不动源码）也让新声明生效
+// ---------------------------------------------------------------------------
+
+/// 用户把 `capabilities.state.kv` 从 `false` 改成 `true`，**一个 `.ts` 字节都不动**。
+///
+/// 这条钉的是「清单参与热重载指纹」（`app/runtime/fingerprint_cache.rs` 的
+/// `manifest_change_alone_changes_the_fingerprint` 是它的单元版）：isolate 只在指纹变化时
+/// 重建，而状态/设备能力是**重建时**按清单装配的。不把 `hbot.json` 算进指纹，用户改完声明
+/// 会看到「旧 handler 照样报 NOT_DECLARED」，必须再动一行源码才生效 —— 那是很难解释的 bug。
+///
+/// 生产 TTL（元数据 2s / 内容地板 5s）不能改（`with_fingerprint_ttls` 是 `#[cfg(test)]`），
+/// 所以这里靠重复投递跨过刷新窗口：拿到 `kv:` 前缀就算生效，超时则把最后一次错误原样报出来。
+#[tokio::test]
+async fn declaring_kv_in_the_manifest_only_takes_effect_without_touching_sources() {
+    let harness = Harness::new(
+        "manifestonly",
+        &kv_handler(),
+        &manifest(false, false),
+        &[BOT_UUID],
+    )
+    .await;
+
+    let before = run_once(&harness, harness.bot, "改之前").await;
+    assert!(
+        before.starts_with("kv-error:HBOT_STATE_NOT_DECLARED:"),
+        "改清单之前必须是声明层拒绝，实际：{before}"
+    );
+
+    // 只改清单：声明 kv，`src/main.ts` 原样不动。
+    harness.write_manifest(&manifest(true, false));
+
+    let mut last = String::new();
+    let mut applied = false;
+    for round in 0..80 {
+        last = deliver(&harness, harness.bot, &format!("改之后 {round}")).await;
+        if last.starts_with("kv:") {
+            applied = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        applied,
+        "只改 hbot.json 也必须让新声明生效（隔离只在指纹变化时重建），最后一次回复：{last}"
+    );
+    // 声明生效后 handler 是全新的：第一次读到的还是 null，所以写进去的是 round=1。
+    assert_eq!(
+        last, r#"kv:{"round":1}"#,
+        "新声明生效后应是干净的第一次写，实际：{last}"
+    );
+
+    assert_ok(&harness.stop(harness.bot).await, "bot_stop");
+}
+
+// ---------------------------------------------------------------------------
+// ⑥ 两个 bot 互不可见
 // ---------------------------------------------------------------------------
 
 /// 同一个 `Store` 上两个 bot 用同一个键名：第二个 bot 读到的是 `null`。
