@@ -25,11 +25,13 @@
 //! * [`fingerprint_cache`]：项目内容指纹的两层缓存（元数据 TTL + 内容地板），
 //!   保证热路径不读文件内容；
 //! * [`sandbox_handler`]：`HandlerExecutor` 的 QuickJS 实现（每 bot ≤2 个 isolate）；
+//! * [`jobs`]：后台作业（`C4.jobs`）的入队端口与清单读取（落到 `bot_jobs` 表）；
 //! * [`outbox_source`]：进程重启后按 bot 续发未发 outbound 的 store 实现；
 //! * [`AdapterFactory`]：[`PlatformRouter`] 是生产用的按平台路由，测试可注入假适配器。
 
 pub mod config;
 pub mod fingerprint_cache;
+pub mod jobs;
 pub mod local;
 pub mod net;
 pub mod onebot;

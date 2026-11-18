@@ -126,6 +126,23 @@ impl AppState {
         let store = Arc::new(Store::open(data_dir.join("hbot.db")).map_err(store_failed)?);
         phase.done();
 
+        // 作业恢复：上次进程崩在一次执行中间时，库里会留下 `running` 行，没有任何东西
+        // 能证明那次跑完了。退回 `pending`（`next_at = now`）= 承认"它可能跑过一半"，
+        // 由作业体自己的幂等兜住重复执行 —— 这是"至少一次"里 running 那一半的落地。
+        // 放在建 store 之后、任何 bot 起来之前：此刻谁都没在跑，跨 bot 全量退回是安全的。
+        let phase = hbot_store::startup_trace::Phase::start("app_resume_jobs");
+        match store.resume_interrupted_jobs(clock.now().unix_millis()) {
+            Ok(0) => {}
+            Ok(resumed) => {
+                tracing::info!(resumed, "启动时把中断的作业退回待跑");
+            }
+            Err(error) => {
+                // 不阻断启动：库暂时读不到不该让整个应用起不来，但必须留痕。
+                tracing::error!(error = %store_failed(error), "恢复中断作业失败");
+            }
+        }
+        phase.done();
+
         // 事件出口与 ID/时钟先建好再共享：`agent` 也要用同一份（否则 UI 收不到
         // agent.delta，且 EditId 会与别处撞号）。
         let phase = hbot_store::startup_trace::Phase::start("app_agent_manager");

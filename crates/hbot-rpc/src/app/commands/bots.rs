@@ -46,6 +46,7 @@ use crate::app::AppState;
 use crate::app::bots::running_bot;
 use crate::app::commands::{done, failed, unimplemented};
 use crate::app::runtime::config::{BotConfig, read_bot_config};
+use crate::app::runtime::jobs::StoreJobQueue;
 use crate::app::runtime::local;
 use crate::app::runtime::onebot::PLATFORM;
 use crate::app::runtime::outbox_source::StorePendingOutbox;
@@ -162,6 +163,16 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
             ai: Some(Arc::new(crate::app::ai::HostAiSource::new(
                 state.data_dir(),
             ))),
+            // 作业能力：入队端口落 `bot_jobs` 表（声明闸在沙箱侧现读清单，见
+            // `SandboxHandler::worker`）。不装配 = `ctx.jobs.enqueue` 报
+            // `HBOT_JOBS_UNAVAILABLE`，明确失败，不是把作业收进内存。
+            jobs: Some(Arc::new(StoreJobQueue::new(
+                bot_id,
+                root.clone(),
+                Arc::clone(state.store()),
+                Arc::clone(state.ids()),
+                Arc::clone(state.clock()),
+            ))),
         })
         // 设备能力：闸是 `AppState` 那一份（唯一判据），后端是当前平台的那一个。
         // 生产装配只有这一处 —— 别的路径（测试/bench）不装，`ctx.device.*` 会明确报
@@ -246,6 +257,9 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
     //
     // 循环必须能被 `bot_stop` 停住：句柄登记进 `BotRegistry` 的 `aux`，`stop()` 会 abort。
     // 登记失败说明这个 bot 已经不在表里（停止与登记赛跑），此时立刻 abort 自己。
+    // 定时器与作业共用同一拍：两者都是"声明了才有"的能力，各自第一句都会先读清单
+    // 决定要不要干活。分成两个函数而不是一个，是因为 `tick` 的早退条件是"没有计划"——
+    // 复用给作业会让只声明 jobs 的项目永远派发不到。
     let ticker_handler = Arc::clone(&executor);
     let ticker_clock = Arc::clone(state.clock());
     let ticker = tokio::spawn(async move {
@@ -254,9 +268,13 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if let Err(error) = ticker_handler.tick(ticker_clock.now()).await {
+            let now = ticker_clock.now();
+            if let Err(error) = ticker_handler.tick(now).await {
                 // 一秒一次的错误不刷屏：记一行 warn，下一拍再试。
                 tracing::warn!(bot = %bot_id, error = %error, "定时器 tick 失败");
+            }
+            if let Err(error) = ticker_handler.tick_jobs(now).await {
+                tracing::warn!(bot = %bot_id, error = %error, "作业 tick 失败");
             }
         }
     });
@@ -342,6 +360,24 @@ pub async fn stop(state: &AppState, bot_id: BotId) -> Response {
     let was_running = state.bots().stop(&bot_id).await;
     if !was_running {
         tracing::debug!(bot = %bot_id, "bot_stop 作用于未运行的 bot（幂等）");
+    }
+
+    // 未完成的作业跟着停：`cancelled` 是终态，重启的 `resume_interrupted_jobs` 不会
+    // 再把它们捡回来跑（那是给"进程崩在运行中间"用的，不是给"用户按了停止"用的）。
+    // 已经 `done` / `failed` 的行不动 —— 把成功记录改写成"取消"会抹掉真实结果。
+    let store = Arc::clone(state.store());
+    let at = state.clock().now().unix_millis();
+    match tokio::task::spawn_blocking(move || store.cancel_jobs_for_bot(&bot_id, at)).await {
+        Err(error) => {
+            tracing::error!(bot = %bot_id, error = %error, "取消作业任务失败");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(bot = %bot_id, error = %store_failed(error), "取消作业失败");
+        }
+        Ok(Ok(0)) => {}
+        Ok(Ok(cancelled)) => {
+            tracing::info!(bot = %bot_id, cancelled, "bot_stop 取消了未完成的作业");
+        }
     }
 
     let persisted = persist_status(state, bot_id, BOT_STATUS_STOPPED).await;

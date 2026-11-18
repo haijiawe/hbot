@@ -52,6 +52,7 @@ use tokio::sync::mpsc;
 use crate::app::debug::sink::BotDebugSink;
 use crate::app::debug::{BreakpointTarget, DebugRegistry};
 use crate::app::runtime::fingerprint_cache::FingerprintCache;
+use crate::app::runtime::jobs::declared_jobs;
 use crate::app::runtime::net::http_config;
 use crate::app::{EventBus, store_failed};
 use crate::dto::{Event, LogLevel};
@@ -81,6 +82,13 @@ pub const CRASH_BUDGET_LIMIT: u32 = 3;
 /// （`MIN_INTERVAL_MS`）的地板价，这边是宿主的轮询周期。轮询周期比最小间隔大，就等于
 /// 让所有小间隔计划系统性迟到，所以两者必须相等；取值只在这里定义一次。
 pub const TICK_INTERVAL: Duration = hbot_code::timer::TICK;
+
+/// 一次作业 tick 最多认领几条。
+///
+/// 与定时器不同：定时器的"一批"由计划表长度决定（最多 16），作业的到期行可能有几百条。
+/// 每认领一条就占住一个 isolate 跑一路（最长 10 分钟），所以一拍最多取
+/// [`MAX_ISOLATES`] 条 —— 再多也只是排队等下一拍，而不是把 isolate 队列撑爆。
+pub const JOB_CLAIM_LIMIT: u32 = MAX_ISOLATES as u32;
 
 /// 沙箱执行器的装配参数（字段全公开：`bot_start` 处一眼能看到都接了什么）。
 pub struct SandboxHandlerConfig {
@@ -118,6 +126,15 @@ pub struct SandboxHandlerConfig {
     /// 存工厂而不是现成实例：清单的 `capabilities.ai` 会被 Agent 改，每次新建
     /// isolate 时现读一遍（与 [`Self::state`] 同一理由）。
     pub ai: Option<Arc<dyn crate::app::ai::AiSource>>,
+
+    /// 作业入队端口（`ctx.jobs.enqueue` 落到 `bot_jobs` 表）。
+    ///
+    /// `None` = 这台宿主没有装配作业端口（测试、`hbot-bench`、以及任何没走
+    /// `AppState::start_bot` 的路径），此时生成代码里 `ctx.jobs.enqueue` 每次调用都回
+    /// `HBOT_JOBS_UNAVAILABLE`，**不是**静默把作业收进内存（那样重启后消失会像正常行为）。
+    ///
+    /// 装的是端口而不是"队列"：真正排在哪由 store 决定，沙箱不留第二份队列。
+    pub jobs: Option<Arc<crate::app::runtime::jobs::StoreJobQueue>>,
 }
 
 /// 一个 worker 槽位：指纹一致就复用，不一致说明代码变了，换新 isolate。
@@ -320,6 +337,11 @@ pub struct SandboxHandler {
     /// 与 [`Self::state`] 同一条纪律：在**每次新建 isolate 时**才调 `client()` 并
     /// `set_ai`，所以清单里 `capabilities.ai` 的改动会在热重载后生效。
     ai: Option<Arc<dyn crate::app::ai::AiSource>>,
+    /// 作业能力的入队端口（`None` = 未装配，`ctx.jobs.enqueue` 报 `HBOT_JOBS_UNAVAILABLE`）。
+    ///
+    /// 与 [`Self::state`] 同一条纪律：**每次新建 isolate 时**才 `set_jobs`，所以清单里
+    /// `capabilities.jobs` 的改动会在热重载后生效。
+    jobs: Option<Arc<crate::app::runtime::jobs::StoreJobQueue>>,
 }
 
 /// 设备能力的两个端口 + 装配时刻。
@@ -356,6 +378,7 @@ impl SandboxHandler {
             device: None,
             state: config.state,
             ai: config.ai,
+            jobs: config.jobs,
         }
     }
 
@@ -402,6 +425,16 @@ impl SandboxHandler {
     /// 这里只负责"把工厂装进去"。
     pub fn with_ai(mut self, source: Arc<dyn crate::app::ai::AiSource>) -> Self {
         self.ai = Some(source);
+        self
+    }
+
+    /// 装配作业能力（`ctx.jobs.enqueue` 的入队端口）。在 [`Self::new`] 之后立刻调。
+    ///
+    /// 不调用本方法 = `ctx.jobs.enqueue` 每次回 `HBOT_JOBS_UNAVAILABLE`，明确失败，
+    /// 不是静默把作业收进内存。声明闸不在这里：清单的 `capabilities.jobs` 在每次起
+    /// isolate 时现读（见 [`Self::worker`]），这里只负责"把端口装进去"。
+    pub fn with_jobs(mut self, queue: Arc<crate::app::runtime::jobs::StoreJobQueue>) -> Self {
+        self.jobs = Some(queue);
         self
     }
 
@@ -661,6 +694,16 @@ impl SandboxHandler {
             let schedules = declared_schedules(&self.project_root);
             if !schedules.is_empty() {
                 sandbox.set_schedules(&schedules, self.clock.now());
+            }
+
+            // 作业能力：清单里 `capabilities.jobs` 现读一遍，连同入队端口装进槽位
+            // （每个新 isolate 装一次）。声明表与端口一起装：只装端口会让"声明了才准入队"
+            // 变成"装配了就能入队"。
+            if let Some(queue) = &self.jobs {
+                sandbox.set_jobs(
+                    &declared_jobs(&self.project_root),
+                    Arc::clone(queue) as Arc<dyn hbot_code::jobs::JobQueue>,
+                );
             }
             tracing::debug!(
                 bot = %self.bot_id,
@@ -989,6 +1032,321 @@ impl SandboxHandler {
             self.replies.send(request).await.map_err(|_| {
                 HbotError::internal(format!(
                     "回复通道已关闭（bot {}）：supervisor 已停止，这条定时器回复没有进入 outbox",
+                    self.bot_id
+                ))
+            })?;
+        }
+        Ok(())
+    }
+    /// 跑一轮作业 tick：认领本 bot 的到期作业，逐条派发、落日志、发回复、结算终态。
+    ///
+    /// 与 [`Self::tick] 是**两条独立的循环**，不能合并成一条：定时器那条第一句就是
+    /// "没声明计划就 return"，把它复用给作业会让"只声明了 jobs、没声明 timer"的项目
+    /// 永远派发不到作业（而且看起来像"作业不跑"，不像配置问题）。
+    ///
+    /// ## 顺序：先编译，再认领
+    ///
+    /// 反过来的话，编译失败的那一刻作业行**已经被改成 `running 且 `attempts 已加一**，
+    /// 下一拍又因为 `state != 'pending' 拿不到它 —— 这条作业就卡在 `running 里，
+    /// 只能等下一次进程启动的 `resume_interrupted_jobs 救回来。编译在前，失败时行还
+    /// 是 `pending，下一拍自然重试。
+    ///
+    /// 单条作业失败不影响同批其它作业：每条独立结算（重试 / 落 `failed）。
+    pub async fn tick_jobs(&self, now: hbot_core::Timestamp) -> Result<(), HbotError> {
+        // 没声明作业类型就直接走：与定时器同一条理由（别给每个 bot 加一份每秒一次的
+        // 编译 + isolate 开销）。
+        if declared_jobs(&self.project_root).is_empty() {
+            return Ok(());
+        }
+        let (fingerprint, project) = match self.compiled().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                // 编译失败不在这里重试：下一拍照样会走一遍，用户改好代码即恢复。
+                tracing::warn!(bot = %self.bot_id, error = %error, "作业 tick 无法取到项目");
+                return Ok(());
+            }
+        };
+        let claimed = self.claim_jobs(now).await?;
+        for row in claimed {
+            self.run_claimed_job(&fingerprint, &project, row, now).await;
+        }
+        Ok(())
+    }
+
+    /// 认领本 bot 的到期作业（一步 SQL：挑 + 改 `running + `attempts + 1）。
+    ///
+    /// **只能走 `claim_due_jobs_for_bot**：全局 `claim_due_jobs 会让 A 把 B 的作业抢走
+    /// 并在 A 的 isolate 里跑 —— 跨 bot 隔离当场破，而且日志里看不出任何异常（名字对、
+    /// 载荷对，只有上下文错）。
+    async fn claim_jobs(
+        &self,
+        now: hbot_core::Timestamp,
+    ) -> Result<Vec<hbot_store::JobRow>, HbotError> {
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
+        let at = now.unix_millis();
+        tokio::task::spawn_blocking(move || {
+            store.claim_due_jobs_for_bot(&bot_id, at, JOB_CLAIM_LIMIT)
+        })
+        .await
+        .map_err(|error| {
+            HbotError::internal(format!(
+                "认领到期作业的任务失败（bot {}）：{error}",
+                self.bot_id
+            ))
+        })?
+        .map_err(store_failed)
+    }
+
+    /// 跑一条已经认领的作业，并结算它的终态（`done / 重试 / `failed）。
+    async fn run_claimed_job(
+        &self,
+        fingerprint: &str,
+        project: &Arc<CompiledProject>,
+        row: hbot_store::JobRow,
+        now: hbot_core::Timestamp,
+    ) {
+        let name = row.name.clone();
+        // 两个 crate 各有一个 `JobId 新类型（同底层 Uuid，不同类型）：走 `from_uuid
+        // 而不是字符串往返 —— 主键是库里读出来的，绕一圈 `to_string 只会多一处可能
+        // 悄悄变形的环节。
+        let job_id = hbot_core::JobId::from_uuid(*row.id.as_uuid());
+        let payload = match serde_json::from_str::<Value>(&row.payload_json) {
+            Ok(payload) => payload,
+            Err(error) => {
+                // 载荷坏了重试多少次都是坏的：直接落 failed，别让它每秒重跑一遍。
+                let message = format!(
+                    "作业 `{name}`（{job_id}）的载荷不是合法 JSON（payload_json 已损坏）：{error}"
+                );
+                self.fail_job(&row, &message, now, false).await;
+                return;
+            }
+        };
+        // 作业没有"会话"这个稳定键，用作业主键映射到 worker：同一条作业的重试落在
+        // 同一个 isolate 上，跨重启也成立（主键落库了）。
+        let index = stable_index(&job_id.to_string(), self.workers.len());
+        let outcome = self
+            .dispatch_job_on(index, fingerprint, project, &row, job_id, payload)
+            .await;
+        match outcome {
+            Ok(outcome) => {
+                self.record_logs(outcome.logs).await;
+                if let Err(error) = self.deliver_job_replies(&row, outcome.replies).await {
+                    // 回复没进 outbox 等于丢了：留痕，但不改终态 —— 作业体本身跑成功了，
+                    // 把它标成 failed 会让它重跑一遍（副作用翻倍）。
+                    tracing::warn!(
+                        bot = %self.bot_id,
+                        job = %name,
+                        error = %error,
+                        "作业回复未能进入 outbox"
+                    );
+                    self.record_error_line(format!("作业 `{name}` 的回复没有发出去：{error}"))
+                        .await;
+                }
+                self.finish_job(&row, now).await;
+            }
+            Err(failure) => {
+                // 失败路径也要落日志：`ctx.log` 在抛出前写的那几行是排障的唯一线索。
+                let mapped = remap_error(&failure.error, project);
+                self.record_logs(failure.logs).await;
+                self.fail_job(&row, &mapped.to_string(), now, true).await;
+            }
+        }
+    }
+
+    /// 在**指定的** worker 上派发一条作业。
+    ///
+    /// 与 [`Self::dispatch_timer_on] 同形：预算、日志收集、失败形状都由 `hbot-code`
+    /// 的 [`Sandbox::dispatch_job_collecting] 负责，这里只负责"在哪个 isolate 上跑"。
+    async fn dispatch_job_on(
+        &self,
+        index: usize,
+        fingerprint: &str,
+        project: &Arc<CompiledProject>,
+        row: &hbot_store::JobRow,
+        job_id: hbot_core::JobId,
+        payload: Value,
+    ) -> Result<hbot_code::EventOutcome, hbot_code::EventFailure> {
+        let mut guard = self
+            .worker(index, fingerprint, project)
+            .await
+            .map_err(|error| {
+                hbot_code::EventFailure::without_output(hbot_code::CodeError::SandboxDead {
+                    message: error.to_string(),
+                })
+            })?;
+        let Some(worker) = guard.as_mut() else {
+            return Err(hbot_code::EventFailure::without_output(
+                hbot_code::CodeError::SandboxDead {
+                    message: format!(
+                        "作业 `{}` 的 isolate 槽位 {index} 在派发前被清空（bot {}）",
+                        row.name, self.bot_id
+                    ),
+                },
+            ));
+        };
+        let sandbox = Arc::clone(&worker.sandbox);
+        // budget_ms 取**行里冻结的那一份**，不重读清单：改清单不该让已经排队的作业
+        // 换预算（换语义是排障时最费时间的一类问题）。
+        let budget_ms = row.budget_ms;
+        let name = row.name.clone();
+        let key = row.idempotency_key.clone();
+        let conversation = row.conversation.clone();
+        tokio::task::spawn_blocking(move || {
+            sandbox.dispatch_job_collecting(job_id, budget_ms, &name, payload, &key, conversation)
+        })
+        .await
+        .map_err(|error| {
+            hbot_code::EventFailure::without_output(hbot_code::CodeError::SandboxDead {
+                message: format!("作业派发任务失败：{error}"),
+            })
+        })?
+    }
+
+    /// 标成功：落 `done 终态。
+    async fn finish_job(&self, row: &hbot_store::JobRow, now: hbot_core::Timestamp) {
+        let store = Arc::clone(&self.store);
+        let id = row.id;
+        let at = now.unix_millis();
+        let written = tokio::task::spawn_blocking(move || store.mark_job_done(&id, at)).await;
+        match written {
+            Err(error) => {
+                tracing::error!(bot = %self.bot_id, error = %error, "标记作业成功的任务失败");
+            }
+            Ok(Err(error)) => {
+                tracing::error!(bot = %self.bot_id, error = %store_failed(error), "标记作业成功失败");
+            }
+            Ok(Ok(false)) => {
+                // 行不在了（被并发改成终态）：留痕，不静默吞。
+                tracing::warn!(
+                    bot = %self.bot_id,
+                    job = %row.name,
+                    "作业跑完了但库里已经没有这一行（可能被并发取消）"
+                );
+            }
+            Ok(Ok(true)) => {}
+        }
+    }
+
+    /// 结算一次失败：按声明表决定"重试一次"还是"落 `failed"。
+    ///
+    /// `retryable = false 用于载荷损坏这类"再跑一次也是同样的坏"的失败。
+    async fn fail_job(
+        &self,
+        row: &hbot_store::JobRow,
+        message: &str,
+        now: hbot_core::Timestamp,
+        retryable: bool,
+    ) {
+        let name = row.name.clone();
+        // 重试次数取**清单里现读的那一份**：retries 是"这个作业类型失败几次后放弃"，
+        // 属于策略而不是这一次执行的快照（预算反过来，预算按行冻结）。
+        let retries = declared_jobs(&self.project_root)
+            .iter()
+            .find(|spec| spec.name == name)
+            .map_or(0, |spec| spec.retries);
+        // attempts 在认领时已经加过了，所以它现在的值就是"这一次是第几次"。
+        if retryable && row.attempts <= retries {
+            let delay = hbot_core::retry_delay_ms(row.attempts);
+            let next_at = now
+                .unix_millis()
+                .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX));
+            let store = Arc::clone(&self.store);
+            let id = row.id;
+            let at = now.unix_millis();
+            let error = message.to_owned();
+            let written =
+                tokio::task::spawn_blocking(move || store.reschedule_job(&id, next_at, &error, at))
+                    .await;
+            match written {
+                Err(error) => {
+                    tracing::error!(bot = %self.bot_id, error = %error, "排下一次作业重试的任务失败");
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(bot = %self.bot_id, error = %store_failed(error), "排作业重试失败");
+                }
+                Ok(Ok(_)) => {}
+            }
+            self.record_error_line(format!(
+                "作业 `{name}` 第 {} 次执行失败，{delay} 毫秒后重试（本类型最多重试 {retries} 次）：{message}",
+                row.attempts
+            ))
+            .await;
+            return;
+        }
+
+        let store = Arc::clone(&self.store);
+        let id = row.id;
+        let at = now.unix_millis();
+        let error = message.to_owned();
+        let written =
+            tokio::task::spawn_blocking(move || store.mark_job_failed(&id, &error, at)).await;
+        match written {
+            Err(error) => {
+                tracing::error!(bot = %self.bot_id, error = %error, "标记作业失败的任务失败");
+            }
+            Ok(Err(error)) => {
+                tracing::error!(bot = %self.bot_id, error = %store_failed(error), "标记作业失败失败");
+            }
+            Ok(Ok(_)) => {}
+        }
+        self.record_error_line(format!(
+            "作业 `{name}` 执行失败（第 {} 次，不再重试）：{message}",
+            row.attempts
+        ))
+        .await;
+    }
+
+    /// 把作业产出的回复交给 supervisor 的 outbox 通道。
+    ///
+    /// 目标会话从库里按 `(bot_id, external_id) 查，与 [`Self::deliver_timer_replies]
+    /// 同一口径：**会话类型不猜**，查不到就报错（由调用方写成一行 error 日志），不静默丢弃。
+    async fn deliver_job_replies(
+        &self,
+        row: &hbot_store::JobRow,
+        replies: Vec<String>,
+    ) -> Result<(), HbotError> {
+        if replies.is_empty() {
+            return Ok(());
+        }
+        let Some(external_id) = row.conversation.clone() else {
+            return Err(HbotError::invalid(format!(
+                "作业 `{}` 产出了 {} 条回复，但入队时没有写 options.conversation：\
+                 没有目标会话就不发（猜一个群发出去收不回来）",
+                row.name,
+                replies.len()
+            )));
+        };
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
+        let lookup = external_id.clone();
+        let conversation = tokio::task::spawn_blocking(move || {
+            store.get_conversation_by_external(&bot_id, &lookup)
+        })
+        .await
+        .map_err(|error| HbotError::internal(format!("查作业目标会话的任务失败：{error}")))?
+        .map_err(store_failed)?;
+        let Some(found) = conversation else {
+            return Err(HbotError::invalid(format!(
+                "作业 `{}` 的目标会话 `{external_id}` 还不存在（这个会话从没收到过消息）：\
+                 先让它收到一条消息，或在入队时写对 externalId",
+                row.name
+            )));
+        };
+        let target = hbot_bot::ConversationRef::new(
+            found.external_id.clone(),
+            crate::app::runtime::conversation_kind_from_str(&found.kind),
+        );
+        for text in replies {
+            let request = OutboundRequest {
+                conversation: target.clone(),
+                text,
+                // 主动消息：作业背后没有可引用的历史事件，**不得**冒用旧 ID。
+                reply_to: None,
+            };
+            self.replies.send(request).await.map_err(|_| {
+                HbotError::internal(format!(
+                    "回复通道已关闭（bot {}）：supervisor 已停止，这条作业回复没有进入 outbox",
                     self.bot_id
                 ))
             })?;
@@ -1458,6 +1816,9 @@ mod tests {
                     state: None,
                     // 同上：`ctx.ai.complete` 一律回 `HBOT_AI_UNAVAILABLE`。
                     ai: None,
+                    // 本文件的用例都不依赖 `ctx.jobs`；不装端口时入队报
+                    // `HBOT_JOBS_UNAVAILABLE`（明确的失败，不是静默收下）。
+                    jobs: None,
                 })
                 .with_debounce(debounce)
                 .with_fingerprint_ttls(metadata_ttl, content_floor),

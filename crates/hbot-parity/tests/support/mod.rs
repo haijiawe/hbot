@@ -698,6 +698,8 @@ pub fn sandbox_executor(
         state: None,
         // 同样不装智能能力：这些用例不调 `ctx.ai.complete`，装了反而多一层不确定性。
         ai: None,
+        // 同理不装作业端口：对等性用例不调 `ctx.jobs.enqueue`。
+        jobs: None,
     })
     // 热重载防抖在生产里是 300ms；测试里关掉，否则每条消息都要多等一拍。
     .with_debounce(Duration::ZERO);
