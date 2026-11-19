@@ -58,6 +58,7 @@ pub mod permissions;
 pub mod runtime;
 pub mod send;
 pub mod session;
+pub mod sql;
 pub mod state;
 pub mod timer;
 

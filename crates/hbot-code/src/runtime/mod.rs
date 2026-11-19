@@ -25,6 +25,7 @@ mod isolate;
 pub(crate) mod jobs_api;
 pub(crate) mod send_api;
 pub(crate) mod session_api;
+pub(crate) mod sql_api;
 pub(crate) mod state_api;
 
 use std::time::Duration;

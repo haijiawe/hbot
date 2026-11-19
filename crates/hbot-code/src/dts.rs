@@ -152,6 +152,19 @@ declare module 'hbot' {
      * `HBOT_SESSION_PENDING` 并点名挡路的那条）。等待落库，进程重启后仍然有效。 */
     readonly session: SessionApi;
 
+    /* SQL 能力面（C2）。
+     *
+     * **存在不等于被授权。** `ctx.sql` 出现在这里只说明本项目 `hbot.json` 的
+     * `capabilities.state.sql` 声明了它；宿主没装配后端时抛 `HBOT_SQL_UNAVAILABLE`。
+     *
+     * **每 bot 一个库文件**：你写的 `users` 表在别的 bot 的连接里根本不存在，不需要自己加
+     * 前缀。表结构写在项目的 `migrations/*.sql` 里，由宿主在启动时执行 —— 运行时
+     * `CREATE` / `ALTER` / `DROP` / `ATTACH` / `PRAGMA` 一律 `HBOT_SQL_DENIED`。
+     *
+     * **只接受参数化语句**：`params` 数组与 `?` 占位符数量必须相等；拼字符串是注入的唯一
+     * 入口，而生成代码是模型写的。 */
+    readonly sql: SqlApi;
+
     /* 出口能力面（C3）。
      *
      * **存在不等于被授权。** `ctx.send` / `ctx.notify` 出现在这里只说明本项目
@@ -594,6 +607,31 @@ declare module 'hbot' {
     /** 内容类型，缺省 `application/json`。 */
     contentType?: string;
   }
+  /** `ctx.sql.query` 的结果。 */
+  export interface SqlRows {
+    /** 列名，与每行的顺序一致。 */
+    readonly columns: string[];
+    /** 行；每行长度等于 `columns.length`。值只可能是 null / 数字 / 字符串 / 数字数组。 */
+    readonly rows: unknown[][];
+    /** 是否因为行数上限被截断（**不是错误**）。 */
+    readonly truncated: boolean;
+  }
+
+  /** `ctx.sql.exec` 的结果。 */
+  export interface SqlChange {
+    /** 受影响的行数。 */
+    readonly affected: number;
+  }
+
+  /** `ctx.sql`：参数化读写这个 bot 自己的库。 */
+  export interface SqlApi {
+    /** 跑一条 SELECT，最多 500 行（超出截断并标记）。
+     *  参数只接受 null / 布尔 / 数字 / 字符串；拼字符串会被拒（占位符数量必须与参数相等）。 */
+    query(sql: string, params?: unknown[]): Promise<SqlRows>;
+    /** 跑一条写语句（INSERT / UPDATE / DELETE / WITH），返回受影响行数。
+     *  超过 10000 行**回滚并报错**；DDL 与多条语句一律 `HBOT_SQL_DENIED`。 */
+    exec(sql: string, params?: unknown[]): Promise<SqlChange>;
+  }
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */
@@ -631,6 +669,8 @@ declare module 'hbot' {
   export const jobs: JobApi;
   /** 会话等待面，与 `ctx.session` 是同一份实现。 */
   export const session: SessionApi;
+  /** SQL 能力，与 `ctx.sql` 是同一份实现。声明了不等于被授权：后端没装配时 `HBOT_SQL_UNAVAILABLE`。 */
+  export const sql: SqlApi;
 }
 "#;
 

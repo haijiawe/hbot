@@ -144,6 +144,12 @@ pub struct StateCapabilities {
     /// `ctx.history(n)`：读本会话最近 n 条（含自己发过的），只读。
     #[serde(default)]
     pub history: bool,
+    /// `ctx.sql.*`：每 bot 一套表（`docs/07` §5）。
+    ///
+    /// 表结构由项目的 `migrations/*.sql` 定义，**运行时禁 DDL** —— 所以这个布尔同时开两个口子：
+    /// 启动时执行迁移、以及 handler 里的参数化读写。
+    #[serde(default)]
+    pub sql: bool,
     /// `ctx.session.*`：跨消息的多轮等待（`docs/07` §5.1）。
     ///
     /// 开着它项目才能 `ctx.session.prompt(...)` 注册一条等待、由下一条匹配消息
@@ -165,6 +171,11 @@ impl Capabilities {
         self.state.history
     }
 
+    /// `ctx.sql.*` 是否可用（声明层判据；宿主装配再判一道）。
+    #[must_use]
+    pub fn sql(&self) -> bool {
+        self.state.sql
+    }
     /// `ctx.session.*` 是否可用（声明层判据；宿主装配再判一道）。
     #[must_use]
     pub fn session(&self) -> bool {

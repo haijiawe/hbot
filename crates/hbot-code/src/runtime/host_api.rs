@@ -46,6 +46,7 @@ use crate::http::{GetOptions, HttpConfig, HttpResponse};
 use crate::jobs::JobSlot;
 use crate::limits::Deadline;
 use crate::send::SendSlot;
+use crate::sql::SqlSlot;
 use crate::state::StateSlot;
 
 /// The keys [`install`] writes on `globalThis.__hbot`, in one place.
@@ -55,7 +56,7 @@ use crate::state::StateSlot;
 /// so a binding added here without its two declarations is a test failure.
 pub(crate) const HOST_BINDING_KEYS: &[&str] = &[
     "log", "reply", "sleep", "http", "device", "kv", "history", "ai", "jobs", "session", "send",
-    "notify",
+    "notify", "sql",
 ];
 
 /// Upper bound on captured `log`/`reply` entries per event.
@@ -156,6 +157,7 @@ pub(crate) fn install<'js>(
     jobs: Arc<JobSlot>,
     session: Arc<crate::session::SessionSlot>,
     send: Arc<SendSlot>,
+    sql: Arc<SqlSlot>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -251,6 +253,8 @@ pub(crate) fn install<'js>(
     // 出站同样不需要预算：一次出站入队是往 supervisor 的有界通道里放一条，不是
     // 一次模型调用 —— 通道满时它等的是 worker 的进度，不是 handler 的墙钟。
     let (send_function, notify_function) = super::send_api::install(ctx, &send)?;
+    // SQL 不需要预算参数：每条语句在一次 `spawn_blocking` 里跑完，isolate 只等结果。
+    let sql_object = super::sql_api::install(ctx, &sql)?;
 
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
@@ -267,6 +271,7 @@ pub(crate) fn install<'js>(
     host.set("send", send_function).map_err(super::js_error)?;
     host.set("notify", notify_function)
         .map_err(super::js_error)?;
+    host.set("sql", sql_object).map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
             .filter_map(Result::ok)
@@ -628,7 +633,31 @@ export const session = {
   },
 };
 
-export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session, send, notify };
+
+/**
+ * SQL（C2）。`sql.query(sql, params?)` 读、`sql.exec(sql, params?)` 写。
+ *
+ * 三条硬规则：
+ * ① **只接受参数化语句**：`params` 数组与 `?` 占位符数量必须相等，拼字符串会被拒；
+ * ② **运行时禁 DDL**：`CREATE` / `ALTER` / `DROP` / `ATTACH` / `PRAGMA` 一律 `HBOT_SQL_DENIED`，
+ *   表结构写进项目的 `migrations/*.sql`，由宿主在启动时执行；
+ * ③ **每 bot 一个库文件**：A 的表在 B 的连接里根本不存在，不需要自己加 bot 前缀。
+ *
+ * 参数只接受 null / 布尔 / 数字 / 字符串；结构化数据请自己 `JSON.stringify`，二进制请存 base64。
+ *
+ * Presence is not authorization: `ctx.sql` 出现在 `hbot.d.ts` 里只说明项目声明了
+ * `capabilities.state.sql`；宿主没装配后端时抛 `HBOT_SQL_UNAVAILABLE`。
+ */
+export const sql = {
+  query(sql, params) {
+    return host.sql.query(sql, params);
+  },
+  exec(sql, params) {
+    return host.sql.exec(sql, params);
+  },
+};
+
+export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session, send, notify, sql };
 "#;
 
 #[cfg(test)]

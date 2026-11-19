@@ -164,6 +164,11 @@ pub struct Sandbox {
     /// 是在 handler 体内被调用的，它们读的是**这个槽**，不是事件里那份快照 ——
     /// 改清单（声明 / 通知目标）之后下一次调用就按新清单判，不需要重启 bot。
     send: Arc<SendSlot>,
+    /// SQL 槽：声明开关 + 后端 + 本事件的 bot 身份，随事件替换。
+    ///
+    /// 与 [`Sandbox::state`] 同一理由 clone 给 worker：`ctx.sql.*` 在 handler 体内执行，
+    /// 它要读「本事件属于哪个 bot」（每 bot 一个库文件），而那只有 worker 侧知道。
+    sql: Arc<crate::sql::SqlSlot>,
 }
 
 /// Mutable debug state shared with the worker thread.
@@ -244,6 +249,8 @@ impl Sandbox {
         let worker_session = Arc::clone(&session);
         let send = Arc::new(SendSlot::new());
         let worker_send = Arc::clone(&send);
+        let sql = Arc::new(crate::sql::SqlSlot::new());
+        let worker_sql = Arc::clone(&sql);
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
         let worker_http = Arc::clone(&http);
@@ -266,6 +273,7 @@ impl Sandbox {
                     worker_jobs,
                     worker_session,
                     worker_send,
+                    worker_sql,
                     &started_tx,
                     &finished_tx,
                 )
@@ -288,6 +296,7 @@ impl Sandbox {
             jobs,
             session,
             send,
+            sql,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -515,6 +524,20 @@ impl Sandbox {
             }
             Err(RecvTimeoutError::Disconnected) => Err(EventFailure::without_output(self.dead())),
         }
+    }
+
+    /// 装（或替换）SQL 能力的声明开关与后端。
+    ///
+    /// 声明与后端**一起**装：只装后端会让「声明了才准用 SQL」变成「装配了就能用」。
+    pub fn set_sql(&self, declared: bool, backend: Arc<dyn crate::sql::SqlBackend>) {
+        self.sql.set_declared(declared);
+        self.sql.set_backend(backend);
+    }
+
+    /// SQL 后端是否装上了（声明开关可以独立为假）。
+    #[must_use]
+    pub fn is_sql_assembled(&self) -> bool {
+        self.sql.is_assembled()
     }
 
     /// 装（或替换）会话等待的声明开关与端口。
@@ -1175,11 +1198,12 @@ fn worker(
     jobs: Arc<JobSlot>,
     session: Arc<crate::session::SessionSlot>,
     send: Arc<SendSlot>,
+    sql: Arc<crate::sql::SqlSlot>,
     started: &Sender<Result<(), CodeError>>,
     finished: &Sender<()>,
 ) {
     if let Err(error) = serve(
-        inbox, project, limits, debug, control, http, device, state, ai, jobs, session, send,
+        inbox, project, limits, debug, control, http, device, state, ai, jobs, session, send, sql,
         started,
     ) {
         tracing::error!(
@@ -1274,6 +1298,7 @@ fn serve(
     jobs: Arc<JobSlot>,
     session: Arc<crate::session::SessionSlot>,
     send: Arc<SendSlot>,
+    sql: Arc<crate::sql::SqlSlot>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1333,12 +1358,13 @@ fn serve(
         let jobs = &jobs;
         let session = &session;
         let send = &send;
+        let sql = &sql;
         local.block_on(&runtime, async move {
             context
                 .async_with(async |ctx| {
                     bootstrap(
                         &ctx, &entry, output, deadline, project, debug, control, http, device,
-                        state, ai, jobs, session, send, limits,
+                        state, ai, jobs, session, send, sql, limits,
                     )
                     .await
                 })
@@ -1375,6 +1401,7 @@ fn serve(
                     let ai = &ai;
                     let jobs = &jobs;
                     let session = &session;
+                    let sql = &sql;
                     local.block_on(&runtime, async move {
                         context
                             .async_with(async |ctx| {
@@ -1391,6 +1418,7 @@ fn serve(
                                     ai,
                                     jobs,
                                     session,
+                                    sql,
                                     instrumented,
                                     limits,
                                 )
@@ -1704,6 +1732,7 @@ async fn bootstrap<'js>(
     jobs: &Arc<JobSlot>,
     session: &Arc<crate::session::SessionSlot>,
     send: &Arc<SendSlot>,
+    sql: &Arc<crate::sql::SqlSlot>,
     limits: Limits,
 ) -> Result<Hooks, CodeError> {
     deadline.reset();
@@ -1721,6 +1750,7 @@ async fn bootstrap<'js>(
             Arc::clone(jobs),
             Arc::clone(session),
             Arc::clone(send),
+            Arc::clone(sql),
         )?;
         // The probe functions exist in both builds so the loader never has to
         // care, but `__hbot_dbg` starts `false`: a release build never emits a
@@ -1836,6 +1866,7 @@ async fn run_event<'js>(
     ai: &Arc<AiSlot>,
     jobs: &Arc<JobSlot>,
     session: &Arc<crate::session::SessionSlot>,
+    sql: &Arc<crate::sql::SqlSlot>,
     instrumented: bool,
     limits: Limits,
 ) -> RawEvent {
@@ -1854,7 +1885,7 @@ async fn run_event<'js>(
 
     let started = Instant::now();
     let result = invoke(
-        ctx, payload, handler, project, device, state, ai, jobs, session,
+        ctx, payload, handler, project, device, state, ai, jobs, session, sql,
     )
     .await;
     let duration = started.elapsed();
@@ -1886,8 +1917,9 @@ async fn invoke<'js>(
     ai: &AiSlot,
     jobs: &JobSlot,
     session: &crate::session::SessionSlot,
+    sql: &crate::sql::SqlSlot,
 ) -> Result<(), CodeError> {
-    match invoke_inner(ctx, payload, handler, device, state, ai, jobs, session).await {
+    match invoke_inner(ctx, payload, handler, device, state, ai, jobs, session, sql).await {
         Ok(()) => Ok(()),
         Err(error) => Err(describe(ctx, error, project)),
     }
@@ -2770,8 +2802,9 @@ async fn invoke_inner<'js>(
     ai: &AiSlot,
     jobs: &JobSlot,
     session: &crate::session::SessionSlot,
+    sql: &crate::sql::SqlSlot,
 ) -> rquickjs::Result<()> {
-    let event = build_event(ctx, payload, device, state, ai, jobs, session)?;
+    let event = build_event(ctx, payload, device, state, ai, jobs, session, sql)?;
     let function = handler.clone().restore(ctx)?;
     // `MaybePromise` accepts both `onMessage(ctx) {}` and
     // `async onMessage(ctx) {}`; awaiting it is also what drives any
@@ -2796,6 +2829,7 @@ async fn invoke_inner<'js>(
 /// ...没有 botId...` and every state call fail with `HBOT_STATE_INVALID`,
 /// instead of inheriting the previous event's bot or reading another
 /// conversation's history.
+#[allow(clippy::too_many_arguments)]
 fn build_event<'js>(
     ctx: &Ctx<'js>,
     payload: &str,
@@ -2804,6 +2838,7 @@ fn build_event<'js>(
     ai: &AiSlot,
     jobs: &JobSlot,
     session: &crate::session::SessionSlot,
+    sql: &crate::sql::SqlSlot,
 ) -> rquickjs::Result<Object<'js>> {
     let parsed: Value<'js> = ctx.json_parse(payload.to_owned())?;
     let event = match Object::from_value(parsed.clone()) {
@@ -2828,6 +2863,10 @@ fn build_event<'js>(
     // 「哪个会话、谁在等」。定时器 / 作业 / 恢复事件不经过这里，它们的槽位身份由
     // 各自的 build_*_event 显式清空（不写就报错，不继承上一条消息）。
     session.set_current(conversation_external_id_of(payload), sender_id_of(payload));
+    // SQL 只需要 bot 身份（每 bot 一个库文件），不需要会话：`ctx.sql` 在消息、定时器、
+    // 作业、恢复事件里都能用，只是**没有 bot 身份的事件**（比如 webhook 与生命周期）里
+    // 会明确报 `HBOT_SQL_INVALID`。
+    sql.set_current_bot(bot_id_of(payload));
 
     let host: Object<'js> = ctx.globals().get("__hbot")?;
     event.set("reply", host.get::<_, Function<'js>>("reply")?)?;
@@ -2843,6 +2882,7 @@ fn build_event<'js>(
     // `dts` 的 message_ctx_functions 按「4 空格缩进且含左括号」收集它们。
     event.set("send", host.get::<_, Function<'js>>("send")?)?;
     event.set("notify", host.get::<_, Function<'js>>("notify")?)?;
+    event.set("sql", host.get::<_, Object<'js>>("sql")?)?;
     Ok(event)
 }
 
