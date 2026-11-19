@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook` 与 `onStart`/`onStop` 全部落地**（1861 个 Rust 测试 / 120 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook` 与 `onStart`/`onStop` 全部落地**（1862 个 Rust 测试 / 120 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -474,6 +474,15 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 92. **JS 侧不区分整数与浮点，绑定到 SQLite 时必须区分**（2026-11-20）。JS 里 `7` 也是 double，直接绑定会让 `INTEGER PRIMARY KEY` 的比较走类型亲和性，出现「明明插进去了却查不到」。做法：整数值且 `|v| < 2^53` 绑定成 `Integer`，其余成 `Real`；参数只收五种标量（null / 布尔 / 数字 / 字符串 / Blob），**拒绝对象与数组**而不是 `JSON.stringify` —— 静默转换会把「传错类型」变成「看起来成功的写入」，错误发生在很久以后、离调用点很远。
 
 93. **写语句必须「先 rollback 再报错」**（2026-11-20）。`BotSqlSchemas::exec` 在事务里跑，受影响行数超 `MAX_SQL_AFFECTED`（10000）时先 `rollback()` 再返回 `Denied`。顺序反了就是「报了错但数据已经落了」—— 已经写下去的行没法撤回一部分，判据只能放在提交之前。
+
+94. **进程退出/切项目不许裸调 `bots().stop_all()`**（2026-11-20，接 `shutdown` 触发点时定）。
+    `BotRegistry::stop_all()` 只停 supervisor —— 它**跳过 `onStop`**、也不注销 webhook、不取消未完成作业与等待。
+    于是用户写好的「存档 / 关连接 / 写最后一行日志」在 Ctrl-C、桌面端退出、切项目这三条**最常见**的收尾路径上
+    一条都不跑，而 `bot_stop` 上跑得好好的；现象是「手动停能保存，关窗就丢」，很难联想到是两条不同的路径。
+    规则：收尾一律走 `AppState::shutdown()`（内部 `stop_all_with_reason(Shutdown)`，逐个 `stop_with_reason`）。
+    同族纪律：`crash` 这个原因**暂时没人发**是刻意的 —— 现在唯一的「崩」是 isolate 崩溃，而它有 last-good
+    版本兜底（坑 24），bot 仍然活着；在那一刻调 `onStop(crash)` 会让清理逻辑跑在一个还活着的 bot 上，
+    之后每条消息都在被清空的环境里执行。**宁可这个原因暂时没人发，也不要发错**。
 
 ---
 

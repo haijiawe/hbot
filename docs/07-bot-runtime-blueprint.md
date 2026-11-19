@@ -438,7 +438,8 @@ export default defineBot({
 | 层 | 判据 | 位置 | 没过的症状 |
 |---|---|---|---|
 | 钩子层 | `defineBot` 的 `onStart` / `onStop` | `hbot-code` 的 `Hooks.start` / `Hooks.stop`（boot 时取） | **没有钩子不是错误**（清单里没有对应声明项），静默跳过 |
-| 时刻层 | `onStart` 在 `supervisor.start()` 之后、登记之前；`onStop` 在注销 webhook 与取消作业之前 | `hbot-rpc` 的 `commands::bots::start_inner` / `stop` | 顺序错了会「消息先于初始化被消费」或「停机时执行器已经拆掉」 |
+| 时刻层 | `onStart` 在 `supervisor.start()` 之后、登记之前；`onStop` 在注销 webhook 与取消作业之前 | `hbot-rpc` 的 `commands::bots::start_inner` / `stop_with_reason` | 顺序错了会「消息先于初始化被消费」或「停机时执行器已经拆掉」 |
+| 原因层 | `user`（用户点停止）／`shutdown`（切项目、Ctrl-C、桌面端退出） | `commands::bots::stop` → `User`；`AppState::shutdown()` → `Shutdown` | 一律报成 `user` 会让 handler 的「存档并退出」在正常关机路径上不跑 |
 | 预算层 | `onStart` 用 `limits.handlerMs`；`onStop` 用 `hbot_core::STOP_BUDGET`（**5 秒**） | `hbot-code` 的 `run_lifecycle` | 超时按 `HBOT_TIMEOUT` 中断，`onStart` 会因此让启动失败 |
 | 失败层 | `onStart` 失败 = 启动失败；`onStop` 失败 = 一行 error 日志 | `hbot-rpc` 的 `run_lifecycle` 调用点 | 前者回滚到 stopped；后者不影响 `bot_stop` 的返回值 |
 
@@ -448,10 +449,13 @@ export default defineBot({
 2. **`onStop` 只给 5 秒，且失败不报错**。停机路径上有人在等（`bot_stop` 的返回、进程退出），所以它必须有一个比任何业务动作都短的硬上界；而给它一个返回值只会诱使调用方去判断「停得好不好」，那件事无法恢复。
 3. **编译失败时跳过两个钩子，而不是让 `bot_start` 失败**。这是 `AGENTS.md` 坑 24 的同一条纪律：编译错误是用户代码的问题，正确形状是「bot 起着、消息留在未处理、改好代码自动重试」。把 `onStart` 接成硬失败会让一个 typo 永久挡住启动。
 4. **生命周期钩子的 ctx 比所有事件都窄**：只有 `phase` / `reason` 与 `log` / `sleep` / `ai`。没有 `reply`（启动时没有会话、停机时没有任何东西保证消息发得出去），也没有 `kv` / `history` / `device` / `jobs` / `session` —— 它们都要一个 bot 身份，而钩子恰恰在身份建立之前、拆除之后跑。
+5. **`reason` 由调用点给，不由钩子猜**。三个停机入口各说各的：`bot_stop` 是 `user`；切项目、`hbot serve` 收到 Ctrl-C / SIGTERM、桌面端退出都走 `AppState::shutdown()` → `shutdown`。为什么不让收尾路径复用裸的 `bots().stop_all()`：那会跳过 `onStop`，于是「Ctrl-C 之后什么都没保存」变成一类无法解释的现象。`parse` 不认识的字符串直接报错、**不默认成 `User`** —— 把崩溃报成用户点的停止会让存档逻辑读到不可信状态。
 
-**实测**（`hbot-rpc` 的 `tests/lifecycle_capability.rs`，5 条，全走 `Dispatcher` 真派发 + 真库）：`onStart` 启动时真跑一次且只一次；`onStart` 抛错时 `bot_start` 返回错误、抛错前的 `ctx.log` 仍落库、错误点名 `onStart`；`onStop` 的第二个参数与 `ctx.reason` 都是 `user`；`onStop` 抛错时 `bot_stop` 仍成功且错误点名 `onStop`；没写钩子时既不报错也不留点名钩子的日志。契约层另有 3 条（原因字符串往返、预算值、阶段名）。
+**实测**（`hbot-rpc` 的 `tests/lifecycle_capability.rs`，6 条，全走 `Dispatcher` 真派发 + 真库）：`onStart` 启动时真跑一次且只一次；`onStart` 抛错时 `bot_start` 返回错误、抛错前的 `ctx.log` 仍落库、错误点名 `onStart`；`onStop` 的第二个参数与 `ctx.reason` 都是 `user`；`onStop` 抛错时 `bot_stop` 仍成功且错误点名 `onStop`；没写钩子时既不报错也不留点名钩子的日志；`AppState::shutdown()` 之后 `onStop` 收到的是 `shutdown` 且 bot 已从登记表摘掉。契约层另有 3 条（原因字符串往返、预算值、阶段名）。
 
-**还没做**：`shutdown` / `crash` 两种原因的**触发点**（`reason` 的形状与渲染已经就位，但 `AppState::open_project` 的 `stop_all` 与崩溃降级路径还没接上）；`onStart` 里写状态的正式形状（现在只有 `log`/`sleep`/`ai`，要持久化得在建连之后由消息驱动）；`onSchedule`（与 `onTimer` 不是同一件事）。
+**还没做**：`crash` 的**触发点**（枚举与渲染已就位，但**没有可靠检测**「supervisor 自己死了」的地方 —— 详情见下）；`onStart` 里写状态的正式形状（现在只有 `log`/`sleep`/`ai`，要持久化得在建连之后由消息驱动）；`onSchedule`（与 `onTimer` 不是同一件事）。
+
+> `crash` 为什么还空着：现在唯一的「崩」是 isolate 崩溃，而它有 last-good 版本兜底（`AGENTS.md` 坑 24），bot 仍然在跑 —— 在那一刻调 `onStop(crash)` 会让用户的清理逻辑跑在一个还活着的 bot 上（关连接、删临时文件），然后每条新消息都在被清空的环境里继续执行。真要接，得先给 supervisor 加一个「读循环意外结束」的信号，那是另一件事。**宁可让这个原因暂时没人发，也不要发错**。
 
 ---
 
