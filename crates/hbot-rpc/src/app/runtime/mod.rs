@@ -38,6 +38,7 @@ pub mod onebot;
 pub mod outbox_source;
 pub mod qq;
 pub mod sandbox_handler;
+pub mod send;
 pub mod waits;
 
 use std::sync::Arc;

@@ -54,6 +54,7 @@ use crate::app::debug::{BreakpointTarget, DebugRegistry};
 use crate::app::runtime::fingerprint_cache::FingerprintCache;
 use crate::app::runtime::jobs::declared_jobs;
 use crate::app::runtime::net::http_config;
+use crate::app::runtime::send::declared_egress;
 use crate::app::runtime::waits::declared_session;
 use crate::app::{EventBus, store_failed};
 use crate::dto::{Event, LogLevel};
@@ -361,6 +362,11 @@ pub struct SandboxHandler {
     /// 与其它能力同一条纪律：**每次新建 isolate 时**才 `set_session`，所以清单里
     /// `capabilities.state.session` 的改动会在热重载后生效。
     waits: Option<Arc<crate::app::runtime::waits::StoreWaitQueue>>,
+    /// 出站端口（`None` = 未装配，`ctx.send` / `ctx.notify` 报 `HBOT_SEND_UNAVAILABLE`）。
+    ///
+    /// 与其它能力同一条纪律：**每次新建 isolate 时**才 `set_egress`，所以清单里
+    /// `capabilities.send` / `capabilities.notify` 的改动会在热重载后生效。
+    send: Option<Arc<dyn hbot_code::send::SendQueue>>,
 }
 
 /// 设备能力的两个端口 + 装配时刻。
@@ -399,6 +405,7 @@ impl SandboxHandler {
             ai: config.ai,
             jobs: config.jobs,
             waits: config.waits,
+            send: None,
         }
     }
 
@@ -464,6 +471,16 @@ impl SandboxHandler {
     /// 不是把等待收进内存（旧项目 `wait_input` 的失败形状，见 `docs/00` P0-3）。
     pub fn with_waits(mut self, queue: Arc<crate::app::runtime::waits::StoreWaitQueue>) -> Self {
         self.waits = Some(queue);
+        self
+    }
+
+    /// 装配出站能力（`ctx.send` / `ctx.notify` 的端口）。在 [`Self::new`] 之后立刻调。
+    ///
+    /// 不调用本方法 = `ctx.send` 每次回 `HBOT_SEND_UNAVAILABLE`，明确失败，不是静默把消息丢掉。
+    /// 声明闸不在这里：清单的 `capabilities.send` / `capabilities.notify` 在每次起 isolate 时现读
+    /// （见 [`Self::worker`]），这里只负责「把端口装进去」。
+    pub fn with_send(mut self, queue: Arc<dyn hbot_code::send::SendQueue>) -> Self {
+        self.send = Some(queue);
         self
     }
 
@@ -741,6 +758,13 @@ impl SandboxHandler {
                     declared_session(&self.project_root),
                     Arc::clone(queue) as Arc<dyn hbot_code::session::WaitQueue>,
                 );
+            }
+            // 出站能力：清单里 `capabilities.send` / `capabilities.notify` 现读一遍，连同端口一起装
+            // （每个新 isolate 装一次）。三样一起装的理由同 `set_session`：只装端口会让「声明了才准发」
+            // 变成「装配了就能发」，只装声明会让 `send` 永远拿不到队列。
+            if let Some(queue) = &self.send {
+                let (declared, target) = declared_egress(&self.project_root);
+                sandbox.set_egress(declared, target, Arc::clone(queue));
             }
             tracing::debug!(
                 bot = %self.bot_id,

@@ -53,6 +53,7 @@ use crate::app::runtime::outbox_source::StorePendingOutbox;
 use crate::app::runtime::sandbox_handler::{
     REPLY_CAPACITY, SandboxHandler, SandboxHandlerConfig, TICK_INTERVAL,
 };
+use crate::app::runtime::send::StoreSendQueue;
 use crate::app::runtime::waits::StoreWaitQueue;
 use crate::app::runtime::{AdapterPorts, conversation_kind_from_str, conversation_kind_str};
 use crate::app::store_failed;
@@ -153,7 +154,9 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
             store: Arc::clone(state.store()),
             events: Arc::clone(state.events()),
             clock: Arc::clone(state.clock()),
-            replies: replies_tx,
+            // 出站端口要复用同一条通道（`ctx.send` 的主动消息与 handler 返回值排在同一个队列里），
+            // 所以这里留一份给下面的 `with_send`。
+            replies: replies_tx.clone(),
             // 状态能力：声明闸在 `StoreBotState` 里，工厂每次起 isolate 现读清单。
             state: Some(Arc::new(crate::app::state::StoreStateSource::new(
                 Arc::clone(state.store()),
@@ -188,7 +191,15 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
         .with_device(
             state.device().gate(),
             Arc::new(hbot_device::platform_backend()),
-        ),
+        )
+        // 出站能力：`ctx.send` / `ctx.notify` 走 supervisor 的回复通道（`reply_to: None` = 主动消息）。
+        // 生产装配只有这一处 —— 不装配时 `ctx.send` 明确报 `HBOT_SEND_UNAVAILABLE`，不是静默丢消息。
+        .with_send(Arc::new(StoreSendQueue::new(
+            bot_id,
+            Arc::clone(state.store()),
+            replies_tx,
+            Arc::clone(state.clock()),
+        )) as Arc<dyn hbot_code::send::SendQueue>),
     );
 
     // 执行器要给两处：supervisor（跑 handler）和下面的定时器 tick 循环。
