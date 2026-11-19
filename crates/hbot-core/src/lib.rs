@@ -26,6 +26,7 @@
 #![warn(missing_docs)]
 
 pub mod bot_ai;
+pub mod bot_egress;
 pub mod bot_jobs;
 pub mod bot_session;
 pub mod bot_state;
@@ -44,6 +45,11 @@ pub use bot_ai::{
     AiClient, AiError, AiRequest, AiText, AiUsage, DEFAULT_OUTPUT_TOKENS, MAX_CALLS_PER_EVENT,
     MAX_OUTPUT_TOKENS, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES, MAX_TEMPERATURE, MAX_TIME_PER_EVENT,
     validate_max_tokens, validate_prompt, validate_system, validate_temperature,
+};
+pub use bot_egress::{
+    MAX_CONVERSATION_ID_BYTES, MAX_NOTIFY_TEXT_BYTES, MAX_SEND_TEXT_BYTES, NotifyError,
+    NotifyRequest, NotifyTarget, SendError, SendRequest, validate_conversation, validate_notify,
+    validate_notify_target, validate_send,
 };
 pub use bot_jobs::{
     DEFAULT_JOB_BUDGET_MS, DEFAULT_JOB_RETRIES, JobError, JobRequest, JobSpec, JobState,
