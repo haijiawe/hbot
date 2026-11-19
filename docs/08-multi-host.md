@@ -250,7 +250,7 @@ Play 的 AccessibilityService 政策原文禁的是「an app to **autonomously i
 |---|---|---|---|
 | **L0 桌面同进程** | Tauri 壳直接链接核心 | 本机进程内 | ✅ 已实现（默认） |
 | **L1 本机无头** | `hbot serve`，IDE 连 loopback | 本机进程 | ✅ 已实现（`36.4 ms` 到 ready） |
-| **L2 局域网另一台机器** | 同上，但绑非 loopback | 那台机器 | ⚠️ 代码可用，**缺 TLS 与认证强化** |
+| **L2 局域网另一台机器** | 同上，但绑非 loopback | 那台机器 | ⚠️ 代码可用（绑非回环现在要显式 `--allow-remote`），**缺 TLS 与多客户端 token** |
 | **L3 云端服务器** | 同上，公网可达 | 云主机 | ❌ 未做（见 §9.4） |
 
 `L2`/`L3` 与 `L0`/`L1` 的差别只在**传输与部署**，不在运行时行为。这条性质是刻意保留的：`ADR-0004` 的"一份契约"如果因为要上云而分裂，手机端就没有意义了。
@@ -269,10 +269,29 @@ Play 的 AccessibilityService 政策原文禁的是「an app to **autonomously i
 |---|---|---|
 | **传输加密** | 现在 `ws://` 只在 loopback 上安全，公网明文等于把 token 和全部消息内容广播出去 | `wss://`（`tokio-rustls` 或反向代理终止）+ 强制 `wss` 才允许非 loopback 绑定 |
 | **认证与授权** | 单 token 足够本机，不够公网（泄露即全权） | 每个客户端一枚 token（可独立吊销）+ 登录审计 + 失败退避 |
-| **非 loopback 绑定的显式确认** | 默认只绑 `127.0.0.1` 是**安全默认**，不能被配置"顺手"改掉 | 绑非回环地址时必须显式 flag + 启动横幅警告 + 文档同步 |
-| **运维物** | 云上进程会挂、盘会满、日志会撑爆 | systemd 单元 + 重启策略 + 日志轮转 + 备份脚本 + 健康检查端点 |
+| **非 loopback 绑定的显式确认** | 默认只绑 `127.0.0.1` 是**安全默认**，不能被配置"顺手"改掉 | ✅ **已做**（`ensure_bind_allowed`）：绑非回环必须 `--allow-remote`，否则拒启 |
+| **运维物** | 云上进程会挂、盘会满、日志会撑爆 | ✅ **本地这一半已做**：systemd 单元 + 重启策略 + logrotate + `GET /healthz` + `hbot token --write`；备份脚本与真机验收未做 |
 
-**已实现的与未实现的要分清**：RPC 的 token 校验、Origin 白名单、首帧 auth 5s 超时、1 MiB 帧上限、32 in-flight 都已实现并有测试；**TLS 终止、多客户端 token、审计、绑定确认、健康检查、备份**都还没做。
+**已实现的与未实现的要分清**：RPC 的 token 校验、Origin 白名单、首帧 auth 5s 超时、1 MiB 帧上限、32 in-flight 都已实现并有测试；绑定确认（`--allow-remote`）、健康检查（`GET /healthz`）、token 落地（`hbot token --write`）与 systemd/logrotate 部署物见 §9.3.1 也已落地；**TLS 终止、多客户端 token、登录审计、备份脚本、真机 24h 验收**都还没做。
+
+### 9.3.1 已落地：`M9` 的本地可写一半（2026-11-20）
+
+云端宿主拆成两半：**「不需要服务器就能做、也能测」的一半**，与**「必须有一台真机跑满 24h」的一半**。本轮只做前一半，后一半等真机。
+
+| 件 | 落点 | 判据 |
+|---|---|---|
+| 绑非回环必须显式确认 | `crates/hbot-cli/src/serve.rs` 的 `ensure_bind_allowed` | 绑 `0.0.0.0` 不给 flag → 拒启，错误里写清「本服务不提供 TLS」与 `--allow-remote`（`crates/hbot-cli/tests/cli.rs`）|
+| `GET /healthz` | `crates/hbot-rpc/src/ws.rs` | 不握手、不要 token、回 `{"status":"ok","version":…}`；其它路径仍走 WS 握手（同文件两条测试）|
+| token 落成 EnvironmentFile | `crates/hbot-cli/src/token.rs` 的 `hbot token --write PATH` | 写 `HBOT_TOKEN=<64 hex>` 一行、`0600`、stdout 只打路径（不进终端回滚）|
+| 部署物 | `packaging/{systemd,logrotate.d,README.md,install.sh}` | `ExecStart` 绑 `127.0.0.1:8787`、`EnvironmentFile=-/etc/hbot/hbot.env`；**未在真机跑过**，README 开篇即声明 |
+
+三个设计决定：
+
+1. **健康检查用 `peek` 再决定，不在 WS 握手里答。** tungstenite 在调用握手回调**之前**就拒掉非升级请求，所以在回调里返回 200 得到的是**一条空响应**。实测过，因此改成先 `peek` 头部 1 KiB 判 `GET /healthz`。
+2. **非回环拒启而不是警告。** 与 `ADR-0006` D4 一致：明文链路上用户通常不知道自己在明文传输。`--allow-remote` 是「我知道这段网络我自己保护了」的显式确认，不是便利开关。
+3. **`token --write` 只打路径。** token 进终端回滚/grep 历史是真实泄漏面；写文件 + 打印路径同时满足 systemd `EnvironmentFile` 与「不在屏幕上留下秘密」。
+
+**明确没做的**：`wss`（TLS 终止与证书轮换）、每客户端独立 token 与吊销、登录审计与失败退避、备份脚本、真机 24h 不断线验收。这些都要一台真服务器，编不出来。
 
 ### 9.4 云端特有的取舍
 

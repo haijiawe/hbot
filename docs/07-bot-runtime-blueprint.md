@@ -751,7 +751,7 @@ export default defineBot({
 
 | 档 | 形态 | 能干什么 | 代价 | 状态 |
 |---|---|---|---|---|
-| **E1** | npm 依赖（构建期打包进 bundle） | 生态里的一切纯 JS 库 | 供应链攻击面、bundle 体积 | `设计`（见 `docs/08` §5） |
+| **E1** | npm 依赖（构建期打包进 bundle） | 生态里的一切纯 JS 库 | 供应链攻击面、bundle 体积 | `不做`（[ADR-0007](adr/0007-no-node-in-the-build.md)：引入 npm 会把「代码是唯一真源」与「运行时不含 Node」两条硬规则一起推翻） |
 | **E2** | WASM 扩展（wasmtime） | Rust/Go/C 算法、图像、加密；1–5 MB/实例 | 编译链、每实例内存 | `未做` |
 | **E3** | 原生动态库插件 | 真正的系统能力 | 签名、崩溃面、跨平台三份 | **建议不做** |
 
@@ -929,7 +929,7 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 | **已落地 2026-11-19**（§5.2） |
 | 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | **全部已落地 2026-11-19**（`send`/`notify` 见 §3.4，`webhook` 见 §3.5） |
 | 5.5 | `C1.lifecycle` + `C2.sql` | 启动初始化/停机收尾；排行榜、工单、存档 | **全部已落地 2026-11-19**（`onStart`/`onStop` 见 §4.6，`sql` 见 §5.3） |
-| 6 | `E1` npm 打包 | 生态接入（见 `docs/08` §5） | 未开始 |
+| 6 | `E1` npm 打包 | 生态接入（见 `docs/08` §5） | **不做**（2026-11-20，[ADR-0007](adr/0007-no-node-in-the-build.md)）；生态接入改走「宿主按需长能力」，已有 `ctx.http`/`ctx.kv`/`ctx.sql`/`ctx.ai`/`ctx.files`… |
 | 7 | `C6.device`（桌面三平台） | 玩游戏的 bot；见 §9，里程碑 `M10` | **窄版已落地 2026-11-17**（Windows，见 `docs/09`）；2026-11-20 补按窗口截图；完整版（macOS/Linux + 每屏 DPI 归一 + 跨屏拼图）未做 |
 | 8 | 云端执行宿主 | 见 `docs/08` §9 与 `ADR-0006`，里程碑 `M9` | 未开始 |
 

@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（1911 个 Rust 测试 / 122 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（1920 个 Rust 测试 / 122 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -210,11 +210,10 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 49. **Landlock 的 `handled_access_fs = 0` 意思是"什么都不管"，不是"什么都不许"**（2026-11-17）。
    `crates/hbot-command/src/landlock.rs` 第一版把**放行掩码**当成了 handle 掩码，于是 `read_only`
    档变成零规则集 —— 限制层装上了却等于没装，而所有测试都是绿的（因为没人从 Linux 内核那侧验）。
-   现在拆成两个函数：`write_permissions()`（要放行的位）与 `handled_write_bits()`（要接管的位，
-   恒为全集、按 ABI 版本收窄）。另一个同族坑：`pre_exec` 里装载失败要 `_exit(127)` **并**往 stderr
-   写标记，父进程必须**同时**看到 127 与标记才改判 `IsolationUnavailable` —— 只判 exit code 会把
-   "命令自己退 127"误判成隔离失败。**这台机器没有 Linux 内核（无 WSL distro），本层一次都没真跑过**，
-   所以它现在的证据只到"交叉编译 + 纯逻辑单测"，别在 README 或 ADR 里写成"已验证"。
+   现在拆成 `write_permissions()`（放行的位）与 `handled_write_bits()`（接管的位，恒为全集、按 ABI 收窄）。
+   同族：`pre_exec` 装载失败要 `_exit(127)` **并**往 stderr 写标记，父进程必须同时看到两者才改判
+   `IsolationUnavailable`（只判 exit code 会把"命令自己退 127"误判成隔离失败）。**本机没有 Linux 内核，
+   本层一次没真跑过**，证据只到"交叉编译 + 纯逻辑单测"，别写成"已验证"。
 
 50. **条件断点在 JS 侧求值，因此它不是沙箱**（2026-11-17）。条件是一段真的 JS 表达式，在 isolate
    里用 `new Function` + `with(scope)` 求值 —— 那里才有 `ctx`、局部变量与模块作用域。后果：
@@ -234,9 +233,9 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 52. **资源上限必须 fail-closed：装不上就拒绝执行，不是"装不上就放开"**（2026-11-17）。`crates/hbot-command/src/limits.rs`
     与 `containment*.rs` 里，CPU/内存/进程数/IO 四条限额谁的平台原语装不上，就让这次执行返回
     `CommandDenied::{CpuLimit,MemoryLimit,IoLimit,ProcessLimit}`（`HBOT_COMMAND_*_LIMIT`），**绝不静默降级成无限额**。
-    下游 `crates/hbot-agent/src/tools/shell.rs` 的 `denied_to_result` 把这四类归到与 `TooLong` 同一类输出（命令真跑了并被杀，
-    所以不记 denied 以免污染审批率、也不记 internal 以免误导排障）。`CommandOutput` 多了 `usage: ResourceUsage` 字段，
-    加字段会打断所有测试字面量，改 core 公开结构后先 `cargo check --workspace --all-targets` 再报清单。
+    下游 `crates/hbot-agent/src/tools/shell.rs` 的 `denied_to_result` 把它们归到 `TooLong` 一类（命令真跑了并被杀：
+    不记 denied 以免污染审批率，也不记 internal 以免误导排障）。`CommandOutput` 带 `usage: ResourceUsage`，
+    改 core 公开结构后先 `cargo check --workspace --all-targets` 再报清单（加字段会打断所有测试字面量）。
 
 53. **`Ctx<'js>` 不许存进 `Async` 闭包 —— 否则整个测试进程在退出时崩**（2026-11-18，代价 >30 分钟）。症状：所有
     `hbot-code` 的 isolate 集成测试（连 `s3_device.rs`）在**进程退出那一刻**崩
@@ -270,13 +269,11 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     再看一眼 `cargo clippy --workspace --all-targets` 的失败点是不是落在别人文件里（判读方法见坑 44）。
 
 58. **"等模型"必须从 handler 预算里抵账，否则这个能力在默认配置下等于不存在**（2026-11-18）。handler 预算是
-    `limits.handlerMs`，上限 2000ms；真实补全 3–30 秒。`crates/hbot-code/src/ai.rs` 的 `call()` 在等完模型后
-    重新 `deadline.arm(left)`（`Deadline::arm` 语义是"从此刻起给预算"，所以这等于把墙钟抹掉），代价是必须有
-    上限 —— 每事件 4 次 / 累计 60 秒，`build_event` 里每事件 `reset_event()`（不清零就变成"每 isolate 4 次"，
-    一个活着的 bot 只能补全四次，第二次事件立刻报 `HBOT_AI_BUDGET`）。
-    **测这条必须用忙等，不能用 `ctx.sleep`**：`sleep` 自己也会被夹到剩余预算，用它测不出抵账
-    （`crates/hbot-code/tests/s2_ai.rs` 的 4 条正是这样：1.2 s 补全后 1.2 s 忙等必须成功，反向对照
-    "同样 2.4 s 忙等但不调模型"必须超时）。
+    `limits.handlerMs`，上限 2000ms；真实补全 3–30 秒。`crates/hbot-code/src/ai.rs` 的 `call()` 等完模型后
+    重新 `deadline.arm(left)`（等于把墙钟抹掉），代价是必须有上限：每事件 4 次 / 累计 60 秒，
+    `build_event` 每事件 `reset_event()`（不清零就变成"每 isolate 4 次"，第二次事件立刻报 `HBOT_AI_BUDGET`）。
+    **测这条必须忙等，不能用 `ctx.sleep`**（`sleep` 自己也被夹到剩余预算，测不出抵账）：
+    `crates/hbot-code/tests/s2_ai.rs` 的 4 条就是这个形状。
 
 59. **宿主状态/模型/设备三类能力都有"声明层 vs 装配层"两个码，别混用**（2026-11-18）。
     `HBOT_*_NOT_DECLARED` = 项目清单里没写（补救动作是改 `hbot.json`）；`HBOT_*_UNAVAILABLE` = 宿主没装配
@@ -286,21 +283,18 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     不许构造时快照** —— 缓存声明会让"改了清单但 isolate 没换"变成静默失效。
 
 60. **清单（`hbot.json`）参与热重载指纹**（2026-11-18，`crates/hbot-rpc/src/app/runtime/fingerprint_cache.rs` 的
-    `source_files`）。isolate 出生时按清单装配设备/状态/模型能力，只算 `src/**` 会留下「改清单不改源码 →
-    指纹不变 → isolate 不换 → 新声明永不生效」的洞。代价：**任何清单改动（包括只调设备白名单）都会触发一次
-    全量 isolate 重建**，这是正确性优先的取舍；真嫌频繁应该给清单单独做一层"只比 `capabilities`/`permissions`
-    子集"的指纹，而不是把清单移出指纹。相关测试的两条形态：单测
-    `manifest_change_alone_changes_the_fingerprint`、端到端
+    `source_files`）。isolate 出生时按清单装配能力，只算 `src/**` 会留下「改清单不改源码 → 指纹不变 →
+    isolate 不换 → 新声明永不生效」的洞。代价：**任何清单改动都触发一次全量 isolate 重建**（正确性优先）；
+    真嫌频繁应给清单单独做"只比 `capabilities`/`permissions` 子集"的指纹，而不是把它移出指纹。
+    测试：`manifest_change_alone_changes_the_fingerprint` 与端到端
     `declaring_kv_in_the_manifest_only_takes_effect_without_touching_sources`（生产 TTL 2s/5s 不能注入，
-    所以它要轮询 ≤80×100ms，单条 8–11 秒）。
+    所以轮询 ≤80×100ms，单条 8–11 秒）。
 
 61. **用 PowerShell 数组按下标增删 Rust 源码里的行会静默漂移**（2026-11-18，改 `sandbox_handler.rs` 时踩了
-    五次）。`(Get-Content).LineNumber` 只要一次 `Select-String` 命中多处（或返回 `Object[]`），索引就错，
-    后果是把 `pub mod bots;` 覆盖成 `pub mod ai;`、整行删掉 `pub mod debug;`、`Self { … }` 丢掉
-    `root`/`store`/`events` 三行、字面量里插出重复的 `ai: None,` 与重复的 `.with_fingerprint_ttls(...)`。
-    规则：① 改前先确认"这个模式真的只匹配一处"（`-List` 或先打印命中数）；② 每次改完立刻
-    `git diff <file>` 逐 hunk 复查，再读一遍目标区域；③ 多行结构（结构体字面量、模块表、builder 链）
-    优先整块重写而不是逐行插删；④ 大规模改动改用 `edit` 工具（它按字面量匹配，不会下标漂移）。
+    五次）。`(Get-Content).LineNumber` 只要一次 `Select-String` 命中多处（或返回 `Object[]`），索引就错：
+    曾把 `pub mod bots;` 覆盖成 `pub mod ai;`、整行删掉 `pub mod debug;`、`Self { … }` 丢三行、插出重复字段。
+    规则：① 先确认"这个模式真的只匹配一处"（先打印命中数）；② 改完立刻 `git diff <file>` 逐 hunk 复查；
+    ③ 多行结构（结构体字面量、模块表、builder 链）整块重写而不是逐行插删；④ 大改用 `edit` 工具（按字面量匹配）。
 
 62. **`cargo fmt`/`cargo check` 报 `unexpected closing delimiter … src/app/mod.rs:2:1` 是文件被结构化编辑
     交错坏了**（2026-11-18）。症状：`git diff` 只显示文档注释被削短，fmt 却在第 2 行报语法错。
@@ -315,10 +309,9 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 64. **条件/日志点之外，`isolate.rs` 里还有第二个"事件上下文"**（2026-11-18）。`onTimer` 的 ctx 由
     `build_timer_event` 造，**刻意比消息 ctx 窄**（只有 `name`/`reply`/`log`/`sleep`/`ai`）。两个坑：
     ① 那个函数的局部变量**不能叫 `event`** —— `dts.rs` 的 `ctx_function_keys` 扫描器按 `event.set(` 行首
-    收集"消息 ctx 上的宿主函数"，叫 `event` 会把 `name`/`ai` 混进去，`message_ctx_functions_match_the_event_object` 红；
-    ② timer 的 `reply` 必须是**独立函数**（不是消息路径那个），否则"计划没声明 `conversation`"就无从判、只能
-    猜一个会话发出去。定时器没有入站身份，所以 `device.set_current_bot(None)` / `state.set_current_bot(None, None)`
-    每次都显式清空 —— 别为了"省几行"让定时器沿用上一个事件的身份。
+    收集"消息 ctx 上的宿主函数"，叫 `event` 会把 `name`/`ai` 混进去而红；② timer 的 `reply` 必须是**独立函数**
+    （不是消息路径那个），否则"计划没声明 `conversation`"就无从判、只能猜一个会话发出去。定时器没有入站身份，
+    `device.set_current_bot(None)` / `state.set_current_bot(None, None)` 每次显式清空 —— 别让它沿用上一个事件的身份。
 
 65. **负向清单测试是按字符串匹配的，注释里也不能出现被禁名字**（2026-11-18）。`dts.rs` 的
     `hbot_dts_does_not_promise_unimplemented_apis` 断言 `HOST_DTS` 不含 `"onStart"` 等，而 `HOST_DTS` 里那句
