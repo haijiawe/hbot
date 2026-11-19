@@ -27,6 +27,7 @@
 
 pub mod bot_ai;
 pub mod bot_egress;
+pub mod bot_file;
 pub mod bot_jobs;
 pub mod bot_lifecycle;
 pub mod bot_session;
@@ -53,6 +54,13 @@ pub use bot_egress::{
     MAX_CONVERSATION_ID_BYTES, MAX_NOTIFY_TEXT_BYTES, MAX_SEND_TEXT_BYTES, NotifyError,
     NotifyRequest, NotifyTarget, SendError, SendRequest, validate_conversation, validate_notify,
     validate_notify_target, validate_send,
+};
+pub use bot_file::{
+    FileEntry, FileError, FileKind, FileStore, FilesCapability, MAX_FILE_LIST_ENTRIES,
+    MAX_FILE_PATH_BYTES, MAX_FILE_READ_BYTES, MAX_FILE_SEGMENT_BYTES, MAX_FILE_WRITE_BYTES,
+    ReadFile, normalize_path as normalize_file_path, validate_list as validate_file_list,
+    validate_read as validate_file_read, validate_remove as validate_file_remove,
+    validate_write as validate_file_write,
 };
 pub use bot_jobs::{
     DEFAULT_JOB_BUDGET_MS, DEFAULT_JOB_RETRIES, JobError, JobRequest, JobSpec, JobState,
