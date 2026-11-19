@@ -253,6 +253,12 @@ impl Capabilities {
 /// The one exception is this spelling, which the `ws` requirement is keyed on.
 pub const ONE_BOT_KIND: &str = "onebot11";
 
+/// 本地试跑平台的标识（`hbot-rpc` 的 `local` 适配器、示例项目与端到端测试都用它）。
+///
+/// 与 [`ONE_BOT_KIND`] 一样只是**一个拼写**，不是平台白名单：`hbot-code` 依旧不
+/// 枚举平台，认识哪些平台由入口（`hbot check`、`bots.json` 的校验）自己决定。
+pub const LOCAL_KIND: &str = "local";
+
 /// The platform block of the manifest.
 ///
 /// `kind` is deliberately a **string, not an enum**: adding a platform must not

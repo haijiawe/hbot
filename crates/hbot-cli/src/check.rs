@@ -26,7 +26,8 @@ use serde::Serialize;
 /// 这份名单**只属于 CLI**：`hbot-code` 里 `platform.kind` 是开放字符串，核心库
 /// 不知道产品上有哪些平台（每加一个平台就改一次核心库，依赖方向就反了）。识别
 /// 哪些平台是面向用户的入口——也就是 `hbot check`——的职责。
-pub const KNOWN_PLATFORMS: [&str; 2] = [manifest::ONE_BOT_KIND, "qq_official"];
+pub const KNOWN_PLATFORMS: [&str; 3] =
+    [manifest::ONE_BOT_KIND, "qq_official", manifest::LOCAL_KIND];
 
 /// 体检结果。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -173,8 +174,9 @@ fn platform_warnings(platform: &PlatformSpec) -> Vec<String> {
 
     if !KNOWN_PLATFORMS.contains(&platform.kind.as_str()) {
         warnings.push(format!(
-            "平台 \"{}\" 未被本版本识别；bots.json 里的 platform 必须写 \"onebot11\" 或 \"qq_official\"",
-            platform.kind
+            "平台 \"{}\" 未被本版本识别；bots.json 里的 platform 只能写 {}（逗号分隔）",
+            platform.kind,
+            KNOWN_PLATFORMS.join("、")
         ));
     }
 

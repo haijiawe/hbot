@@ -36,6 +36,8 @@ pub enum Command {
     Replay(ReplayArgs),
     /// 夹具：把历史存成夹具文件，或用夹具重跑当前代码。
     Fixture(FixtureArgs),
+    /// 生成一个认证 token（可选直接写成 systemd 的 `EnvironmentFile`）。
+    Token(TokenArgs),
 }
 
 /// `hbot serve` 的参数。
@@ -53,6 +55,22 @@ pub struct ServeArgs {
     /// 允许的 `Origin`；可重复。为空表示只接受无 `Origin` 的本地客户端。
     #[arg(long = "origin")]
     pub origins: Vec<String>,
+    /// 确认「这个端口由前置反向代理终结 TLS」。
+    ///
+    /// 绑定非回环地址时**必须**显式给这一条：本服务自己不提供 TLS，直接把它暴露到
+    /// 网络上等于把 token 明文发出去。不给就拒绝启动，不做"默认放宽"。
+    #[arg(long)]
+    pub allow_remote: bool,
+}
+
+/// `hbot token` 的参数。
+#[derive(Debug, Args)]
+pub struct TokenArgs {
+    /// 写进这个文件（内容是 `HBOT_TOKEN=…` 一行，systemd 的 `EnvironmentFile` 直接读）。
+    ///
+    /// 给了就往文件里写、**stdout 只打路径**：token 本身不该出现在终端回滚里。
+    #[arg(long, value_name = "PATH")]
+    pub write: Option<std::path::PathBuf>,
 }
 
 /// `hbot check` 的参数。

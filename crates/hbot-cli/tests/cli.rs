@@ -444,3 +444,49 @@ fn check_fails_when_onebot11_has_no_ws() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── serve 的绑定判据（M9：没有 TLS 就不许往外绑）────────────────────────
+
+#[test]
+fn binding_a_loopback_address_needs_no_confirmation() {
+    let bind: SocketAddr = "127.0.0.1:8787".parse().expect("地址");
+    assert!(hbot_cli::ensure_bind_allowed(bind, false).is_ok());
+    let v6: SocketAddr = "[::1]:8787".parse().expect("地址");
+    assert!(hbot_cli::ensure_bind_allowed(v6, false).is_ok());
+}
+
+#[test]
+fn binding_a_public_address_is_refused_without_confirmation() {
+    let bind: SocketAddr = "0.0.0.0:8787".parse().expect("地址");
+    let error = hbot_cli::ensure_bind_allowed(bind, false).expect_err("必须拒绝");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("--allow-remote"),
+        "错误要告诉人怎么补救，实际：{message}"
+    );
+    assert!(
+        message.contains("TLS"),
+        "错误要说清为什么（没有 TLS），实际：{message}"
+    );
+
+    // 显式确认之后才允许。
+    assert!(hbot_cli::ensure_bind_allowed(bind, true).is_ok());
+}
+
+// ── hbot token ────────────────────────────────────────────────────────────
+
+#[test]
+fn token_subcommand_writes_an_environment_file() {
+    let path = temp_project("token").join("hbot.env");
+    let args = hbot_cli::TokenArgs {
+        write: Some(path.clone()),
+    };
+    let outcome = hbot_cli::token::run(&args).expect("生成 token");
+    assert_eq!(outcome, hbot_cli::Outcome::Success);
+
+    let text = std::fs::read_to_string(&path).expect("读 token 文件");
+    let (key, value) = text.trim_end().split_once('=').expect("KEY=VALUE");
+    assert_eq!(key, "HBOT_TOKEN");
+    assert_eq!(value.len(), 64, "token 是 32 字节的十六进制");
+    let _ = std::fs::remove_dir_all(path.parent().expect("父目录"));
+}

@@ -89,6 +89,8 @@ pub struct ServePlan {
     pub data_dir: Option<PathBuf>,
     /// `Origin` 白名单。
     pub origins: Vec<String>,
+    /// 用户是否确认「TLS 由前置反向代理终结」。
+    pub allow_remote: bool,
 }
 
 impl ServePlan {
@@ -99,6 +101,7 @@ impl ServePlan {
             token: resolve_token(args.token, token_from_env()),
             data_dir: args.data_dir,
             origins: args.origins,
+            allow_remote: args.allow_remote,
         }
     }
 
@@ -111,6 +114,21 @@ impl ServePlan {
             ..WsConfig::default()
         }
     }
+}
+
+/// 绑定地址的判据：非回环必须显式确认「TLS 在前面」。
+///
+/// 本服务**没有** TLS 实现（`docs/08` §6：无头宿主要么被反代保护、要么只绑本机）。
+/// 于是这里只有两条路：绑回环，或者用户明确承认自己在前置代理后面。没有第三条
+/// 「先跑起来再说」—— 把 token 明文发到公网是那种"出事才发现"的错误。
+pub fn ensure_bind_allowed(bind: SocketAddr, allow_remote: bool) -> anyhow::Result<()> {
+    if bind.ip().is_loopback() || allow_remote {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "拒绝绑定非回环地址 {bind}：本服务不提供 TLS，直接暴露等于把 token 明文发出去。\n确实由前置反向代理终结 TLS 时，加 --allow-remote 显式确认。"
+    )
 }
 
 /// 就绪行（单行 JSON，写 stdout）。
@@ -135,6 +153,13 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     point("serve_enter", "");
     let plan = ServePlan::from_args(args);
+    ensure_bind_allowed(plan.bind, plan.allow_remote)?;
+    if plan.allow_remote && !plan.bind.ip().is_loopback() {
+        warn!(
+            bind = %plan.bind,
+            "监听非回环地址：TLS 与访问控制由前置反向代理负责，本进程只认 token"
+        );
+    }
     let pid = std::process::id();
 
     let server = WsServer::new(plan.ws_config());
