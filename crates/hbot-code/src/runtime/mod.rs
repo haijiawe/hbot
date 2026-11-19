@@ -20,6 +20,7 @@
 pub(crate) mod ai_api;
 pub(crate) mod debug_host;
 pub(crate) mod device_api;
+pub(crate) mod file_api;
 pub(crate) mod host_api;
 mod isolate;
 pub(crate) mod jobs_api;

@@ -48,6 +48,7 @@ pub mod device;
 mod dispatch;
 pub mod dts;
 pub mod error;
+pub mod file;
 pub mod http;
 mod instrument;
 pub mod jobs;

@@ -35,6 +35,7 @@ use crate::compile::CompiledProject;
 use crate::device::DeviceSlot;
 use crate::dispatch::EventFailure;
 use crate::error::CodeError;
+use crate::file::FileSlot;
 use crate::http::HttpConfig;
 use crate::instrument;
 use crate::jobs::JobSlot;
@@ -169,6 +170,11 @@ pub struct Sandbox {
     /// 与 [`Sandbox::state`] 同一理由 clone 给 worker：`ctx.sql.*` 在 handler 体内执行，
     /// 它要读「本事件属于哪个 bot」（每 bot 一个库文件），而那只有 worker 侧知道。
     sql: Arc<crate::sql::SqlSlot>,
+    /// 文件槽：声明（读 / 写分开）+ 端口。
+    ///
+    /// 不需要事件身份（文件属于项目而不是某个会话），所以只在 worker 侧装一次，
+    /// `build_event` 只把宿主对象挂上去。
+    files: Arc<FileSlot>,
 }
 
 /// Mutable debug state shared with the worker thread.
@@ -251,6 +257,8 @@ impl Sandbox {
         let worker_send = Arc::clone(&send);
         let sql = Arc::new(crate::sql::SqlSlot::new());
         let worker_sql = Arc::clone(&sql);
+        let files = Arc::new(FileSlot::new());
+        let worker_files = Arc::clone(&files);
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
         let worker_http = Arc::clone(&http);
@@ -274,6 +282,7 @@ impl Sandbox {
                     worker_session,
                     worker_send,
                     worker_sql,
+                    worker_files,
                     &started_tx,
                     &finished_tx,
                 )
@@ -297,6 +306,7 @@ impl Sandbox {
             session,
             send,
             sql,
+            files,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -538,6 +548,24 @@ impl Sandbox {
     #[must_use]
     pub fn is_sql_assembled(&self) -> bool {
         self.sql.is_assembled()
+    }
+
+    /// 装（或替换）文件能力的声明与端口。
+    ///
+    /// 声明与端口**一起**装：只装端口会让「声明了才准读写」变成「装配了就能读写」。
+    pub fn set_files(
+        &self,
+        declared: hbot_core::FilesCapability,
+        store: Arc<dyn hbot_core::FileStore>,
+    ) {
+        self.files.set_declared(declared);
+        self.files.set_backend(store);
+    }
+
+    /// 文件后端是否装上了（声明可以独立为拒绝）。
+    #[must_use]
+    pub fn is_files_assembled(&self) -> bool {
+        self.files.is_assembled()
     }
 
     /// 装（或替换）会话等待的声明开关与端口。
@@ -1199,12 +1227,13 @@ fn worker(
     session: Arc<crate::session::SessionSlot>,
     send: Arc<SendSlot>,
     sql: Arc<crate::sql::SqlSlot>,
+    files: Arc<FileSlot>,
     started: &Sender<Result<(), CodeError>>,
     finished: &Sender<()>,
 ) {
     if let Err(error) = serve(
         inbox, project, limits, debug, control, http, device, state, ai, jobs, session, send, sql,
-        started,
+        files, started,
     ) {
         tracing::error!(
             code = error.code(),
@@ -1299,6 +1328,7 @@ fn serve(
     session: Arc<crate::session::SessionSlot>,
     send: Arc<SendSlot>,
     sql: Arc<crate::sql::SqlSlot>,
+    files: Arc<FileSlot>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1364,7 +1394,7 @@ fn serve(
                 .async_with(async |ctx| {
                     bootstrap(
                         &ctx, &entry, output, deadline, project, debug, control, http, device,
-                        state, ai, jobs, session, send, sql, limits,
+                        state, ai, jobs, session, send, sql, &files, limits,
                     )
                     .await
                 })
@@ -1733,6 +1763,7 @@ async fn bootstrap<'js>(
     session: &Arc<crate::session::SessionSlot>,
     send: &Arc<SendSlot>,
     sql: &Arc<crate::sql::SqlSlot>,
+    files: &Arc<FileSlot>,
     limits: Limits,
 ) -> Result<Hooks, CodeError> {
     deadline.reset();
@@ -1751,6 +1782,7 @@ async fn bootstrap<'js>(
             Arc::clone(session),
             Arc::clone(send),
             Arc::clone(sql),
+            Arc::clone(files),
         )?;
         // The probe functions exist in both builds so the loader never has to
         // care, but `__hbot_dbg` starts `false`: a release build never emits a
@@ -2883,6 +2915,7 @@ fn build_event<'js>(
     event.set("send", host.get::<_, Function<'js>>("send")?)?;
     event.set("notify", host.get::<_, Function<'js>>("notify")?)?;
     event.set("sql", host.get::<_, Object<'js>>("sql")?)?;
+    event.set("files", host.get::<_, Object<'js>>("files")?)?;
     Ok(event)
 }
 

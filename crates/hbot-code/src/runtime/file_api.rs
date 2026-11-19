@@ -1,0 +1,338 @@
+//! ctx.files.read / write / list / remove —— 文件能力（C3.file）在 JS 侧的那层桥。
+//!
+//! 契约类型、路径规范化与体积闸在 hbot_core::bot_file，声明闸与端口在 crate::file。
+//! 本模块只做两件事：把 JS 参数解析成 (路径, 选项)，把槽位的判定结果变成 rejection。
+//!
+//! 顺序与 kv / sql / jobs 一致：先同步解析参数，后进槽位（规范化 → 参数闸 → 声明闸 →
+//! 装配闸 → 端口）。第 1 步不过就 rejection，一次 IO 都不会发生。
+//!
+//! 返回值的形状：read → { path, text, bytes, truncated }；write → 一条 FileEntry；
+//! list → FileEntry 数组；remove → undefined（成功与否由 rejection 表达）。
+
+use std::sync::Arc;
+
+use rquickjs::prelude::{Async, Opt};
+use rquickjs::{Array, Ctx, Exception, Function, Object, Value};
+
+use crate::error::CodeError;
+use crate::file::FileSlot;
+use hbot_core::{FileEntry, FileKind, MAX_FILE_LIST_ENTRIES, MAX_FILE_READ_BYTES, ReadFile};
+
+/// ctx.files 上的方法名，一处声明。
+///
+/// 这是数据不是散文：crate::dts 的漂移测试把它与 install 的 entries 表、
+/// HOST_MODULE_SOURCE 的 files 命名空间、hbot.d.ts 的 FilesApi 四方对齐。
+pub(crate) const FILES_BINDING_KEYS: &[&str] = &["read", "write", "list", "remove"];
+
+/// 装 ctx.files 对象，返回它。
+pub(crate) fn install<'js>(ctx: &Ctx<'js>, slot: &Arc<FileSlot>) -> Result<Object<'js>, CodeError> {
+    let object = Object::new(ctx.clone()).map_err(super::js_error)?;
+
+    let read = {
+        let slot = Arc::clone(slot);
+        Function::new(
+            ctx.clone(),
+            Async(
+                move |handle: Ctx<'js>, path: Value<'js>, options: Opt<Value<'js>>| {
+                    let prepared = parse_read(&path, options.0.as_ref());
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let (path, max_bytes) = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(message) => return ReadReply(Err(message)).into_js(&handle),
+                        };
+                        let outcome =
+                            tokio::task::spawn_blocking(move || slot.read(&path, max_bytes)).await;
+                        let result = match outcome {
+                            Ok(result) => result.map_err(|error| error.to_string()),
+                            Err(error) => Err(format!("文件读取的任务没能跑完：{error}")),
+                        };
+                        ReadReply(result).into_js(&handle)
+                    }
+                },
+            ),
+        )
+        .and_then(|function| function.with_name("read"))
+        .map_err(super::js_error)?
+    };
+
+    let write = {
+        let slot = Arc::clone(slot);
+        Function::new(
+            ctx.clone(),
+            Async(
+                move |handle: Ctx<'js>, path: Value<'js>, text: Value<'js>| {
+                    let prepared = parse_write(&path, &text);
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let (path, text) = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(message) => return EntryReply(Err(message)).into_js(&handle),
+                        };
+                        let outcome =
+                            tokio::task::spawn_blocking(move || slot.write(&path, &text)).await;
+                        let result = match outcome {
+                            Ok(result) => result.map_err(|error| error.to_string()),
+                            Err(error) => Err(format!("文件写入的任务没能跑完：{error}")),
+                        };
+                        EntryReply(result).into_js(&handle)
+                    }
+                },
+            ),
+        )
+        .and_then(|function| function.with_name("write"))
+        .map_err(super::js_error)?
+    };
+
+    let list = {
+        let slot = Arc::clone(slot);
+        Function::new(
+            ctx.clone(),
+            Async(
+                move |handle: Ctx<'js>, path: Opt<Value<'js>>, options: Opt<Value<'js>>| {
+                    let prepared = parse_list(path.0.as_ref(), options.0.as_ref());
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let (path, limit) = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(message) => return ListReply(Err(message)).into_js(&handle),
+                        };
+                        let outcome =
+                            tokio::task::spawn_blocking(move || slot.list(&path, limit)).await;
+                        let result = match outcome {
+                            Ok(result) => result.map_err(|error| error.to_string()),
+                            Err(error) => Err(format!("目录列表的任务没能跑完：{error}")),
+                        };
+                        ListReply(result).into_js(&handle)
+                    }
+                },
+            ),
+        )
+        .and_then(|function| function.with_name("list"))
+        .map_err(super::js_error)?
+    };
+
+    let remove = {
+        let slot = Arc::clone(slot);
+        Function::new(
+            ctx.clone(),
+            Async(move |handle: Ctx<'js>, path: Value<'js>| {
+                let prepared = text_of(&path, "files.remove(path)");
+                let slot = Arc::clone(&slot);
+                async move {
+                    let path = match prepared {
+                        Ok(path) => path,
+                        Err(message) => return RemovedReply(Err(message)).into_js(&handle),
+                    };
+                    let outcome = tokio::task::spawn_blocking(move || slot.remove(&path)).await;
+                    let result = match outcome {
+                        Ok(result) => result.map_err(|error| error.to_string()),
+                        Err(error) => Err(format!("删除的任务没能跑完：{error}")),
+                    };
+                    RemovedReply(result).into_js(&handle)
+                }
+            }),
+        )
+        .and_then(|function| function.with_name("remove"))
+        .map_err(super::js_error)?
+    };
+
+    let entries: [(&str, Function<'js>); FILES_BINDING_KEYS.len()] = [
+        ("read", read),
+        ("write", write),
+        ("list", list),
+        ("remove", remove),
+    ];
+    for (name, function) in entries {
+        object.set(name, function).map_err(super::js_error)?;
+    }
+    debug_assert_eq!(
+        object
+            .keys::<String>()
+            .filter_map(Result::ok)
+            .filter(|key| FILES_BINDING_KEYS.contains(&key.as_str()))
+            .count(),
+        FILES_BINDING_KEYS.len(),
+        "every key in FILES_BINDING_KEYS must be installed: {FILES_BINDING_KEYS:?}"
+    );
+    Ok(object)
+}
+
+fn parse_read<'js>(
+    path: &Value<'js>,
+    options: Option<&Value<'js>>,
+) -> Result<(String, usize), String> {
+    let path = text_of(path, "files.read(path, options)")?;
+    let max_bytes = match options {
+        None => MAX_FILE_READ_BYTES,
+        Some(value) if value.is_undefined() || value.is_null() => MAX_FILE_READ_BYTES,
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid("files.read 的 options 必须是对象"))?;
+            match object.get::<_, Option<Value<'js>>>("maxBytes") {
+                Ok(Some(raw)) if !raw.is_undefined() && !raw.is_null() => {
+                    let number = raw
+                        .as_number()
+                        .ok_or_else(|| invalid("files.read 的 maxBytes 必须是数字"))?;
+                    if !number.is_finite() || number <= 0.0 {
+                        return Err(invalid("files.read 的 maxBytes 必须是正数"));
+                    }
+                    usize::try_from(number as u64)
+                        .map_err(|_| invalid("files.read 的 maxBytes 太大"))?
+                }
+                Ok(_) => MAX_FILE_READ_BYTES,
+                Err(error) => return Err(js_message(error)),
+            }
+        }
+    };
+    Ok((path, max_bytes))
+}
+
+fn parse_write<'js>(path: &Value<'js>, text: &Value<'js>) -> Result<(String, String), String> {
+    let path = text_of(path, "files.write(path, text)")?;
+    let text = text_of(text, "files.write(path, text)")?;
+    Ok((path, text))
+}
+
+fn parse_list<'js>(
+    path: Option<&Value<'js>>,
+    options: Option<&Value<'js>>,
+) -> Result<(String, usize), String> {
+    let path = match path {
+        None => String::new(),
+        Some(value) if value.is_undefined() || value.is_null() => String::new(),
+        Some(value) => text_of(value, "files.list(path, options)")?,
+    };
+    let limit = match options {
+        None => MAX_FILE_LIST_ENTRIES,
+        Some(value) if value.is_undefined() || value.is_null() => MAX_FILE_LIST_ENTRIES,
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid("files.list 的 options 必须是对象"))?;
+            match object.get::<_, Option<Value<'js>>>("limit") {
+                Ok(Some(raw)) if !raw.is_undefined() && !raw.is_null() => {
+                    let number = raw
+                        .as_number()
+                        .ok_or_else(|| invalid("files.list 的 limit 必须是数字"))?;
+                    if !number.is_finite() || number <= 0.0 {
+                        return Err(invalid("files.list 的 limit 必须是正数"));
+                    }
+                    usize::try_from(number as u64)
+                        .map_err(|_| invalid("files.list 的 limit 太大"))?
+                }
+                Ok(_) => MAX_FILE_LIST_ENTRIES,
+                Err(error) => return Err(js_message(error)),
+            }
+        }
+    };
+    Ok((path, limit))
+}
+
+fn text_of<'js>(value: &Value<'js>, what: &str) -> Result<String, String> {
+    value
+        .as_string()
+        .and_then(|string| string.to_string().ok())
+        .ok_or_else(|| invalid(format!("{what}: 参数必须是字符串")))
+}
+
+fn invalid(detail: impl AsRef<str>) -> String {
+    hbot_core::FileError::Invalid {
+        message: detail.as_ref().to_owned(),
+    }
+    .to_string()
+}
+
+fn js_message(error: rquickjs::Error) -> String {
+    error.to_string()
+}
+
+struct ReadReply(Result<ReadFile, String>);
+
+impl<'js> ReadReply {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.0 {
+            Ok(file) => {
+                let object = Object::new(ctx.clone())?;
+                object.set("path", file.path)?;
+                object.set("text", file.text)?;
+                object.set("bytes", file.bytes as u64)?;
+                object.set("truncated", file.truncated)?;
+                Ok(object.into_value())
+            }
+            Err(message) => Err(Exception::throw_message(ctx, &message)),
+        }
+    }
+}
+
+struct EntryReply(Result<FileEntry, String>);
+
+impl<'js> EntryReply {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.0 {
+            Ok(entry) => entry_into_js(ctx, &entry),
+            Err(message) => Err(Exception::throw_message(ctx, &message)),
+        }
+    }
+}
+
+struct ListReply(Result<Vec<FileEntry>, String>);
+
+impl<'js> ListReply {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.0 {
+            Ok(entries) => {
+                let array = Array::new(ctx.clone())?;
+                for (index, entry) in entries.iter().enumerate() {
+                    array.set(index, entry_into_js(ctx, entry)?)?;
+                }
+                Ok(array.into_value())
+            }
+            Err(message) => Err(Exception::throw_message(ctx, &message)),
+        }
+    }
+}
+
+struct RemovedReply(Result<(), String>);
+
+impl<'js> RemovedReply {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.0 {
+            Ok(()) => Ok(Value::new_undefined(ctx.clone())),
+            Err(message) => Err(Exception::throw_message(ctx, &message)),
+        }
+    }
+}
+
+fn entry_into_js<'js>(ctx: &Ctx<'js>, entry: &FileEntry) -> rquickjs::Result<Value<'js>> {
+    let object = Object::new(ctx.clone())?;
+    object.set("path", entry.path.as_str())?;
+    object.set("kind", kind_str(entry.kind))?;
+    object.set("size", entry.size)?;
+    Ok(object.into_value())
+}
+
+fn kind_str(kind: FileKind) -> &'static str {
+    kind.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_method_list_is_exactly_what_the_bridge_installs() {
+        assert_eq!(FILES_BINDING_KEYS.len(), 4);
+        assert!(FILES_BINDING_KEYS.contains(&"read"));
+        assert!(FILES_BINDING_KEYS.contains(&"write"));
+        assert!(FILES_BINDING_KEYS.contains(&"list"));
+        assert!(FILES_BINDING_KEYS.contains(&"remove"));
+    }
+
+    #[test]
+    fn parameter_errors_carry_the_file_prefix() {
+        let message = invalid("x");
+        assert!(message.starts_with("HBOT_FILE_INVALID"));
+    }
+}

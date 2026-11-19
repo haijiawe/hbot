@@ -42,6 +42,7 @@ use rquickjs::{Ctx, Exception, Function, IntoJs, Object, Value};
 use crate::ai::AiSlot;
 use crate::device::DeviceSlot;
 use crate::error::CodeError;
+use crate::file::FileSlot;
 use crate::http::{GetOptions, HttpConfig, HttpResponse};
 use crate::jobs::JobSlot;
 use crate::limits::Deadline;
@@ -56,7 +57,7 @@ use crate::state::StateSlot;
 /// so a binding added here without its two declarations is a test failure.
 pub(crate) const HOST_BINDING_KEYS: &[&str] = &[
     "log", "reply", "sleep", "http", "device", "kv", "history", "ai", "jobs", "session", "send",
-    "notify", "sql",
+    "notify", "sql", "files",
 ];
 
 /// Upper bound on captured `log`/`reply` entries per event.
@@ -158,6 +159,7 @@ pub(crate) fn install<'js>(
     session: Arc<crate::session::SessionSlot>,
     send: Arc<SendSlot>,
     sql: Arc<SqlSlot>,
+    files: Arc<FileSlot>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -255,6 +257,7 @@ pub(crate) fn install<'js>(
     let (send_function, notify_function) = super::send_api::install(ctx, &send)?;
     // SQL 不需要预算参数：每条语句在一次 `spawn_blocking` 里跑完，isolate 只等结果。
     let sql_object = super::sql_api::install(ctx, &sql)?;
+    let files_object = super::file_api::install(ctx, &files)?;
 
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
@@ -272,6 +275,7 @@ pub(crate) fn install<'js>(
     host.set("notify", notify_function)
         .map_err(super::js_error)?;
     host.set("sql", sql_object).map_err(super::js_error)?;
+    host.set("files", files_object).map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
             .filter_map(Result::ok)
@@ -657,7 +661,36 @@ export const sql = {
   },
 };
 
-export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session, send, notify, sql };
+/**
+ * 文件（C3）。`files.read(path, options?)` / `files.write(path, text)` /
+ * `files.list(path?, options?)` / `files.remove(path)`。
+ *
+ * 三条硬规则：
+ * ① **只认项目内的相对路径**：绝对路径、`..`、盘符、反斜杠一律 `HBOT_FILE_DENIED`；
+ * ② **读写分开声明**：`capabilities.files.read` 与 `.write` 是两半，只读的项目拿不到删除权限；
+ * ③ **单次有体积上限**：读默认 256 KiB、写 1 MiB，超了报 `HBOT_FILE_TOO_LARGE`，请分块。
+ *
+ * 只读文本：非 UTF-8 内容会被拒（`HBOT_FILE_INVALID`），二进制请存 base64 字符串。
+ *
+ * Presence is not authorization: `ctx.files` 出现在 `hbot.d.ts` 里只说明项目声明了
+ * `capabilities.files`；宿主没装配后端时抛 `HBOT_FILE_UNAVAILABLE`。
+ */
+export const files = {
+  read(path, options) {
+    return host.files.read(path, options);
+  },
+  write(path, text) {
+    return host.files.write(path, text);
+  },
+  list(path, options) {
+    return host.files.list(path, options);
+  },
+  remove(path) {
+    return host.files.remove(path);
+  },
+};
+
+export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session, send, notify, sql, files };
 "#;
 
 #[cfg(test)]

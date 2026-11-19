@@ -150,6 +150,12 @@ pub struct StateCapabilities {
     /// 启动时执行迁移、以及 handler 里的参数化读写。
     #[serde(default)]
     pub sql: bool,
+    /// `ctx.files.*`：读写项目内的文件（`docs/07` §3.6）。
+    ///
+    /// 读写分开声明：只做导出的项目不该顺手拿到删除权限。路径只能是项目内的相对路径，
+    /// 单次读写各有体积上限（见 `hbot_core::bot_file`）。
+    #[serde(default)]
+    pub files: hbot_core::FilesCapability,
     /// `ctx.session.*`：跨消息的多轮等待（`docs/07` §5.1）。
     ///
     /// 开着它项目才能 `ctx.session.prompt(...)` 注册一条等待、由下一条匹配消息
@@ -175,6 +181,11 @@ impl Capabilities {
     #[must_use]
     pub fn sql(&self) -> bool {
         self.state.sql
+    }
+    /// `ctx.files.*` 的声明（read / write 分开）。
+    #[must_use]
+    pub fn files(&self) -> hbot_core::FilesCapability {
+        self.state.files
     }
     /// `ctx.session.*` 是否可用（声明层判据；宿主装配再判一道）。
     #[must_use]

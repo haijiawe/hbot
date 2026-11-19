@@ -165,6 +165,18 @@ declare module 'hbot' {
      * 入口，而生成代码是模型写的。 */
     readonly sql: SqlApi;
 
+    /* 文件能力面（C3）。
+     *
+     * **存在不等于被授权。** `ctx.files` 出现在这里只说明本项目 `hbot.json` 的
+     * `capabilities.files` 声明了它（读与写是分开的两半）；宿主没装配后端时抛
+     * `HBOT_FILE_UNAVAILABLE`。
+     *
+     * **只认项目内的相对路径**：绝对路径、`..`、盘符、反斜杠一律 `HBOT_FILE_DENIED`。
+     * 值的大小有上限（读 256 KiB / 写 1 MiB），超了 `HBOT_FILE_TOO_LARGE`，请分块。
+     *
+     * 只读文本：非 UTF-8 内容被拒（`HBOT_FILE_INVALID`），二进制请自己转 base64 字符串。 */
+    readonly files: FilesApi;
+
     /* 出口能力面（C3）。
      *
      * **存在不等于被授权。** `ctx.send` / `ctx.notify` 出现在这里只说明本项目
@@ -644,6 +656,51 @@ declare module 'hbot' {
      *  超过 10000 行**回滚并报错**；DDL 与多条语句一律 `HBOT_SQL_DENIED`。 */
     exec(sql: string, params?: unknown[]): Promise<SqlChange>;
   }
+  /** 一条目录记录（`ctx.files.list` 的元素，也是 `write` 的返回值）。 */
+  export interface FileEntry {
+    /** 相对项目根的路径，用 / 分隔。 */
+    readonly path: string;
+    /** `file` 或 `dir`。 */
+    readonly kind: 'file' | 'dir';
+    /** 字节数；目录恒为 0。 */
+    readonly size: number;
+  }
+
+  /** `ctx.files.read` 的结果。 */
+  export interface FileText {
+    /** 相对项目根的路径。 */
+    readonly path: string;
+    /** 文件内容。 */
+    readonly text: string;
+    /** 实际读到的字节数。 */
+    readonly bytes: number;
+    /** 是否在 `maxBytes` 处被截断（**不是错误**）。 */
+    readonly truncated: boolean;
+  }
+
+  /** `ctx.files.read` 的选项。 */
+  export interface FileReadOptions {
+    /** 最多读多少字节，1..=262144，缺省 262144。 */
+    maxBytes?: number;
+  }
+
+  /** `ctx.files.list` 的选项。 */
+  export interface FileListOptions {
+    /** 最多返回多少条，1..=200，缺省 200。 */
+    limit?: number;
+  }
+
+  /** `ctx.files`：读写项目内的文件（只认相对路径）。 */
+  export interface FilesApi {
+    /** 读一个文本文件。不存在 `HBOT_FILE_NOT_FOUND`，不是 UTF-8 `HBOT_FILE_INVALID`。 */
+    read(path: string, options?: FileReadOptions): Promise<FileText>;
+    /** 覆盖写一个文本文件（父目录不存在会建）。超过 1 MiB `HBOT_FILE_TOO_LARGE`。 */
+    write(path: string, text: string): Promise<FileEntry>;
+    /** 列一个目录（不递归）；不传路径就是项目根。 */
+    list(path?: string, options?: FileListOptions): Promise<FileEntry[]>;
+    /** 删一个文件或空目录；不存在 `HBOT_FILE_NOT_FOUND`。 */
+    remove(path: string): Promise<void>;
+  }
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */
@@ -683,6 +740,8 @@ declare module 'hbot' {
   export const session: SessionApi;
   /** SQL 能力，与 `ctx.sql` 是同一份实现。声明了不等于被授权：后端没装配时 `HBOT_SQL_UNAVAILABLE`。 */
   export const sql: SqlApi;
+  /** 文件能力，与 `ctx.files` 是同一份实现。声明了不等于被授权：后端没装配时 `HBOT_FILE_UNAVAILABLE`。 */
+  export const files: FilesApi;
 }
 "#;
 
