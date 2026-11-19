@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（1905 个 Rust 测试 / 121 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（1911 个 Rust 测试 / 122 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -516,6 +516,12 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     在第二次调用时取到的正是上一次那条。做法：发送前存快照 `Vec<String>`，等到"出现不在快照里的回复"，
     再取第一条不在快照里的（`find(|reply| !before.contains(reply))`）。同族：任何"等新行"的断言都要比
     **内容差集**，不要比长度再按下标取。
+
+100. **`onSchedule` 与 `onTimer` 是同一个钩子的两个名字，不是两条派发路径**（2026-11-20，P2 定案）。
+     需求里这个钩子叫 `onSchedule`（`docs/01` FR-15），首个发布实现成了 `onTimer`，于是 `docs/07` §4.1 长期挂着一句「`onSchedule` 未做、且与 `onTimer` 不是同一件事」。
+     正确形状（`crates/hbot-code/src/runtime/isolate.rs` 的 `bootstrap`）：**两个名字在取钩子时合并成同一个 `Hooks.timer`**；两个都写 → 启动失败并同时点名两者（静默挑一个会让「我删了 `onTimer` 怎么行为变了」变成只能读源码才能解释的排查）；两个都没写 → 到点报错文案点名 `onSchedule` 并说明 `onTimer` 是旧名。
+     **不新增清单字段**（继续用 `capabilities.timer`），也不把 `onTimer` 标成 deprecated —— 删掉它会让已有项目升级那一刻**静默失去定时行为**。
+     同族判据：给钩子改名/加别名时先问「宿主会不会因此多一条执行路径」。会，就说明这个改法错了。
 
 ---
 

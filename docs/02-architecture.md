@@ -260,7 +260,7 @@ turn = user message
     build/           source map 与编译缓存
 ```
 
-入口导出（**这是 M1 唯一被运行时承认的形状**；`onStart`/`onStop`/`onSchedule` 尚未实现，见 §6.3 的 API 状态表）：
+入口导出（**这是 M1 唯一被运行时承认的形状**；钩子的实现状态见 §6.3 的 API 状态表）：
 
 ```ts
 import { defineBot, reply } from 'hbot'
@@ -270,7 +270,8 @@ export default defineBot({
     reply(`收到：${ctx.text}`)
   },
   // 可选：只在 hbot.json 的 capabilities.timer 里声明了计划时才会被调用
-  async onTimer(ctx, name) {
+  // （onSchedule / onTimer 是一个钩子的两个名字，只许写一个，见 docs/07 §4.4.1）
+  async onSchedule(ctx, name) {
     ctx.log(`tick ${name}`)
   },
 })
@@ -359,9 +360,11 @@ export default defineBot({
   | `ctx.history(n)` | 已实现（2026-11-18） | 最近 n 条（时间升序、含 outbound、**不含 `payload`**），默认 20、上限 50（超了夹住不报错）。清单 `capabilities.state.history` 独立声明 |
   | `ctx.device.*` | 已实现（2026-11-17，Windows 窄版） | `screen` / `ocr` / `windows` / `click` / `key` / `keyCombo` / `clipboardRead` / `clipboardWrite`，全 Promise。三道闸：清单 `permissions.device.sub` → 运行时会话（限时/可撤销/应用白名单）→ 参数；另有 20 次/秒、2 帧/秒限速。`read-only` 档连闸都不问。细节见 `docs/09` |
   | `ctx.ai.complete({prompt, system?, maxTokens?, temperature?})` | 已实现（2026-11-18） | 返回 `{ text, promptTokens, completionTokens, model }`，全 Promise。四道判据：清单 `capabilities.ai`（`HBOT_AI_NOT_DECLARED`）→ 宿主有没有配模型（`HBOT_AI_UNAVAILABLE`）→ 参数闸（prompt 32KiB / system 16KiB / maxTokens 1..=4096 / temperature 0..=2.0）→ 预算（每事件 4 次、累计 60 秒，`HBOT_AI_BUDGET`）。**等模型的墙钟从 handler 预算里抵掉**（否则 2s handler 下这个能力等于不存在）。参数里没有 baseUrl/apiKey/model（key 不出核心）。模型文本是不可信外部内容。细节见 `docs/07` §3.3 |
-  | `onTimer(ctx, name)` | 已实现（2026-11-18） | 计划写在清单 `capabilities.timer`（`every` / `daily` + 固定 UTC 偏移），tick 周期 1 秒、休眠后只补触发一次。**timer 的 `ctx` 比消息上下文窄**：只有 `name` / `reply` / `log` / `sleep` / `ai`，不挂 `kv` / `history` / `device`。回复目标必须在计划里显式声明 `conversation`，否则 `ctx.reply` 抛 `HBOT_TIMER_NO_TARGET`；会话类型从 `conversations` 表取，不猜。细节见 `docs/07` §4.4 |
-  | `ctx.send` / `ctx.state` | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
-  | `onStart` / `onStop` / `onSchedule` | **未实现** | 入口只取 `default.onMessage` 与 `default.onTimer`（`isolate.rs` 的 `bootstrap`）；`onStart`/`onStop` 是 M7 后续步骤 |
+  | `onSchedule(ctx, name)`（旧名 `onTimer`） | 已实现（2026-11-18；2026-11-20 起两个名字合并成一条派发路径） | 计划写在清单 `capabilities.timer`（`every` / `daily` + 固定 UTC 偏移），tick 周期 1 秒、休眠后只补触发一次。**计划钩子的 `ctx` 比消息上下文窄**：只有 `name` / `reply` / `log` / `sleep` / `ai`，不挂 `kv` / `history` / `device`。回复目标必须在计划里显式声明 `conversation`，否则 `ctx.reply` 抛 `HBOT_TIMER_NO_TARGET`；会话类型从 `conversations` 表取，不猜。两个名字都写会**启动失败**（不静默挑一个）。细节见 `docs/07` §4.4 / §4.4.1 |
+  | `ctx.send` / `ctx.notify` | 已实现（2026-11-19） | 主动出站：`reply_to` 恒为空，目标必须由调用点或清单给出（不猜 `kind`）。细节见 `docs/07` §3.4 |
+  | `ctx.files.*` / `ctx.sql.*` / `ctx.jobs.*` / `ctx.session.*` | 已实现（2026-11-19/20） | 分别见 `docs/07` §3.6 / §5.3 / §4.5 / §5.2 |
+  | `onStart` / `onStop` / `onWebhook` / `onResume` / `onJob` | 已实现（2026-11-19/20） | 入口由 `isolate.rs` 的 `bootstrap` 逐个取；缺 `onStart`/`onStop` 静默跳过，缺 `onJob`/`onWebhook`/`onResume` 在第一次派发时点名。细节见 `docs/07` §4.6 / §3.5 / §5.2 / §4.5 |
+  | 附件型与插件型出口（`ctx.sendFile` / `ctx.wasm`） | **未实现** | 不得出现在 `hbot.d.ts` 或模板里；Agent 会照着写，然后在运行时报「不是函数」 |
 
 - **`onMessage(ctx)` 的 `ctx` 真实形状**（由 `hbot-bot/src/event_json.rs` 的 `EventSource` / `event_json` **唯一拼装**，生产 `sandbox_handler` 与 `hbot replay` 共用这一份实现；`isolate.rs:924-942` 只追加宿主函数）：入站字段**平铺**在 ctx 上，不是嵌套在 `ctx.message` 里。
 

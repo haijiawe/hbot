@@ -96,7 +96,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **齐了** |
 | **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面、定时、`sql`、`jobs` 都有，缺 `wasm` |
 
-> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C1.webhook + C1.lifecycle + C2.kv/history/session/sql + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.onSchedule`，见 §11 的落地顺序。
+> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer/onSchedule + C1.webhook + C1.lifecycle + C2.kv/history/session/sql + C3.reply/send/notify/http/file + C4.jobs + C5.ai + C6.device 这几个口子**。截至 2026-11-20，`docs/07` 列出的能力面已全部开到位；剩下的不是能力缺口，而是**平台覆盖**（macOS/Linux 设备面、手机宿主）与**附件型出站**（`ctx.sendFile`），见 §11。
 
 ### 3.2 能力怎么声明
 
@@ -327,12 +327,12 @@ import { defineBot } from 'hbot'
 export default defineBot({
   async onStart(ctx) { /* 一次；失败 = bot 启动失败 */ },
   async onMessage(ctx) { /* 每条消息；已实现 */ },
-  async onTimer(ctx, name) { /* cron/interval 触发；name 是声明里的名字 */ },
+  async onSchedule(ctx, name) { /* 具名计划触发；name 是声明里的名字（旧名 onTimer） */ },
   async onStop(ctx, reason) { /* 'user' | 'shutdown' | 'crash'；有 5s 预算 */ },
 })
 ```
 
-现状：`onMessage` / `onTimer` / `onJob` / `onResume` / `onWebhook` / `onStart` / `onStop` 均已实现（`onSchedule` 未做）。细节见 §4.4 / §4.5 / §4.6 / §5.2 / §3.4 / §3.5。
+现状：`onMessage` / `onSchedule`（旧名 `onTimer`，同一条执行路径）/ `onJob` / `onResume` / `onWebhook` / `onStart` / `onStop` 均已实现。细节见 §4.4 / §4.4.1 / §4.5 / §4.6 / §5.2 / §3.4 / §3.5。
 
 **为什么钩子要少而固定**：每多一个钩子，宿主就多一条执行路径、多一份超时与取消语义。四个够覆盖四类 bot；不够再加要写 ADR。
 
@@ -366,7 +366,7 @@ ctx.jobs.enqueue('settle-war', { warId })
 
 **为什么必须做这一层**：现在的"每会话串行 + 2 s 预算"决定了**写不出任何跨分钟的业务**（国战结算、批量推送、抓取+分析）。这不是性能问题，是能力缺失。
 
-### 4.4 已落地：定时器（`C1.timer`，2026-11-18）
+### 4.4 已落地：定时计划（`C1.timer`，2026-11-18；2026-11-20 起钩子正式名 `onSchedule`）
 
 ```jsonc
 // hbot.json
@@ -383,7 +383,7 @@ ctx.jobs.enqueue('settle-war', { warId })
 
 ```ts
 export default defineBot({
-  async onTimer(ctx, name) {           // name = 上面声明的名字
+  async onSchedule(ctx, name) {        // name = 上面声明的名字；旧名 onTimer 等价
     ctx.log(`tick ${name}`);           // 定时器里可用的只有 name / reply / log / sleep / ai
     ctx.reply('到点了');                // 只有计划声明了 conversation 才允许
   },
@@ -407,7 +407,36 @@ export default defineBot({
 5. **计划表按 isolate 各一份**：`due()` 必须在取到它的那个 isolate 上派发，否则另一个 isolate 的计划表没推进过。
 6. **tick 循环挂在 `BotRegistry::aux`**：`bot_stop` 先 abort 辅助任务再发停止信号（tick 可能正持槽位锁跑 handler，先停能避免拖住 supervisor 排空）。没声明计划时 tick 只是一秒一次的空转（一次读清单 + 一个长度判断）。
 
-**还没做**：`onSchedule`（`§4.1` 的第四个钩子，与 `onTimer` 不是同一件事）、定时器里的 `ctx.kv`（见第 1 条）、计划表的运行时增删（要改清单并等重载）。
+**还没做**：定时器里的 `ctx.kv`（见第 1 条）、计划表的运行时增删（要改清单并等重载）。
+
+### 4.4.1 已落地：`onSchedule` 与 `onTimer` 是同一个钩子（2026-11-20）
+
+需求里这个钩子叫 `onSchedule`（`docs/01` FR-15），首个发布把它实现成了 `onTimer`，于是 §4.1 长期挂着一句「`onSchedule` 未做，且与 `onTimer` 不是同一件事」。**2026-11-20 的决定是：它们是同一个钩子的两个名字，不是两件事。**
+
+```ts
+// 两种写法都能跑，但**只许写一个**
+export default defineBot({ async onSchedule(ctx, name) { /* 新项目写这个 */ } })
+export default defineBot({ async onTimer(ctx, name) { /* 旧项目仍这样，不需要改 */ } })
+```
+
+| 判据 | 位置 | 失败时 |
+|---|---|---|
+| 钩子层 | `isolate.rs` 的 `bootstrap` 把两个名字**合并成一个 `Hooks.timer`** | 两个都写 → 启动失败并同时点名两者，不静默挑一个 |
+| 可调用层 | `defineBot` 对两个名字各判一次 `typeof === 'function'` | 给了但不是函数 → `TypeError`，开机即报 |
+| 缺钩子层 | `run_timer` 的 `None` 分支 | 每次到点记一行 error，点名 `onSchedule`（并说明 `onTimer` 是同一条路径的旧名） |
+| 预算 / 超时 / ctx | 与 §4.4 的表逐条相同（`limits.handlerMs`、`name`/`reply`/`log`/`sleep`/`ai`） | —— 没有第二套 |
+| 声明层 | 同一个 `capabilities.timer`（**没有**新增清单字段） | 空表 = 不触发，见 §4.4 |
+
+**四条设计决定与理由**：
+
+1. **不新增第二条派发路径**。钩子每多一条路径，宿主就多一份预算、超时、取消与失败语义要维护（§4.1 的「钩子要少而固定」）。改名就只是改名。
+2. **两个都写 = 启动失败，不静默取一个**。改名的项目最容易留下旧钩子；静默优先会让「我删了 `onTimer` 怎么行为变了」变成一次只能靠读源码才能解释的排查。
+3. **不新增清单字段、不做 `capabilities.schedule`**。已有 `capabilities.timer` 就是计划表，再开一个等于让同一个概念有两个名字的数据源。
+4. **`onTimer` 不是 deprecated，是旧名**。文档与 `hbot.d.ts` 都保留它并标注等价；删掉它会让已有项目在升级那一刻静默失去定时行为（`bootstrap` 找不到钩子 → 每次到点报错）。
+
+**实测**（`crates/hbot-rpc/tests/schedule_capability.rs`，6 条）：写 `onSchedule` 的具名计划到点真跑并落 `logs`；没声明不触发；声明了没写钩子 → 点名 `onSchedule`；两个都写 → `bot_start` 失败且消息含两个名字；只写旧名 `onTimer` 仍触发（`sched:tick:tick`）；重开核心后计划仍按清单重新对齐并再次触发。
+
+**触发点不落库**：`TimerSlot` 的 `next_at` 是 isolate 内存里按 `when.next_after(now)` 现算的（§4.4 第 3、5 条），所以「重启后仍按 deadline」的正确读法是**重新对齐到当前时刻**，不是从库里恢复旧触发点，更不补跑错过的那些。
 ### 4.5 已落地：后台作业（`C4.jobs`，2026-11-19）
 
 ```jsonc
