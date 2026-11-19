@@ -256,7 +256,10 @@ mod tests {
     fn escaping_the_root_is_refused() {
         let root = TempRoot::new();
         let files = ProjectFiles::new(&root.0).expect("backend");
-        assert!(matches!(files.read("../secret", 16), Err(FileError::Denied { .. })));
+        assert!(matches!(
+            files.read("../secret", 16),
+            Err(FileError::Denied { .. })
+        ));
         assert!(matches!(
             files.write("a/../../x", "x"),
             Err(FileError::Denied { .. })
