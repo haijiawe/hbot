@@ -6,7 +6,7 @@
 //! `AppState::start_bot` → `webhooks().register` → `WebhookServer` 收一条真 TCP 请求
 //! → `authorize` → `SandboxHandler::dispatch_webhook` → `onWebhook` → **返回值就是 HTTP 应答**。
 //!
-//! 八条断言：
+//! 十条断言：
 //!
 //! 1. **没声明路由就是 401**（三种鉴权失败统一 401：路由没声明 / 环境变量没设 / 密钥不匹配）；
 //! 2. **环境变量没设 → 401**，不退化成「没配就放行」；
@@ -15,7 +15,9 @@
 //! 5. **handler 返回 `null` → 204**（无应答体）；
 //! 6. **信封 `{ status, body }` 改得了状态码**（418）；
 //! 7. **非 POST → 405**；`bot_stop` 之后 → 404；
-//! 8. **`Content-Length` 超上限 → 413**（在派发之前就拒）。
+//! 8. **`Content-Length` 超上限 → 413**（在派发之前就拒）；
+//! 9. **webhook 里可以 `ctx.notify`**，收件人是清单 `capabilities.notify` 定的（外部请求能提醒人，却不能指定发到哪）；
+//! 10. **没声明 `capabilities.notify`** 时那次 notify 失败，文案点名 `HBOT_NOTIFY_NOT_DECLARED`。
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -80,6 +82,15 @@ export default defineBot({
     if (ctx.route === 'empty') {
       return null;
     }
+    if (ctx.route === 'notify') {
+      // 收件人来自清单：这一路只能'提醒'，不能指定发到哪。
+      try {
+        await ctx.notify('hook alert: ' + ctx.body);
+        return { notified: true };
+      } catch (error) {
+        return { status: 500, body: 'notify-error:' + error.message };
+      }
+    }
     return { status: 418, body: 'teapot', contentType: 'text/plain' };
   },
 });
@@ -100,6 +111,31 @@ fn manifest(routes: &[(&str, &str)]) -> String {
             entries.join(",")
         )
     }
+}
+
+/// 清单：在 `webhook` 之外还可以声明 `notify`（收件人钉在清单里）。
+fn manifest_with_notify(routes: &[(&str, &str)], notify: Option<(&str, &str)>) -> String {
+    // 逐段拼、再用逗号连接 —— 每段都自带前导逗号会让空清单也留下一个孤零零的逗号，
+    // 而那个 JSON 解析失败之后的表现是「路由没声明」（401），完全看不出是清单写坏了。
+    let mut capabilities: Vec<String> = Vec::new();
+    if !routes.is_empty() {
+        let entries: Vec<String> = routes
+            .iter()
+            .map(|(path, secret_env)| {
+                format!("{{\"path\":\"{path}\",\"secretEnv\":\"{secret_env}\"}}")
+            })
+            .collect();
+        capabilities.push(format!("\"webhook\":[{}]", entries.join(",")));
+    }
+    if let Some((conversation, kind)) = notify {
+        capabilities.push(format!(
+            "\"notify\":{{\"conversation\":\"{conversation}\",\"kind\":\"{kind}\"}}"
+        ));
+    }
+    format!(
+        "{{\"name\":\"hook-bot\",\"platform\":{{\"kind\":\"local\"}},\"capabilities\":{{{}}}}}\n",
+        capabilities.join(",")
+    )
 }
 
 fn bots_json() -> String {
@@ -435,6 +471,71 @@ async fn an_oversized_body_is_413() {
         text.starts_with("HTTP/1.1 413"),
         "超上限必须 413，实际响应：{text}"
     );
+    server.shutdown().await;
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+// ---------------------------------------------------------------------------
+// ⑨ webhook 里可以 `ctx.notify`：收件人来自清单，因此外部请求能提醒人
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_webhook_can_notify_the_operator_through_the_manifest_target() {
+    let env = "HBOT_TEST_HOOK_NOTIFY";
+    set_secret(env, "s3cret");
+    let harness = Harness::new(
+        "notify",
+        &manifest_with_notify(&[("notify", env)], Some(("local:default", "private"))),
+    )
+    .await;
+    assert_ok(&harness.start().await, "bot_start");
+    let server = harness.serve().await;
+    let addr = server.addr().expect("拿到端口");
+
+    let (status, body) =
+        call_with_secret(addr, &format!("/hook/{BOT_UUID}/notify"), "s3cret", "hello").await;
+    assert_eq!(status, 200, "notify 路由必须成功，实际体：{body}");
+    assert!(body.contains("notified"), "应答体应说明通知已发出：{body}");
+
+    // local 适配器把出站消息写成 `[reply] …` 日志行，与会话/定时器测试同一口径。
+    // **必须等**：`ctx.notify` 只是把出站请求塞进队列，投递与写日志都发生在 HTTP 应答之后。
+    // 立刻读日志会读到"什么都没有"，而那不是"没发"，只是"还没发"。
+    let mut found = None;
+    for _ in 0..200 {
+        let logs = harness.logs();
+        if let Some(line) = logs.iter().find(|line| line.contains("hook alert: hello")) {
+            found = Some(line.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        found.is_some(),
+        "通知应当落成一行出站日志，实际日志：{:?}",
+        harness.logs()
+    );
+
+    server.shutdown().await;
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+#[tokio::test]
+async fn a_webhook_without_a_declared_notify_target_is_told_so() {
+    let env = "HBOT_TEST_HOOK_NONOTIFY";
+    set_secret(env, "s3cret");
+    let harness = Harness::new("nonotify", &manifest_with_notify(&[("notify", env)], None)).await;
+    assert_ok(&harness.start().await, "bot_start");
+    let server = harness.serve().await;
+    let addr = server.addr().expect("拿到端口");
+
+    let (status, body) =
+        call_with_secret(addr, &format!("/hook/{BOT_UUID}/notify"), "s3cret", "hello").await;
+    assert_eq!(status, 500, "没声明收件人时必须失败，实际体：{body}");
+    assert!(
+        body.contains("HBOT_NOTIFY_NOT_DECLARED"),
+        "错误文案要点名缺的是哪一半，实际体：{body}"
+    );
+
     server.shutdown().await;
     assert_ok(&harness.stop().await, "bot_stop");
 }

@@ -2710,13 +2710,17 @@ fn build_job_event<'js>(
     job_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
     Ok(job_event)
 }
-/// `onWebhook` 的上下文：请求字段 + `log` / `sleep` / `ai`。
+/// `onWebhook` 的上下文：请求字段 + `log` / `sleep` / `ai` / `notify`。
 ///
 /// 比消息 ctx 窄得多，理由与 `build_timer_event` 相同：外部请求没有会话，也就没有
 /// 回复目标。这里**没有** `ctx.reply`（不是"有但会报错"）—— webhook 的应答走 handler
 /// 的返回值，多一个 `reply` 只会让人以为消息真发出去了。`device` / `kv` /
 /// `history` / `jobs` / `session` 同样不挂：它们都要一个 bot 或会话身份，而这一路
 /// 只有"哪个路由 + 一段体"。
+///
+/// `ctx.notify` 是**唯一**挂进来的出站口，而且它是安全的：收件人来自清单
+/// `capabilities.notify`，不由这一路决定。外部请求因此能主动提醒运营，却没法把
+/// 数据发到任意会话（那正是 `ctx.send` 不允许出现在这里的原因）。
 fn build_webhook_event<'js>(
     ctx: &Ctx<'js>,
     route: &str,
@@ -2750,6 +2754,8 @@ fn build_webhook_event<'js>(
     request_event.set("log", host.get::<_, Function<'js>>("log")?)?;
     request_event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
     request_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
+    // 收件人钉在清单里，所以这一路可以主动提醒，却没法指定发到哪。
+    request_event.set("notify", host.get::<_, Function<'js>>("notify")?)?;
     Ok(request_event)
 }
 // Nine arguments like its siblings above: they are the same slot set (device / state /

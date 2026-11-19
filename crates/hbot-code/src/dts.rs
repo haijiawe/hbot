@@ -631,6 +631,10 @@ declare module 'hbot' {
     sleep(ms: number): Promise<void>;
     /** 智能能力面，与消息事件同一份实现。 */
     readonly ai: AiApi;
+    /** 提醒运营。收件人来自清单 `capabilities.notify`，**不由这次请求决定** ——
+     *  所以外部请求能主动开口，却没法把数据发到任意会话。
+     *  没声明 `capabilities.notify` 时抛 `HBOT_NOTIFY_NOT_DECLARED`。 */
+    notify(text: string): Promise<void>;
   }
 
   /** `onWebhook` 可以返回的应答信封（其余返回值按状态码 200 处理）。 */
