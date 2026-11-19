@@ -101,7 +101,7 @@ pub use device::{
     CapabilityGate, ClipboardOp, ClipboardValue, DeviceActor, DeviceAuditEntry, DeviceBackend,
     DeviceCapability, DeviceCapabilityReport, DeviceError, DeviceGate, DeviceRateLimits,
     DeviceRateWindow, DeviceSessionState, DeviceTarget, InputAction, MouseButton, OcrRequest,
-    OcrText, Screenshot, ScreenshotRequest, WindowInfo,
+    OcrText, Screenshot, ScreenshotRequest, WindowCapture, WindowCaptureRequest, WindowInfo,
 };
 pub use domain::{
     ApprovalDecision, Bot, BotStatus, Conversation, ConversationKind, InboundMessage,

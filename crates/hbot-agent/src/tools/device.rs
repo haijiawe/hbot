@@ -156,6 +156,7 @@ mod tests {
                 ocr: true,
                 input: false,
                 window: false,
+                window_capture: false,
                 clipboard: false,
                 detail: None,
             }

@@ -335,6 +335,36 @@ pub struct Screenshot {
     pub monitor: u32,
 }
 
+/// 按窗口截图的请求。
+///
+/// 与 [`ScreenshotRequest`] 分开而不是给它加一个 `window` 字段：
+/// 屏幕序号与窗口句柄是两种目标，塞进同一个结构体就会出现"两个都给了算什么"的
+/// 问题，而这类歧义在授权层必须不存在（有歧义的地方，判据就会长出第二份）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowCaptureRequest {
+    /// 平台窗口句柄（来自 [`DeviceBackend::windows`] / 旧版 `capabilities().window` 的 `id`）。
+    pub window: u64,
+    /// PNG 字节上限（超过就 [`DeviceError::TooLarge`]，**不截断**）。
+    pub max_bytes: usize,
+}
+
+/// 一次按窗口截图的结果。
+///
+/// 窗口在这段时间里可能已经销毁、最小化，或者被 DWM 挡住（独占全屏、DRM 内容）：
+/// 那时后端必须**报错**，不能给一张全黑的图 —— 纯黑图会让模型以为"窗口是黑的"，
+/// 而实际是"我们根本没抓到"（与按窗口 OCR 同一条判据，见 `docs/09` §11.2）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowCapture {
+    /// 物理像素宽。
+    pub width: u32,
+    /// 物理像素高。
+    pub height: u32,
+    /// PNG 编码后的字节。
+    pub png: Vec<u8>,
+    /// 实际截的窗口句柄。
+    pub window: u64,
+}
+
 /// 鼠标按键。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -452,6 +482,13 @@ pub struct DeviceCapabilityReport {
     pub input: bool,
     /// 能枚举窗口。
     pub window: bool,
+    /// 能**按窗口**截图（[`DeviceBackend::capture_window`]）。
+    ///
+    /// 与 [`Self::window`] 分开：枚举窗口是三平台都能做到的（列清单而已），
+    /// 而按窗口抓像素要窗口渲染路径（Windows 的 `PrintWindow`、macOS 的
+    /// `CGWindowListCreateImage`），别的宿主没有。混成一个布尔会让调用方以为
+    /// "能列窗口就能抓窗口"，然后在 `HBOT_DEVICE_HOST_LIMIT` 上排查半天。
+    pub window_capture: bool,
     /// 能读写剪贴板。
     pub clipboard: bool,
     /// 不可用的原因（人话，给 UI）。
@@ -703,6 +740,20 @@ pub trait DeviceBackend: Send + Sync {
     /// 截屏。
     fn screenshot(&self, request: &ScreenshotRequest) -> Result<Screenshot, DeviceError>;
 
+    /// 按窗口截图。
+    ///
+    /// **默认实现就是"这个宿主没有这个能力"**：[`DeviceError::HostLimit`]。
+    /// 不给默认实现的话，每加一个后端（含所有测试夹具）都要为它写一个
+    /// `unimplemented!`，而那正是"装不上就放开"的温床。默认返回明确的
+    /// 失败码，能力报告里的 [`DeviceCapabilityReport::window_capture`] 负责
+    /// 让调用方**事前**就知道。
+    fn capture_window(&self, request: &WindowCaptureRequest) -> Result<WindowCapture, DeviceError> {
+        let _ = request;
+        Err(DeviceError::HostLimit {
+            detail: "当前宿主没有按窗口截图的入口（只有整屏截图）".to_owned(),
+        })
+    }
+
     /// 读屏幕文字（OCR）。
     ///
     /// 实现自己负责"先抓图再做识别"：调用方不该为了 OCR 先要一张 PNG
@@ -936,6 +987,64 @@ mod tests {
                 other => panic!("期望 RateLimited，得到 {other:?}"),
             }
         }
+    }
+
+    /// 没实现 `capture_window` 的后端必须给出**明确的**宿主限制，而不是
+    /// panic、也不是假装成功（空 PNG 会让调用方以为截到了一张全透明的图）。
+    #[test]
+    fn a_backend_without_window_capture_says_so_instead_of_panicking() {
+        struct ScreenOnly;
+
+        impl DeviceBackend for ScreenOnly {
+            fn capabilities(&self) -> DeviceCapabilityReport {
+                DeviceCapabilityReport {
+                    screen: true,
+                    ..DeviceCapabilityReport::default()
+                }
+            }
+
+            fn screenshot(&self, _request: &ScreenshotRequest) -> Result<Screenshot, DeviceError> {
+                Err(DeviceError::HostLimit {
+                    detail: "not used".to_owned(),
+                })
+            }
+
+            fn ocr(&self, _request: &OcrRequest) -> Result<OcrText, DeviceError> {
+                Err(DeviceError::HostLimit {
+                    detail: "not used".to_owned(),
+                })
+            }
+
+            fn input(&self, _action: &InputAction, _apps: &[String]) -> Result<(), DeviceError> {
+                Err(DeviceError::HostLimit {
+                    detail: "not used".to_owned(),
+                })
+            }
+
+            fn windows(&self) -> Result<Vec<WindowInfo>, DeviceError> {
+                Ok(Vec::new())
+            }
+
+            fn clipboard(&self, _op: &ClipboardOp) -> Result<ClipboardValue, DeviceError> {
+                Err(DeviceError::HostLimit {
+                    detail: "not used".to_owned(),
+                })
+            }
+        }
+
+        let report = ScreenOnly.capabilities();
+        assert!(report.screen, "夹具声明了整屏截图");
+        assert!(
+            !report.window_capture,
+            "默认值必须是 false：能力报告不许把没实现的东西说成有"
+        );
+        let error = ScreenOnly
+            .capture_window(&WindowCaptureRequest {
+                window: 42,
+                max_bytes: 1024,
+            })
+            .expect_err("默认实现必须报错");
+        assert_eq!(error.code(), "HBOT_DEVICE_HOST_LIMIT");
     }
 
     /// 时钟倒退（测试或系统时间跳变）时不 panic、不误放行一堆。
