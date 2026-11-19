@@ -71,7 +71,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | **C1 事件** | `message` | 收到消息（已归一化） | `已实现` |
 | | `timer` | 固定间隔 / 每天某时刻（`onTimer(ctx, name)`） | `已实现`（2026-11-18，见 §4.4） |
 | | `webhook` | 外部系统打进来（HTTP 入口） | `已实现`（2026-11-19，见 §3.5） |
-| | `lifecycle` | `onStart` / `onStop` | `设计` |
+| | `lifecycle` | `onStart` / `onStop` | `已实现`（2026-11-19，见 §4.6） |
 | | `device` | 屏幕变化、输入事件（预留，见 §9） | `未做` |
 | **C2 状态** | `kv` | 每 bot 命名空间的键值（JSON 值、TTL、批量原子写） | `已实现`（2026-11-18） |
 | | `sql` | 每 bot 一套表（迁移文件定义，只允许参数化 DML） | `设计` |
@@ -96,7 +96,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **一半**：`webhook` / `session` / `notify` / `ai` / `send` 都已落地，只缺 `sql` |
 | **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面与定时都有，缺 `sql` 与长作业 |
 
-> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C2.kv/history/session + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.lifecycle`、`C2.sql`、`C3.file`，见 §11 的落地顺序。
+> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C2.kv/history/session + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.onSchedule`、`C2.sql`、`C3.file`，见 §11 的落地顺序。
 
 ### 3.2 能力怎么声明
 
@@ -282,7 +282,7 @@ export default defineBot({
 })
 ```
 
-现状：`onMessage` 与 `onTimer` 已实现；`onStart`/`onStop` 是 `设计`。定时器的落地细节见 §4.4。
+现状：`onMessage` / `onTimer` / `onJob` / `onResume` / `onWebhook` / `onStart` / `onStop` 均已实现（`onSchedule` 未做）。细节见 §4.4 / §4.5 / §4.6 / §5.2 / §3.4 / §3.5。
 
 **为什么钩子要少而固定**：每多一个钩子，宿主就多一条执行路径、多一份超时与取消语义。四个够覆盖四类 bot；不够再加要写 ADR。
 
@@ -417,6 +417,41 @@ export default defineBot({
 **实测**：`hbot-rpc` 的 `tests/jobs_capability.rs` 6 条，全走 `Dispatcher` 真派发 + 真 tick + 真库：没声明 → `NOT_DECLARED` 且**不落库**；声明后入队 → 落库 → 下一拍认领 → `onJob` 真跑 → `done` → 回复进 outbox；同幂等键入队两次只留一行、只跑一次；缺 `onJob` 时每次派发记一行点名钩子的 error；`bot_stop` 之后 `pending` 落 `cancelled` 且不再派发；作业体抛异常时 `retries: 0` 直接落 `failed` 并写 `last_error` + error 日志。存储层另有 12 条（含 per-bot claim 不越界、`resume` 退回 `pending`、级联删除）。
 
 **还没做**：`jobs` 的宿主级预算上限（手机上 30 秒这类"平台取小"还在 `docs/08` 的设计里，当前只有清单写的值）；作业状态的 UI 面板；作业池的"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
+
+### 4.6 已落地：生命周期钩子（`C1.lifecycle`，2026-11-19）
+
+```ts
+export default defineBot({
+  async onStart(ctx) {
+    // 失败 = 这次启动失败（bot_start 回滚到 stopped 并报错）
+    ctx.log('booting');
+  },
+  async onStop(ctx, reason) {
+    // reason: 'user' | 'shutdown' | 'crash'；预算 5 秒；失败只落日志
+    ctx.log(`bye: ${reason}`);
+  },
+})
+```
+
+**四道判据**：
+
+| 层 | 判据 | 位置 | 没过的症状 |
+|---|---|---|---|
+| 钩子层 | `defineBot` 的 `onStart` / `onStop` | `hbot-code` 的 `Hooks.start` / `Hooks.stop`（boot 时取） | **没有钩子不是错误**（清单里没有对应声明项），静默跳过 |
+| 时刻层 | `onStart` 在 `supervisor.start()` 之后、登记之前；`onStop` 在注销 webhook 与取消作业之前 | `hbot-rpc` 的 `commands::bots::start_inner` / `stop` | 顺序错了会「消息先于初始化被消费」或「停机时执行器已经拆掉」 |
+| 预算层 | `onStart` 用 `limits.handlerMs`；`onStop` 用 `hbot_core::STOP_BUDGET`（**5 秒**） | `hbot-code` 的 `run_lifecycle` | 超时按 `HBOT_TIMEOUT` 中断，`onStart` 会因此让启动失败 |
+| 失败层 | `onStart` 失败 = 启动失败；`onStop` 失败 = 一行 error 日志 | `hbot-rpc` 的 `run_lifecycle` 调用点 | 前者回滚到 stopped；后者不影响 `bot_stop` 的返回值 |
+
+**四条设计决定与理由**：
+
+1. **`onStart` 失败就是启动失败**。不报错会让「bot 起来了但没初始化完」变成一种状态，而后续每条消息都会在这个半初始化状态里跑 —— 那种 bug 只在真机上出现，且日志里看不出。
+2. **`onStop` 只给 5 秒，且失败不报错**。停机路径上有人在等（`bot_stop` 的返回、进程退出），所以它必须有一个比任何业务动作都短的硬上界；而给它一个返回值只会诱使调用方去判断「停得好不好」，那件事无法恢复。
+3. **编译失败时跳过两个钩子，而不是让 `bot_start` 失败**。这是 `AGENTS.md` 坑 24 的同一条纪律：编译错误是用户代码的问题，正确形状是「bot 起着、消息留在未处理、改好代码自动重试」。把 `onStart` 接成硬失败会让一个 typo 永久挡住启动。
+4. **生命周期钩子的 ctx 比所有事件都窄**：只有 `phase` / `reason` 与 `log` / `sleep` / `ai`。没有 `reply`（启动时没有会话、停机时没有任何东西保证消息发得出去），也没有 `kv` / `history` / `device` / `jobs` / `session` —— 它们都要一个 bot 身份，而钩子恰恰在身份建立之前、拆除之后跑。
+
+**实测**（`hbot-rpc` 的 `tests/lifecycle_capability.rs`，5 条，全走 `Dispatcher` 真派发 + 真库）：`onStart` 启动时真跑一次且只一次；`onStart` 抛错时 `bot_start` 返回错误、抛错前的 `ctx.log` 仍落库、错误点名 `onStart`；`onStop` 的第二个参数与 `ctx.reason` 都是 `user`；`onStop` 抛错时 `bot_stop` 仍成功且错误点名 `onStop`；没写钩子时既不报错也不留点名钩子的日志。契约层另有 3 条（原因字符串往返、预算值、阶段名）。
+
+**还没做**：`shutdown` / `crash` 两种原因的**触发点**（`reason` 的形状与渲染已经就位，但 `AppState::open_project` 的 `stop_all` 与崩溃降级路径还没接上）；`onStart` 里写状态的正式形状（现在只有 `log`/`sleep`/`ai`，要持久化得在建连之后由消息驱动）；`onSchedule`（与 `onTimer` 不是同一件事）。
 
 ---
 

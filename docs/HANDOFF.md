@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-19 19:20**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook` 全部落地 —— **M7 第 1–5 步完成**。
+> 本快照时间：**2026-11-19 20:15**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 全部落地 —— **M7 第 1–5 步完成**。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1812 passed / 0 failed / 118 target
+cargo test -j 2 --workspace              # 当前 1820 passed / 0 failed / 119 target
 pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 ```
 
-现状：**六道全绿**（2026-11-19 19:05 实测）。`apps/web/src/generated/*.ts` **要入库**；
+现状：**六道全绿**（2026-11-19 20:10 实测）。`apps/web/src/generated/*.ts` **要入库**；
 改 `dto` 后必须 `gen`（还要 `gen --check`）再提交。
 纯文档提交不需要跑全闸，但要在提交信息里说明"仅文档"。
 
@@ -111,12 +111,13 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | `C2.session`（`bot_waits`） | **已实现（2026-11-19，`docs/07` §5.2）** |
 | `C3.send` / `C3.notify` | **已实现（2026-11-19，`docs/07` §3.4）** |
 | `C1.webhook` | **已实现（2026-11-19，`docs/07` §3.5）** |
-| `onStart` / `onStop` / `onSchedule` | **未开始** ← 下一步（小件） |
+| `onStart` / `onStop` | **已实现（2026-11-19，`docs/07` §4.6）** |
+| `onSchedule` / `C2.sql` | **未开始** ← 下一步 |
 | `E1` npm 打包 / 云端宿主 | **未开始** |
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 86 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 88 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -214,6 +215,12 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 **还没做的四件**（都不阻塞主线）：`GET`/`HEAD` 探活、应答体流式（现整段进内存，上限 256 KiB）、
 路由级超时（现在统一用 handler 预算）、反向代理/公网暴露（手机做不到，见 `docs/08` §4.4）。
 
+**刚落地的那两件（`onStart` / `onStop`，`docs/07` §4.6）**：失败语义**相反** —— `onStart` 抛错就是
+启动失败（回滚到 stopped），`onStop` 抛错只落一行 error 日志；预算也不同（`onStart` 用 `handlerMs`，
+`onStop` 用 5 秒）。**编译失败时两个钩子都跳过**，绝不能让 `bot_start` 因此失败（坑 88）。
+还剩：`shutdown` / `crash` 两种原因的触发点未接（形状已就位）、`onSchedule`、`C2.sql`、`E1` 打包、
+设备完整版、云端宿主、`M6`。
+
 ### D. 其它未做（不阻塞主线）
 
 - `onStart` / `onStop`（生命周期钩子，`docs/07` §4.1 目标形状里已有）；
@@ -244,7 +251,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 3ded642 或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1812 passed / 118 target
+cargo test -j 2 --workspace                              # 基线：1820 passed / 119 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §5.2 session + §11 落地顺序**（这是本轮的施工图）。

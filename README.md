@@ -69,8 +69,8 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | 旧项目代码体检 | 完成（`docs/00-assessment.md`） |
 | 技术栈 ADR | Proposed（`0002`；转 Accepted 还差 QuickJS 长跑、真 OneBot 网关、macOS 隔离） |
 | 架构 / 目录 / 计划 / 闸门 / IDE | Draft，已按实现回填实测口径（`02`–`06`） |
-| 代码 | **已落地 M0–M2 主体 + M3/M4/M5 绝大部分 + C6 设备能力窄版（Windows）+ M7 第 1–4 步全部（`ctx.kv` / `ctx.history` / `ctx.ai` / `onTimer` / `ctx.jobs` / `ctx.session`）+ `ctx.send` / `ctx.notify` / `ctx.webhook`（`onWebhook`）**（`crates/` 下 16 个 crate + `xtask`，`apps/web` 可构建） |
-| 测试 | 最近一次 `cargo test --workspace`：**1812 passed / 0 failed**（118 个 target）；`apps/web`：46 文件 417 用例 |
+| 代码 | **已落地 M0–M2 主体 + M3/M4/M5 绝大部分 + C6 设备能力窄版（Windows）+ M7 第 1–4 步全部（`ctx.kv` / `ctx.history` / `ctx.ai` / `onTimer` / `ctx.jobs` / `ctx.session`）+ `ctx.send` / `ctx.notify` / `ctx.webhook`（`onWebhook`）+ `onStart` / `onStop`**（`crates/` 下 16 个 crate + `xtask`，`apps/web` 可构建） |
+| 测试 | 最近一次 `cargo test --workspace`：**1820 passed / 0 failed**（119 个 target）；`apps/web`：46 文件 417 用例 |
 | 真机验证 | QQ 官方群/私聊被动回复已端到端跑通（`docs/spikes/S9-e2e-qq-official.md`）；Windows NSIS 安装包 9.14 MiB、安装冒烟 11/11；Windows 设备能力（截屏/原生 OCR/输入/多显示器）真机验证；DPI 声明 `unaware → per-monitor-v2` 实测 |
 | 未完成 | M6 迁移/影子（缺测试账号）、M7 第 6 步 `E1` npm 打包与云端执行宿主、真 NapCat 登录（需扫码且二维码会过期）、Linux/macOS 运行（Landlock 只交叉编译过、一次没真跑）、CI 从未执行（无 remote）、设备混合 DPI 跨屏拼图/按窗口截图（部分已做）/中文以外的 OCR 语言包 |
 

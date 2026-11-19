@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–4 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`）、`C3.send`/`C3.notify` 与 `C1.webhook` 全部落地**（1812 个 Rust 测试 / 118 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–4 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`）、`C3.send`/`C3.notify` 、`C1.webhook` 与 `onStart`/`onStop` 全部落地**（1820 个 Rust 测试 / 119 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -450,6 +450,20 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     结构体再存 `listener` 字段会报 `E0382 use of moved value`。正确形状：**绑定时就把 `local_addr()` 存下来**，
     结构体只留 `address: SocketAddr`，接受循环拿走 listener。测试要靠 `addr()` 拿系统挑的端口，所以这一步
     不是可选的。
+
+87. **生命周期钩子的失败语义与别的钩子相反**（2026-11-19，`C1.lifecycle` 落地）。`onStart` 抛错
+    **就是**启动失败（`bot_start` 回滚到 stopped）—— 不报错会让「起来了但没初始化完」变成一种状态，
+    后续每条消息都在半初始化里跑。`onStop` 抛错**只落一行 error 日志**，`bot_stop` 仍返回成功：
+    停机路径上没有任何人在等它的结果，给它一个错误只会诱使调用方判断「停得好不好」。
+    两者的预算也不同：`onStart` 用 `limits.handlerMs`，`onStop` 用 `hbot_core::STOP_BUDGET`（5 秒，
+    因为「不能拖住停机」比「不能拖住会话」更硬）。
+
+88. **编译失败时生命周期钩子要跳过，不能让 `bot_start` 因此失败**（2026-11-19，被 `bot_runtime`
+    的 `compile_error_is_reported_and_inbound_stays_unprocessed` 抓出来的）。`run_lifecycle` 第一句
+    是 `compiled()`，如果把它 `?` 出去，一个 typo 就让 `bot_start` 永久失败 —— 而用户修好代码后
+    没有任何路径能让它恢复。正确形状：`compiled()` 失败只 `warn` 一行并返回 `Ok`，让 bot 起着、
+    消息留在未处理、改好代码自动重试（与坑 24 同一条纪律）。**通用判据**：任何接在 `bot_start`
+    路径上的新步骤，都要先想「用户代码坏了会不会把它永久挡住」。
 
 ---
 
