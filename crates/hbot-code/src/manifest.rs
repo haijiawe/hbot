@@ -125,11 +125,11 @@ pub struct Capabilities {
     /// 这件事在代码里无从写错收件人，也不需要每次调用都查库。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<hbot_core::NotifyTarget>,
-    /// 事件能力（C1）：{BT}onWebhook(ctx){BT} 的入站路由表。
+    /// 事件能力（C1）：`onWebhook(ctx)` 的入站路由表。
     ///
-    /// 与 {BT}timer{BT} / {BT}jobs{BT} 同一个形状：每条路由都要有路径与密钥来源，
+    /// 与 `timer` / `jobs` 同一个形状：每条路由都要有路径与密钥来源，
     /// "true" 无法回答"从哪条 URL 进、密钥在哪个环境变量"。空数组 = 没声明 ——
-    /// 那时任何 {BT}POST /hook/…{BT} 都回 {BT}HBOT_WEBHOOK_NOT_DECLARED{BT}，而不是悄悄收下。
+    /// 那时任何 `POST /hook/…` 都回 `HBOT_WEBHOOK_NOT_DECLARED`，而不是悄悄收下。
     #[serde(default)]
     pub webhook: Vec<hbot_core::WebhookRoute>,
 }
@@ -200,10 +200,10 @@ impl Capabilities {
         &self.jobs
     }
 
-    /// webhook 路由表（{BT}onWebhook{BT} 的路径与密钥来源从这里来）。
+    /// webhook 路由表（`onWebhook` 的路径与密钥来源从这里来）。
     ///
-    /// 返回空切片表示"没声明"，与 {BT}Self::timer{BT} 同一语义：声明层只回答"项目要不要
-    /// 被外部系统调用"，不回答"服务有没有在听"（后者由 {BT}hbot-rpc{BT} 的 {BT}WebhookServer{BT} 回答）。
+    /// 返回空切片表示"没声明"，与 `Self::timer` 同一语义：声明层只回答"项目要不要
+    /// 被外部系统调用"，不回答"服务有没有在听"（后者由 `hbot-rpc` 的 `WebhookServer` 回答）。
     #[must_use]
     pub fn webhook(&self) -> &[hbot_core::WebhookRoute] {
         &self.webhook

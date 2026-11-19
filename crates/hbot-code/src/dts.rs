@@ -223,17 +223,39 @@ declare module 'hbot' {
      */
     onResume(ctx: ResumeCtx, message: InboundMessage): void | Promise<void>;
     /**
-     * 外部系统的一次 HTTP 请求打进来时调用（需要 {BT}capabilities.webhook{BT} 里声明了对应路由）。
+     * 启动时调用一次（在第一条消息到来之前）。
      *
-     * **返回值就是 HTTP 应答**：{BT}undefined{BT} / {BT}null{BT} → 204（只确认收到）；字符串 →
-     * {BT}text/plain{BT} + 200；其它值序列化成 JSON + 200；要改状态码就返回信封
-     * {BT}{ status: 418, body: 'teapot', contentType: 'text/plain' }{BT}。
+     * **它失败就等于这次启动失败**：`bot_start` 回滚到 stopped 并把错误报出来，
+     * 而不是「起来了但没初始化完」—— 后者会让后续每条消息都在半初始化状态里跑。
      *
-     * 上下文比所有其它事件都窄：只有这次请求的 {BT}route{BT} / {BT}method{BT} / {BT}contentType{BT} /
-     * {BT}body{BT} / {BT}bodyJson{BT} 与 {BT}log{BT} / {BT}sleep{BT} / {BT}ai{BT}。**没有** {BT}reply{BT}：
-     * 外部系统没有会话，应答走返回值；想主动推消息用 {BT}ctx.send{BT}（那是另一个能力，另一次判据）。
+     * 上下文只有 `phase` 与 `log` / `sleep` / `ai`：启动时还没有会话，`ctx.reply` 无从
+     * 发出去，所以**没有** `reply`；也没有 `kv` / `history` / `device`（身份尚未建立）。
      *
-     * 声明了路由却没定义这个钩子时，每条请求都会记一条点名 {BT}onWebhook{BT} 的错误日志，
+     * 预算与 handler 相同（`limits.handlerMs`）。超时或抛错都按启动失败处理。
+     */
+    onStart?(ctx: LifecycleCtx): void | Promise<void>;
+    /**
+     * 停机前调用一次，`reason` 说明为什么停（`'user'` / `'shutdown'` / `'crash'`）。
+     *
+     * **预算 5 秒**，与 handler 的 2 秒分开定：那个是「不拖住会话」，这个是「不拖住停机」。
+     * 5 秒够写一次存档，不够跑一次完整结算 —— 那是 `ctx.jobs` 的事。
+     *
+     * 失败**只落一行 error 日志**：停机路径上没有任何人在等结果，给调用方一个错误只会
+     * 诱使它去判断「停得好不好」，而那件事无法恢复。同样没有 `reply`。
+     */
+    onStop?(ctx: LifecycleCtx, reason: 'user' | 'shutdown' | 'crash'): void | Promise<void>;
+    /**
+     * 外部系统的一次 HTTP 请求打进来时调用（需要 `capabilities.webhook` 里声明了对应路由）。
+     *
+     * **返回值就是 HTTP 应答**：`undefined` / `null` → 204（只确认收到）；字符串 →
+     * `text/plain` + 200；其它值序列化成 JSON + 200；要改状态码就返回信封
+     * `{ status: 418, body: 'teapot', contentType: 'text/plain' }`。
+     *
+     * 上下文比所有其它事件都窄：只有这次请求的 `route` / `method` / `contentType` /
+     * `body` / `bodyJson` 与 `log` / `sleep` / `ai`。**没有** `reply`：
+     * 外部系统没有会话，应答走返回值；想主动推消息用 `ctx.send`（那是另一个能力，另一次判据）。
+     *
+     * 声明了路由却没定义这个钩子时，每条请求都会记一条点名 `onWebhook` 的错误日志，
      * 并向调用方回 500 —— 而不是悄悄回一个 204 让外部系统以为成功了。
      */
     onWebhook?(ctx: WebhookCtx): unknown | Promise<unknown>;
@@ -530,33 +552,46 @@ declare module 'hbot' {
     kind?: 'private' | 'group' | 'channel';
   }
 
-  /** 外部系统打进来的一次请求（{BT}onWebhook{BT} 的上下文）。 */
+  /** 生命周期钩子的上下文（`onStart` / `onStop`）：只有阶段与宿主能力。 */
+  export interface LifecycleCtx {
+    /** `'start'` 或 `'stop'`。 */
+    readonly phase: 'start' | 'stop';
+    /** 仅 `onStop`：停机原因（与第二个参数相同）。`onStart` 时是 `undefined`。 */
+    readonly reason?: 'user' | 'shutdown' | 'crash';
+    /** 写一行运行日志。 */
+    log(message: string): void;
+    /** 让出 `ms` 毫秒；会被本次钩子的预算截断。 */
+    sleep(ms: number): Promise<void>;
+    /** 智能能力面，与消息事件同一份实现。 */
+    readonly ai: AiApi;
+  }
+  /** 外部系统打进来的一次请求（`onWebhook` 的上下文）。 */
   export interface WebhookCtx {
-    /** 命中的路由路径，与 {BT}hbot.json{BT} 的 {BT}capabilities.webhook[].path{BT} 一致。 */
+    /** 命中的路由路径，与 `hbot.json` 的 `capabilities.webhook[].path` 一致。 */
     readonly route: string;
-    /** HTTP 方法；v1 只可能是 {BT}'POST'{BT}。 */
+    /** HTTP 方法；v1 只可能是 `'POST'`。 */
     readonly method: string;
-    /** 调用方给的 {BT}Content-Type{BT}；没给是 {BT}undefined{BT}。 */
+    /** 调用方给的 `Content-Type`；没给是 `undefined`。 */
     readonly contentType?: string;
     /** 请求体原文（已按 UTF-8 校验，非法编码在传输层就变成 400）。 */
     readonly body: string;
-    /** 请求体解析成 JSON 的结果；不是 JSON 时是 {BT}undefined{BT}（不是 {BT}null{BT}，也不抛）。 */
+    /** 请求体解析成 JSON 的结果；不是 JSON 时是 `undefined`（不是 `null`，也不抛）。 */
     readonly bodyJson?: unknown;
     /** 写一行运行日志。 */
     log(message: string): void;
-    /** 让出 {BT}ms{BT} 毫秒；会被本次请求的预算截断。 */
+    /** 让出 `ms` 毫秒；会被本次请求的预算截断。 */
     sleep(ms: number): Promise<void>;
     /** 智能能力面，与消息事件同一份实现。 */
     readonly ai: AiApi;
   }
 
-  /** {BT}onWebhook{BT} 可以返回的应答信封（其余返回值按状态码 200 处理）。 */
+  /** `onWebhook` 可以返回的应答信封（其余返回值按状态码 200 处理）。 */
   export interface WebhookEnvelope {
     /** HTTP 状态码，200–599 的整数；字符串会被拒绝（不做隐式转换）。 */
     status?: number;
     /** 应答体；字符串原样发，其它值序列化成 JSON。 */
     body?: unknown;
-    /** 内容类型，缺省 {BT}application/json{BT}。 */
+    /** 内容类型，缺省 `application/json`。 */
     contentType?: string;
   }
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
@@ -1325,9 +1360,9 @@ mod drift {
         // "`kv.` must not appear" is now false by design. What is still missing is
         // **cross-conversation** history and any streaming/watch API — those are
         // the entries a broad "`history`" would have covered, so spell them out.
+        // `onStart` / `onStop` 已落地（2026-11-19，`C1.lifecycle`）：宽泛条目按 `AGENTS.md` §8.7
+        // 必须**整条删**，否则它会在能力实现后继续假装「这个没做」。仍在缺的那一项单独列出。
         for absent in [
-            "onStart",
-            "onStop",
             "onSchedule",
             "sendFile(",
             "sendImage(",

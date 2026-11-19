@@ -620,13 +620,46 @@ impl Sandbox {
         }
     }
 
-    /// 跑一次 {BT}onWebhook{BT}，把 handler 的返回值一并带回来。
+    /// 跑一次生命周期钩子（{BT}onStart{BT} / {BT}onStop{BT}）。
     ///
-    /// 与 {BT}Sandbox::dispatch_job_collecting{BT} 同形，区别在第二个返回值：webhook 的应答体是
-    /// handler 的**返回值**，不是 {BT}ctx.reply{BT} 收集到的文本 —— 调用方在等 HTTP 响应，只有
+    /// 缺钩子时**成功返回**（不报错）：清单里没有「声明生命周期钩子」这一项，所以「没写」
+    /// 是最常见的情况。返回 `Ok` 意味着「该跑的都跑了」，而不是「一定写了钩子」。
+    ///
+    /// {BT}onStart{BT} 失败要当成启动失败处理（调用方负责回滚）；{BT}onStop{BT} 失败只该落一行
+    /// error 日志 —— 停机路径上没有任何人在等它的结果。
+    pub fn dispatch_lifecycle_collecting(
+        &self,
+        phase: hbot_core::LifecyclePhase,
+        reason: Option<hbot_core::StopReason>,
+    ) -> Result<EventOutcome, EventFailure> {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.send(Command::Lifecycle {
+            phase,
+            reason,
+            reply,
+        })
+        .map_err(EventFailure::without_output)?;
+
+        match result.recv_timeout(self.backstop()) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => {
+                Err(EventFailure::without_output(CodeError::SandboxDead {
+                    message: format!(
+                        "isolate did not answer within {:?}; the worker thread is wedged",
+                        self.backstop()
+                    ),
+                }))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(EventFailure::without_output(self.dead())),
+        }
+    }
+    /// 跑一次 `onWebhook`，把 handler 的返回值一并带回来。
+    ///
+    /// 与 `Sandbox::dispatch_job_collecting` 同形，区别在第二个返回值：webhook 的应答体是
+    /// handler 的**返回值**，不是 `ctx.reply` 收集到的文本 —— 调用方在等 HTTP 响应，只有
     /// 返回值能当应答。
     ///
-    /// {BT}body{BT} 已由传输层按 UTF-8 校验；非法编码在更外层就变成 400，走不到这里。
+    /// `body` 已由传输层按 UTF-8 校验；非法编码在更外层就变成 400，走不到这里。
     pub fn dispatch_webhook_collecting(
         &self,
         route: &str,
@@ -1098,12 +1131,12 @@ enum Command {
         conversation: Option<String>,
         reply: Sender<Result<EventOutcome, EventFailure>>,
     },
-    /// 跑一次 {BT}onWebhook(ctx){BT}：外部系统的一次 HTTP 请求，handler 的返回值就是应答。
+    /// 跑一次 `onWebhook(ctx)`：外部系统的一次 HTTP 请求，handler 的返回值就是应答。
     ///
-    /// 与 {BT}Timer{BT} / {BT}Job{BT} 同理是独立变体：webhook 既没有入站消息也没有会话，走
-    /// {BT}build_event{BT} 会给它一个假 payload，还会把设备/状态身份留在槽位上。
+    /// 与 `Timer` / `Job` 同理是独立变体：webhook 既没有入站消息也没有会话，走
+    /// `build_event` 会给它一个假 payload，还会把设备/状态身份留在槽位上。
     ///
-    /// 应答体不走 {BT}HostOutput{BT}（那是日志与回复的收集器），而是随这条命令的 {BT}reply{BT}
+    /// 应答体不走 `HostOutput`（那是日志与回复的收集器），而是随这条命令的 `reply`
     /// 一起回来：调用方在等 HTTP 响应，晚一步就没有意义了。
     Webhook {
         route: String,
@@ -1112,6 +1145,16 @@ enum Command {
         /// 请求体（传输层已按 UTF-8 校验过，这里不会拿到半截字符）。
         body: String,
         reply: Sender<Result<(EventOutcome, Option<serde_json::Value>), EventFailure>>,
+    },
+    /// 跑一次生命周期钩子（`onStart` / `onStop`）。
+    ///
+    /// 一个变体带阶段而不是两个：两者的预算、ctx 与失败处理不同，但派发路径完全一样
+    /// （编译 → 取 worker → 在 isolate 上跑一个可选钩子），而那段是最容易写错的地方。
+    Lifecycle {
+        phase: hbot_core::LifecyclePhase,
+        /// `onStop` 的原因；`onStart` 时为 `None`。
+        reason: Option<hbot_core::StopReason>,
+        reply: Sender<Result<EventOutcome, EventFailure>>,
     },
     /// Stop the worker loop.
     Shutdown,
@@ -1189,6 +1232,11 @@ fn reject(command: Command, failure: &CodeError) {
         Command::Resume { reply, .. } => {
             let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
                 message: message.clone(),
+            })));
+        }
+        Command::Lifecycle { reply, .. } => {
+            let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
+                message,
             })));
         }
         Command::Webhook { reply, .. } => {
@@ -1448,6 +1496,49 @@ fn serve(
                 let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
                 let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
             }
+            Command::Lifecycle {
+                phase,
+                reason,
+                reply,
+            } => {
+                let raw = {
+                    let context = &context;
+                    let start_handler = &hooks.start;
+                    let stop_handler = &hooks.stop;
+                    let output = &output;
+                    let deadline = &deadline;
+                    let project = &project;
+                    let control = &control;
+                    let ai = &ai;
+                    let budget = match phase {
+                        hbot_core::LifecyclePhase::Start => limits.handler_timeout,
+                        // 停机的预算与 handler 分开定：那个是「不拖住会话」，这个是「不拖住停机」。
+                        hbot_core::LifecyclePhase::Stop => hbot_core::STOP_BUDGET,
+                    };
+                    local.block_on(&runtime, async move {
+                        context
+                            .async_with(async |ctx| {
+                                run_lifecycle(
+                                    &ctx,
+                                    phase,
+                                    reason,
+                                    budget,
+                                    start_handler,
+                                    stop_handler,
+                                    output,
+                                    deadline,
+                                    project,
+                                    control,
+                                    ai,
+                                )
+                                .await
+                            })
+                            .await
+                    })
+                };
+                let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
+                let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
+            }
             Command::Webhook {
                 route,
                 method,
@@ -1581,11 +1672,19 @@ struct Hooks {
     /// 缺它时不是开机错误：与 `onJob` 同一处理 —— 第一次唤醒会报一条点名
     /// `onResume` 的错（见 `run_resume`）。
     resume: Option<Persistent<Function<'static>>>,
-    /// {BT}onWebhook{BT}，可选：没声明 {BT}capabilities.webhook{BT} 的项目没有理由定义它。
+    /// `onWebhook`，可选：没声明 `capabilities.webhook` 的项目没有理由定义它。
     ///
-    /// 缺它时不是开机错误：与 {BT}onJob{BT} 同一处理 —— 第一条外部请求会报一条点名
-    /// {BT}onWebhook{BT} 的错（见 {BT}run_webhook{BT}），而不是让调用方收到一个看起来成功的空应答。
+    /// 缺它时不是开机错误：与 `onJob` 同一处理 —— 第一条外部请求会报一条点名
+    /// `onWebhook` 的错（见 `run_webhook`），而不是让调用方收到一个看起来成功的空应答。
     webhook: Option<Persistent<Function<'static>>>,
+    /// `onStart`，可选：没有它项目照样能跑（只是没有「启动时初始化」这个口子）。
+    ///
+    /// 与 `onTimer` / `onJob` 不同，清单里**没有**「声明生命周期钩子」这一项，所以不能把
+    /// 「没写」当成配置错误 —— 缺 `onStart` 是最常见的情况，静默跳过即可。
+    start: Option<Persistent<Function<'static>>>,
+    /// `onStop`，可选；同 `start`。失败时只落一行 error 日志：停机路径上没有任何人在等
+    /// 它的结果，给调用方一个错误只会诱使它去判断「停得好不好」，而那件事无法恢复。
+    stop: Option<Persistent<Function<'static>>>,
 }
 
 /// Evaluate `src/main.ts` and capture its hooks.
@@ -1695,12 +1794,24 @@ async fn bootstrap<'js>(
             .map_err(js_error)?
             .map(|function| Persistent::save(ctx, function));
 
+        // 生命周期钩子：两个都可选，缺了不算错（清单里没有对应的声明项）。
+        let start = config
+            .get::<_, Option<Function<'js>>>("onStart")
+            .map_err(js_error)?
+            .map(|function| Persistent::save(ctx, function));
+        let stop = config
+            .get::<_, Option<Function<'js>>>("onStop")
+            .map_err(js_error)?
+            .map(|function| Persistent::save(ctx, function));
+
         Ok::<_, CodeError>(Hooks {
             message: Persistent::save(ctx, handler),
             timer,
             job,
             resume,
             webhook,
+            start,
+            stop,
         })
     }
     .await;
@@ -1953,6 +2064,121 @@ async fn run_job<'js>(
     }
 }
 
+/// 跑一次生命周期钩子：{BT}onStart{BT}（失败即启动失败）或 {BT}onStop{BT}（失败只留痕）。
+///
+/// 缺钩子不报错：清单里没有「声明生命周期钩子」这一项，所以「没写」是最常见的情况。
+/// 与 {BT}onTimer{BT} / {BT}onJob{BT} 的「点名缺钩子」不同 —— 那两个是清单说了有、代码没实现。
+#[allow(clippy::too_many_arguments)]
+async fn run_lifecycle<'js>(
+    ctx: &Ctx<'js>,
+    phase: hbot_core::LifecyclePhase,
+    reason: Option<hbot_core::StopReason>,
+    budget: Duration,
+    start_handler: &Option<Persistent<Function<'static>>>,
+    stop_handler: &Option<Persistent<Function<'static>>>,
+    output: &Arc<Mutex<HostOutput>>,
+    deadline: &Arc<Deadline>,
+    project: &CompiledProject,
+    control: &Arc<DebugControl>,
+    ai: &AiSlot,
+) -> RawEvent {
+    let started = Instant::now();
+    let handler = match phase {
+        hbot_core::LifecyclePhase::Start => start_handler,
+        hbot_core::LifecyclePhase::Stop => stop_handler,
+    };
+    let Some(handler) = handler else {
+        // 没写就是没写：这是合法的项目形状，不是错误。
+        return RawEvent {
+            logs: Vec::new(),
+            replies: Vec::new(),
+            duration: started.elapsed(),
+            interrupted: false,
+            result: Ok(()),
+        };
+    };
+
+    deadline.reset();
+    deadline.arm(budget);
+    output
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    control.begin_event(false);
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+
+    let result = invoke_lifecycle(ctx, phase, reason, handler, output, project, ai).await;
+    let duration = started.elapsed();
+
+    control.end_event();
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+    deadline.disarm();
+    let interrupted = deadline.take_interrupted();
+    let (logs, replies) = output.lock().unwrap_or_else(PoisonError::into_inner).take();
+
+    RawEvent {
+        logs,
+        replies,
+        duration,
+        interrupted,
+        result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn invoke_lifecycle<'js>(
+    ctx: &Ctx<'js>,
+    phase: hbot_core::LifecyclePhase,
+    reason: Option<hbot_core::StopReason>,
+    handler: &Persistent<Function<'static>>,
+    output: &Arc<Mutex<HostOutput>>,
+    project: &CompiledProject,
+    ai: &AiSlot,
+) -> Result<(), CodeError> {
+    let result = async {
+        let event = build_lifecycle_event(ctx, phase, reason, output, ai)?;
+        let function = handler.clone().restore(ctx)?;
+        // {BT}onStop{BT} 拿原因作为第二个参数；{BT}onStart{BT} 只有一个参数。
+        let pending: MaybePromise<'js> = match phase {
+            hbot_core::LifecyclePhase::Start => function.call((event,))?,
+            hbot_core::LifecyclePhase::Stop => {
+                function.call((event, reason.map(|reason| reason.as_str())))?
+            }
+        };
+        pending.into_future::<Value<'js>>().await?;
+        Ok::<(), rquickjs::Error>(())
+    }
+    .await;
+    result.map_err(|error| describe(ctx, error, project))
+}
+
+/// 生命周期钩子的 ctx：只有 {BT}phase{BT} / {BT}reason{BT} 与 {BT}log{BT} / {BT}sleep{BT} / {BT}ai{BT}。
+///
+/// 比所有其它事件都窄，理由同定时器：{BT}onStart{BT} / {BT}onStop{BT} 背后没有会话，也就没有
+/// 回复目标与历史。**没有** {BT}reply{BT}（停机时发消息没有任何东西保证它发得出去），
+/// 也没有 {BT}kv{BT} / {BT}history{BT} / {BT}device{BT} / {BT}jobs{BT} / {BT}session{BT} —— 它们都要一个 bot 身份，
+/// 而生命周期钩子恰恰在身份建立之前 / 拆除之后跑。
+fn build_lifecycle_event<'js>(
+    ctx: &Ctx<'js>,
+    phase: hbot_core::LifecyclePhase,
+    reason: Option<hbot_core::StopReason>,
+    output: &Arc<Mutex<HostOutput>>,
+    ai: &AiSlot,
+) -> rquickjs::Result<Object<'js>> {
+    let lifecycle_event = Object::new(ctx.clone())?;
+    lifecycle_event.set("phase", phase.as_str())?;
+    lifecycle_event.set("reason", reason.map(|reason| reason.as_str()))?;
+    // 这一路没有 bot / 会话身份，任何残留都是「读到上一个人的东西」。
+    ai.reset_event();
+    let _ = output;
+
+    let host: Object<'js> = ctx.globals().get("__hbot")?;
+    lifecycle_event.set("log", host.get::<_, Function<'js>>("log")?)?;
+    lifecycle_event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
+    lifecycle_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
+    Ok(lifecycle_event)
+}
 /// 一次 webhook 调用的原始结果：常规事件结果 + handler 的返回值。
 ///
 /// 与 [`RawEvent`] 分开是刻意的：只有这一路有返回值，给其余命令都挂一个恒为 `None`
@@ -1962,7 +2188,7 @@ struct RawWebhook {
     response: Option<serde_json::Value>,
 }
 
-/// 跑一次 {BT}onWebhook{BT}：预算、日志收集、返回值都归这里。
+/// 跑一次 `onWebhook`：预算、日志收集、返回值都归这里。
 #[allow(clippy::too_many_arguments)]
 async fn run_webhook<'js>(
     ctx: &Ctx<'js>,
@@ -2036,10 +2262,10 @@ async fn run_webhook<'js>(
     }
 }
 
-/// 调用 {BT}onWebhook{BT}，把返回值转成 JSON。
+/// 调用 `onWebhook`，把返回值转成 JSON。
 ///
-/// {BT}undefined{BT} / {BT}null{BT} 是合法的"无应答体"（204），不是错误；其余值走
-/// {BT}JSON.stringify{BT}，所以 {BT}{ status: 418, body: "teapot" }{BT} 这类信封天然可表达。
+/// `undefined` / `null` 是合法的"无应答体"（204），不是错误；其余值走
+/// `JSON.stringify`，所以 `{ status: 418, body: "teapot" }` 这类信封天然可表达。
 #[allow(clippy::too_many_arguments)]
 async fn invoke_webhook<'js>(
     ctx: &Ctx<'js>,
@@ -2062,7 +2288,7 @@ async fn invoke_webhook<'js>(
     result.map_err(|error| describe(ctx, error, project))
 }
 
-/// 把 handler 的返回值转成 {BT}serde_json::Value{BT}；{BT}undefined{BT} / {BT}null{BT} → {BT}None{BT}。
+/// 把 handler 的返回值转成 `serde_json::Value`；`undefined` / `null` → `None`。
 fn json_of_return<'js>(
     ctx: &Ctx<'js>,
     value: &Value<'js>,
@@ -2393,12 +2619,12 @@ fn build_job_event<'js>(
     job_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
     Ok(job_event)
 }
-/// {BT}onWebhook{BT} 的上下文：请求字段 + {BT}log{BT} / {BT}sleep{BT} / {BT}ai{BT}。
+/// `onWebhook` 的上下文：请求字段 + `log` / `sleep` / `ai`。
 ///
-/// 比消息 ctx 窄得多，理由与 {BT}build_timer_event{BT} 相同：外部请求没有会话，也就没有
-/// 回复目标。这里**没有** {BT}ctx.reply{BT}（不是"有但会报错"）—— webhook 的应答走 handler
-/// 的返回值，多一个 {BT}reply{BT} 只会让人以为消息真发出去了。{BT}device{BT} / {BT}kv{BT} /
-/// {BT}history{BT} / {BT}jobs{BT} / {BT}session{BT} 同样不挂：它们都要一个 bot 或会话身份，而这一路
+/// 比消息 ctx 窄得多，理由与 `build_timer_event` 相同：外部请求没有会话，也就没有
+/// 回复目标。这里**没有** `ctx.reply`（不是"有但会报错"）—— webhook 的应答走 handler
+/// 的返回值，多一个 `reply` 只会让人以为消息真发出去了。`device` / `kv` /
+/// `history` / `jobs` / `session` 同样不挂：它们都要一个 bot 或会话身份，而这一路
 /// 只有"哪个路由 + 一段体"。
 fn build_webhook_event<'js>(
     ctx: &Ctx<'js>,
