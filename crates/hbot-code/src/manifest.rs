@@ -112,6 +112,19 @@ pub struct Capabilities {
     /// 而不是收下一个跑不起来的作业。
     #[serde(default)]
     pub jobs: Vec<hbot_core::JobSpec>,
+    /// 出口能力（C3）：`ctx.send(conversationId, text, options?)`。
+    ///
+    /// 一个布尔就够：发到哪个会话由**调用点**决定（那是数据，不是声明）。
+    /// 反过来说明「有没有权力主动发消息」才是清单该回答的问题 —— 它比 `reply`
+    /// 大一级：`reply` 只能回到刚刚说话的那个会话，`send` 能开一个新对话。
+    #[serde(default)]
+    pub send: bool,
+    /// 出口能力（C3）：`ctx.notify(text)` 的目标，**钉在清单里**。
+    ///
+    /// 与 `send` 相反：目标不来自参数，来自声明。这样「运维告警发给值班群」
+    /// 这件事在代码里无从写错收件人，也不需要每次调用都查库。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<hbot_core::NotifyTarget>,
 }
 
 /// 状态能力（`docs/07` §5）。
@@ -178,6 +191,20 @@ impl Capabilities {
     #[must_use]
     pub fn jobs(&self) -> &[hbot_core::JobSpec] {
         &self.jobs
+    }
+
+    /// `ctx.send` 是否可用（声明层判据；宿主装配再判一道）。
+    #[must_use]
+    pub fn send(&self) -> bool {
+        self.send
+    }
+
+    /// `ctx.notify` 的目标（`None` = 没声明这个能力）。
+    ///
+    /// 返回的是引用：目标里有会话 ID，拷贝出去只会让两处各自演化。
+    #[must_use]
+    pub fn notify(&self) -> Option<&hbot_core::NotifyTarget> {
+        self.notify.as_ref()
     }
 }
 
@@ -378,6 +405,16 @@ impl Manifest {
         // 作业类型表：与定时器同一个判据顺序、同一个理由（写错就在加载时报，
         // 不等到第一次入队才静默不动）。校验只有一份，在
         // `hbot-core::bot_jobs::validate_specs`。
+        // 通知目标在加载时就校验，不留到第一次 `ctx.notify`：清单写错类型
+        // 的后果是发给另一个人，那不该在半夜第一次告警时才暴露。
+        if let Some(target) = &self.capabilities.notify {
+            hbot_core::validate_notify_target(target).map_err(|error| {
+                crate::error::CodeError::ManifestInvalid {
+                    path: manifest_path.to_path_buf(),
+                    message: format!("`capabilities.notify` 不合法：{error}"),
+                }
+            })?;
+        }
         hbot_core::validate_specs(&self.capabilities.jobs).map_err(|error| {
             invalid(
                 &manifest_path,

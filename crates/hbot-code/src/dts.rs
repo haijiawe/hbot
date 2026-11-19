@@ -152,6 +152,26 @@ declare module 'hbot' {
      * `HBOT_SESSION_PENDING` 并点名挡路的那条）。等待落库，进程重启后仍然有效。 */
     readonly session: SessionApi;
 
+    /* 出口能力面（C3）。
+     *
+     * **存在不等于被授权。** `ctx.send` / `ctx.notify` 出现在这里只说明本项目
+     * `hbot.json` 声明了 `capabilities.send` / `capabilities.notify`；宿主没接出站
+     * 队列时抛 `HBOT_SEND_UNAVAILABLE` / `HBOT_NOTIFY_UNAVAILABLE`（**不**先收进内存：
+     * 那会让"进程一崩这条消息就没了"变成没人发现的静默行为）。
+     *
+     * 与 `reply` 的差别只有一处，但它是安全边界：`reply` 绑定在触发本次 handler 的
+     * 那条入站消息上（`reply_to` 指向它）；`send` 是**主动**消息、不带 `reply_to` ——
+     * 不许把一条主动消息挂到一条旧事件上。
+     *
+     * 目标缺失是独立的一种失败：`send` 没给 `options.kind` 时宿主会去 `conversations`
+     * 查这个会话，查不到报 `HBOT_SEND_NO_TARGET`，**不猜**类型 —— 猜错就是发给另一个人。
+     */
+
+    /** 主动发一条消息到指定会话（平台侧会话 id，不是库里的 UUID）。 */
+    send(conversationId: string, text: string, options?: SendOptions): Promise<void>;
+    /** 发到清单 `capabilities.notify` 钉死的那个会话；目标不来自参数。 */
+    notify(text: string): Promise<void>;
+
     /** 回复这条消息，绑定 reply_to。 */
     reply(text: string): void;
     /** 写一条运行日志，进 RunLog，不进聊天。 */
@@ -488,6 +508,13 @@ declare module 'hbot' {
     /** 智能能力面，与消息事件同一份实现。 */
     readonly ai: AiApi;
   }
+  /** `ctx.send` 的第三个参数。 */
+  export interface SendOptions {
+    /** 目标会话的类型。省略时宿主去 `conversations` 表里查；查不到报
+     *  `HBOT_SEND_NO_TARGET`。写上它就省掉那次查询，也省掉"猜"的机会。 */
+    kind?: 'private' | 'group' | 'channel';
+  }
+
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */
@@ -496,6 +523,14 @@ declare module 'hbot' {
   export function reply(text: string): void;
   /** 等待若干毫秒，等同 ctx.sleep。 */
   export function sleep(ms: number): Promise<void>;
+  /** 主动发消息，等同 `ctx.send`。 */
+  export function send(
+    conversationId: string,
+    text: string,
+    options?: SendOptions,
+  ): Promise<void>;
+  /** 发到清单钉死的会话，等同 `ctx.notify`。 */
+  export function notify(text: string): Promise<void>;
   /** HTTP 客户端。当前只有 GET，且 host 必须在 hbot.json 的 permissions.http 里。 */
   export const http: {
     /** 发一个 GET；失败时 reject，message 以 `HBOT_HTTP_DENIED` / `HBOT_HTTP_FAILED` 开头。 */
@@ -1237,6 +1272,11 @@ mod drift {
         // with an init bag. Keep this list precise; a broad entry would have to be
         // deleted instead of narrowed, and would take the whole check with it.
         //
+        // `send(` was removed when C3.send shipped (2026-11-19): it is false by design now.
+        // What is still missing on the egress side is **attachments** — text is all a caller
+        // can push — so the entries below are the precise remainder instead of the broad one
+        // (`AGENTS.md` §8.7: a broad entry must be deleted, not kept).
+        //
         // `kv.` was removed for the same reason: `ctx.kv` shipped with C2, so
         // "`kv.` must not appear" is now false by design. What is still missing is
         // **cross-conversation** history and any streaming/watch API — those are
@@ -1245,7 +1285,9 @@ mod drift {
             "onStart",
             "onStop",
             "onSchedule",
-            "send(",
+            "sendFile(",
+            "sendImage(",
+            "notifyFile(",
             "http.post",
             "http.fetch",
             "http.request",

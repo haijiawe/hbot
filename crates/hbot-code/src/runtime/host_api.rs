@@ -45,6 +45,7 @@ use crate::error::CodeError;
 use crate::http::{GetOptions, HttpConfig, HttpResponse};
 use crate::jobs::JobSlot;
 use crate::limits::Deadline;
+use crate::send::SendSlot;
 use crate::state::StateSlot;
 
 /// The keys [`install`] writes on `globalThis.__hbot`, in one place.
@@ -53,7 +54,8 @@ use crate::state::StateSlot;
 /// exports of [`HOST_MODULE_SOURCE`] and with the declarations in `hbot.d.ts`,
 /// so a binding added here without its two declarations is a test failure.
 pub(crate) const HOST_BINDING_KEYS: &[&str] = &[
-    "log", "reply", "sleep", "http", "device", "kv", "history", "ai", "jobs", "session",
+    "log", "reply", "sleep", "http", "device", "kv", "history", "ai", "jobs", "session", "send",
+    "notify",
 ];
 
 /// Upper bound on captured `log`/`reply` entries per event.
@@ -153,6 +155,7 @@ pub(crate) fn install<'js>(
     ai: Arc<AiSlot>,
     jobs: Arc<JobSlot>,
     session: Arc<crate::session::SessionSlot>,
+    send: Arc<SendSlot>,
 ) -> Result<(), CodeError> {
     let host = Object::new(ctx.clone()).map_err(super::js_error)?;
 
@@ -245,6 +248,9 @@ pub(crate) fn install<'js>(
     // 会话等待同样不需要预算参数：`prompt` 是一次库写（`spawn_blocking` 里等），
     // 不是一次模型调用 —— 它没有可抵账的墙钟。
     let session_object = super::session_api::install(ctx, &session)?;
+    // 出站同样不需要预算：一次出站入队是往 supervisor 的有界通道里放一条，不是
+    // 一次模型调用 —— 通道满时它等的是 worker 的进度，不是 handler 的墙钟。
+    let (send_function, notify_function) = super::send_api::install(ctx, &send)?;
 
     host.set("log", log).map_err(super::js_error)?;
     host.set("reply", reply).map_err(super::js_error)?;
@@ -257,6 +263,9 @@ pub(crate) fn install<'js>(
     host.set("ai", ai_object).map_err(super::js_error)?;
     host.set("jobs", jobs_object).map_err(super::js_error)?;
     host.set("session", session_object)
+        .map_err(super::js_error)?;
+    host.set("send", send_function).map_err(super::js_error)?;
+    host.set("notify", notify_function)
         .map_err(super::js_error)?;
     debug_assert_eq!(
         host.keys::<String>()
@@ -392,6 +401,40 @@ export function log(message) {
 
 export function reply(text) {
   return host.reply(text);
+}
+
+/**
+ * 主动发一条消息给指定会话（**不是**回复入站消息）。
+ *
+ * 与 `reply()` 的差别只有一处，但它是安全边界：`reply()` 绑定在触发这次 handler
+ * 的那条入站消息上（`reply_to` 指向它）；`send()` 是**主动**消息，不带
+ * `reply_to` —— 不许把一条主动消息挂到一条旧事件上（见 AGENTS.md §4.1）。
+ *
+ * `conversationId` 是平台侧的会话标识（群号 / 用户 ID / 频道 ID），不是库里的 UUID。
+ * `options.kind`（`'private' | 'group' | 'channel'`）缺省时宿主会去 `conversations`
+ * 表里查这个会话；查不到就拒绝（`HBOT_SEND_NO_TARGET`），而不是猜一个 `private` ——
+ * 猜错就是把消息发给别人。想避免这次查询就把 `kind` 写上。
+ *
+ * 需要 `hbot.json` 的 `capabilities.send: true`。没声明报 `HBOT_SEND_NOT_DECLARED`，
+ * 宿主没接出站队列报 `HBOT_SEND_UNAVAILABLE`，参数不合法报 `HBOT_SEND_INVALID`。
+ *
+ * Presence is not authorization: `ctx.send` 出现在 `hbot.d.ts` 里只说明项目声明了这个
+ * 能力，宿主有没有装出站队列是另一回事。
+ */
+export function send(conversationId, text, options) {
+  return host.send(conversationId, text, options);
+}
+
+/**
+ * 发到清单里钉死的那个会话（`capabilities.notify`）。
+ *
+ * 与 `send()` 的差别是**目标来自清单、不来自参数**：调用点无从选错收件人，这正是
+ * "运维告警发给值班群"需要的形状。没声明报 `HBOT_NOTIFY_NOT_DECLARED`，宿主没装
+ * 出站队列报 `HBOT_NOTIFY_UNAVAILABLE`，参数不合法报 `HBOT_NOTIFY_INVALID`。
+ * 清单里的目标必须带 `kind`（`unknown` 不算），所以这里不存在"猜类型"。
+ */
+export function notify(text) {
+  return host.notify(text);
 }
 
 export function sleep(ms) {
@@ -585,7 +628,7 @@ export const session = {
   },
 };
 
-export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session };
+export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session, send, notify };
 "#;
 
 #[cfg(test)]

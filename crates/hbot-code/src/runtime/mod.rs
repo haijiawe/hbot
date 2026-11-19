@@ -23,6 +23,7 @@ pub(crate) mod device_api;
 pub(crate) mod host_api;
 mod isolate;
 pub(crate) mod jobs_api;
+pub(crate) mod send_api;
 pub(crate) mod session_api;
 pub(crate) mod state_api;
 

@@ -40,6 +40,7 @@ use crate::instrument;
 use crate::jobs::JobSlot;
 use crate::limits::{Deadline, Limits};
 use crate::modules;
+use crate::send::SendSlot;
 use crate::state::StateSlot;
 use crate::timer::TimerSlot;
 use hbot_core::debug::{Breakpoints, DebugSink};
@@ -157,6 +158,12 @@ pub struct Sandbox {
     /// 与 [`Sandbox::jobs`] 同一理由 clone 给 worker：`ctx.session.prompt` 是在 handler
     /// 体内被调用的，它要读「本事件属于哪个会话、谁在说话」，两样都在 worker 侧。
     session: Arc<crate::session::SessionSlot>,
+    /// 出站槽：声明开关 + 清单目标 + 出站端口，随事件替换。
+    ///
+    /// 与 [`Sandbox::jobs`] 同一理由 clone 给 worker：`ctx.send` / `ctx.notify`
+    /// 是在 handler 体内被调用的，它们读的是**这个槽**，不是事件里那份快照 ——
+    /// 改清单（声明 / 通知目标）之后下一次调用就按新清单判，不需要重启 bot。
+    send: Arc<SendSlot>,
 }
 
 /// Mutable debug state shared with the worker thread.
@@ -235,6 +242,8 @@ impl Sandbox {
         let worker_jobs = Arc::clone(&jobs);
         let session = Arc::new(crate::session::SessionSlot::new());
         let worker_session = Arc::clone(&session);
+        let send = Arc::new(SendSlot::new());
+        let worker_send = Arc::clone(&send);
         let worker_debug = Arc::clone(&debug);
         let worker_control = Arc::clone(&control);
         let worker_http = Arc::clone(&http);
@@ -256,6 +265,7 @@ impl Sandbox {
                     worker_ai,
                     worker_jobs,
                     worker_session,
+                    worker_send,
                     &started_tx,
                     &finished_tx,
                 )
@@ -277,6 +287,7 @@ impl Sandbox {
             timer,
             jobs,
             session,
+            send,
         };
 
         // Wait for the entry module to finish evaluating before handing out a
@@ -538,6 +549,24 @@ impl Sandbox {
     #[must_use]
     pub fn is_jobs_assembled(&self) -> bool {
         self.jobs.is_assembled()
+    }
+
+    /// 装（或替换）出口能力的声明开关、通知目标与出站端口。
+    ///
+    /// 三样**一起**装，理由同 [`Sandbox::set_session`]：只装端口会让「声明了才准发」
+    /// 退化成「装配了就能发」，而只装声明会让清单说可以、调用报 `UNAVAILABLE`。
+    ///
+    /// `target` 是 `capabilities.notify` 里的目标；`None` 表示清单没声明该能力
+    /// （`ctx.notify` 报 `HBOT_NOTIFY_NOT_DECLARED`，与「宿主没装队列」分开）。
+    pub fn set_egress(
+        &self,
+        send_declared: bool,
+        target: Option<hbot_core::NotifyTarget>,
+        queue: Arc<dyn crate::send::SendQueue>,
+    ) {
+        self.send.set_send_declared(send_declared);
+        self.send.set_notify_target(target);
+        self.send.set_queue(queue);
     }
 
     /// 已声明的作业类型数（0 表示清单没写 `capabilities.jobs`）。
@@ -1050,11 +1079,13 @@ fn worker(
     ai: Arc<AiSlot>,
     jobs: Arc<JobSlot>,
     session: Arc<crate::session::SessionSlot>,
+    send: Arc<SendSlot>,
     started: &Sender<Result<(), CodeError>>,
     finished: &Sender<()>,
 ) {
     if let Err(error) = serve(
-        inbox, project, limits, debug, control, http, device, state, ai, jobs, session, started,
+        inbox, project, limits, debug, control, http, device, state, ai, jobs, session, send,
+        started,
     ) {
         tracing::error!(
             code = error.code(),
@@ -1137,6 +1168,7 @@ fn serve(
     ai: Arc<AiSlot>,
     jobs: Arc<JobSlot>,
     session: Arc<crate::session::SessionSlot>,
+    send: Arc<SendSlot>,
     started: &Sender<Result<(), CodeError>>,
 ) -> Result<(), CodeError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1195,12 +1227,13 @@ fn serve(
         let ai = &ai;
         let jobs = &jobs;
         let session = &session;
+        let send = &send;
         local.block_on(&runtime, async move {
             context
                 .async_with(async |ctx| {
                     bootstrap(
                         &ctx, &entry, output, deadline, project, debug, control, http, device,
-                        state, ai, jobs, session, limits,
+                        state, ai, jobs, session, send, limits,
                     )
                     .await
                 })
@@ -1464,6 +1497,7 @@ async fn bootstrap<'js>(
     ai: &Arc<AiSlot>,
     jobs: &Arc<JobSlot>,
     session: &Arc<crate::session::SessionSlot>,
+    send: &Arc<SendSlot>,
     limits: Limits,
 ) -> Result<Hooks, CodeError> {
     deadline.reset();
@@ -1480,6 +1514,7 @@ async fn bootstrap<'js>(
             Arc::clone(ai),
             Arc::clone(jobs),
             Arc::clone(session),
+            Arc::clone(send),
         )?;
         // The probe functions exist in both builds so the loader never has to
         // care, but `__hbot_dbg` starts `false`: a release build never emits a
@@ -2296,6 +2331,10 @@ fn build_event<'js>(
     event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
     event.set("jobs", host.get::<_, Object<'js>>("jobs")?)?;
     event.set("session", host.get::<_, Object<'js>>("session")?)?;
+    // 出站是**平铺**在 ctx 上的两个函数（与 reply / history 同形），不是对象：
+    // `dts` 的 message_ctx_functions 按「4 空格缩进且含左括号」收集它们。
+    event.set("send", host.get::<_, Function<'js>>("send")?)?;
+    event.set("notify", host.get::<_, Function<'js>>("notify")?)?;
     Ok(event)
 }
 
