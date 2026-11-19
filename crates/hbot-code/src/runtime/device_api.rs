@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use hbot_core::{
     ClipboardOp, DeviceCapability, DeviceTarget, InputAction, MouseButton, OcrRequest, OcrText,
-    ScreenshotRequest, WindowInfo,
+    ScreenshotRequest, WindowCaptureRequest, WindowInfo,
 };
 use rquickjs::prelude::{Async, Opt};
 use rquickjs::{Array, Ctx, Exception, Function, IntoJs, Object, Value};
@@ -135,22 +135,41 @@ pub(crate) fn install<'js>(
                             return DeviceReply::Screen(Err(message));
                         }
                     };
-                    let max_bytes = request.max_bytes;
-                    let outcome = call(
-                        granted.handles.backend_arc(),
-                        granted.budget,
-                        move |backend| backend.screenshot(&request),
-                    )
-                    .await;
-                    DeviceReply::Screen(outcome.map_err(|failure| failure.message()).and_then(
-                        |screenshot| {
-                            // 后端不判"是不是太胖"（`docs/09` §5 ②）：上限在闸之后、
-                            // 进 JS 堆之前由这里判，超了就是拒绝，不截断。
-                            check_frame_size(screenshot.png.len(), max_bytes)
-                                .map_err(|error| error.to_string())?;
-                            Ok(ScreenFrame::from(screenshot))
-                        },
-                    ))
+                    // 两个目标走同一段尾巴：**取帧上限在闸之后、进 JS 堆之前**判
+                    // （`docs/09` §5 ② 后端不判胖瘦），超了就是拒绝，不截断。
+                    let outcome = match request {
+                        ScreenRequest::Monitor(request) => {
+                            let max_bytes = request.max_bytes;
+                            call(
+                                granted.handles.backend_arc(),
+                                granted.budget,
+                                move |backend| backend.screenshot(&request),
+                            )
+                            .await
+                            .map_err(|failure| failure.message())
+                            .and_then(|screenshot| {
+                                check_frame_size(screenshot.png.len(), max_bytes)
+                                    .map_err(|error| error.to_string())?;
+                                Ok(ScreenFrame::from(screenshot))
+                            })
+                        }
+                        ScreenRequest::Window(request) => {
+                            let max_bytes = request.max_bytes;
+                            call(
+                                granted.handles.backend_arc(),
+                                granted.budget,
+                                move |backend| backend.capture_window(&request),
+                            )
+                            .await
+                            .map_err(|failure| failure.message())
+                            .and_then(|capture| {
+                                check_frame_size(capture.png.len(), max_bytes)
+                                    .map_err(|error| error.to_string())?;
+                                Ok(ScreenFrame::from(capture))
+                            })
+                        }
+                    };
+                    DeviceReply::Screen(outcome)
                 }
             }),
         )
@@ -450,16 +469,45 @@ async fn send_input(granted: Granted, action: InputAction) -> Result<(), String>
     .map_err(|failure| failure.message())
 }
 
+/// `screen(options)` 要截的目标。
+///
+/// 屏幕与窗口是**两种**目标，不是一个请求上的两个可选字段：后者会让
+/// "两个都给了算什么"变成每个消费者各自解释的事，而授权层不能有这种歧义。
+enum ScreenRequest {
+    Monitor(ScreenshotRequest),
+    Window(WindowCaptureRequest),
+}
+
 /// `screen()` 的默认请求：主屏、[`MAX_SCREEN_BYTES`]。
-fn default_request() -> Result<ScreenshotRequest, String> {
-    Ok(ScreenshotRequest {
+fn default_request() -> Result<ScreenRequest, String> {
+    Ok(ScreenRequest::Monitor(ScreenshotRequest {
         monitor: None,
         max_bytes: MAX_SCREEN_BYTES,
-    })
+    }))
+}
+
+/// 把 `screen({ window })` 的句柄解析成 `u64`。
+///
+/// 窗口句柄在 JS 侧就是 `windows()` 返回的 `id`（数字），两处口径必须一致：
+/// 一处数字一处字符串（为了避免 u64 精度）比精度本身更难查 —— 调用方会把
+/// 一个方法里拿到的值喂给另一个方法，类型不匹配的那一刻才发现。
+///
+/// 拒绝 0 与负数：Win32 的 `HWND` 永远不是 0（0 是 NULL），负数只可能是把别的
+/// 数字错当成句柄。不做隐式转换：`'12345'` 不是句柄，`12345.5` 也不是。
+fn parse_window_id(window: f64) -> Result<u64, String> {
+    if !window.is_finite() || window <= 0.0 || window.fract() != 0.0 {
+        return Err(failed(
+            "screen(options): window 必须是 windows() 给出的窗口 id（正整数）",
+        ));
+    }
+    if window > (u64::MAX as f64) {
+        return Err(failed("screen(options): window 超出 64 位句柄范围"));
+    }
+    Ok(window as u64)
 }
 
 /// 读 `screen(options?)`。
-fn parse_screen_options(value: &Value<'_>) -> Result<ScreenshotRequest, String> {
+fn parse_screen_options(value: &Value<'_>) -> Result<ScreenRequest, String> {
     if value.is_undefined() || value.is_null() {
         return default_request();
     }
@@ -467,31 +515,49 @@ fn parse_screen_options(value: &Value<'_>) -> Result<ScreenshotRequest, String> 
         return Err(failed("screen(options): options 必须是对象"));
     };
 
-    let mut request = ScreenshotRequest {
-        monitor: None,
-        max_bytes: MAX_SCREEN_BYTES,
-    };
-    if let Some(monitor) = object
+    let monitor = object
         .get::<_, Option<f64>>("monitor")
+        .map_err(js_message)?;
+    let window = object.get::<_, Option<f64>>("window").map_err(js_message)?;
+
+    if monitor.is_some() && window.is_some() {
+        // 两个目标互斥：静默挑一个会让"我明明给了窗口"变成"截了整屏"。
+        return Err(failed(
+            "screen(options): monitor 与 window 只能给一个（前者截整块屏，后者截一个窗口）",
+        ));
+    }
+
+    let mut max_bytes = MAX_SCREEN_BYTES;
+    if let Some(limit) = object
+        .get::<_, Option<f64>>("maxBytes")
         .map_err(js_message)?
     {
+        if !limit.is_finite() || limit < 1.0 {
+            return Err(failed("screen(options): maxBytes 必须是正数"));
+        }
+        // 只能更小：上限是宿主定的（`docs/09` §5），调用方要不到更大的帧。
+        max_bytes = (limit.min(MAX_SCREEN_BYTES as f64)) as usize;
+    }
+
+    if let Some(window) = window {
+        return Ok(ScreenRequest::Window(WindowCaptureRequest {
+            window: parse_window_id(window)?,
+            max_bytes,
+        }));
+    }
+
+    let mut request = ScreenshotRequest {
+        monitor: None,
+        max_bytes,
+    };
+    if let Some(monitor) = monitor {
         // 0 = 主屏；显示器编号是整数，`1.5` 这种只可能是拼错了。
         if !monitor.is_finite() || monitor < 0.0 || monitor.fract() != 0.0 || monitor > 32.0 {
             return Err(failed("screen(options): monitor 必须是非负整数"));
         }
         request.monitor = Some(monitor as u32);
     }
-    if let Some(max_bytes) = object
-        .get::<_, Option<f64>>("maxBytes")
-        .map_err(js_message)?
-    {
-        if !max_bytes.is_finite() || max_bytes < 1.0 {
-            return Err(failed("screen(options): maxBytes 必须是正数"));
-        }
-        // 只能更小：上限是宿主定的（`docs/09` §5），调用方要不到更大的帧。
-        request.max_bytes = (max_bytes.min(MAX_SCREEN_BYTES as f64)) as usize;
-    }
-    Ok(request)
+    Ok(ScreenRequest::Monitor(request))
 }
 
 /// `ocr()` 的默认请求：整屏、[`DEFAULT_OCR_MAX_CHARS`] 个字符。
@@ -700,7 +766,15 @@ impl<'js> IntoJs<'js> for DeviceReply {
                     object.set("width", i64::from(frame.width))?;
                     object.set("height", i64::from(frame.height))?;
                     object.set("pngBase64", frame.png_base64.as_str())?;
-                    object.set("monitor", i64::from(frame.monitor))?;
+                    // 两个目标字段恰好给一个：整屏给 `monitor`，按窗口给 `window`。
+                    // 缺的那个**不写**（JS 侧是 `undefined`），而不是写成 0 / -1 ——
+                    // 0 是"主屏"这个合法值，用它冒充"没有"会让调用方误读来源。
+                    if let Some(monitor) = frame.monitor {
+                        object.set("monitor", i64::from(monitor))?;
+                    }
+                    if let Some(window) = frame.window {
+                        object.set("window", i64::try_from(window).unwrap_or(i64::MAX))?;
+                    }
                     Ok(object.into_value())
                 }
                 Err(message) => rejected(ctx, &message),
@@ -769,9 +843,28 @@ mod tests {
 
     #[test]
     fn screen_options_default_to_the_primary_monitor_and_the_host_cap() {
-        let request = default_request().expect("默认请求");
-        assert_eq!(request.monitor, None);
-        assert_eq!(request.max_bytes, MAX_SCREEN_BYTES);
+        match default_request().expect("默认请求") {
+            ScreenRequest::Monitor(request) => {
+                assert_eq!(request.monitor, None);
+                assert_eq!(request.max_bytes, MAX_SCREEN_BYTES);
+            }
+            ScreenRequest::Window(_) => panic!("默认请求必须是整屏，不是窗口"),
+        }
+    }
+
+    #[test]
+    fn a_window_handle_must_be_a_positive_whole_number() {
+        assert_eq!(parse_window_id(0x1234 as f64).expect("正常句柄"), 0x1234);
+        // 0 是 NULL；负数与小数只可能是把别的数字错当成句柄。
+        assert!(parse_window_id(0.0).is_err());
+        assert!(parse_window_id(-1.0).is_err());
+        assert!(parse_window_id(12.5).is_err());
+        assert!(parse_window_id(f64::NAN).is_err());
+        assert!(parse_window_id(f64::INFINITY).is_err());
+        // 错误文案只说"不合法"，不回显调用方给的值（与设备审计红线一致）。
+        let message = parse_window_id(-1.0).expect_err("负数必须拒");
+        assert!(message.starts_with("HBOT_DEVICE_FAILED: "), "{message}");
+        assert!(!message.contains("-1"), "错误里不该回显参数：{message}");
     }
 
     #[test]

@@ -63,8 +63,15 @@ pub struct ScreenFrame {
     pub height: u32,
     /// PNG 的 base64（标准字母表，带 `=` 补齐）。
     pub png_base64: String,
-    /// 这一帧来自哪个显示器（`0` = 主屏）。
-    pub monitor: u32,
+    /// 这一帧来自哪块屏（`0` = 主屏）；按窗口截图时是 `None`。
+    pub monitor: Option<u32>,
+    /// 这一帧来自哪个窗口句柄；整屏截图时是 `None`。
+    ///
+    /// 两个字段**恰好有一个**是 `Some`：目标本来就互斥（见
+    /// [`hbot_core::WindowCaptureRequest`] 的文档），这里用两个 `Option` 而不是一个枚举，
+    /// 是因为 JS 侧要把它摊成可选字段（`monitor?` / `window?`），摊开的形状与
+    /// 两个可选属性一一对应，比再套一层 `{ target: {...} }` 更贴调用方的写法。
+    pub window: Option<u64>,
 }
 
 impl From<Screenshot> for ScreenFrame {
@@ -73,7 +80,20 @@ impl From<Screenshot> for ScreenFrame {
             width: screenshot.width,
             height: screenshot.height,
             png_base64: base64_encode(&screenshot.png),
-            monitor: screenshot.monitor,
+            monitor: Some(screenshot.monitor),
+            window: None,
+        }
+    }
+}
+
+impl From<hbot_core::WindowCapture> for ScreenFrame {
+    fn from(capture: hbot_core::WindowCapture) -> Self {
+        Self {
+            width: capture.width,
+            height: capture.height,
+            png_base64: base64_encode(&capture.png),
+            monitor: None,
+            window: Some(capture.window),
         }
     }
 }

@@ -348,15 +348,24 @@ declare module 'hbot' {
     at: number;
   }
 
-  /** `ctx.device.screen(options)` 的可选参数。 */
+  /** `ctx.device.screen(options)` 的可选参数。
+   *
+   *  `monitor` 与 `window` **只能给一个**：前者截一整块屏，后者只截一个窗口。
+   *  两个都给会整次被拒绝（不静默挑一个）。 */
   export interface DeviceScreenOptions {
-    /** 显示器序号；省略取主屏。超范围或不是非负整数则整次调用被拒绝。 */
+    /** 显示器序号；省略取主屏（整屏截图）。超范围或不是非负整数则整次调用被拒绝。 */
     monitor?: number;
+    /** 要截的窗口句柄：取 `windows()` 返回的 `id`。窗口必须存在且没有最小化，
+     *  否则拒绝（不存在/已关闭/最小化分别是不同的失败文案）。 */
+    window?: number;
     /** 本帧字节上限（PNG 原始字节，不是 base64 长度）；默认 4 MiB，超过按 4 MiB 算。 */
     maxBytes?: number;
   }
 
-  /** 一帧截图。 */
+  /** 一帧截图。
+   *
+   *  `monitor` 与 `window` **恰好出现一个**：整屏截图给 `monitor`，按窗口截图给
+   *  `window`。缺的那个是 `undefined`（不是 0 或 -1 —— 0 是"主屏"这个合法值）。 */
   export interface DeviceScreen {
     /** 物理像素宽。 */
     width: number;
@@ -364,8 +373,10 @@ declare module 'hbot' {
     height: number;
     /** PNG 字节的 base64 文本（不是 `Uint8Array`，隔离区没有 Buffer）。 */
     pngBase64: string;
-    /** 这帧来自哪块屏（`monitor` 参数的解析结果）。 */
-    monitor: number;
+    /** 这帧来自哪块屏（`monitor` 参数的解析结果）。按窗口截图时没有这个字段。 */
+    monitor?: number;
+    /** 这帧来自哪个窗口（`window` 参数的解析结果）。整屏截图时没有这个字段。 */
+    window?: number;
   }
 
   /** 一块可见窗口。 */
@@ -406,7 +417,8 @@ declare module 'hbot' {
    *
    *  是否可用由运行时逐次判定，见 `MessageCtx.device` 的说明。 */
   export interface DeviceApi {
-    /** 截一帧；`pngBase64` 超上限时整次失败，不会给半帧。 */
+    /** 截一帧：默认主屏整屏；`window` 给了就只截那个窗口。
+     *  `pngBase64` 超上限时整次失败，不会给半帧。窗口最小化/已关闭会拒绝。 */
     screen(options?: DeviceScreenOptions): Promise<DeviceScreen>;
     /** 列出可见窗口。 */
     windows(): Promise<DeviceWindow[]>;

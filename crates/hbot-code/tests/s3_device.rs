@@ -28,7 +28,7 @@ use hbot_core::domain::SandboxMode;
 use hbot_core::{
     BotId, ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapability, DeviceCapabilityReport,
     DeviceError, DeviceGate, DeviceTarget, InputAction, OcrRequest, OcrText, Screenshot,
-    ScreenshotRequest, WindowInfo,
+    ScreenshotRequest, WindowCapture, WindowCaptureRequest, WindowInfo,
 };
 use serde_json::{Value, json};
 
@@ -120,6 +120,9 @@ struct Recorder {
     clipboard: Mutex<Vec<ClipboardOp>>,
     /// OCR requests the backend received.
     ocr: Mutex<Vec<OcrRequest>>,
+    /// 按窗口截图的请求：用它证明 window 目标走的是 `capture_window`，
+    /// 而不是"截整屏再裁"。
+    window_captures: Mutex<Vec<WindowCaptureRequest>>,
 }
 
 impl Recorder {
@@ -149,6 +152,13 @@ impl Recorder {
 
     fn ocr_requests(&self) -> Vec<OcrRequest> {
         self.ocr.lock().expect("ocr").clone()
+    }
+
+    fn window_captures(&self) -> Vec<WindowCaptureRequest> {
+        self.window_captures
+            .lock()
+            .expect("window captures")
+            .clone()
     }
 }
 
@@ -246,6 +256,7 @@ impl DeviceBackend for FakeBackend {
             ocr: true,
             input: true,
             window: true,
+            window_capture: true,
             clipboard: true,
             detail: None,
         }
@@ -308,6 +319,27 @@ impl DeviceBackend for FakeBackend {
         }
         Ok(ClipboardValue {
             text: "host-clipboard".to_owned(),
+        })
+    }
+
+    fn capture_window(&self, request: &WindowCaptureRequest) -> Result<WindowCapture, DeviceError> {
+        self.recorder.backend_calls.fetch_add(1, Ordering::SeqCst);
+        self.recorder
+            .window_captures
+            .lock()
+            .expect("window captures")
+            .push(request.clone());
+        let png = vec![0x89, 0x50, 0x4e, 0x48];
+        if png.len() > request.max_bytes {
+            return Err(DeviceError::TooLarge {
+                limit_bytes: request.max_bytes,
+            });
+        }
+        Ok(WindowCapture {
+            width: 5,
+            height: 6,
+            png,
+            window: request.window,
         })
     }
 
@@ -448,6 +480,77 @@ export default defineBot({
         json!([{ "id": 7, "title": "记事本", "process": "notepad.exe", "focused": true }])
     );
     assert_eq!(recorder.backend_calls(), 2, "截图 + 枚举各一次");
+}
+
+// ---------------------------------------------------------------------------
+// ③b 按窗口截图（2026-11-20）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_window_target_captures_that_window_and_never_touches_the_monitor_path() {
+    let source = r#"
+import { defineBot } from 'hbot';
+
+export default defineBot({
+  async onMessage(ctx) {
+    const frame = await ctx.device.screen({ window: 7, maxBytes: 1024 });
+    ctx.log(JSON.stringify(frame));
+  },
+});
+"#;
+    let (_project, sandbox) = sandbox("window-target", source, HttpConfig::deny_all());
+    let recorder = assemble(&sandbox, Verdict::Allow);
+
+    let outcome = dispatch(&sandbox).expect("全允许时应成功");
+    let frame: Value = serde_json::from_str(&outcome.logs[0]).expect("frame 是 JSON");
+    assert_eq!(frame["width"], json!(5));
+    assert_eq!(frame["height"], json!(6));
+    assert_eq!(frame["window"], json!(7), "来源必须是那个窗口");
+    assert!(
+        frame.get("monitor").is_none(),
+        "按窗口抓的帧不该带 monitor（0 是主屏这个合法值，不能拿来冒充『没有』）：{frame}"
+    );
+    assert_eq!(
+        frame["pngBase64"],
+        json!("iVBOSA=="),
+        "PNG 仍是 base64 字符串"
+    );
+
+    let requests = recorder.window_captures();
+    assert_eq!(requests.len(), 1, "只调一次按窗口截图");
+    assert_eq!(requests[0].window, 7);
+    assert_eq!(requests[0].max_bytes, 1024, "maxBytes 真的透传下去了");
+    assert_eq!(
+        recorder.backend_calls(),
+        1,
+        "不许先截整屏再裁：那样会多一次后端调用"
+    );
+}
+
+#[test]
+fn giving_both_monitor_and_window_is_refused_without_touching_the_backend() {
+    let source = r#"
+import { defineBot } from 'hbot';
+
+export default defineBot({
+  async onMessage(ctx) {
+    await ctx.device.screen({ monitor: 0, window: 7 });
+  },
+});
+"#;
+    let (_project, sandbox) = sandbox("window-and-monitor", source, HttpConfig::deny_all());
+    let recorder = assemble(&sandbox, Verdict::Allow);
+
+    let message = dispatch_error(&sandbox);
+    assert!(
+        message.starts_with("HBOT_DEVICE_FAILED:"),
+        "参数错误用 DEVICE_FAILED 前缀，实际：{message}"
+    );
+    assert!(
+        message.contains("只能给一个"),
+        "错误要说清两个目标互斥，实际：{message}"
+    );
+    assert_eq!(recorder.backend_calls(), 0, "参数不合法就不许碰后端");
 }
 
 // ---------------------------------------------------------------------------
