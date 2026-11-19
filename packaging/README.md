@@ -15,6 +15,8 @@
 > - 第一次在真机上装的时候，请从「按最宽松的配置跑通 → 再一条一条加加固」的顺序来。
 >
 > 唯一被真实执行验证过的部分是 `hbot serve` 本身（它已有单测与真机启动记录），
+> 以及本文件里引用的三个 CLI 行为：`hbot serve --allow-remote` 的拒启判据、
+> `hbot token --write`、`GET /healthz`（各有单测/集成测试，见 §3 的括号）。
 > 本文只负责"怎么把它挂成服务"。
 
 ---
@@ -26,13 +28,16 @@
 | `hbot` 二进制 | 放到 `/usr/local/bin/hbot` | 与 unit 里的 `ExecStart` 一致；换路径要同步改 unit |
 | 专用用户 | `hbot:hbot`，无登录 shell | 不要用 root 跑 |
 | 数据目录 | `/var/lib/hbot` | 由 `StateDirectory=hbot` 交给 systemd 创建（`0750`），**不要手工 `mkdir`** |
-| 端口 | `hbot serve` 默认监听本地回环 | 需要外部访问时自己加 `--addr`，并同步改防火墙 |
+| token 文件 | `/etc/hbot/hbot.env`，`0600 hbot:hbot` | unit 用 `EnvironmentFile=-` 读它；用 `hbot token --write` 生成，**别自己编一个** |
+| 端口 | `127.0.0.1:8787`（unit 里写死） | 要换端口改 `ExecStart` 的 `--bind`，并同步改 §3 的验证命令 |
 
 `hbot serve` 已经能跑：它启动后往 **stdout 打一行 ready JSON**
 （`{"type":"ready","addr":"…","pid":N}`），然后等 SIGTERM/SIGINT 优雅关闭
 （停机器人 → `handle.shutdown()`）。本目录不改它的任何行为。
 
 ## 2. 安装
+
+手工按顺序来（或者用 `packaging/install.sh`，它做的正是下面这几步）：
 
 ```bash
 # 1) 建用户（无家目录、无登录 shell）
@@ -41,21 +46,28 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin hbot
 # 2) 装二进制
 sudo install -Dm755 ./hbot /usr/local/bin/hbot
 
-# 3) 装 unit 与轮转配置
+# 3) 生成 token，写进 systemd 的 EnvironmentFile
+#    内容是 `HBOT_TOKEN=<64 位十六进制>` 一行；stdout 只打路径，token 不进终端回滚。
+sudo install -d -m 750 -o hbot -g hbot /etc/hbot
+sudo -u hbot /usr/local/bin/hbot token --write /etc/hbot/hbot.env
+sudo chmod 600 /etc/hbot/hbot.env
+
+# 4) 装 unit 与轮转配置
 sudo install -Dm644 packaging/systemd/hbot.service /etc/systemd/system/hbot.service
 sudo install -Dm644 packaging/logrotate.d/hbot     /etc/logrotate.d/hbot
 
-# 4) 起服务并设为开机启动
+# 5) 起服务并设为开机启动
 sudo systemctl daemon-reload
 sudo systemctl enable --now hbot
 
-# 5) 看状态与日志
+# 6) 看状态与日志
 systemctl status hbot
 journalctl -u hbot -f
 ```
 
 `--data-dir /var/lib/hbot` 是 unit 里写死的。数据目录里的内容是
-`hbot.db`（SQLite，WAL）与 `logs/`（崩溃报告 `crash-<时间戳>.log`）。
+`hbot.db`（SQLite，WAL）、`bot_sql/<botId>.db`（每个 bot 一个 SQL 库）与 `logs/`
+（崩溃报告 `crash-<时间戳>.log`）。
 
 ### 需要 GUI 时
 
@@ -69,16 +81,26 @@ journalctl -u hbot -f
 ```bash
 systemctl is-enabled hbot        # 期望 enabled
 systemctl is-active hbot        # 期望 active
-journalctl -u hbot -n 50 --no-pager   # 期望看到一行 ready JSON 与"数据目录"日志
+journalctl -u hbot -n 50 --no-pager   # 期望看到 ready JSON（含 addr 127.0.0.1:8787）与"数据目录"日志
+
+# 活体探针：不需要 token、不需要 WebSocket。给 systemd/反向代理/监控用。
+curl -s http://127.0.0.1:8787/healthz        # 期望 {"status":"ok","version":"…"}
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/   # 期望不是 200（那是 WS 入口）
+
 ls -la /var/lib/hbot            # 期望 hbot.db、logs/ 都是 hbot:hbot
+sudo -u hbot test -r /etc/hbot/hbot.env && echo token-ok
 sqlite3 /var/lib/hbot/hbot.db 'select count(*) from bots;'   # 期望不报错（0 也行）
 ```
+
+前两条 CLI 行为在仓库里有测试钉住：`/healthz` 见 `crates/hbot-rpc/src/ws.rs` 的
+`healthz_answers_a_plain_http_get_without_a_token`；`token --write` 见
+`crates/hbot-cli/tests/cli.rs` 的 `token_subcommand_writes_an_environment_file`。
 
 ## 4. 卸载
 
 ```bash
 sudo systemctl disable --now hbot
-sudo rm -f /etc/systemd/system/hbot.service /etc/logrotate.d/hbot
+sudo rm -f /etc/systemd/system/hbot.service /etc/logrotate.d/hbot /etc/hbot/hbot.env
 sudo systemctl daemon-reload
 sudo systemctl reset-failed hbot 2>/dev/null || true
 # 数据要不要删自己决定 —— 删了就没了（含机器人配置与聊天记录）
@@ -86,7 +108,33 @@ sudo rm -rf /var/lib/hbot
 sudo userdel hbot
 ```
 
-## 5. 加固与命令隔离：这里的取舍（重要）
+## 5. 对外暴露：必须显式确认（这里不提供 TLS）
+
+`hbot serve` **不实现 TLS**：它的 token 在 WebSocket 握手的第一帧里明文传输。
+因此绑定非回环地址时它会**拒绝启动**，除非显式加 `--allow-remote`：
+
+```bash
+# 会被拒绝（错误里会写清楚为什么、以及怎么补救）
+sudo -u hbot /usr/local/bin/hbot serve --bind 0.0.0.0:8787
+# 拒绝绑定非回环地址 0.0.0.0:8787：本服务不提供 TLS，直接暴露等于把 token 明文发出去。
+# 确实由前置反向代理终结 TLS 时，加 --allow-remote 显式确认。
+
+# 正确的对外形状：反向代理（nginx/caddy）终结 TLS，回源到 127.0.0.1:8787
+# —— 这种情况下根本不需要 --allow-remote，因为绑定地址仍是回环。
+```
+
+只有一种情况该加 `--allow-remote`：**代理与 hbot 不在同一台机器**、且这段网络你已经
+自己保护好了（内网/VPN/专用网段）。加之前先想清楚：这一段链路上 token 是明文。
+
+```ini
+# 那种情况下 unit 里改成（示例，按需替换地址）
+ExecStart=/usr/local/bin/hbot serve --bind 10.0.0.5:8787 --allow-remote --data-dir /var/lib/hbot
+```
+
+`--allow-remote` 在仓库里也有测试：`binding_a_public_address_is_refused_without_confirmation`
+（`crates/hbot-cli/tests/cli.rs`）。
+
+## 6. 加固与命令隔离：这里的取舍（重要）
 
 unit 里开了这一串加固：
 
@@ -115,7 +163,7 @@ unit 里开了这一串加固：
 - `DynamicUser=true`：与 `StateDirectory` 里的持久数据搭配容易出现属主漂移，
   本轮用固定系统用户。
 
-## 6. logrotate 说明（它管的其实很少）
+## 7. logrotate 说明（它管的其实很少）
 
 `packaging/logrotate.d/hbot` 只轮转 `/var/lib/hbot/logs/*.log`：
 
@@ -130,14 +178,12 @@ unit 里开了这一串加固：
   sudo logrotate -d /etc/logrotate.d/hbot     # -d = dry run，只打印计划
   ```
 
-## 7. 已知缺失
+## 8. 已知缺失
 
-- 没有打包成 `.deb` / `.rpm`：`packaging/` 只有 unit 与 logrotate，安装步骤是手工的。
-  （Tauri 的 `bundle.targets` 里有 `deb`/`appimage`，但那是给**桌面壳**用的，
-  不含这个 systemd unit。）
-- 没有 TLS/鉴权前置：`serve` 的 token 由 `--token` 或 `HBOT_TOKEN` 给；unit 里**没有**
-  写 token（写进 unit 等于写进 `/etc` 明文）。需要时用 `EnvironmentFile=` 指向一个
-  `0600` 的文件。
+- 没有打包成 `.deb` / `.rpm`：`packaging/` 只有 unit、logrotate 与一个安装脚本，
+  手工程序仍要按 §2 走一遍。（Tauri 的 `bundle.targets` 里有 `deb`/`appimage`，
+  但那是给**桌面壳**用的，不含这个 systemd unit。）
+- `install.sh` 也是草稿：它只在 Windows 上做过 shellcheck 级的人工审阅，没有在真机跑过。
 - 没做 `hbot` 用户的资源限制（`LimitNOFILE`、cgroup 内存上限）。
 - 没验证过重启风暴：`Restart=on-failure` + `RestartSec=5` 是最朴素的配置，
   没有 `StartLimitBurst` 调优。

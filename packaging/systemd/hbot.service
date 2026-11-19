@@ -1,3 +1,7 @@
+# 部署物（M9 本地可写那一半）。真机从未运行过，见 packaging/README.md 的状态声明。
+#
+# systemd-analyze verify packaging/systemd/hbot.service 在 Windows 上没法跑，
+# 第一次上真机请先 systemctl daemon-reload 再看 systemctl status 的报错。
 [Unit]
 Description=HBot QQ 机器人运行时（headless serve）
 Documentation=file:///usr/share/doc/hbot/README.md
@@ -9,7 +13,17 @@ Wants=network-online.target
 Type=simple
 # 注意：`hbot serve` 会往 stdout 打一行 ready JSON（含实际监听地址与 pid），
 # 那是启动成功的信号；Type=simple 不解析它，日志进 journald。
-ExecStart=/usr/local/bin/hbot serve --data-dir /var/lib/hbot
+#
+# 端口写死 127.0.0.1:8787 而不是默认的 :0：服务每次重启都换随机端口的话，
+# 前面的探活/反向代理就没法配。要换端口改这一行，并同步改 README 的验证清单。
+#
+# 这里**故意**没有 --allow-remote：本服务不提供 TLS，绑非回环等于把 token 明文发出去。
+# 真要对外，在前面放反向代理终结 TLS，再改成本机地址 + --allow-remote（见 README §5）。
+ExecStart=/usr/local/bin/hbot serve --bind 127.0.0.1:8787 --data-dir /var/lib/hbot
+# token 从 EnvironmentFile 读（内容就是 `HBOT_TOKEN=…` 一行，用 `hbot token --write` 生成）。
+# 前缀 `-` 表示文件不存在也不报错 —— 但那种情况下 serve 会自己随机生成一个 token，
+# 只有能从 journald 里读到它才连得上，所以正式部署请务必先生成这个文件。
+EnvironmentFile=-/etc/hbot/hbot.env
 # 让 Ctrl-C / systemctl stop 走 serve 已有的 SIGTERM 路径（停 bot → handle.shutdown()）。
 KillSignal=SIGTERM
 # 优雅退出最多等 30 秒（每个 bot 最多 5 秒停止宽限，见 hbot-rpc 的 STOP_GRACE）。
