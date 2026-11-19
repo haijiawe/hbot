@@ -360,6 +360,7 @@ mod tests {
                 history,
                 session: false,
                 sql: false,
+                files: hbot_core::FilesCapability::default(),
             },
             ..Capabilities::default()
         }

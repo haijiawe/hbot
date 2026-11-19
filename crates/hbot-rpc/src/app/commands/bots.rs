@@ -46,6 +46,7 @@ use crate::app::AppState;
 use crate::app::bots::running_bot;
 use crate::app::commands::{done, failed, unimplemented};
 use crate::app::runtime::config::{BotConfig, read_bot_config};
+use crate::app::runtime::files::ProjectFiles;
 use crate::app::runtime::jobs::StoreJobQueue;
 use crate::app::runtime::local;
 use crate::app::runtime::onebot::PLATFORM;
@@ -178,6 +179,11 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
                 root.clone(),
                 Arc::clone(state.bot_sql()),
             ))),
+            // 文件能力：路径钉在项目根里（符号链接也要落在根内），读 / 写分开声明。
+            // 不装配 = `ctx.files.*` 报 `HBOT_FILE_UNAVAILABLE`，明确失败。
+            files: Some(Arc::new(ProjectFiles::new(root.clone()).map_err(
+                |error| HbotError::internal(format!("项目根不可用，无法装配文件能力：{error}")),
+            )?)),
             jobs: Some(Arc::new(StoreJobQueue::new(
                 bot_id,
                 root.clone(),

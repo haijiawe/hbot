@@ -51,6 +51,7 @@ use tokio::sync::mpsc;
 
 use crate::app::debug::sink::BotDebugSink;
 use crate::app::debug::{BreakpointTarget, DebugRegistry};
+use crate::app::runtime::files::declared_files;
 use crate::app::runtime::fingerprint_cache::FingerprintCache;
 use crate::app::runtime::jobs::declared_jobs;
 use crate::app::runtime::net::http_config;
@@ -154,6 +155,11 @@ pub struct SandboxHandlerConfig {
     pub waits: Option<Arc<crate::app::runtime::waits::StoreWaitQueue>>,
     /// SQL 后端（`None` = 未装配，`ctx.sql.*` 报 `HBOT_SQL_UNAVAILABLE`）。
     pub sql: Option<Arc<crate::app::runtime::sql::StoreSqlBackend>>,
+    /// 文件后端（`None` = 未装配，`ctx.files.*` 报 `HBOT_FILE_UNAVAILABLE`）。
+    ///
+    /// 路径钉在项目根里：用户给的相对路径只在这个根的子树内解析，符号链接也要
+    /// 落到根里才放行（见 `app/runtime/files.rs`）。
+    pub files: Option<Arc<crate::app::runtime::files::ProjectFiles>>,
 }
 
 /// 一个 worker 槽位：指纹一致就复用，不一致说明代码变了，换新 isolate。
@@ -376,6 +382,11 @@ pub struct SandboxHandler {
     /// 与其它能力同一条纪律：**每次新建 isolate 时**才 `set_sql`，所以清单里
     /// `capabilities.state.sql` 的改动会在热重载后生效。
     sql: Option<Arc<crate::app::runtime::sql::StoreSqlBackend>>,
+    /// 文件端口（`None` = 未装配，`ctx.files.*` 报 `HBOT_FILE_UNAVAILABLE`）。
+    ///
+    /// 与其它能力同一条纪律：**每次新建 isolate 时**才 `set_files`，所以清单里
+    /// `capabilities.state.files` 的改动会在热重载后生效。
+    files: Option<Arc<crate::app::runtime::files::ProjectFiles>>,
 }
 
 /// 设备能力的两个端口 + 装配时刻。
@@ -416,6 +427,7 @@ impl SandboxHandler {
             waits: config.waits,
             send: None,
             sql: config.sql,
+            files: config.files,
         }
     }
 
@@ -500,6 +512,15 @@ impl SandboxHandler {
     /// 不是返回一个空结果集（那会让「表里没有数据」与「能力没装配」分不清）。
     pub fn with_sql(mut self, backend: Arc<crate::app::runtime::sql::StoreSqlBackend>) -> Self {
         self.sql = Some(backend);
+        self
+    }
+
+    /// 装配文件能力（`ctx.files.*` 的后端）。在 [`Self::new`] 之后立刻调。
+    ///
+    /// 不调用本方法 = `ctx.files.read` 每次回 `HBOT_FILE_UNAVAILABLE`，明确失败，
+    /// 不是返回空内容（那会让「文件是空的」与「能力没装配」分不清）。
+    pub fn with_files(mut self, backend: Arc<crate::app::runtime::files::ProjectFiles>) -> Self {
+        self.files = Some(backend);
         self
     }
 
@@ -791,6 +812,14 @@ impl SandboxHandler {
                 sandbox.set_sql(
                     declared_sql(&self.project_root),
                     Arc::clone(backend) as Arc<dyn hbot_code::sql::SqlBackend>,
+                );
+            }
+            // 文件能力：声明（读 / 写两半）与后端一起装。声明层现读清单，后端把路径钉在项目根上。
+            // 只装端口会让「声明了才准写」变成「装配了就能写」，与前面几个能力同一条纪律。
+            if let Some(backend) = &self.files {
+                sandbox.set_files(
+                    declared_files(&self.project_root),
+                    Arc::clone(backend) as Arc<dyn hbot_core::FileStore>,
                 );
             }
             tracing::debug!(
@@ -2274,6 +2303,7 @@ mod tests {
                     jobs: None,
                     waits: None,
                     sql: None,
+                    files: None,
                 })
                 .with_debounce(debounce)
                 .with_fingerprint_ttls(metadata_ttl, content_floor),

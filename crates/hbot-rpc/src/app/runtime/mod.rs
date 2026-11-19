@@ -30,6 +30,7 @@
 //! * [`AdapterFactory`]：[`PlatformRouter`] 是生产用的按平台路由，测试可注入假适配器。
 
 pub mod config;
+pub mod files;
 pub mod fingerprint_cache;
 pub mod jobs;
 pub mod local;
