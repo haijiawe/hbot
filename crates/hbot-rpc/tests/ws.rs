@@ -444,3 +444,59 @@ async fn metrics_count_authenticated_connections() {
     client.close(None).await.expect("关闭客户端");
     handle.shutdown().await;
 }
+
+// ── 健康检查：GET /healthz 不需要 token，也不升级 WebSocket ──────────────
+
+#[tokio::test]
+async fn healthz_answers_a_plain_http_get_without_a_token() {
+    let (handle, _dispatcher) = start(WsConfig::default()).await;
+    let addr = handle.addr();
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = TcpStream::connect(addr).await.expect("连健康检查端口");
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("写请求");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.expect("读响应");
+    let text = String::from_utf8(response).expect("响应是 UTF-8");
+
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "健康检查必须 200，实际响应：{text}"
+    );
+    assert!(
+        text.contains("\"status\":\"ok\""),
+        "健康检查的体要说清状态，实际响应：{text}"
+    );
+    // 探针不需要 token：整段应答里不该出现它。
+    assert!(!text.contains(TOKEN), "健康检查不能回显 token");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn other_paths_still_go_through_the_websocket_handshake() {
+    let (handle, _dispatcher) = start(WsConfig::default()).await;
+    let addr = handle.addr();
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = TcpStream::connect(addr).await.expect("连端口");
+    stream
+        .write_all(b"GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("写请求");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response).await;
+    let text = String::from_utf8_lossy(&response).to_string();
+
+    // 不是 /healthz 的普通 GET 不是 WebSocket 握手：tungstenite 在解析阶段就拒，
+    // 连一个字节的应答都不写（实测是空响应 + 关闭连接）。这里钉的是"拒绝"，
+    // 不是某一种具体的拒绝形状 —— 但**绝不能**是 200。
+    assert!(
+        !text.starts_with("HTTP/1.1 200"),
+        "非 /healthz 的 GET 不能被当健康检查，实际响应：{text}"
+    );
+    handle.shutdown().await;
+}

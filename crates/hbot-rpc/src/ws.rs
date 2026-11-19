@@ -71,6 +71,7 @@ use anyhow::Context as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use hbot_core::EventSink;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -105,6 +106,13 @@ pub const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 1024;
 ///
 /// 小而有界：关键事件数量天然少，给它一条不被状态洪水挤占的通道即可。
 const CRITICAL_QUEUE_CAPACITY: usize = 64;
+
+/// 健康检查路径：`GET /healthz` 回一行 JSON，供 systemd / 探针使用。
+///
+/// 它**不走** WebSocket 握手：在握手回调里直接给出 HTTP 应答并关闭连接。这样
+/// "服务还活着吗"与"能不能调用 RPC"是两件事 —— 探针不需要 token，也就不会把
+/// token 抄进监控系统的配置里。
+pub const HEALTH_PATH: &str = "/healthz";
 
 /// 关闭时等待单个任务收尾的上限。
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -640,12 +648,16 @@ async fn handle_connection(
 
 /// 单连接的完整流程。
 async fn run_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     peer: Option<SocketAddr>,
     hub: &Arc<Hub>,
     cfg: &Arc<WsConfig>,
     dispatcher: &Arc<Dispatcher>,
 ) -> anyhow::Result<()> {
+    if serve_health_if_requested(&mut stream).await {
+        return Ok(());
+    }
+
     let mut websocket = accept(stream, hub, cfg).await?;
     let mut shutdown = hub.shutdown.subscribe();
 
@@ -833,6 +845,56 @@ async fn accept(
     accept_hdr_async_with_config(stream, callback, Some(protocol))
         .await
         .context("WebSocket 握手失败")
+}
+
+/// `/healthz` 的应答体。
+fn health_body() -> String {
+    format!(
+        "{{\"status\":\"ok\",\"version\":\"{}\"}}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// 如果这条连接是一个 `GET /healthz`，就地回一行 HTTP 并关掉它。
+///
+/// **为什么要先 `peek` 再决定**：健康检查不是 WebSocket 升级请求，`tungstenite`
+/// 在解析握手之前就会拒掉它（连回调都不会进），所以"在握手回调里回答"这个写法
+/// 试过、拿到的是一条空的响应。`peek` 只读不消费：命中健康检查才真读走这段请求，
+/// 其余连接一个字节都不动，继续交给 `tungstenite`。
+///
+/// 返回 `true` 表示已经应答完毕，调用方直接返回。
+async fn serve_health_if_requested(stream: &mut TcpStream) -> bool {
+    const PEEK_TIMEOUT: Duration = Duration::from_millis(500);
+    const HEAD_BYTES: usize = 1024;
+
+    let mut probe = [0u8; HEAD_BYTES];
+    let peeked = match timeout(PEEK_TIMEOUT, stream.peek(&mut probe)).await {
+        Ok(Ok(peeked)) => peeked,
+        _ => return false,
+    };
+    if peeked == 0 {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&probe[..peeked]);
+    let is_health = head.starts_with("GET /healthz ")
+        || head.starts_with("GET /healthz\r")
+        || head.starts_with("GET /healthz?");
+    if !is_health {
+        return false;
+    }
+
+    // 把这段请求头读走（健康检查的请求头很短；读不到也无所谓，下面照样应答）。
+    let mut consumed = [0u8; HEAD_BYTES];
+    let _ = timeout(PEEK_TIMEOUT, stream.read(&mut consumed)).await;
+
+    let body = health_body();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+    true
 }
 
 /// 403 响应：`Origin` 被拒。
