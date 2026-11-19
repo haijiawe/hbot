@@ -28,6 +28,7 @@
 pub mod bot_ai;
 pub mod bot_egress;
 pub mod bot_jobs;
+pub mod bot_lifecycle;
 pub mod bot_session;
 pub mod bot_state;
 pub mod bot_timer;
@@ -59,6 +60,7 @@ pub use bot_jobs::{
     MIN_RETRY_DELAY_MS, retry_delay_ms, validate_idempotency_key, validate_job_name,
     validate_payload, validate_request, validate_specs,
 };
+pub use bot_lifecycle::{LifecyclePhase, STOP_BUDGET, StopReason};
 pub use bot_session::{
     DEFAULT_WAIT_TIMEOUT_MS, DueWait, MAX_WAIT_KEY_BYTES, MAX_WAIT_PROMPT_BYTES,
     MAX_WAIT_TIMEOUT_MS, MAX_WAITS_PER_BOT, MAX_WAITS_PER_CONVERSATION, MIN_WAIT_TIMEOUT_MS,
