@@ -1471,16 +1471,16 @@ impl SandboxHandler {
 
     /// 派发一次 webhook 请求，返回 HTTP 应答。
     ///
-    /// 与 {BT}dispatch_job_on{BT} 同形（编译 → 取 worker 槽 → {BT}spawn_blocking{BT}），但**没有重试、
+    /// 与 `dispatch_job_on` 同形（编译 → 取 worker 槽 → `spawn_blocking`），但**没有重试、
     /// 没有落库**：调用方是一个在等 HTTP 响应的外部系统，一次请求就是一次事件。
     ///
-    /// 三条错误各有各的归宿（见 {BT}hbot_core::bot_webhook::WebhookError{BT}）：
+    /// 三条错误各有各的归宿（见 `hbot_core::bot_webhook::WebhookError`）：
     ///
-    /// * 路由不在清单里 → {BT}NoRoute{BT}（404）；
-    /// * 没有 isolate（bot 没起来、槽位被清空）→ {BT}Unavailable{BT}（503）；
-    /// * handler 抛错 / 超时 → {BT}Failed{BT} / {BT}Timeout{BT}（500 / 504）。
+    /// * 路由不在清单里 → `NoRoute`（404）；
+    /// * 没有 isolate（bot 没起来、槽位被清空）→ `Unavailable`（503）；
+    /// * handler 抛错 / 超时 → `Failed` / `Timeout`（500 / 504）。
     ///
-    /// 日志无论成败都落库：外部系统看不到 {BT}ctx.log{BT}，它是唯一排障线索。
+    /// 日志无论成败都落库：外部系统看不到 `ctx.log`，它是唯一排障线索。
     pub async fn dispatch_webhook(
         &self,
         route: &str,
@@ -1503,7 +1503,7 @@ impl SandboxHandler {
                     reason: error.to_string(),
                 })?;
         // 外部请求没有会话可做稳定哈希，用路由名映射到 worker：同一条路由总落在同一个
-        // isolate 上，与 {BT}run_claimed_job{BT} 用作业主键是同一手法。
+        // isolate 上，与 `run_claimed_job` 用作业主键是同一手法。
         let index = stable_index(route, self.workers.len());
         let mut guard = self
             .worker(index, &fingerprint, &project)
@@ -1567,6 +1567,75 @@ impl SandboxHandler {
                         }
                     },
                 )
+            }
+        }
+    }
+
+    /// 跑一次生命周期钩子（`onStart` / `onStop`）。
+    ///
+    /// 缺钩子时**成功返回**：清单里没有「声明生命周期钩子」这一项，所以「没写」是最常见
+    /// 的情况，不该让每次启动都记一条错误。
+    ///
+    /// `onStart` 的失败要由调用方当成启动失败（回滚）；`onStop` 的失败只落一行 error 日志。
+    pub async fn run_lifecycle(
+        &self,
+        phase: hbot_core::LifecyclePhase,
+        reason: Option<hbot_core::StopReason>,
+    ) -> Result<(), HbotError> {
+        // 编译不出来就不跑：`onStart` 是「初始化一份能跑的代码」，现在没有代码可初始化。
+        //
+        // **不能把这件事报成启动失败**（`AGENTS.md` 坑 24）：一个 typo 会让 bot_start 永久
+        // 失败，而用户修好代码后没有任何路径能让它恢复 —— 编译错误的正确形状是「bot 起着、
+        // 消息留在未处理、改好代码自动重试」。`compiled()` 自己已经写了编译失败的错误日志。
+        let (fingerprint, project) = match self.compiled().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(
+                    bot = %self.bot_id,
+                    hook = phase.hook_name(),
+                    error = %error,
+                    "编译失败，跳过生命周期钩子（bot 继续等用户修代码）"
+                );
+                return Ok(());
+            }
+        };
+        // 生命周期钩子不属于任何会话，用固定槽位 0：它每轮只跑一次，落在哪个 isolate
+        // 上都行，但**必须在同一个**上（否则 `onStart` 初始化的东西与 `onStop` 收尾的
+        // 东西会落在两个不同的 isolate 里，而它们不共享任何内存）。
+        let mut guard = self.worker(0, &fingerprint, &project).await?;
+        let Some(worker) = guard.as_mut() else {
+            return Err(HbotError::internal(format!(
+                "isolate 槽位 0 在生命周期钩子派发前被清空（bot {}）",
+                self.bot_id
+            )));
+        };
+        let sandbox = Arc::clone(&worker.sandbox);
+        drop(guard);
+        let dispatched = tokio::task::spawn_blocking(move || {
+            sandbox.dispatch_lifecycle_collecting(phase, reason)
+        })
+        .await
+        .map_err(|error| {
+            HbotError::internal(format!(
+                "生命周期钩子派发任务失败（bot {}）：{error}",
+                self.bot_id
+            ))
+        })?;
+        match dispatched {
+            Ok(outcome) => {
+                lock(&self.hot).crashes.record_success();
+                self.record_logs(outcome.logs).await;
+                Ok(())
+            }
+            Err(failure) => {
+                let mapped = remap_error(&failure.error, &project);
+                self.record_logs(failure.logs).await;
+                self.record_error_line(format!(
+                    "生命周期钩子 `{}` 执行失败：{mapped}",
+                    phase.hook_name()
+                ))
+                .await;
+                Err(mapped)
             }
         }
     }

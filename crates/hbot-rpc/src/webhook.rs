@@ -1,32 +1,32 @@
-//! webhook 的 HTTP 传输层（`C1.webhook`）：外部系统 POST 进来，宿主把它交给 {BT}onWebhook{BT}。
+//! webhook 的 HTTP 传输层（`C1.webhook`）：外部系统 POST 进来，宿主把它交给 `onWebhook`。
 //!
 //! # 为什么手写 HTTP/1.1 而不是引入框架
 //!
-//! 服务只做一件事：收一条 {BT}POST{BT}、读 {BT}Content-Length{BT} 字节、回一条响应。为此引入
-//! {BT}axum{BT} + {BT}hyper{BT} 会往依赖图里塞进一整套异步生态，而要复用的判断（方法、体积、
-//! 密钥、路由）一条都不会因此变少。这里的取舍与 {BT}ws.rs{BT} 一致：传输层自己刻，
-//! 判据全部落在 {BT}hbot-core{BT}（{BT}bot_webhook{BT}）。
+//! 服务只做一件事：收一条 `POST`、读 `Content-Length` 字节、回一条响应。为此引入
+//! `axum` + `hyper` 会往依赖图里塞进一整套异步生态，而要复用的判断（方法、体积、
+//! 密钥、路由）一条都不会因此变少。这里的取舍与 `ws.rs` 一致：传输层自己刻，
+//! 判据全部落在 `hbot-core`（`bot_webhook`）。
 //!
 //! # 形状
 //!
-//! {BT}{BT}{BT}
+//! ```text
 //! POST /hook/<bot_id>/<path>
 //! x-hbot-secret: <secret>
 //! Content-Length: <n>
 //!
 //! <body>
-//! {BT}{BT}{BT}
+//! ```
 //!
-//! * {BT}<bot_id>{BT} 是 UUID；不在运行中的 bot 表里 → 404；
-//! * {BT}<path>{BT} 必须在该 bot 清单的 {BT}capabilities.webhook[].path{BT} 里，否则 404；
+//! * `<bot_id>` 是 UUID；不在运行中的 bot 表里 → 404；
+//! * `<path>` 必须在该 bot 清单的 `capabilities.webhook[].path` 里，否则 404；
 //! * 密钥与那个路由声明的环境变量**常数时间**比较，不匹配 → 401；环境变量没设 → 401
 //!   （fail-closed，不退化成「没配就放行」）；
-//! * 请求体上限 {BT}MAX_WEBHOOK_BODY_BYTES{BT} → 413；{BT}Transfer-Encoding{BT} / 其它方法 → 405；
-//! * 应答直接来自 handler 的返回值（见 {BT}bot_webhook::response_from_handler{BT}）。
+//! * 请求体上限 `MAX_WEBHOOK_BODY_BYTES` → 413；`Transfer-Encoding` / 其它方法 → 405；
+//! * 应答直接来自 handler 的返回值（见 `bot_webhook::response_from_handler`）。
 //!
 //! # 单连接一问一答
 //!
-//! 一条 TCP 连接只处理一个请求就关（{BT}Connection: close{BT}）。理由：webhook 调用方通常是
+//! 一条 TCP 连接只处理一个请求就关（`Connection: close`）。理由：webhook 调用方通常是
 //! 「发一条就走」的脚本/服务，keep-alive 在这里省不下可观的握手，却要引入连接生命周期、
 //! 空闲超时与流水线顺序三条额外的状态机。
 
@@ -49,7 +49,7 @@ use crate::app::AppState;
 /// 外部系统可能连上不发（扫描器、健康检查误配），不设上限就是一条连接占一个任务。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 请求头字节上限：8 KiB（{BT}Content-Length{BT} 本身加上几个头远不到）。
+/// 请求头字节上限：8 KiB（`Content-Length` 本身加上几个头远不到）。
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// 路由前缀：所有 webhook 都在它下面。
@@ -126,11 +126,11 @@ impl ParseRejection {
     }
 }
 
-/// 从一段字节里解析一个请求（{BT}Content-Length{BT} 必须已经把体读全）。
+/// 从一段字节里解析一个请求（`Content-Length` 必须已经把体读全）。
 ///
-/// 只认三种形状：请求行 + 头 + 空行 + 体。不支持 {BT}Transfer-Encoding{BT}（{BT}chunked{BT} 需要
-/// 一整套分块状态机，而 webhook 的调用方给 {BT}Content-Length{BT} 是常态）、不支持
-/// {BT}Expect: 100-continue{BT}、不支持流水线。
+/// 只认三种形状：请求行 + 头 + 空行 + 体。不支持 `Transfer-Encoding`（`chunked` 需要
+/// 一整套分块状态机，而 webhook 的调用方给 `Content-Length` 是常态）、不支持
+/// `Expect: 100-continue`、不支持流水线。
 pub fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, ParseRejection> {
     // 头与体以第一个 CRLFCRLF 分界。
     let split = bytes
@@ -183,7 +183,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, ParseRejection> {
     })
 }
 
-/// 把 {BT}/hook/<bot_id>/<path>{BT} 拆成两段。
+/// 把 `/hook/<bot_id>/<path>` 拆成两段。
 #[must_use]
 pub fn route_of(path: &str) -> Option<(BotId, String)> {
     let rest = path.strip_prefix(ROUTE_PREFIX)?;
@@ -251,7 +251,7 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/// 把 {BT}WebhookError{BT} 翻成 HTTP 状态码与错误体。
+/// 把 `WebhookError` 翻成 HTTP 状态码与错误体。
 ///
 /// 状态码的选择是**给调用方看的语义**：401 让他去查密钥、404 让他去查路径、503 让他
 /// 稍后重试、500/504 让他把请求报文与宿主日志一起交给维护者。全部自带错误码前缀。
@@ -397,7 +397,7 @@ async fn handle_connection(
     Ok(())
 }
 
-/// 读一个请求：先读到 {BT}\r\n\r\n{BT}，再按 {BT}Content-Length{BT} 读体。
+/// 读一个请求：先读到 `\r\n\r\n`，再按 `Content-Length` 读体。
 async fn read_request(stream: &mut TcpStream) -> Result<ParsedRequest, ParseRejection> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
@@ -482,7 +482,7 @@ async fn dispatch(state: &Arc<AppState>, request: &ParsedRequest) -> WireRespons
     }
 }
 
-/// 运行中的 bot → 它的执行器；没在跑就是 {BT}None{BT}。
+/// 运行中的 bot → 它的执行器；没在跑就是 `None`。
 fn handler_of(
     state: &Arc<AppState>,
     bot_id: &BotId,
@@ -491,9 +491,9 @@ fn handler_of(
 }
 /// 运行中的 bot → 它的 sandbox 执行器。
 ///
-/// 为什么不是从 {BT}BotRegistry{BT} 拿：登记表存的是 supervisor（消息侧要它），webhook 要的是
-/// 执行器本身 —— 它不走 supervisor，因为没有会话、没有队列、没有去重。给 {BT}RunningBot{BT} 加
-/// 一个执行器字段会让「登记表存什么」的边界变糊；单独一张小表更清楚，而且 {BT}bot_stop{BT}
+/// 为什么不是从 `BotRegistry` 拿：登记表存的是 supervisor（消息侧要它），webhook 要的是
+/// 执行器本身 —— 它不走 supervisor，因为没有会话、没有队列、没有去重。给 `RunningBot` 加
+/// 一个执行器字段会让「登记表存什么」的边界变糊；单独一张小表更清楚，而且 `bot_stop`
 /// 时清掉它正好等于「这个 bot 的 webhook 立刻 404」。
 #[derive(Default)]
 pub struct WebhookRegistry {
@@ -518,7 +518,7 @@ impl WebhookRegistry {
         self.lock().insert(bot_id, handler);
     }
 
-    /// 注销（{BT}bot_stop{BT} 调）：之后这个 bot 的 webhook 一律 404。
+    /// 注销（`bot_stop` 调）：之后这个 bot 的 webhook 一律 404。
     pub fn unregister(&self, bot_id: &BotId) {
         self.lock().remove(bot_id);
     }

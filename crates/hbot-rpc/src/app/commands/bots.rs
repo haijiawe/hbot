@@ -229,6 +229,19 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
     let supervisor = Arc::new(Supervisor::new(spec, deps));
     supervisor.start().await?;
 
+    // `onStart`：**失败就是启动失败**。放在 supervisor.start 之后、登记之前 ——
+    // 此刻还没有任何消息被消费（队列是空的），所以「初始化没成功就别让它开始接活」
+    // 这句话是成立的；失败时的收尾与 ensure_local_conversation 那条路一致（先停 supervisor）。
+    if let Err(error) = executor
+        .run_lifecycle(hbot_core::LifecyclePhase::Start, None)
+        .await
+    {
+        if let Err(stop_error) = supervisor.stop().await {
+            tracing::warn!(bot = %bot_id, error = %stop_error, "onStart 失败后停止 supervisor 也失败");
+        }
+        return Err(error);
+    }
+
     // `local` 平台的会话行：它不订阅任何真实事件，所以没有人会替它建 conversation 行，
     // 而 `bot_inject` 要求这一行存在（`inject_inner` 会 `get_conversation`，拿不到 -32001）。
     // 失败要收尾：supervisor 已经在跑，直接返回 Err 会留下一个没人登记的 runtime。
@@ -383,6 +396,19 @@ async fn ensure_local_conversation(state: &AppState, bot: &Bot) -> Result<(), Hb
 
 /// 停止一个 bot（幂等：没在跑也返回 ok）。
 pub async fn stop(state: &AppState, bot_id: BotId) -> Response {
+    // `onStop`：在拆掉执行器之前跑，给它 5 秒（`hbot_core::STOP_BUDGET`）。
+    // 失败只落日志 —— 停机路径上没有任何人在等它的结果。
+    if let Some(executor) = state.webhooks().get(&bot_id) {
+        if let Err(error) = executor
+            .run_lifecycle(
+                hbot_core::LifecyclePhase::Stop,
+                Some(hbot_core::StopReason::User),
+            )
+            .await
+        {
+            tracing::warn!(bot = %bot_id, error = %error, "onStop 执行失败");
+        }
+    }
     // 先注销 webhook：停下来的 bot 不该再被外部系统打到（下一步的请求立刻 404），
     // 而不是等 supervisor 排空完了才发现执行器已经不可用。
     state.webhooks().unregister(&bot_id);
