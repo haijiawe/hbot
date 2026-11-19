@@ -129,6 +129,11 @@ impl TempDir {
     pub(crate) fn db_path(&self) -> PathBuf {
         self.path.join("hbot.db")
     }
+
+    /// 这个临时目录本身（给「一个 bot 一个库文件」这类用例当 root 用）。
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
 }
 
 impl Drop for TempDir {

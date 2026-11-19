@@ -61,6 +61,7 @@
 //! ```
 #![deny(unsafe_code)]
 
+mod bot_sql;
 mod db;
 mod error;
 mod ids;
@@ -77,6 +78,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+pub use bot_sql::BotSqlSchemas;
 pub use db::{BUSY_TIMEOUT_MS, Store};
 pub use error::{Result, StoreError};
 pub use ids::{BotId, ConversationId, InboundId, JobId, OutboundId, ProjectId, WaitId};
