@@ -228,7 +228,7 @@ declare module 'hbot' {
      * `ctx.reply` 只在计划里声明了 `conversation` 时可用，否则抛
      * `HBOT_TIMER_NO_TARGET`（宿主没有依据猜该发给谁）。
      */
-    onSchedule(ctx: TimerCtx, name: string): void | Promise<void>;
+    onSchedule?(ctx: TimerCtx, name: string): void | Promise<void>;
     /**
      * `onSchedule` 的旧名，与它是**同一条执行路径**（同样的预算、超时与失败语义）。
      *
@@ -247,7 +247,7 @@ declare module 'hbot' {
      * 清单声明了作业类型却没定义这个钩子时，每条作业都会记一条点名缺钩子的错误日志，
      * 而不是悄悄当成跑成功。
      */
-    onJob(ctx: JobCtx, name: string): void | Promise<void>;
+    onJob?(ctx: JobCtx, name: string): void | Promise<void>;
     /**
      * 一条消息命中了 `ctx.session.prompt` 注册的等待时调用（而不是 `onMessage`）。
      *
@@ -257,7 +257,7 @@ declare module 'hbot' {
      * 声明了 `capabilities.state.session` 却没定义它时，每次唤醒都会记一条点名
      * `onResume` 的错误日志，而不是悄悄当成处理成功。
      */
-    onResume(ctx: ResumeCtx, message: InboundMessage): void | Promise<void>;
+    onResume?(ctx: ResumeCtx, message: InboundMessage): void | Promise<void>;
     /**
      * 启动时调用一次（在第一条消息到来之前）。
      *
