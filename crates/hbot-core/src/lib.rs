@@ -31,6 +31,7 @@ pub mod bot_jobs;
 pub mod bot_session;
 pub mod bot_state;
 pub mod bot_timer;
+pub mod bot_webhook;
 pub mod command;
 pub mod debug;
 pub mod device;
@@ -74,6 +75,14 @@ pub use bot_timer::{
     DAY_MS, DueSchedule, MAX_INTERVAL_MS, MAX_SCHEDULE_NAME_BYTES, MAX_SCHEDULES,
     MAX_UTC_OFFSET_MINUTES, MIN_INTERVAL_MS, MIN_UTC_OFFSET_MINUTES, ScheduleSpec, ScheduleWhen,
     TimerError, validate_name, validate_schedules, validate_when,
+};
+pub use bot_webhook::{
+    DEFAULT_WEBHOOK_CONTENT_TYPE, MAX_WEBHOOK_BODY_BYTES, MAX_WEBHOOK_PATH_BYTES,
+    MAX_WEBHOOK_RESPONSE_BYTES, MAX_WEBHOOK_ROUTES, MAX_WEBHOOK_SECRET_ENV_BYTES,
+    WEBHOOK_SECRET_HEADER, WebhookError, WebhookRequest, WebhookResponse, WebhookRoute,
+    response_from_handler, route_for, secrets_match, validate_request as validate_webhook_request,
+    validate_response as validate_webhook_response, validate_route_path, validate_routes,
+    validate_secret_env,
 };
 pub use command::{
     CommandDenied, CommandOutput, CommandSpec, CommandStatus, IoDirection, OutputStream, Platform,
