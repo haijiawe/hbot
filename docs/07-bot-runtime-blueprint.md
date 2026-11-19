@@ -78,8 +78,8 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | | `history` | 最近 N 条消息（只读） | `已实现`（2026-11-18） |
 | | `session` | 会话状态机 + "等下一条消息" | `设计` |
 | **C3 出口** | `reply` | 被动回复（绑定入站消息） | `已实现` |
-| | `send` | 主动推送到指定会话 | `设计` |
-| | `notify` | 通知人（管理员/工单） | `设计` |
+| | `send` | 主动推送到指定会话 | `已实现`（2026-11-19，见 §3.4） |
+| | `notify` | 通知人（管理员/工单） | `已实现`（2026-11-19，见 §3.4） |
 | | `http` | 出站 HTTP（清单授权） | `已实现`（`ctx.http.get`） |
 | | `file` | 项目内读写（经宿主，不是裸 `fs`） | `部分`（Agent 有工具，bot 代码没有） |
 | **C4 计算** | `jobs` | 后台作业（脱离 handler 预算、持久化、崩溃恢复） | `已实现`（2026-11-19，见 §4.5） |
@@ -92,11 +92,11 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | 形态 | 触发 | 状态 | 出口 | 还需要 | 今天能做吗 |
 |---|---|---|---|---|---|
 | **聊天**（人设/多轮/情感） | `message` | `history` `kv` | `reply` | `ai` | **能**：`history`/`kv`/`ai` 都已落地 |
-| **游戏性**（签到/抽卡/排行榜/国战） | `message` `timer` | `kv` `sql` | `reply` `send` | `jobs`（长结算） | **一半**：定时已落地，缺 `sql` 与主动 `send` |
-| **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **不能**：缺 webhook / `sql` / `session` / `notify` |
+| **游戏性**（签到/抽卡/排行榜/国战） | `message` `timer` | `kv` `sql` | `reply` `send` | `jobs`（长结算） | **一半**：定时、主动 `send`、`jobs` 都已落地，缺 `sql` |
+| **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **一半**：`session` / `notify` / `ai` / `send` 都已落地，缺 `webhook` 与 `sql` |
 | **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面与定时都有，缺 `sql` 与长作业 |
 
-> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C3.reply + C3.http + C2.kv/history + C5.ai + C6.device 这几个口子**，缺的那几格在 §11 的落地顺序里。
+> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C2.kv/history/session + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.webhook`、`C1.lifecycle`、`C2.sql`、`C3.file`，见 §11 的落地顺序。
 
 ### 3.2 能力怎么声明
 
@@ -163,6 +163,52 @@ const answer = await ctx.ai.complete({ prompt: "写一句问候" });
 **实测**（`hbot-rpc` 的 `tests/ai_capability.rs`，7 条，全部走 `Dispatcher` 真派发 + 进程内 loopback 假模型）：没声明时**一个请求都不发**（服务端计数 0，这条同时挡住"接线漏了"——那种情况报的是 `UNAVAILABLE`）；声明后文本与两个用量数字都照实传回；没配 `agent.json` 时报 `UNAVAILABLE` 而不是 `NOT_DECLARED`；补上配置后下一次 `bot_start` 即生效（配置在装配时现读，不是进程启动快照）；两个 bot 各按自己的清单判；额度**按事件**重算（一条消息 4 次、下一条事件重新拿到 4 次）。
 
 **还没做**：多轮对话（`ctx.ai` 只发一次请求，没有消息历史）；流式回传（`ProviderAiClient` 用 `NullSink`）；结构化输出 / tool calling；每 bot 独立的模型设置（现在是宿主级一份 `agent.json`）；`ctx.ai` 的 token 用量没有进 run log（只有 `promptTokens`/`completionTokens` 回到 handler，用户看不到累计成本）。
+
+### 3.4 已落地：主动出站（`C3.send` / `C3.notify`，2026-11-19）
+
+```jsonc
+// hbot.json —— send 与 notify 的判据不同：send 的目标来自调用点，notify 的目标钉在清单里
+{
+  "capabilities": {
+    "send": true,
+    "notify": { "conversation": "group:123456", "kind": "group" }
+  }
+}
+```
+
+```ts
+export default defineBot({
+  async onMessage(ctx) {
+    // 目标显式给出；kind 可省（宿主去 conversations 表查，查不到就报错，不猜）
+    await ctx.send('group:987654', '开服了', { kind: 'group' });
+    // 通知只能发给清单钉死的目标：一段被注入的代码改不了收件人
+    await ctx.notify('有人下了大单');
+  },
+})
+```
+
+**五道判据，一层一份**：
+
+| 层 | 判据 | 位置 | 没过的症状 |
+|---|---|---|---|
+| 声明层 | 清单 `capabilities.send` / `capabilities.notify` | `hbot-code` 的 `SendSlot::set_send_declared` / `set_notify_target`（每次起 isolate 现读清单） | `HBOT_SEND_NOT_DECLARED` / `HBOT_NOTIFY_NOT_DECLARED` |
+| 参数层 | 正文 ≤ 8 KiB、无控制字符；会话 ID ≤ 128 字节；`notify` 的 `kind` 不许 `unknown` | `hbot-core` 的 `validate_send` / `validate_notify` / `validate_notify_target`（**唯一一份**） | `HBOT_SEND_INVALID` / `HBOT_NOTIFY_INVALID`；清单写坏则**加载失败** |
+| 目标层 | `send` 的 `kind`：调用点 > `conversations` 表；`notify` 的目标只来自清单 | `hbot-rpc` 的 `StoreSendQueue::ensure_target` | `HBOT_SEND_NO_TARGET`（提示补 `kind`） |
+| 装配层 | 宿主有没有 `set_egress`（bot 没起来、无头模式没有出站队列） | `hbot-code` 的 `SendSlot::is_assembled` | `HBOT_SEND_UNAVAILABLE` / `HBOT_NOTIFY_UNAVAILABLE` |
+| 通道层 | supervisor 的 `replies` 通道（与 handler 返回值同一条队列） | `SandboxHandler::with_send` → `StoreSendQueue::send` | `HBOT_SEND_FAILED` / `HBOT_NOTIFY_FAILED` |
+
+**六条设计决定与理由**：
+
+1. **只有一个出口**：复用 `SandboxHandler.replies`，不自己写 `outbound` 行。绕过去会立刻长出第二份「目标怎么构造」的逻辑（`reply_to` 填不填、`target_json` 放什么、`conversation_id` 怎么派生），而两份总有对不上的一天。
+2. **`reply_to` 恒为 `None`**：`ctx.send` 是主动消息，不绑定任何入站事件，不得冒用旧消息 ID（`AGENTS.md` §4.1）。被动回复仍走 handler 返回值。
+3. **会话类型不猜**：`ConversationKind` 必须能确定。调用点给了就用；没给就查 `conversations` 表（那是适配器落地消息时记下的答案）；库里也没有就报 `NO_TARGET` 并要求补 `kind`。猜成 `private` 而目标其实是群，就是把消息发给另一个人。
+4. **`notify` 的目标不许由调用点指定**：目标一旦能在运行时指定，一段被注入的代码就能把 bot 读到的东西发给任意群 —— 那是外发数据泄漏，不是通知。所以目标钉在清单，且 `kind` 必填（少写在加载时就失败，不是等到第一次 `ctx.notify`）。
+5. **发送前补建 `conversations` 行**：`outbound.conversation_id` 有外键，缺行会在出站那一刻撞 `FOREIGN KEY constraint failed` —— 而那时 `ctx.send` 早已返回成功，用户只看到「发了但对方没收到」。会话 ID 用与 supervisor 同一个确定性派生（`hbot_bot::conversation_id_for`），补建用 `INSERT OR IGNORE`：判据交给唯一约束，不做「先查后插」。
+6. **两个能力的码分开**：`SEND_*` 与 `NOTIFY_*` 各有 `NOT_DECLARED` / `UNAVAILABLE` / `INVALID` / `FAILED`，因为补救动作不同（改清单 / 起 bot / 改参数）；`NO_TARGET` 是 `send` 独有的第四类（改调用点）。
+
+**实测**（`hbot-rpc` 的 `tests/send_capability.rs`，7 条，全走 `Dispatcher` 真派发 + 真库）：没声明 → `NOT_DECLARED`；声明后正文真的经 `replies` → `outbound` → `local` 适配器落成 `[reply] …` 日志行；库里查得到的会话不必给 `kind`；查不到又没给 `kind` → `NO_TARGET` 且**不留会话行**；显式 `kind: 'group'` 会补建 `conversations` 行且类型照调用点（不许猜成私聊）；只声明 `send` 时 `notify` 仍报 `NOT_DECLARED`；声明了 `notify` 目标后正文发到清单那个会话。存储层另有 1 条钉住幂等补建（第二次返回 `false` 且不覆盖已有行）。
+
+**还没做**：附件（`sendFile` / `sendImage`，正负清单里已换成这三条精确条目）；`ctx.send` 的返回值只到「交给出站队列」，平台侧回执由 sender 的重试与 `mark_outbound_sent` 记录、不回传 handler；`notify` 只有单一目标（管理员与工单分档未做）。
 
 ---
 
@@ -631,12 +677,12 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 | **已落地 2026-11-18**（§3.3） |
 | 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 | `C1.timer` **已落地 2026-11-18**（§4.4）；`C4.jobs` **已落地 2026-11-19**（§4.5） |
 | 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 | **已落地 2026-11-19**（§5.2） |
-| 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | 未开始 |
+| 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | `C3.send/notify` **已落地 2026-11-19**（§3.4）；`C1.webhook` 未开始 |
 | 6 | `E1` npm 打包 | 生态接入（见 `docs/08` §5） | 未开始 |
 | 7 | `C6.device`（桌面三平台） | 玩游戏的 bot；见 §9，里程碑 `M10` | **窄版已落地 2026-11-17**（Windows，见 `docs/09`）；完整版未做 |
 | 8 | 云端执行宿主 | 见 `docs/08` §9 与 `ADR-0006`，里程碑 `M9` | 未开始 |
 
-> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 4 → 7 完成，5 → 6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
+> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 4 → 7 完成，5 只差 `C1.webhook`，6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
 
 ---
 

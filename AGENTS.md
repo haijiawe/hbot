@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–4 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`）全部落地**（1736 个 Rust 测试 / 116 个 target / web 400 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–4 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`）与 `C3.send`/`C3.notify` 全部落地**（1778 个 Rust 测试 / 117 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -401,6 +401,29 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     `hbot-rpc/src/app/ids.rs`、`hbot-bot/tests/common/mod.rs`、`hbot-redteam/tests/e_resource_exhaustion.rs`
     三处 `IdGenerator` 实现全部 `E0046`。这是**好事**（类型安全逼着每个替身表态），但要在加方法那一批里
     一起改完，别等末轮 `cargo test --workspace` 才发现。判读方法：`cargo check --workspace --all-targets` 一次看全。
+
+79. **主动发消息必须先保证 `conversations` 行存在，否则失败发生在「已经报告成功」之后**（2026-11-19，`C3.send` 落地）。
+    `outbound.conversation_id` 有指向 `conversations` 的外键（`0001_init.sql`），而 `Store::open` 对每条连接 `PRAGMA foreign_keys = ON`
+    （`crates/hbot-store/src/db.rs`）。主动消息的常态正是「平台从没推过这个会话」—— 没有行，于是出站那一刻撞
+    `FOREIGN KEY constraint failed`，而这时 `ctx.send` 早已返回、用户只看到「发了但对方没收到」。规则：`ctx.send` 在交给
+    `replies` 通道前先补建会话行（`Store::insert_conversation_if_absent`），会话 ID 用与 supervisor 同一个确定性派生
+    `hbot_bot::conversation_id_for`，不要自己拼。
+
+80. **幂等补建用 `INSERT OR IGNORE`，不要复制「嗅探错误文本」那条路**（2026-11-19）。`hbot-bot` 的 `is_conversation_conflict`
+    靠 `message.contains("UNIQUE constraint failed") && contains("conversations")` 判重，且它是 `pub(crate)` —— 在 `hbot-rpc` 里
+    既用不了、也不该出现第二份同样脆弱的判据（错误文案一改就静默失效）。判据应当交给唯一约束本身：`INSERT OR IGNORE` +
+    返回值 `inserted > 0`。同理，任何「先查后插」在并发下都会两次读到「没有」，别拿它当幂等。
+
+81. **`ctx.notify` 的收件人不许由调用点决定**（2026-11-19）。目标来自清单 `capabilities.notify: { conversation, kind }`，
+    并且 `kind` 必填（`unknown` 在**加载清单时**就失败，不等第一次调用）。一旦目标能在运行时指定，一段被注入的 handler
+    代码就能把 bot 读到的数据发到任意群 —— 那是外发泄漏，不是通知。与之相对，`ctx.send` 的目标本来就该来自调用点
+    （它就是「主动发给谁」），所以两个能力的判据必须分开写，别合并成一个 `send`。
+
+82. **`ctx.send` 复用 `replies` 通道，`reply_to` 恒为 `None`**（2026-11-19）。`SandboxHandler.replies: mpsc::Sender<OutboundRequest>`
+    是唯一出站路径；自己写 `outbound` 行会立刻长出第二份「目标怎么构造」的逻辑（`target_json` 放什么、`conversation_id` 怎么派生），
+    两份总有对不上的一天。而 `reply_to: None` 是硬约束：主动消息不绑定任何入站事件，不得冒用旧消息 ID（§4.1）。
+    被动回复仍然只能走 handler 的返回值。另：`StoreSendQueue::send` 在 `spawn_blocking` 里跑，所以用 `blocking_send` 是对的；
+    在 async 上下文里直接调它会把 reactor 卡住。
 
 ---
 
