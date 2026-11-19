@@ -620,6 +620,43 @@ impl Sandbox {
         }
     }
 
+    /// 跑一次 {BT}onWebhook{BT}，把 handler 的返回值一并带回来。
+    ///
+    /// 与 {BT}Sandbox::dispatch_job_collecting{BT} 同形，区别在第二个返回值：webhook 的应答体是
+    /// handler 的**返回值**，不是 {BT}ctx.reply{BT} 收集到的文本 —— 调用方在等 HTTP 响应，只有
+    /// 返回值能当应答。
+    ///
+    /// {BT}body{BT} 已由传输层按 UTF-8 校验；非法编码在更外层就变成 400，走不到这里。
+    pub fn dispatch_webhook_collecting(
+        &self,
+        route: &str,
+        method: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> Result<(EventOutcome, Option<serde_json::Value>), EventFailure> {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.send(Command::Webhook {
+            route: route.to_owned(),
+            method: method.to_owned(),
+            content_type: content_type.map(str::to_owned),
+            body: body.to_owned(),
+            reply,
+        })
+        .map_err(EventFailure::without_output)?;
+
+        match result.recv_timeout(self.backstop()) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => {
+                Err(EventFailure::without_output(CodeError::SandboxDead {
+                    message: format!(
+                        "isolate did not answer within {:?}; the worker thread is wedged",
+                        self.backstop()
+                    ),
+                }))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(EventFailure::without_output(self.dead())),
+        }
+    }
     /// Run `onMessage` for one JSON event.
     ///
     /// This is a blocking call: use it from `spawn_blocking` or a dedicated
@@ -1061,6 +1098,21 @@ enum Command {
         conversation: Option<String>,
         reply: Sender<Result<EventOutcome, EventFailure>>,
     },
+    /// 跑一次 {BT}onWebhook(ctx){BT}：外部系统的一次 HTTP 请求，handler 的返回值就是应答。
+    ///
+    /// 与 {BT}Timer{BT} / {BT}Job{BT} 同理是独立变体：webhook 既没有入站消息也没有会话，走
+    /// {BT}build_event{BT} 会给它一个假 payload，还会把设备/状态身份留在槽位上。
+    ///
+    /// 应答体不走 {BT}HostOutput{BT}（那是日志与回复的收集器），而是随这条命令的 {BT}reply{BT}
+    /// 一起回来：调用方在等 HTTP 响应，晚一步就没有意义了。
+    Webhook {
+        route: String,
+        method: String,
+        content_type: Option<String>,
+        /// 请求体（传输层已按 UTF-8 校验过，这里不会拿到半截字符）。
+        body: String,
+        reply: Sender<Result<(EventOutcome, Option<serde_json::Value>), EventFailure>>,
+    },
     /// Stop the worker loop.
     Shutdown,
 }
@@ -1137,6 +1189,11 @@ fn reject(command: Command, failure: &CodeError) {
         Command::Resume { reply, .. } => {
             let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
                 message: message.clone(),
+            })));
+        }
+        Command::Webhook { reply, .. } => {
+            let _ = reply.send(Err(EventFailure::without_output(CodeError::SandboxDead {
+                message,
             })));
         }
         Command::Job { reply, .. } => {
@@ -1391,6 +1448,51 @@ fn serve(
                 let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
                 let _ = reply.send(finish(raw, memory_report(usage, limits), limits));
             }
+            Command::Webhook {
+                route,
+                method,
+                content_type,
+                body,
+                reply,
+            } => {
+                let raw = {
+                    let context = &context;
+                    let webhook_handler = &hooks.webhook;
+                    let output = &output;
+                    let deadline = &deadline;
+                    let project = &project;
+                    let control = &control;
+                    let ai = &ai;
+                    let content_type = content_type.as_deref();
+                    let budget = limits.handler_timeout;
+                    local.block_on(&runtime, async move {
+                        context
+                            .async_with(async |ctx| {
+                                run_webhook(
+                                    &ctx,
+                                    &route,
+                                    &method,
+                                    content_type,
+                                    &body,
+                                    budget,
+                                    webhook_handler,
+                                    output,
+                                    deadline,
+                                    project,
+                                    control,
+                                    ai,
+                                )
+                                .await
+                            })
+                            .await
+                    })
+                };
+                let usage = local.block_on(&runtime, async { quicksjs.memory_usage().await });
+                let RawWebhook { event, response } = raw;
+                let finished = finish(event, memory_report(usage, limits), limits)
+                    .map(|outcome| (outcome, response));
+                let _ = reply.send(finished);
+            }
             Command::Resume {
                 message_payload,
                 wait_key,
@@ -1479,6 +1581,11 @@ struct Hooks {
     /// 缺它时不是开机错误：与 `onJob` 同一处理 —— 第一次唤醒会报一条点名
     /// `onResume` 的错（见 `run_resume`）。
     resume: Option<Persistent<Function<'static>>>,
+    /// {BT}onWebhook{BT}，可选：没声明 {BT}capabilities.webhook{BT} 的项目没有理由定义它。
+    ///
+    /// 缺它时不是开机错误：与 {BT}onJob{BT} 同一处理 —— 第一条外部请求会报一条点名
+    /// {BT}onWebhook{BT} 的错（见 {BT}run_webhook{BT}），而不是让调用方收到一个看起来成功的空应答。
+    webhook: Option<Persistent<Function<'static>>>,
 }
 
 /// Evaluate `src/main.ts` and capture its hooks.
@@ -1581,11 +1688,19 @@ async fn bootstrap<'js>(
             .map_err(js_error)?
             .map(|function| Persistent::save(ctx, function));
 
+        // 同上：webhook 钩子可选。缺它时第一条外部请求点名报错 —— 否则调用方只会收到
+        // 一个 204 空应答，看起来像成功了。
+        let webhook = config
+            .get::<_, Option<Function<'js>>>("onWebhook")
+            .map_err(js_error)?
+            .map(|function| Persistent::save(ctx, function));
+
         Ok::<_, CodeError>(Hooks {
             message: Persistent::save(ctx, handler),
             timer,
             job,
             resume,
+            webhook,
         })
     }
     .await;
@@ -1838,6 +1953,131 @@ async fn run_job<'js>(
     }
 }
 
+/// 一次 webhook 调用的原始结果：常规事件结果 + handler 的返回值。
+///
+/// 与 [`RawEvent`] 分开是刻意的：只有这一路有返回值，给其余命令都挂一个恒为 `None`
+/// 的字段会让人以为消息/定时器/作业的 handler 也能"回答"什么。
+struct RawWebhook {
+    event: RawEvent,
+    response: Option<serde_json::Value>,
+}
+
+/// 跑一次 {BT}onWebhook{BT}：预算、日志收集、返回值都归这里。
+#[allow(clippy::too_many_arguments)]
+async fn run_webhook<'js>(
+    ctx: &Ctx<'js>,
+    route: &str,
+    method: &str,
+    content_type: Option<&str>,
+    body: &str,
+    budget: Duration,
+    handler: &Option<Persistent<Function<'static>>>,
+    output: &Arc<Mutex<HostOutput>>,
+    deadline: &Arc<Deadline>,
+    project: &CompiledProject,
+    control: &Arc<DebugControl>,
+    ai: &AiSlot,
+) -> RawWebhook {
+    let started = Instant::now();
+    let Some(handler) = handler else {
+        // 清单声明了路由、代码没写钩子：点名说清楚。否则调用方只会收到一个 204 空应答，
+        // 看起来像成功了 —— 这类"不报错的失效"比崩掉难查一个数量级。
+        let error = CodeError::JsException {
+            message: format!(
+                "路由 `{route}` 收到请求了，但项目的默认导出没有 `onWebhook` 函数（defineBot 里要写 `async onWebhook(ctx)`）"
+            ),
+            stack: None,
+        };
+        return RawWebhook {
+            event: RawEvent {
+                logs: Vec::new(),
+                replies: Vec::new(),
+                duration: started.elapsed(),
+                interrupted: false,
+                result: Err(error),
+            },
+            response: None,
+        };
+    };
+
+    deadline.reset();
+    deadline.arm(budget);
+    output
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    control.begin_event(false);
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+
+    let result = invoke_webhook(ctx, route, method, content_type, body, handler, project, ai).await;
+    let duration = started.elapsed();
+
+    control.end_event();
+    let _ = ctx.globals().set(instrument::DEBUG_FLAG, false);
+    deadline.disarm();
+    let interrupted = deadline.take_interrupted();
+    let (logs, replies) = output.lock().unwrap_or_else(PoisonError::into_inner).take();
+
+    let (result, response) = match result {
+        Ok(response) => (Ok(()), response),
+        Err(error) => (Err(error), None),
+    };
+
+    RawWebhook {
+        event: RawEvent {
+            logs,
+            replies,
+            duration,
+            interrupted,
+            result,
+        },
+        response,
+    }
+}
+
+/// 调用 {BT}onWebhook{BT}，把返回值转成 JSON。
+///
+/// {BT}undefined{BT} / {BT}null{BT} 是合法的"无应答体"（204），不是错误；其余值走
+/// {BT}JSON.stringify{BT}，所以 {BT}{ status: 418, body: "teapot" }{BT} 这类信封天然可表达。
+#[allow(clippy::too_many_arguments)]
+async fn invoke_webhook<'js>(
+    ctx: &Ctx<'js>,
+    route: &str,
+    method: &str,
+    content_type: Option<&str>,
+    body: &str,
+    handler: &Persistent<Function<'static>>,
+    project: &CompiledProject,
+    ai: &AiSlot,
+) -> Result<Option<serde_json::Value>, CodeError> {
+    let result = async {
+        let request_event = build_webhook_event(ctx, route, method, content_type, body, ai)?;
+        let function = handler.clone().restore(ctx)?;
+        let pending: MaybePromise<'js> = function.call((request_event,))?;
+        let value: Value<'js> = pending.into_future::<Value<'js>>().await?;
+        json_of_return(ctx, &value)
+    }
+    .await;
+    result.map_err(|error| describe(ctx, error, project))
+}
+
+/// 把 handler 的返回值转成 {BT}serde_json::Value{BT}；{BT}undefined{BT} / {BT}null{BT} → {BT}None{BT}。
+fn json_of_return<'js>(
+    ctx: &Ctx<'js>,
+    value: &Value<'js>,
+) -> Result<Option<serde_json::Value>, rquickjs::Error> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let Some(text) = ctx.json_stringify(value.clone())? else {
+        return Ok(None);
+    };
+    let text = text.to_string()?;
+    // 序列化已经成功，解析失败只可能是我们自己的类型问题；退化成 None（204）
+    // 比把一条 500 抛给外部系统好，日志里仍能看到 handler 的 ctx.log。
+    Ok(serde_json::from_str(&text).ok())
+}
 #[allow(clippy::too_many_arguments)]
 async fn invoke_job<'js>(
     ctx: &Ctx<'js>,
@@ -2152,6 +2392,48 @@ fn build_job_event<'js>(
     job_event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
     job_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
     Ok(job_event)
+}
+/// {BT}onWebhook{BT} 的上下文：请求字段 + {BT}log{BT} / {BT}sleep{BT} / {BT}ai{BT}。
+///
+/// 比消息 ctx 窄得多，理由与 {BT}build_timer_event{BT} 相同：外部请求没有会话，也就没有
+/// 回复目标。这里**没有** {BT}ctx.reply{BT}（不是"有但会报错"）—— webhook 的应答走 handler
+/// 的返回值，多一个 {BT}reply{BT} 只会让人以为消息真发出去了。{BT}device{BT} / {BT}kv{BT} /
+/// {BT}history{BT} / {BT}jobs{BT} / {BT}session{BT} 同样不挂：它们都要一个 bot 或会话身份，而这一路
+/// 只有"哪个路由 + 一段体"。
+fn build_webhook_event<'js>(
+    ctx: &Ctx<'js>,
+    route: &str,
+    method: &str,
+    content_type: Option<&str>,
+    body: &str,
+    ai: &AiSlot,
+) -> rquickjs::Result<Object<'js>> {
+    let request_event = Object::new(ctx.clone())?;
+    request_event.set("route", route)?;
+    request_event.set("method", method)?;
+    request_event.set("contentType", content_type)?;
+    request_event.set("body", body)?;
+    // 体是 JSON 就顺手给一份解析好的，省得每个项目自己 try/catch 一次；不是 JSON 就是
+    // undefined —— 作者写 `ctx.bodyJson.x` 时能立刻看出"这不是 JSON"，而不是拿到 null。
+    //
+    // 先在 Rust 侧试一次 `serde_json`，成功了才交给 `json_parse`：非 JSON 的体是**正常形状**
+    // （表单提交、纯文本回调），不该抛异常，也不该让 handler 每次自己 try/catch。
+    let body_json: Option<Value<'js>> = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => ctx.json_parse(value.to_string()).ok(),
+        Err(_) => None,
+    };
+    match body_json {
+        Some(value) => request_event.set("bodyJson", value)?,
+        None => request_event.set("bodyJson", Value::new_undefined(ctx.clone()))?,
+    }
+    // 这一路没有 bot / 会话，任何残留都是"读到上一个人的东西"。
+    ai.reset_event();
+
+    let host: Object<'js> = ctx.globals().get("__hbot")?;
+    request_event.set("log", host.get::<_, Function<'js>>("log")?)?;
+    request_event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
+    request_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
+    Ok(request_event)
 }
 // Nine arguments like its siblings above: they are the same slot set (device / state /
 // ai) threaded down from `serve`, and bundling them into a struct would only move the

@@ -222,6 +222,21 @@ declare module 'hbot' {
      * `onResume` 的错误日志，而不是悄悄当成处理成功。
      */
     onResume(ctx: ResumeCtx, message: InboundMessage): void | Promise<void>;
+    /**
+     * 外部系统的一次 HTTP 请求打进来时调用（需要 {BT}capabilities.webhook{BT} 里声明了对应路由）。
+     *
+     * **返回值就是 HTTP 应答**：{BT}undefined{BT} / {BT}null{BT} → 204（只确认收到）；字符串 →
+     * {BT}text/plain{BT} + 200；其它值序列化成 JSON + 200；要改状态码就返回信封
+     * {BT}{ status: 418, body: 'teapot', contentType: 'text/plain' }{BT}。
+     *
+     * 上下文比所有其它事件都窄：只有这次请求的 {BT}route{BT} / {BT}method{BT} / {BT}contentType{BT} /
+     * {BT}body{BT} / {BT}bodyJson{BT} 与 {BT}log{BT} / {BT}sleep{BT} / {BT}ai{BT}。**没有** {BT}reply{BT}：
+     * 外部系统没有会话，应答走返回值；想主动推消息用 {BT}ctx.send{BT}（那是另一个能力，另一次判据）。
+     *
+     * 声明了路由却没定义这个钩子时，每条请求都会记一条点名 {BT}onWebhook{BT} 的错误日志，
+     * 并向调用方回 500 —— 而不是悄悄回一个 204 让外部系统以为成功了。
+     */
+    onWebhook?(ctx: WebhookCtx): unknown | Promise<unknown>;
   }
 
   /** 定时器事件的上下文：只有宿主能力，没有入站字段。 */
@@ -515,6 +530,35 @@ declare module 'hbot' {
     kind?: 'private' | 'group' | 'channel';
   }
 
+  /** 外部系统打进来的一次请求（{BT}onWebhook{BT} 的上下文）。 */
+  export interface WebhookCtx {
+    /** 命中的路由路径，与 {BT}hbot.json{BT} 的 {BT}capabilities.webhook[].path{BT} 一致。 */
+    readonly route: string;
+    /** HTTP 方法；v1 只可能是 {BT}'POST'{BT}。 */
+    readonly method: string;
+    /** 调用方给的 {BT}Content-Type{BT}；没给是 {BT}undefined{BT}。 */
+    readonly contentType?: string;
+    /** 请求体原文（已按 UTF-8 校验，非法编码在传输层就变成 400）。 */
+    readonly body: string;
+    /** 请求体解析成 JSON 的结果；不是 JSON 时是 {BT}undefined{BT}（不是 {BT}null{BT}，也不抛）。 */
+    readonly bodyJson?: unknown;
+    /** 写一行运行日志。 */
+    log(message: string): void;
+    /** 让出 {BT}ms{BT} 毫秒；会被本次请求的预算截断。 */
+    sleep(ms: number): Promise<void>;
+    /** 智能能力面，与消息事件同一份实现。 */
+    readonly ai: AiApi;
+  }
+
+  /** {BT}onWebhook{BT} 可以返回的应答信封（其余返回值按状态码 200 处理）。 */
+  export interface WebhookEnvelope {
+    /** HTTP 状态码，200–599 的整数；字符串会被拒绝（不做隐式转换）。 */
+    status?: number;
+    /** 应答体；字符串原样发，其它值序列化成 JSON。 */
+    body?: unknown;
+    /** 内容类型，缺省 {BT}application/json{BT}。 */
+    contentType?: string;
+  }
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;
   /** 写运行日志。 */

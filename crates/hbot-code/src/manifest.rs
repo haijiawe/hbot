@@ -125,6 +125,13 @@ pub struct Capabilities {
     /// 这件事在代码里无从写错收件人，也不需要每次调用都查库。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<hbot_core::NotifyTarget>,
+    /// 事件能力（C1）：{BT}onWebhook(ctx){BT} 的入站路由表。
+    ///
+    /// 与 {BT}timer{BT} / {BT}jobs{BT} 同一个形状：每条路由都要有路径与密钥来源，
+    /// "true" 无法回答"从哪条 URL 进、密钥在哪个环境变量"。空数组 = 没声明 ——
+    /// 那时任何 {BT}POST /hook/…{BT} 都回 {BT}HBOT_WEBHOOK_NOT_DECLARED{BT}，而不是悄悄收下。
+    #[serde(default)]
+    pub webhook: Vec<hbot_core::WebhookRoute>,
 }
 
 /// 状态能力（`docs/07` §5）。
@@ -191,6 +198,15 @@ impl Capabilities {
     #[must_use]
     pub fn jobs(&self) -> &[hbot_core::JobSpec] {
         &self.jobs
+    }
+
+    /// webhook 路由表（{BT}onWebhook{BT} 的路径与密钥来源从这里来）。
+    ///
+    /// 返回空切片表示"没声明"，与 {BT}Self::timer{BT} 同一语义：声明层只回答"项目要不要
+    /// 被外部系统调用"，不回答"服务有没有在听"（后者由 {BT}hbot-rpc{BT} 的 {BT}WebhookServer{BT} 回答）。
+    #[must_use]
+    pub fn webhook(&self) -> &[hbot_core::WebhookRoute] {
+        &self.webhook
     }
 
     /// `ctx.send` 是否可用（声明层判据；宿主装配再判一道）。
@@ -419,6 +435,16 @@ impl Manifest {
             invalid(
                 &manifest_path,
                 format!("`capabilities.jobs` 不合法：{error}"),
+            )
+        })?;
+
+        // webhook 路由：路径、密钥环境变量名、重复、数量全在这一份判据里
+        // （`hbot-core::bot_webhook::validate_routes`）。写错就在加载时报 —— 等到第一次
+        // 请求才发现，症状是「外部系统一直 401」或「一直 404」，两种都指向错误的方向。
+        hbot_core::validate_routes(&self.capabilities.webhook).map_err(|error| {
+            invalid(
+                &manifest_path,
+                format!("`capabilities.webhook` 不合法：{error}"),
             )
         })?;
 
