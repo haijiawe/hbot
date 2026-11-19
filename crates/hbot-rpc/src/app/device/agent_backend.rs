@@ -23,7 +23,8 @@ use std::sync::{Arc, Weak};
 
 use hbot_core::{
     ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapability, DeviceCapabilityReport,
-    DeviceError, InputAction, OcrRequest, OcrText, Screenshot, ScreenshotRequest, WindowInfo,
+    DeviceError, InputAction, OcrRequest, OcrText, Screenshot, ScreenshotRequest, WindowCapture,
+    WindowCaptureRequest, WindowInfo,
 };
 
 use super::DeviceRegistry;
@@ -68,6 +69,13 @@ impl DeviceBackend for SessionScopedBackend {
     fn screenshot(&self, request: &ScreenshotRequest) -> Result<Screenshot, DeviceError> {
         self.authorize(DeviceCapability::Screen)?;
         self.inner.screenshot(request)
+    }
+
+    /// 按窗口截图走**同一个** `Screen` 判据（不是 `Window`）：它读的是像素，
+    /// 与整屏截图是同一种隐私暴露面，换成窗口目标不降低敏感度。
+    fn capture_window(&self, request: &WindowCaptureRequest) -> Result<WindowCapture, DeviceError> {
+        self.authorize(DeviceCapability::Screen)?;
+        self.inner.capture_window(request)
     }
 
     fn ocr(&self, request: &OcrRequest) -> Result<OcrText, DeviceError> {
