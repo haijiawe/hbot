@@ -77,6 +77,10 @@ pub struct AppState {
     /// 与 [`Self::bots`] 分开：登记表存 supervisor（消息链路要它），webhook 要的是执行器
     /// 本身 —— 它不走 supervisor（没有会话、没有队列、没有去重）。`bot_stop` 时两边一起清。
     webhooks: Arc<crate::webhook::WebhookRegistry>,
+    /// 每 bot 一个库文件的 SQL schema 集（`C2.sql`）。
+    ///
+    /// 进程级共享一份：它内部按 bot 分文件与连接，所以不需要每 bot 一个实例。
+    bot_sql: Arc<hbot_store::BotSqlSchemas>,
     adapter_factory: Arc<dyn runtime::AdapterFactory>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
@@ -182,6 +186,12 @@ impl AppState {
         );
         phase.done();
 
+        // SQL 库文件放在数据目录下：与 `hbot.db` 同处一地，备份/搬家时不会漏。
+        let bot_sql = Arc::new(
+            hbot_store::BotSqlSchemas::open(data_dir.join("bot_sql"))
+                .map_err(|error| HbotError::internal(format!("无法创建 SQL 库目录：{error}")))?,
+        );
+
         let state = Self {
             data_dir,
             store,
@@ -193,6 +203,7 @@ impl AppState {
             agent,
             device,
             webhooks: Arc::new(crate::webhook::WebhookRegistry::new()),
+            bot_sql,
             // 生产工厂是路由：按 bots.platform 选 OneBot 或 QQ 官方（见 runtime::PlatformRouter）。
             adapter_factory: Arc::new(runtime::PlatformRouter),
             clock,
@@ -312,6 +323,14 @@ impl AppState {
     /// `Arc<dyn DeviceGate>` 注入沙箱 —— 它持 `Weak`，不会延长登记表的寿命。
     pub fn device(&self) -> &Arc<device::DeviceRegistry> {
         &self.device
+    }
+
+    /// 每 bot 一个库文件的 SQL schema 集（`C2.sql`）。
+    ///
+    /// 库文件在 `<data_dir>/bot_sql/<bot_id>.db`；一个 bot 一个文件的目的是让跨 bot 越权
+    /// 在物理上不可能 —— 别的 bot 的表根本不在这个连接的命名空间里。
+    pub fn bot_sql(&self) -> &Arc<hbot_store::BotSqlSchemas> {
+        &self.bot_sql
     }
 
     /// 运行中的 bot → 沙箱执行器（webhook 的派发入口，见 [`crate::webhook`]）。

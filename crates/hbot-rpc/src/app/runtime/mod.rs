@@ -39,6 +39,7 @@ pub mod outbox_source;
 pub mod qq;
 pub mod sandbox_handler;
 pub mod send;
+pub mod sql;
 pub mod waits;
 pub mod webhook;
 

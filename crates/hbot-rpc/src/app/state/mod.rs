@@ -359,6 +359,7 @@ mod tests {
                 kv,
                 history,
                 session: false,
+                sql: false,
             },
             ..Capabilities::default()
         }

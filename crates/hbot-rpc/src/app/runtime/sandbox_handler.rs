@@ -55,6 +55,7 @@ use crate::app::runtime::fingerprint_cache::FingerprintCache;
 use crate::app::runtime::jobs::declared_jobs;
 use crate::app::runtime::net::http_config;
 use crate::app::runtime::send::declared_egress;
+use crate::app::runtime::sql::declared_sql;
 use crate::app::runtime::waits::declared_session;
 use crate::app::runtime::webhook::declared_webhook;
 use crate::app::{EventBus, store_failed};
@@ -151,6 +152,8 @@ pub struct SandboxHandlerConfig {
     /// `AppState::start_bot` 的路径），此时 `ctx.session.prompt` 报
     /// `HBOT_SESSION_UNAVAILABLE`，**不是**把等待收进内存（那样重启后消失会像正常行为）。
     pub waits: Option<Arc<crate::app::runtime::waits::StoreWaitQueue>>,
+    /// SQL 后端（`None` = 未装配，`ctx.sql.*` 报 `HBOT_SQL_UNAVAILABLE`）。
+    pub sql: Option<Arc<crate::app::runtime::sql::StoreSqlBackend>>,
 }
 
 /// 一个 worker 槽位：指纹一致就复用，不一致说明代码变了，换新 isolate。
@@ -368,6 +371,11 @@ pub struct SandboxHandler {
     /// 与其它能力同一条纪律：**每次新建 isolate 时**才 `set_egress`，所以清单里
     /// `capabilities.send` / `capabilities.notify` 的改动会在热重载后生效。
     send: Option<Arc<dyn hbot_code::send::SendQueue>>,
+    /// SQL 后端（`None` = 未装配，`ctx.sql.*` 报 `HBOT_SQL_UNAVAILABLE`）。
+    ///
+    /// 与其它能力同一条纪律：**每次新建 isolate 时**才 `set_sql`，所以清单里
+    /// `capabilities.state.sql` 的改动会在热重载后生效。
+    sql: Option<Arc<crate::app::runtime::sql::StoreSqlBackend>>,
 }
 
 /// 设备能力的两个端口 + 装配时刻。
@@ -407,6 +415,7 @@ impl SandboxHandler {
             jobs: config.jobs,
             waits: config.waits,
             send: None,
+            sql: config.sql,
         }
     }
 
@@ -482,6 +491,15 @@ impl SandboxHandler {
     /// （见 [`Self::worker`]），这里只负责「把端口装进去」。
     pub fn with_send(mut self, queue: Arc<dyn hbot_code::send::SendQueue>) -> Self {
         self.send = Some(queue);
+        self
+    }
+
+    /// 装配 SQL 能力（`ctx.sql.*` 的后端）。在 [`Self::new`] 之后立刻调。
+    ///
+    /// 不调用本方法 = `ctx.sql.query` 每次回 `HBOT_SQL_UNAVAILABLE`，明确失败，
+    /// 不是返回一个空结果集（那会让「表里没有数据」与「能力没装配」分不清）。
+    pub fn with_sql(mut self, backend: Arc<crate::app::runtime::sql::StoreSqlBackend>) -> Self {
+        self.sql = Some(backend);
         self
     }
 
@@ -766,6 +784,14 @@ impl SandboxHandler {
             if let Some(queue) = &self.send {
                 let (declared, target) = declared_egress(&self.project_root);
                 sandbox.set_egress(declared, target, Arc::clone(queue));
+            }
+            // SQL 能力：声明开关与后端一起装（每个新 isolate 装一次）。声明层现读清单，
+            // 后端是那个共享的 schema 集 —— 真正的隔离在 store 侧（每 bot 一个文件）。
+            if let Some(backend) = &self.sql {
+                sandbox.set_sql(
+                    declared_sql(&self.project_root),
+                    Arc::clone(backend) as Arc<dyn hbot_code::sql::SqlBackend>,
+                );
             }
             tracing::debug!(
                 bot = %self.bot_id,
@@ -1571,6 +1597,20 @@ impl SandboxHandler {
         }
     }
 
+    /// 执行项目的 `migrations/*.sql`（启动时调一次）。
+    ///
+    /// 这是 SQL 能力**唯一**允许建表结构的路径：运行时 `CREATE` 会被语句闸拒（`HBOT_SQL_DENIED`）。
+    /// 没有 migrations 目录返回 0，不是错误 —— 不用 SQL 的项目本来就没有。
+    ///
+    /// # Errors
+    ///
+    /// 任一条迁移执行失败；失败时整条回滚（见 `BotSqlSchemas::apply_migrations`）。
+    pub fn apply_sql_migrations(&self) -> Result<u32, hbot_core::SqlError> {
+        let Some(backend) = &self.sql else {
+            return Ok(0);
+        };
+        backend.apply_migrations()
+    }
     /// 跑一次生命周期钩子（`onStart` / `onStop`）。
     ///
     /// 缺钩子时**成功返回**：清单里没有「声明生命周期钩子」这一项，所以「没写」是最常见
@@ -2233,6 +2273,7 @@ mod tests {
                     // `HBOT_JOBS_UNAVAILABLE`（明确的失败，不是静默收下）。
                     jobs: None,
                     waits: None,
+                    sql: None,
                 })
                 .with_debounce(debounce)
                 .with_fingerprint_ttls(metadata_ttl, content_floor),

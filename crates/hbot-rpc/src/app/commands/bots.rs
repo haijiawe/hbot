@@ -54,6 +54,7 @@ use crate::app::runtime::sandbox_handler::{
     REPLY_CAPACITY, SandboxHandler, SandboxHandlerConfig, TICK_INTERVAL,
 };
 use crate::app::runtime::send::StoreSendQueue;
+use crate::app::runtime::sql::StoreSqlBackend;
 use crate::app::runtime::waits::StoreWaitQueue;
 use crate::app::runtime::{AdapterPorts, conversation_kind_from_str, conversation_kind_str};
 use crate::app::store_failed;
@@ -170,6 +171,13 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
             // 作业能力：入队端口落 `bot_jobs` 表（声明闸在沙箱侧现读清单，见
             // `SandboxHandler::worker`）。不装配 = `ctx.jobs.enqueue` 报
             // `HBOT_JOBS_UNAVAILABLE`，明确失败，不是把作业收进内存。
+            // SQL 能力：每 bot 一个库文件（隔离靠文件，不靠表名前缀）。
+            // 迁移在 `start_bot` 的后面执行一次（见 `apply_sql_migrations`）。
+            sql: Some(Arc::new(StoreSqlBackend::new(
+                bot_id,
+                root.clone(),
+                Arc::clone(state.bot_sql()),
+            ))),
             jobs: Some(Arc::new(StoreJobQueue::new(
                 bot_id,
                 root.clone(),
@@ -232,6 +240,27 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
     // `onStart`：**失败就是启动失败**。放在 supervisor.start 之后、登记之前 ——
     // 此刻还没有任何消息被消费（队列是空的），所以「初始化没成功就别让它开始接活」
     // 这句话是成立的；失败时的收尾与 ensure_local_conversation 那条路一致（先停 supervisor）。
+    // 项目自带的 `migrations/*.sql` 在 `onStart` **之前**跑：`onStart` 里可能就要读表。
+    // 失败**不阻断启动**（与编译失败同一纪律）：迁移是用户代码的一部分，一个写错的
+    // `CREATE TABLE` 不该让 bot 永远起不来 —— 落一行 error，让它起着、改好再重启。
+    match executor.apply_sql_migrations() {
+        Ok(0) => {}
+        Ok(applied) => {
+            tracing::info!(bot = %bot_id, applied, "SQL 迁移已应用");
+        }
+        Err(error) => {
+            tracing::warn!(bot = %bot_id, error = %error, "SQL 迁移失败（不阻断启动）");
+            local::record_lines(
+                state.store(),
+                state.events(),
+                state.clock(),
+                bot_id,
+                LogLevel::Error,
+                vec![format!("SQL 迁移失败：{error}")],
+            )
+            .await;
+        }
+    }
     if let Err(error) = executor
         .run_lifecycle(hbot_core::LifecyclePhase::Start, None)
         .await
