@@ -30,6 +30,7 @@ pub mod bot_egress;
 pub mod bot_jobs;
 pub mod bot_lifecycle;
 pub mod bot_session;
+pub mod bot_sql;
 pub mod bot_state;
 pub mod bot_timer;
 pub mod bot_webhook;
@@ -67,6 +68,11 @@ pub use bot_session::{
     SessionError, WaitHit, WaitScope, WaitSpec, WaitState, WaitStore,
     validate_key as validate_wait_key, validate_prompt as validate_wait_prompt,
     validate_spec as validate_wait_spec, validate_timeout as validate_wait_timeout,
+};
+pub use bot_sql::{
+    BotSql, MAX_SQL_AFFECTED, MAX_SQL_BYTES, MAX_SQL_PARAMS, MAX_SQL_ROWS, SqlChange, SqlError,
+    SqlRows, SqlStatement, SqlValue, SqlVerb, normalize as normalize_sql, validate as validate_sql,
+    validate_query as validate_sql_query,
 };
 pub use bot_state::{
     BotState, BotStateError, HistoryDirection, HistoryEntry, HistoryReader, KvEntry,
