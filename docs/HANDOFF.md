@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 01:30**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql` 全部落地 —— **M7 第 1–5.5 步完成**。
+> 本快照时间：**2026-11-20 02:45**（工作树还有文档改动待提交）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql` 全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）—— **M7 第 1–5.5 步完成**。
 
 ---
 
@@ -62,7 +62,7 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1862 passed / 0 failed / 120 target
+cargo test -j 2 --workspace              # 当前 1866 passed / 0 failed / 120 target
 pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 ```
 
@@ -85,7 +85,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | `hbot-bot` | 事件 JSON、会话、有界队列、supervisor |
 | `hbot-adapters` | 平台适配器（`onebot11` / `qq_official` / `local`） |
 | `hbot-command` | 命令隔离（Windows Job/受限令牌、Linux Landlock、CPU/内存/进程数/IO 限额） |
-| `hbot-device` | 截屏 / 多显示器 / OCR（含中文）/ 输入 / 剪贴板 / 每屏 DPI（Windows 实现，其它平台 fail-closed） |
+| `hbot-device` | 截屏 / 多显示器 / 按窗口截图 / OCR（含中文）/ 输入 / 剪贴板 / 每屏 DPI（Windows 实现，其它平台 fail-closed） |
 | `hbot-agent` | `ToolGateway`（八步，`Capability` 是第一步）+ 9 个工具 + 审批 |
 | `hbot-replay` | 回放内核 + 夹具导出/不查库重跑 |
 | `hbot-rpc` | DTO、`dispatch`（45 个分派臂）、`AppState` 装配、TS 生成、各能力的 `*Source` |
@@ -106,7 +106,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | `C2.kv` / `C2.history` | 已实现（2026-11-18，`docs/07` §5.0） |
 | `C5.ai`（`ctx.ai.complete`） | 已实现（2026-11-18，`docs/07` §3.3） |
 | `C1.timer`（`onTimer`） | 已实现（2026-11-18，`docs/07` §4.4） |
-| `C6.device` | 窄版已实现（Windows，`docs/09`） |
+| `C6.device` | 窄版已实现（Windows，`docs/09`）；按窗口截图 2026-11-20 补齐 |
 | `C4.jobs`（`ctx.jobs` / `onJob`） | **已实现（2026-11-19，`docs/07` §4.5）** |
 | `C2.session`（`bot_waits`） | **已实现（2026-11-19，`docs/07` §5.2）** |
 | `C3.send` / `C3.notify` | **已实现（2026-11-19，`docs/07` §3.4）** |
@@ -118,7 +118,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 94 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 95 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -238,7 +238,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 - `onStart` / `onStop`（含 `shutdown` 原因）—— **已落地（2026-11-19 / 2026-11-20，`docs/07` §4.6）**，别再重做；
   `crash` 这个原因**暂时没人发**是刻意的（理由见上面 §7 C 段末尾）；
 - `onSchedule`（与 `onTimer` 不是同一件事）；
-- 设备完整版：混合 DPI 跨屏拼图、按窗口截图、中文以外的 OCR 语言包；
+- 设备完整版：混合 DPI 跨屏拼图、中文以外的 OCR 语言包（按窗口截图 2026-11-20 已落地，见 `docs/09` §11.1）；
 - `E1` npm 打包、云端执行宿主（`docs/08` §9 / ADR-0006）。
 
 ---
@@ -264,7 +264,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1862 passed / 120 target
+cargo test -j 2 --workspace                              # 基线：1866 passed / 120 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。

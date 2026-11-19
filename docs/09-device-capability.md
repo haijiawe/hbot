@@ -399,19 +399,19 @@ interface DeviceApi {
 | 项 | 窄版（Windows only） | 完整版 |
 |---|---|---|
 | 平台 | Windows 10/11 | + macOS + Linux（X11 直连、Wayland 走 portal） |
-| 子能力 | 五类全有（`screen`/`ocr`/`input`/`window`/`clipboard`），OCR 走本地引擎、按窗口 OCR 已通 | 同（另加跨平台 OCR 与视觉输入） |
+| 子能力 | 五类全有（`screen`/`ocr`/`input`/`window`/`clipboard`），OCR 走本地引擎、按窗口 OCR 与按窗口截图像素都已通 | 同（另加跨平台 OCR 与视觉输入） |
 | 应用白名单 | ✅ 进程映像名 | ✅ 同 |
 | 限时会话 + 撤销 | ✅ | ✅ 同 |
 | 审计 | ✅（不含内容） | ✅ 同 |
 | 让模型看懂屏幕 | **OCR**（含中文，实测） | 视觉输入（A 路线） |
-| 坐标/多显示器 | 全显示器可枚举、可按序号抓整屏；注入坐标用虚拟桌面绝对坐标 | 每屏 DPI 归一、跨屏拼图、按窗口截图 |
+| 坐标/多显示器 | 全显示器可枚举、可按序号抓整屏、可按窗口抓像素；注入坐标用虚拟桌面绝对坐标 | 每屏 DPI 归一、跨屏拼图 |
 | 出口标准 | V12–V16 中的 V12/V13/V15/V16 + 一条"手动跑通点按钮" | V12–V16 全绿 + 三平台 |
 
 ### 9.3 工作量（粗估，仅供参考）
 
 - 窄版：骨架（gate + grants + 库表 + 4 命令 2 事件 + d.ts）**约 3–4 天**；Windows backend（抓屏 + 注入 + 白名单 + 锁屏检测）**约 3–4 天**；OCR 接线 **约 2 天**；测试与真机 **约 2 天** → **10–12 天**。
-- 完整版另需：macOS（屏幕录制授权流程 + 重启提示）、Linux X11、Wayland portal（ScreenCast + RemoteDesktop 两套）、三平台 OCR、每屏 DPI 归一与跨屏拼图、按窗口截图、视觉输入路线 → **再 3–4 周**。
-- **实际进度已超出窄版的估算**（2026-11-17）：OCR、按窗口 OCR、中文、多显示器、限速、设置读写都已落地，窄版估的 10–12 天里"只做 screen + input"那半边被提前拆掉了。
+- 完整版另需：macOS（屏幕录制授权流程 + 重启提示）、Linux X11、Wayland portal（ScreenCast + RemoteDesktop 两套）、三平台 OCR、每屏 DPI 归一与跨屏拼图、视觉输入路线 → **再 3–4 周**（按窗口截图已于 2026-11-20 落地，见 §11.1）。
+- **实际进度已超出窄版的估算**（2026-11-17，2026-11-20 追加）：OCR、按窗口 OCR、按窗口截图、中文、多显示器、限速、设置读写都已落地，窄版估的 10–12 天里"只做 screen + input"那半边被提前拆掉了。
 
 （这两个数字是估算，不是承诺；实际以 S14 的真机结论为准。）
 
@@ -466,6 +466,7 @@ interface DeviceApi {
 | OCR | **已完成（窄版）**（`hbot-device` 26 lib + 7 api + 14 desktop，clippy 0） | §9.1 的 B 路线：`Windows.Media.Ocr` → 文本。宿主函数 `__hbot.device.ocr`、Agent 工具 `read_screen` |
 | OCR 按窗口 | **已完成（2026-11-17）** | `DeviceTarget::Window{process}` → `PrintWindow`/`BitBlt`；判据是「内容全零」不是 `PrintWindow` 的返回值；找不到可读窗口 → `AppNotAllowed{process}`（见 §11.2 ④） |
 | OCR 中文 | **已完成（2026-11-17 实测）** | 本机 `["en-US","zh-Hans-CN"]`，画 `你好，世界` → `你 好 ， 世 界`；测试自门控（无语言包/字体回退时打印理由跳过，不伪造通过） |
+| 按窗口截图 | **已完成（2026-11-20）** | `screen({ window: <id> })`：`u64` 句柄来自 `ctx.device.windows()` 的 `id`（JS 侧是数字）。实现走 `PrintWindow(PW_RENDERFULLCONTENT)`，位图全零则退窗口 DC 的 `BitBlt`，仍空报 `HBOT_DEVICE_FAILED`（**不给全黑图**）；句柄不存在 / 已最小化 → `HBOT_DEVICE_HOST_LIMIT`（最小化窗口的矩形是 -32000 那一带的占位值，抓了也没意义）。与 `monitor` 互斥，两个都给当场拒；`monitor`/`window` 缺的那一个在返回值里保持 `undefined`（不拿 0 冒充"主屏"） |
 | 多显示器截图 | **已完成（2026-11-17）** | `ScreenshotRequest::monitor: Some(i)` 抓第 i 块整屏（`CreateDCW(szDevice)`，不是 `GetDC(NULL)`）；序号排序 `primary` → 左上角 → `szDevice`；越界 `HostLimit` 带可用范围；清单由 `hbot_device::displays()` 暴露（**本机只有一块屏，第二块屏只验了对称路径**） |
 | 设置写入 + watcher | **已完成（2026-11-17）** | `device_settings_get` / `device_settings_set` / `device.settings`；1 秒 mtime 轮询（不引入 `notify`），坏文件只处理一次（见 §4.2） |
 | IDE 设备设置卡片 | **已完成**（web 31 文件 / 246 用例） | `apps/web/src/features/device/settings-card.tsx`；`maxMinutes>30` 与 `defaultMinutes>maxMinutes` 前端就拦，后端仍独立校验 |
@@ -484,6 +485,12 @@ interface DeviceApi {
 - **设备授权的 bot 身份来自事件 payload 的 `botId`**（`build_event` 里取 `payload.botId`）。手写 payload 的测试/基准里设备能力会报 `HBOT_DEVICE_FAILED: 本次事件没有 botId`。这也是为什么"能构造事件交给 `dispatch` 的路径"等于"能决定对哪个 bot 的会话做授权"。
 - **`read-only` 档连闸都不问**（`authorize` 在第一步就返回 `HBOT_DEVICE_NOT_GRANTED`，假 gate 的 `authorize` 调用计数为 0）：因为 `DeviceGate::authorize` 的实现方自己要读 `device.json`、查会话表，那些也是"碰外部资源"。这比"后端没被调"更强。
 
+**按窗口截图定下来的四条（2026-11-20）**：
+
+1. **`WindowCaptureRequest` 是独立类型，不给 `ScreenshotRequest` 加 `window` 字段。** 屏幕序号与窗口句柄是两种目标，塞进一个结构体会长出"两个都给了算什么"的歧义 —— 而授权层不能有歧义（`DeviceGate` 判的是这次会话能不能读屏幕，不是哪个目标）。
+2. **`DeviceBackend::capture_window` 带默认实现**（返回 `HBOT_DEVICE_HOST_LIMIT`），不是必需方法。否则 `unsupported.rs`、Agent 侧夹具、`hbot-code` 的测试后端全都要写一个 `unimplemented!`，而"这个宿主做不到"本来就是 `HOST_LIMIT` 的语义。
+3. **`DeviceCapabilityReport` 加的是 `window_capture`，不是复用 `window`。** "能枚举窗口"三平台都能做；"能抓窗口像素"要有渲染路径（Windows 的 `PrintWindow`，macOS 要屏幕录制授权）。合成一个布尔会让 UI 在 macOS 上显示"能按窗口截图"然后每次都失败。
+4. **隐私面按 `Screen` 授权，不按 `Window`。** `SessionScopedBackend::capture_window` 第一步是 `self.authorize(DeviceCapability::Screen)` —— 它读的是像素，与整屏截图同一类数据；`window` 那一项管的是"聚焦/最小化/关闭/启动"这类操作。**`read_screen` 工具面不动**：`ChatMessage.content` 仍是 `Option<String>`，模型看不了图，给 Agent 加截图工具没有消费者。
 ### 11.2 两个前置落地时改掉了什么（2026-11-17）
 
 **① 定时器骨架** —— 按 §11 的要求做成可替换入口而不是内联：`DeviceRegistry::spawn_expiry_tick()` 里跑一个 1 秒 `interval`（`MissedTickBehavior::Skip`，`Drop` 时置 cancel），每次只调 `sweep_expired()`。M7 的 `C1.timer` 落地时，把"注册一个周期性任务"这一句换掉即可，`sweep_expired` 的判据不用动。

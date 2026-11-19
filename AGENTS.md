@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook` 与 `onStart`/`onStop` 全部落地**（1862 个 Rust 测试 / 120 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook` 与 `onStart`/`onStop` 全部落地**（1866 个 Rust 测试 / 120 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -484,6 +484,15 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     版本兜底（坑 24），bot 仍然活着；在那一刻调 `onStop(crash)` 会让清理逻辑跑在一个还活着的 bot 上，
     之后每条消息都在被清空的环境里执行。**宁可这个原因暂时没人发，也不要发错**。
 
+95. **抓窗口像素与枚举窗口是两项能力，别合成一个布尔**（2026-11-20，按窗口截图落地时定）。
+    `DeviceCapabilityReport` 现在是 `window`（聚焦/最小化/关闭/启动）与 `window_capture`（`PrintWindow` 抓像素）两个字段。
+    合成一个的后果：macOS 上"能枚举窗口"为真、"能抓像素"要屏幕录制授权，UI 会显示可用然后每次都失败。
+    同批的三条形状：① `WindowCaptureRequest` 是独立类型，不给 `ScreenshotRequest` 加 `window` 字段（两个目标塞一个结构体会长出"都给了算什么"的歧义，而授权层不能有歧义）；
+    ② `DeviceBackend::capture_window` 带**默认实现**返回 `HBOT_DEVICE_HOST_LIMIT`（否则每个夹具都要写 `unimplemented!`，而"这台机器做不到"本来就是 `HOST_LIMIT` 的语义）；
+    ③ 隐私面按 `DeviceCapability::Screen` 授权而不是 `Window`（它读的是像素）。
+    实现细节里两个判据：`PrintWindow` 的返回值**不作数**，要看位图是否全零（全零再退窗口 DC 的 `BitBlt`，仍空报 `FAILED` 而不是给全黑图）；
+    **已最小化的窗口必须直接拒**（`HBOT_DEVICE_HOST_LIMIT`）—— 最小化窗口的矩形是 `-32000` 那一带的占位值，抓出来的东西没有意义。
+    JS 侧 `screen({ window })` 与 `monitor` 互斥（两个都给当场拒），返回值里**没给的那个字段保持 `undefined`**，不要用 `0` 冒充"主屏"（`0` 是合法主屏序号，冒充就再也分不出"主屏"与"没给"）。
 ---
 
 ## 8. 新增 X 的步骤
