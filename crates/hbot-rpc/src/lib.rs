@@ -16,6 +16,7 @@ pub mod app;
 pub mod dispatch;
 pub mod dto;
 pub mod ts;
+pub mod webhook;
 pub mod ws;
 
 pub use app::{AppState, EventBus};

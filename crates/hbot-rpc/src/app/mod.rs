@@ -72,6 +72,11 @@ pub struct AppState {
     bots: bots::BotRegistry,
     agent: Arc<agent::AgentManager>,
     device: Arc<device::DeviceRegistry>,
+    /// 运行中的 bot → 它的沙箱执行器（webhook 的派发入口，见 [`crate::webhook`]）。
+    ///
+    /// 与 [`Self::bots`] 分开：登记表存 supervisor（消息链路要它），webhook 要的是执行器
+    /// 本身 —— 它不走 supervisor（没有会话、没有队列、没有去重）。`bot_stop` 时两边一起清。
+    webhooks: Arc<crate::webhook::WebhookRegistry>,
     adapter_factory: Arc<dyn runtime::AdapterFactory>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
@@ -187,6 +192,7 @@ impl AppState {
             bots: bots::BotRegistry::new(),
             agent,
             device,
+            webhooks: Arc::new(crate::webhook::WebhookRegistry::new()),
             // 生产工厂是路由：按 bots.platform 选 OneBot 或 QQ 官方（见 runtime::PlatformRouter）。
             adapter_factory: Arc::new(runtime::PlatformRouter),
             clock,
@@ -306,6 +312,14 @@ impl AppState {
     /// `Arc<dyn DeviceGate>` 注入沙箱 —— 它持 `Weak`，不会延长登记表的寿命。
     pub fn device(&self) -> &Arc<device::DeviceRegistry> {
         &self.device
+    }
+
+    /// 运行中的 bot → 沙箱执行器（webhook 的派发入口，见 [`crate::webhook`]）。
+    ///
+    /// `start_bot` 登记、`bot_stop` 注销：没有登记时就等于「这个 bot 没有 webhook」，
+    /// 请求回 404 而不是 503 —— 调用方看到的是「路径不对」，与「bot 没起来」区分得开。
+    pub fn webhooks(&self) -> &Arc<crate::webhook::WebhookRegistry> {
+        &self.webhooks
     }
 
     /// 已打开的项目根；没打开项目时 `None`。

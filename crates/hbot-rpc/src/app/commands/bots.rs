@@ -263,6 +263,10 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
         return Err(error);
     }
 
+    // webhook 的派发入口：登记的**执行器**（不是 supervisor）—— 外部请求没有会话，
+    // 不走消息那条「落库 → 入队 → 去重」的管道。
+    state.webhooks().register(bot_id, Arc::clone(&executor));
+
     let started_at = state.clock().now();
     state.bots().insert(
         bot_id,
@@ -379,6 +383,9 @@ async fn ensure_local_conversation(state: &AppState, bot: &Bot) -> Result<(), Hb
 
 /// 停止一个 bot（幂等：没在跑也返回 ok）。
 pub async fn stop(state: &AppState, bot_id: BotId) -> Response {
+    // 先注销 webhook：停下来的 bot 不该再被外部系统打到（下一步的请求立刻 404），
+    // 而不是等 supervisor 排空完了才发现执行器已经不可用。
+    state.webhooks().unregister(&bot_id);
     let was_running = state.bots().stop(&bot_id).await;
     if !was_running {
         tracing::debug!(bot = %bot_id, "bot_stop 作用于未运行的 bot（幂等）");

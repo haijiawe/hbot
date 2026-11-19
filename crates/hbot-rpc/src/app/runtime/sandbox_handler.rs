@@ -56,6 +56,7 @@ use crate::app::runtime::jobs::declared_jobs;
 use crate::app::runtime::net::http_config;
 use crate::app::runtime::send::declared_egress;
 use crate::app::runtime::waits::declared_session;
+use crate::app::runtime::webhook::declared_webhook;
 use crate::app::{EventBus, store_failed};
 use crate::dto::{Event, LogLevel};
 
@@ -1466,6 +1467,108 @@ impl SandboxHandler {
             })?;
         }
         Ok(())
+    }
+
+    /// 派发一次 webhook 请求，返回 HTTP 应答。
+    ///
+    /// 与 {BT}dispatch_job_on{BT} 同形（编译 → 取 worker 槽 → {BT}spawn_blocking{BT}），但**没有重试、
+    /// 没有落库**：调用方是一个在等 HTTP 响应的外部系统，一次请求就是一次事件。
+    ///
+    /// 三条错误各有各的归宿（见 {BT}hbot_core::bot_webhook::WebhookError{BT}）：
+    ///
+    /// * 路由不在清单里 → {BT}NoRoute{BT}（404）；
+    /// * 没有 isolate（bot 没起来、槽位被清空）→ {BT}Unavailable{BT}（503）；
+    /// * handler 抛错 / 超时 → {BT}Failed{BT} / {BT}Timeout{BT}（500 / 504）。
+    ///
+    /// 日志无论成败都落库：外部系统看不到 {BT}ctx.log{BT}，它是唯一排障线索。
+    pub async fn dispatch_webhook(
+        &self,
+        route: &str,
+        method: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> Result<hbot_core::WebhookResponse, hbot_core::WebhookError> {
+        if !declared_webhook(&self.project_root)
+            .iter()
+            .any(|declared| declared.path == route)
+        {
+            return Err(hbot_core::WebhookError::NoRoute {
+                route: route.to_owned(),
+            });
+        }
+        let (fingerprint, project) =
+            self.compiled()
+                .await
+                .map_err(|error| hbot_core::WebhookError::Unavailable {
+                    reason: error.to_string(),
+                })?;
+        // 外部请求没有会话可做稳定哈希，用路由名映射到 worker：同一条路由总落在同一个
+        // isolate 上，与 {BT}run_claimed_job{BT} 用作业主键是同一手法。
+        let index = stable_index(route, self.workers.len());
+        let mut guard = self
+            .worker(index, &fingerprint, &project)
+            .await
+            .map_err(|error| hbot_core::WebhookError::Unavailable {
+                reason: error.to_string(),
+            })?;
+        let Some(worker) = guard.as_mut() else {
+            return Err(hbot_core::WebhookError::Unavailable {
+                reason: format!("isolate 槽位 {index} 在派发前被清空（bot {}）", self.bot_id),
+            });
+        };
+        let sandbox = Arc::clone(&worker.sandbox);
+        let route_owned = route.to_owned();
+        let method_owned = method.to_owned();
+        let content_type_owned = content_type.map(str::to_owned);
+        let body_owned = body.to_owned();
+        let dispatched = tokio::task::spawn_blocking(move || {
+            sandbox.dispatch_webhook_collecting(
+                &route_owned,
+                &method_owned,
+                content_type_owned.as_deref(),
+                &body_owned,
+            )
+        })
+        .await
+        .map_err(|error| hbot_core::WebhookError::Failed {
+            message: format!("webhook 派发任务失败：{error}"),
+        })?;
+
+        match dispatched {
+            Ok((outcome, response)) => {
+                lock(&self.hot).crashes.record_success();
+                self.record_logs(outcome.logs).await;
+                // 返回值缺失 = handler 没回答（undefined/null）→ 204。契约里这是合法形状。
+                match response {
+                    Some(value) => hbot_core::response_from_handler(&value),
+                    None => Ok(hbot_core::WebhookResponse::no_content()),
+                }
+            }
+            Err(failure) => {
+                let mapped = remap_error(&failure.error, &project);
+                let crash = is_crash_class(&failure.error);
+                let dead = if crash { guard.take() } else { None };
+                drop(guard);
+                self.record_logs(failure.logs).await;
+                if let Some(dead) = dead {
+                    release_isolate(dead).await;
+                }
+                if crash {
+                    self.record_crash(&fingerprint).await;
+                }
+                self.record_error_line(format!("路由 `{route}` 处理失败：{mapped}"))
+                    .await;
+                Err(
+                    if matches!(*failure.error, hbot_code::CodeError::Timeout { .. }) {
+                        hbot_core::WebhookError::Timeout
+                    } else {
+                        hbot_core::WebhookError::Failed {
+                            message: mapped.to_string(),
+                        }
+                    },
+                )
+            }
+        }
     }
 }
 

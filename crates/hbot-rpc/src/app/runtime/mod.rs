@@ -40,6 +40,7 @@ pub mod qq;
 pub mod sandbox_handler;
 pub mod send;
 pub mod waits;
+pub mod webhook;
 
 use std::sync::Arc;
 
