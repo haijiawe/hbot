@@ -89,7 +89,8 @@ use std::time::{Duration, Instant};
 
 use hbot_core::device::{
     ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapabilityReport, DeviceError, DeviceTarget,
-    InputAction, MouseButton, OcrRequest, OcrText, Screenshot, ScreenshotRequest, WindowInfo,
+    InputAction, MouseButton, OcrRequest, OcrText, Screenshot, ScreenshotRequest, WindowCapture,
+    WindowCaptureRequest, WindowInfo,
 };
 // WinRT（`Windows.Media.Ocr`）。**是 `windows` crate，不是 `windows-sys`**：后者只有裸 ABI
 // 声明，没有 `OcrEngine` / `SoftwareBitmap` 这些投影出来的类型。
@@ -130,8 +131,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, MONITORINFOF_PRIMARY, PW_RENDERFULLCONTENT, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
-    SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW,
+    IsWindow, IsWindowVisible, MONITORINFOF_PRIMARY, PW_RENDERFULLCONTENT, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    WS_EX_TOOLWINDOW,
 };
 
 use crate::{
@@ -300,6 +302,72 @@ impl WindowsBackend {
             height: frame.height,
             png,
             monitor,
+        })
+    }
+
+    /// 按窗口截图：句柄 → 位图 → PNG → 按 `max_bytes` 检查（**不截断**）。
+    ///
+    /// 复用 [`capture_window_for_ocr`]：那条路径已经处理了"`PrintWindow` 返回成功但位图
+    /// 全零"这个实测坑，并有窗口 DC 的 `BitBlt` 退路。截图与 OCR 要的是同一份像素，
+    /// 分成两份实现只会让其中一个先腐烂。
+    ///
+    /// 两条前置拒绝（都在抓图之前，且都报 `HostLimit` —— 调用方重试同样的句柄
+    /// 也不会成功，补救动作是换句柄或先把窗口开出来）：
+    ///
+    /// 1. 句柄不存在（窗口已关闭）：报 `HostLimit` 并提示重新枚举；
+    /// 2. 窗口最小化（`IsIconic`）：`GetWindowRect` 给的是 `-32000` 那一带的坐标，位图要么
+    ///    全零要么是别的窗口的内容 —— 抓出来的东西与"这个窗口长什么样"无关。
+    ///
+    /// 抓到的位图**尺寸为 0**（窗口被折叠、客户区为空）同样拒绝：给一张 0×0 的 PNG
+    /// 会让调用方以为成功。
+    fn capture_window_frame(
+        &self,
+        request: &WindowCaptureRequest,
+    ) -> Result<WindowCapture, DeviceError> {
+        let hwnd: HWND = request.window as HWND;
+        // SAFETY: 整数转句柄不做任何解引用；`IsWindow` / `IsIconic` 对任意句柄都安全
+        // （包括伪造的、已销毁的），它们只读系统表并返回 0。
+        if hwnd.is_null() || unsafe { IsWindow(hwnd) } == 0 {
+            return Err(DeviceError::HostLimit {
+                detail: format!(
+                    "窗口句柄 {} 不存在或已经关闭：先调 ctx.device.windows() 拿当前句柄",
+                    request.window
+                ),
+            });
+        }
+        // SAFETY: 同上，`IsIconic` 对任意句柄安全。
+        if unsafe { IsIconic(hwnd) } != 0 {
+            return Err(DeviceError::HostLimit {
+                detail: format!(
+                    "窗口 {} 已最小化：最小化窗口的矩形是 -32000 那一带的占位值，抓不到它的内容",
+                    request.window
+                ),
+            });
+        }
+
+        let frame = capture_window_for_ocr(hwnd)?.read_frame()?;
+        if frame.width == 0 || frame.height == 0 {
+            return Err(DeviceError::Failed {
+                message: format!(
+                    "窗口 {} 的可视区域是 0×0（被折叠或没有客户区），没有可截的像素",
+                    request.window
+                ),
+            });
+        }
+        let encoded = png::encode_rgb(frame.width, frame.height, &frame.rgb)?;
+        tracing::debug!(
+            width = frame.width,
+            height = frame.height,
+            bytes = encoded.len(),
+            window = request.window,
+            "按窗口截图完成"
+        );
+        let png = enforce_limit(encoded, request.max_bytes)?;
+        Ok(WindowCapture {
+            width: frame.width,
+            height: frame.height,
+            png,
+            window: request.window,
         })
     }
 
@@ -502,6 +570,11 @@ impl DeviceBackend for WindowsBackend {
             "截图走 PrintWindow/BitBlt：独占全屏 DirectX 游戏、受 DRM 保护的内容可能全黑；\
              {display_note}；monitor 给序号时抓那块屏的整屏，None 时优先抓前台窗口"
         ));
+        notes.push(
+            "按窗口截图走 PrintWindow（失败或位图全零则退窗口 DC 的 BitBlt）：窗口须存在、\
+             未最小化；独占全屏、受 DRM 保护的内容会抓不到（报 HBOT_DEVICE_FAILED 而不是给全黑图）"
+                .into(),
+        );
         notes.push("输入受 UIPI 限制：完整性级别更高的窗口（提权程序、UAC 对话框）无法注入".into());
         match ocr_engine_probe() {
             Ok(()) => {
@@ -522,10 +595,13 @@ impl DeviceBackend for WindowsBackend {
             Err(reason) => notes.push(format!("OCR 不可用：{reason}")),
         }
 
+        // 按窗口截图与整屏截图共用同一条判据（都要一个可交互桌面 + 窗口渲染路径）：
+        // 拿不到屏幕 DC 的会话同样抓不到窗口。
         DeviceCapabilityReport {
             screen,
             input,
             window,
+            window_capture: screen,
             clipboard,
             ocr,
             detail: Some(notes.join("；")),
@@ -534,6 +610,10 @@ impl DeviceBackend for WindowsBackend {
 
     fn screenshot(&self, request: &ScreenshotRequest) -> Result<Screenshot, DeviceError> {
         self.capture(request)
+    }
+
+    fn capture_window(&self, request: &WindowCaptureRequest) -> Result<WindowCapture, DeviceError> {
+        self.capture_window_frame(request)
     }
 
     fn ocr(&self, request: &OcrRequest) -> Result<OcrText, DeviceError> {

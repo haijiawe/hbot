@@ -67,6 +67,7 @@ impl DeviceBackend for UnsupportedBackend {
             ocr: false,
             input: false,
             window: false,
+            window_capture: false,
             clipboard: false,
             detail: Some(NO_DEVICE_SUPPORT.to_string()),
         }
