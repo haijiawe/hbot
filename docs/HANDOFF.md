@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-19 08:45**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify` 都已落地。
+> 本快照时间：**2026-11-19 19:20**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook` 全部落地 —— **M7 第 1–5 步完成**。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1778 passed / 0 failed / 117 target
+cargo test -j 2 --workspace              # 当前 1812 passed / 0 failed / 118 target
 pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 ```
 
-现状：**六道全绿**（2026-11-19 08:33 实测）。`apps/web/src/generated/*.ts` **要入库**；
+现状：**六道全绿**（2026-11-19 19:05 实测）。`apps/web/src/generated/*.ts` **要入库**；
 改 `dto` 后必须 `gen`（还要 `gen --check`）再提交。
 纯文档提交不需要跑全闸，但要在提交信息里说明"仅文档"。
 
@@ -110,13 +110,13 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | `C4.jobs`（`ctx.jobs` / `onJob`） | **已实现（2026-11-19，`docs/07` §4.5）** |
 | `C2.session`（`bot_waits`） | **已实现（2026-11-19，`docs/07` §5.2）** |
 | `C3.send` / `C3.notify` | **已实现（2026-11-19，`docs/07` §3.4）** |
-| `C1.webhook` | **未开始** ← 下一步（M7 第 5 步剩下一半） |
-| `onStart` / `onStop` / `onSchedule` | **未开始** |
+| `C1.webhook` | **已实现（2026-11-19，`docs/07` §3.5）** |
+| `onStart` / `onStop` / `onSchedule` | **未开始** ← 下一步（小件） |
 | `E1` npm 打包 / 云端宿主 | **未开始** |
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 82 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 86 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -167,7 +167,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | M7 第 2 步 | 完成 | `ctx.ai.complete`（四道判据、每事件 4 次 / 60 秒预算、等待抵账、key 不出核心） |
 | M7 第 3 步 | 完成 | `C1.timer`（2026-11-18）+ `C4.jobs`（2026-11-19，`bot_jobs` 表 / `onJob` / 重试退避 / `bot_stop` 取消 / 重启恢复） |
 | M7 第 4 步 | 完成 | `C2.session`（2026-11-19，`bot_waits` 表 / `ctx.session.prompt` / `onResume` / 超时结算 / `bot_stop` 取消） |
-| M7 第 5 步 | 一半 | `C3.send` / `C3.notify`（2026-11-19，`bot_egress` 契约 / 唯一出口复用 `replies` / `notify` 目标钉清单）；**`C1.webhook` 未开始** |
+| M7 第 5 步 | 完成 | `C3.send` / `C3.notify`（2026-11-19）+ `C1.webhook`（2026-11-19，`WebhookServer` 手写 HTTP/1.1 / 三种鉴权失败统一 401 / 返回值即应答） |
 
 ---
 
@@ -199,28 +199,20 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 
 **还没做的三件**：超时**重发提示**（现在只落一行 error）；等待状态面板；把等待转交给别的 bot。
 
-### C. M7 第 5 步 —— `C3.send`/`C3.notify` **已落地 2026-11-19**，`C1.webhook` **未开始**
+### C. M7 第 5 步 —— **全部已落地 2026-11-19**（`C3.send`/`C3.notify` + `C1.webhook`，不要再重做）
 
-**已完成那一半**（`docs/07` §3.4 有五层判据表与六条设计决定）：
+`docs/07` §3.4（send/notify）与 §3.5（webhook）各有五层判据表与设计决定。下一轮碰它们时先记住这几条：
 
-| 片 | 落点 |
-|---|---|
-| 契约 | `crates/hbot-core/src/bot_egress.rs`：`SendRequest` / `NotifyRequest` / `NotifyTarget` / `SendError`（`HBOT_SEND_*`）/ `NotifyError`（`HBOT_NOTIFY_*`）/ 四个参数闸 |
-| 槽位 | `crates/hbot-code/src/send.rs`（`SendSlot`，一个端口 `SendQueue::send` 同时喂 send 与 notify）+ `runtime/send_api.rs`（`ctx.send` / `ctx.notify` 两个平铺函数） |
-| 清单 | `capabilities.send: bool` 与 `capabilities.notify: { conversation, kind }`（`kind` 必填、`unknown` 在加载清单时就拒） |
-| 装配 | `crates/hbot-rpc/src/app/runtime/send.rs` 的 `StoreSendQueue`（查/补建 `conversations` 行 → `replies.blocking_send`，`reply_to` 恒 `None`）+ `SandboxHandler::with_send` |
-| e2e | `crates/hbot-rpc/tests/send_capability.rs`，7 条 |
+- `send` 复用 `replies` 通道、`reply_to` 恒 `None`；**必须先补建 `conversations` 行**（外键，坑 79），
+  补建用 `INSERT OR IGNORE` 而不是嗅探错误文本（坑 80）；
+- `notify` 的收件人钉在清单里，调用点改不了（坑 81）；
+- webhook **不进 `inbound`**、handler 的返回值就是 HTTP 应答（坑 83）；
+- webhook 鉴权的三种失败统一 401，密钥只写环境变量名（坑 84）；
+- `Ctx::json_parse` 吃 `Value` 不吃 `String`（坑 85）；`WebhookServer` 的 listener 一旦 move 进接受循环，
+  `addr()` 就得靠绑定时存下的 `SocketAddr`（坑 86）。
 
-**剩下那一半 `C1.webhook` 的形状**（尚未动工，先读这几条再动手）：
-
-- 它是**入站端口 + 鉴权**：外部系统 POST 到本机的某条路由 → 转成一次 isolate 事件。
-  `docs/07` §3 的能力表里 `webhook` 与 `message` 并列，但前者没有平台身份（没有 sender、没有 conversation），
-  所以**不能**直接塞进 `inbound` 表那条按 `(bot_id, external_id)` 去重的管道 —— 去重键与回复目标都得新设计。
-- 应答模型必须先回答 `AGENTS.md` 坑 74：handler 里等外部事件会死锁同会话队列。
-  两种可选形状 —— ① 请求即事件（handler 处理完，返回值就是 HTTP 应答体）；② 请求注册 + 后续投递（像 `session.prompt`）。
-  选 ①，别选 ②：webhook 调用方在等 HTTP 响应，注册式会把调用方晾在那儿。
-- 鉴权不是可选项：`docs/02-architecture.md` §6 的边界是 127.0.0.1 + token。webhook 路由至少要带**密钥**（清单里声明，走 keyring 或环境），
-  且**不许**因为"是本机"就免鉴权 —— 本机任意进程都能发 POST。
+**还没做的四件**（都不阻塞主线）：`GET`/`HEAD` 探活、应答体流式（现整段进内存，上限 256 KiB）、
+路由级超时（现在统一用 handler 预算）、反向代理/公网暴露（手机做不到，见 `docs/08` §4.4）。
 
 ### D. 其它未做（不阻塞主线）
 
@@ -252,11 +244,13 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 3ded642 或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1778 passed / 117 target
+cargo test -j 2 --workspace                              # 基线：1812 passed / 118 target
 ```
 
-1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §5.2 session + §11 落地顺序**（这是本轮的施工图）。
-2. 按本文 §7 的 **C** 开工（`C1.webhook`），先冻结 `hbot-core` 侧契约并写单测，
+1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §5.2 session + §11 落地顺序**（这是本轮的施工图）。
+2. **M7 第 1–5 步已经全部完成**（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`send`/`notify`/`webhook`）。
+   下一段按本文 §7 的 **D** 挑：`onStart`/`onStop`/`onSchedule` 是小件；`C2.sql` 与 `E1` npm 打包是中等件；
+   云端宿主（`M9`）与 `M6` 迁移需要有外部条件。先冻结 `hbot-core` 侧契约并写单测，
    再决定哪些部分派子代理 —— 参考 §2 第 4 条：**核心那一侧自己写**。
    注意子代理这条路的实测结果：2026-11-19 派的两个（`runlog-virtual` / `device-window`）一个没交终报、
    一个留下编译不过的残骸（`crates/hbot-device/src/windows.rs` 引用了不存在的类型，得 `git checkout` 回滚）。

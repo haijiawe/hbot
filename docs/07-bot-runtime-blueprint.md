@@ -70,7 +70,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 |---|---|---|---|
 | **C1 事件** | `message` | 收到消息（已归一化） | `已实现` |
 | | `timer` | 固定间隔 / 每天某时刻（`onTimer(ctx, name)`） | `已实现`（2026-11-18，见 §4.4） |
-| | `webhook` | 外部系统打进来（HTTP 入口） | `设计` |
+| | `webhook` | 外部系统打进来（HTTP 入口） | `已实现`（2026-11-19，见 §3.5） |
 | | `lifecycle` | `onStart` / `onStop` | `设计` |
 | | `device` | 屏幕变化、输入事件（预留，见 §9） | `未做` |
 | **C2 状态** | `kv` | 每 bot 命名空间的键值（JSON 值、TTL、批量原子写） | `已实现`（2026-11-18） |
@@ -93,10 +93,10 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 |---|---|---|---|---|---|
 | **聊天**（人设/多轮/情感） | `message` | `history` `kv` | `reply` | `ai` | **能**：`history`/`kv`/`ai` 都已落地 |
 | **游戏性**（签到/抽卡/排行榜/国战） | `message` `timer` | `kv` `sql` | `reply` `send` | `jobs`（长结算） | **一半**：定时、主动 `send`、`jobs` 都已落地，缺 `sql` |
-| **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **一半**：`session` / `notify` / `ai` / `send` 都已落地，缺 `webhook` 与 `sql` |
+| **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **一半**：`webhook` / `session` / `notify` / `ai` / `send` 都已落地，只缺 `sql` |
 | **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面与定时都有，缺 `sql` 与长作业 |
 
-> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C2.kv/history/session + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.webhook`、`C1.lifecycle`、`C2.sql`、`C3.file`，见 §11 的落地顺序。
+> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C2.kv/history/session + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.lifecycle`、`C2.sql`、`C3.file`，见 §11 的落地顺序。
 
 ### 3.2 能力怎么声明
 
@@ -210,6 +210,61 @@ export default defineBot({
 
 **还没做**：附件（`sendFile` / `sendImage`，正负清单里已换成这三条精确条目）；`ctx.send` 的返回值只到「交给出站队列」，平台侧回执由 sender 的重试与 `mark_outbound_sent` 记录、不回传 handler；`notify` 只有单一目标（管理员与工单分档未做）。
 
+
+### 3.5 已落地：入站 webhook（`C1.webhook`，2026-11-19）
+
+```jsonc
+// hbot.json —— 每条路由声明一个路径与一个**环境变量名**（密钥本身不入库）
+{
+  "capabilities": {
+    "webhook": [
+      { "path": "tickets", "secretEnv": "HBOT_HOOK_TICKETS" },
+      { "path": "billing/pay", "secretEnv": "HBOT_HOOK_PAY" }
+    ]
+  }
+}
+```
+
+```text
+POST /hook/<botId>/tickets
+x-hbot-secret: <环境变量 HBOT_HOOK_TICKETS 的值>
+Content-Length: 27
+
+{"ticketId": 7, "status":"open"}
+```
+
+```ts
+export default defineBot({
+  async onWebhook(ctx) {
+    // 返回值**就是** HTTP 应答；null → 204，字符串 → text/plain，对象 → JSON
+    ctx.log(`ticket ${ctx.bodyJson.ticketId}`);
+    return { status: 200, body: { accepted: true } };
+  },
+})
+```
+
+**五道判据，一层一份**：
+
+| 层 | 判据 | 位置 | 没过的症状 |
+|---|---|---|---|
+| 声明层 | 清单 `capabilities.webhook[].path` | `SandboxHandler::dispatch_webhook` 先读 `declared_webhook` | `HBOT_WEBHOOK_NO_ROUTE`（404） |
+| 鉴权层 | `x-hbot-secret` 与环境变量**常数时间**比较 | `hbot-rpc::webhook::authorize` + `hbot_core::secrets_match` | `HBOT_WEBHOOK_UNAUTHORIZED`（401；路由没声明 / 变量没设 / 值不对**都是 401**） |
+| 参数层 | 只收 POST、`Content-Length` ≤ 64 KiB、头 ≤ 8 KiB、体必须是 UTF-8 | `hbot-rpc::webhook::read_request` + `hbot_core::validate_request` | 405 / 413 / 400；`Transfer-Encoding` → 501 |
+| 装配层 | 这个 bot 在 `WebhookRegistry` 里（即 `bot_start` 过） | `hbot-rpc::webhook::handler_of` | 404（停掉的 bot 立刻拒，不等到 supervisor 排空） |
+| 应答层 | 解码 handler 返回值 | `hbot_core::response_from_handler` | 非法 `status`（字符串 / 越界）→ `HBOT_WEBHOOK_INVALID`（400） |
+
+**六条设计决定与理由**：
+
+1. **请求即事件，返回值即应答**。不做「注册 + 后续投递」：调用方在等 HTTP 响应，晾着它没有任何东西能保证它等到（`AGENTS.md` 坑 74 的同一条理由）。
+2. **不进 `inbound` 表**。外部系统没有平台身份（无 sender / conversation / message_id），塞进去会让 `UNIQUE (bot_id, external_id)` 去重键与回复目标**同时失去定义**。
+3. **鉴权 fail-closed，三种失败统一 401**。服务只绑 `127.0.0.1`，但本机任意进程都能发 POST —— 「是本机」不构成鉴权。路由没声明 / 环境变量没设 / 密钥不对都回 401（补救动作对调用方是同一个，且区分它们等于送探测者一个路由存在性探针）。密钥**不写进清单**：清单是项目文件，会入库、会被分享。
+4. **传输层手写 HTTP/1.1**。只做「收一条 POST、读 `Content-Length` 字节、回一条响应」；为此引入 `axum` + `hyper` 会把整条异步生态拖进依赖图，而判据一条都不会因此变少。与 `ws.rs` 的取舍一致：传输层自己刻，判据全在 `hbot-core`。
+5. **`onWebhook` 的 ctx 比所有其它事件都窄**：只有 `route` / `method` / `contentType` / `body` / `bodyJson` 与 `log` / `sleep` / `ai`。**没有 `reply`**（外部请求没有会话，应答走返回值），也没有 `kv` / `history` / `device` / `jobs` / `session` —— 它们都要一个 bot 或会话身份。
+6. **单连接一问一答**。`Connection: close`，一条 TCP 只处理一个请求。webhook 调用方通常是「发一条就走」的脚本/服务，keep-alive 省不下可观的握手，却要引入连接生命周期、空闲超时与流水线顺序三条状态机。
+
+**实测**（`hbot-rpc` 的 `tests/webhook_capability.rs`，8 条，真 TCP + 真派发 + 真库）：路由没声明 → 401；环境变量没设 → 401；密钥不匹配 → 401；正确密钥 → handler 的返回值成为应答体（`ctx.bodyJson` 拿到解析后的 JSON，`ctx.log` 落库）；`return null` → 204 空体；信封 `{status: 418, body: 'teapot'}` → 418；`GET` → 405；`bot_stop` 之后同一路径 → 404；`Content-Length` 超上限 → 413（读体之前就拒）。契约层另有 25 条（路径穿越、环境变量名写错、超限、CRLF 注入、非 UTF-8 拒绝替换、信封 status 不做字符串强转）。
+
+**还没做**：`GET` 探活与 `HEAD`；响应体流式（现在整段进内存，上限 256 KiB）；路由级超时（现在统一用 handler 预算）；反向代理/公网暴露（`docs/08` §4.4 说明手机做不到，桌面/无头交给用户的代理）。
 ---
 
 ## 4. 生命周期与并发
@@ -677,12 +732,12 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | 2 | `C5.ai`（`ctx.ai.complete`） | 聊天/客服；顺带解决"key 明文写进项目"的安全问题 | **已落地 2026-11-18**（§3.3） |
 | 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 | `C1.timer` **已落地 2026-11-18**（§4.4）；`C4.jobs` **已落地 2026-11-19**（§4.5） |
 | 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 | **已落地 2026-11-19**（§5.2） |
-| 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | `C3.send/notify` **已落地 2026-11-19**（§3.4）；`C1.webhook` 未开始 |
+| 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | **全部已落地 2026-11-19**（`send`/`notify` 见 §3.4，`webhook` 见 §3.5） |
 | 6 | `E1` npm 打包 | 生态接入（见 `docs/08` §5） | 未开始 |
 | 7 | `C6.device`（桌面三平台） | 玩游戏的 bot；见 §9，里程碑 `M10` | **窄版已落地 2026-11-17**（Windows，见 `docs/09`）；完整版未做 |
 | 8 | 云端执行宿主 | 见 `docs/08` §9 与 `ADR-0006`，里程碑 `M9` | 未开始 |
 
-> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 4 → 7 完成，5 只差 `C1.webhook`，6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
+> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 4 → 5 → 7 完成，6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
 
 ---
 

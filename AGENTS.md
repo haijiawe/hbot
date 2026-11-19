@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–4 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`）与 `C3.send`/`C3.notify` 全部落地**（1778 个 Rust 测试 / 117 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–4 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`）、`C3.send`/`C3.notify` 与 `C1.webhook` 全部落地**（1812 个 Rust 测试 / 118 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -424,6 +424,32 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     两份总有对不上的一天。而 `reply_to: None` 是硬约束：主动消息不绑定任何入站事件，不得冒用旧消息 ID（§4.1）。
     被动回复仍然只能走 handler 的返回值。另：`StoreSendQueue::send` 在 `spawn_blocking` 里跑，所以用 `blocking_send` 是对的；
     在 async 上下文里直接调它会把 reactor 卡住。
+
+83. **webhook 不进 `inbound` 表，`onWebhook` 的返回值就是 HTTP 应答**（2026-11-19，`C1.webhook` 落地）。
+    外部系统没有平台身份（无 sender / conversation / message_id），塞进 `inbound` 会让
+    `UNIQUE (bot_id, external_id)` 去重键与回复目标同时失去定义。形状是**请求即事件**：handler
+    返回 `null` → 204、返回字符串 → `text/plain`、返回对象 → JSON、返回 `{status, body, contentType}`
+    → 那是应答信封。**不要**做成「注册 + 后续投递」——调用方在等 HTTP 响应，晾着它没人能保证它等到
+    （与坑 74 同一条理由）。
+
+84. **webhook 鉴权的三种失败统一回 401，不分别给码**（2026-11-19）。路由没声明、密钥环境变量没设、
+    密钥不匹配 —— 三者的补救动作对调用方是同一个（去问部署方要正确的密钥），而把它们区分开等于
+    送探测者一个「这个路由存在」的探针。另外 **密钥只写环境变量名（`secretEnv`）不写进清单**：清单是
+    项目文件，会入库、会被分享；`environ` 没设时**一律拒绝**，绝不退化成「没配就放行」。服务只绑
+    `127.0.0.1` 也不构成鉴权 —— 本机任意进程都能发 POST。
+
+85. **`Ctx::json_parse` 吃的是 `Value`，不是 `String`**（2026-11-19，写 `build_webhook_event` 时踩到）。
+    把一段 `String` 直接喂进去会同时报两条看着无关的错：`E0308 expected Value, found String` 与
+    `E0277 Vec<u8>: From<Value>`（后者是类型推断顺着 `IntoJs` 走岔了）。想在函数里把一段文本变 JS 值时，
+    先在 Rust 侧用 `serde_json::from_str` 判一次，成功了再 `ctx.json_parse(value.to_string())`。
+    顺带：webhook 的 `bodyJson` 用这条路 —— 非 JSON 的请求体是**正常形状**（表单提交），给 `undefined`
+    而不是抛异常。
+
+86. **`WebhookServer` 把 `TcpListener` move 进接受循环后，`addr()` 就拿不到了**（2026-11-19）。
+    `TcpListener` 不是 `Copy`，`tokio::spawn(async move { ... listener.accept() ... })` 之后原变量已被移动，
+    结构体再存 `listener` 字段会报 `E0382 use of moved value`。正确形状：**绑定时就把 `local_addr()` 存下来**，
+    结构体只留 `address: SocketAddr`，接受循环拿走 listener。测试要靠 `addr()` 拿系统挑的端口，所以这一步
+    不是可选的。
 
 ---
 
