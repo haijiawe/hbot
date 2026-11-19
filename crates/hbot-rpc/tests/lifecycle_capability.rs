@@ -12,7 +12,8 @@
 //! 2. **`onStart` 抛错 = 启动失败**（`bot_start` 返回错误，而不是「起来了但没初始化完」）；
 //! 3. **`onStop` 拿到 `reason = 'user'`**（第二个参数与 `ctx.reason` 两处都对）；
 //! 4. **`onStop` 抛错不影响停机**（`bot_stop` 仍然成功，错误只落日志）；
-//! 5. **没写钩子不是错误**（既不报错也不留错误日志）。
+//! 5. **没写钩子不是错误**（既不报错也不留错误日志）；
+//! 6. **进程退出/切项目走 `shutdown` 而不是 `user`**（`AppState::shutdown()` 的整条链路）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -325,5 +326,46 @@ export default defineBot({
             .all(|line| !line.contains("onStart") && !line.contains("onStop")),
         "没写钩子不该留下任何点名钩子的错误，实际日志：{:?}",
         harness.logs()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ⑥ AppState::shutdown 把 reason = shutdown 交给 onStop
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn app_state_shutdown_hands_the_shutdown_reason_to_on_stop() {
+    let handler = r#"
+import { defineBot, log } from 'hbot';
+
+export default defineBot({
+  async onMessage(ctx) {
+    log('message');
+  },
+  async onStop(ctx, reason) {
+    log('stop:' + ctx.phase + ':' + reason + ':' + ctx.reason);
+  },
+});
+"#;
+    let harness = Harness::new("shutdown", handler).await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    // 进程退出 / 切项目走的是这一条：`onStop` 必须收到 `shutdown`，
+    // 否则「Ctrl-C 之后什么都没保存」会变成一类无解的现象。
+    harness.state.shutdown().await;
+
+    wait_for("onStop 的 shutdown 日志", || {
+        harness.logs().iter().any(|line| line.starts_with("stop:"))
+    })
+    .await;
+    let line = harness
+        .logs()
+        .into_iter()
+        .find(|line| line.starts_with("stop:"))
+        .expect("onStop 日志");
+    assert_eq!(line, "stop:stop:shutdown:shutdown", "退出路径不能报成 user");
+    assert!(
+        !harness.state.bots().is_running(&harness.bot),
+        "shutdown 之后 bot 必须已从登记表里摘掉"
     );
 }

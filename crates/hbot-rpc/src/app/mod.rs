@@ -341,6 +341,17 @@ impl AppState {
         &self.webhooks
     }
 
+    /// 进程退出（或切项目）时的统一收尾：逐个停 bot，`onStop` 收到 `shutdown`。
+    ///
+    /// 为什么不是一个裸的 `bots().stop_all()`：那样会跳过 `onStop` 钩子，
+    /// 用户写好的「存档 / 关连接 / 写最后一行日志」在正常关机的路径上就不会跑，
+    /// 而"Ctrl-C 之后什么都没保存"正是最难解释的一类现象。走命令层的
+    /// `stop_with_reason` 还能顺带注销 webhook、取消未完成作业与等待。
+    pub async fn shutdown(&self) {
+        crate::app::commands::bots::stop_all_with_reason(self, hbot_core::StopReason::Shutdown)
+            .await;
+    }
+
     /// 已打开的项目根；没打开项目时 `None`。
     pub fn project_root(&self) -> Option<PathBuf> {
         self.workspace
@@ -359,7 +370,7 @@ impl AppState {
         let workspace = Workspace::open(path)?;
         let root = workspace.root().to_path_buf();
 
-        self.bots.stop_all().await;
+        self.shutdown().await;
         // 上一轮的 Agent 回合还在跑（或在等审批）时不能让新项目接手：它会拿着旧项目
         // 的路径继续写。待审编辑同理——旧项目的 Diff 不该落到新项目里。
         self.agent.cancel_all();

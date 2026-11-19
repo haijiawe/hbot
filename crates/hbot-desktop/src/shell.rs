@@ -342,7 +342,7 @@ pub fn request_quit(app: &AppHandle) {
 /// 优雅关闭：停 bot → 排空写队列（日志/DB 落到磁盘）→ 由调用方 `exit`。
 ///
 /// 复用现有路径，不新写一条：
-/// - 停 bot：`hbot_rpc::app::bots::BotRegistry::stop_all()`（每个 bot 等 5 秒，
+/// - 停 bot：`AppState::shutdown()`（逐个走 `stop_with_reason`，`onStop` 收到 `shutdown`；每个 bot 等 5 秒，
 ///   超时才 abort，见 `crates/hbot-rpc/src/app/bots.rs` 的 `STOP_GRACE`）。
 /// - 排空写队列：底下的 `Store` 是"单写线程 + 有界队列 + 提交阻塞到回执"，
 ///   所以一次成功的 `AppState::append_log` 就是写屏障 —— 它返回时，它之前排队的写都已经落库。
@@ -366,7 +366,7 @@ async fn shutdown(app: &AppHandle) {
     };
 
     tracing::info!("桌面端开始优雅退出：先停机器人");
-    core.state.bots().stop_all().await;
+    core.state.shutdown().await;
 
     // 写日志表走 `AppState::append_log`（壳不直接依赖 hbot-store）。
     let state = Arc::clone(&core.state);

@@ -424,15 +424,28 @@ async fn ensure_local_conversation(state: &AppState, bot: &Bot) -> Result<(), Hb
 }
 
 /// 停止一个 bot（幂等：没在跑也返回 ok）。
+///
+/// 用户点停止（`bot_stop`）走这里，`onStop` 收到的原因就是 `user`。
 pub async fn stop(state: &AppState, bot_id: BotId) -> Response {
+    stop_with_reason(state, bot_id, hbot_core::StopReason::User).await
+}
+
+/// 停止一个 bot，并把 `reason` 交给 `onStop`。
+///
+/// 三个调用点各有自己的原因：用户点停止是 `user`，切项目与进程退出是 `shutdown`。
+/// 原因不是装饰 —— handler 要靠它区分「存档并退出」与「用户只是重启一下」，
+/// 猜错会让下游逻辑读到不可信状态（`StopReason::parse` 不认识的字符串直接报错，
+/// 不默认成 `User` 也是这个理由）。
+pub async fn stop_with_reason(
+    state: &AppState,
+    bot_id: BotId,
+    reason: hbot_core::StopReason,
+) -> Response {
     // `onStop`：在拆掉执行器之前跑，给它 5 秒（`hbot_core::STOP_BUDGET`）。
     // 失败只落日志 —— 停机路径上没有任何人在等它的结果。
     if let Some(executor) = state.webhooks().get(&bot_id) {
         if let Err(error) = executor
-            .run_lifecycle(
-                hbot_core::LifecyclePhase::Stop,
-                Some(hbot_core::StopReason::User),
-            )
+            .run_lifecycle(hbot_core::LifecyclePhase::Stop, Some(reason))
             .await
         {
             tracing::warn!(bot = %bot_id, error = %error, "onStop 执行失败");
@@ -490,6 +503,19 @@ pub async fn stop(state: &AppState, bot_id: BotId) -> Response {
     match persisted {
         Ok(()) => done(),
         Err(error) => failed(error),
+    }
+}
+
+/// 停掉所有在跑的 bot，并把 `reason` 交给每个 `onStop`。
+///
+/// 切项目与进程退出都走这里：它们和「用户点停止」的唯一差别就是原因。
+/// 没在跑的 bot 不会被叫到（`running()` 只列登记表里的），所以幂等。
+pub async fn stop_all_with_reason(state: &AppState, reason: hbot_core::StopReason) {
+    for bot_id in state.bots().running() {
+        let response = stop_with_reason(state, bot_id, reason).await;
+        if let Response::Error { error } = &response {
+            tracing::warn!(bot = %bot_id, %reason, error = ?error, "退出时停止 bot 失败");
+        }
     }
 }
 

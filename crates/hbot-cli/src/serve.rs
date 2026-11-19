@@ -154,8 +154,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     )
     .context("打开应用状态失败")?;
 
+    // 留一份 `Arc` 给收尾用：`Dispatcher` 拿走之后还要能调 `AppState::shutdown()`，
+    // 否则 Ctrl-C 只能关掉 WS，bot 的 `onStop` 永远不会跑。
+    let state = Arc::new(state);
     let phase = Phase::start("serve_dispatcher");
-    let dispatcher = Arc::new(Dispatcher::new().with_state(Arc::new(state)));
+    let dispatcher = Arc::new(Dispatcher::new().with_state(Arc::clone(&state)));
     phase.done();
 
     let phase = Phase::start("serve_ws_bind");
@@ -187,6 +190,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     wait_for_shutdown().await;
     info!("收到关闭信号，开始收尾");
     handle.shutdown().await;
+    // WS 关掉之后才停 bot：信号窗口里正在处理的命令先跑完，否则会在「命令执行到一半」
+    // 时拆掉它依赖的执行器。`AppState::shutdown` 会给每个 `onStop` 传 `shutdown`。
+    state.shutdown().await;
     info!("hbot serve 已退出");
     Ok(())
 }
