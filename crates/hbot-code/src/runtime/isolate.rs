@@ -1716,8 +1716,10 @@ fn memory_report(usage: rquickjs::qjs::JSMemoryUsage, limits: Limits) -> MemoryR
 struct Hooks {
     /// `onMessage`, always required.
     message: Persistent<Function<'static>>,
-    /// `onTimer`, optional: a project with no `capabilities.timer` has no
-    /// reason to define one, and a table installed later must not need a restart.
+    /// `onSchedule`（旧名 `onTimer`），可选：没声明 `capabilities.timer` 的项目
+    /// 没有理由定义它，而计划表晚于 isolate 出生装配时也不该要求重启。
+    ///
+    /// 两个名字在 `bootstrap` 里合并成这一个字段 —— 同一条执行路径，不复制派发。
     timer: Option<Persistent<Function<'static>>>,
     /// `onJob`，可选：没声明 `capabilities.jobs` 的项目没有理由定义它。
     ///
@@ -1829,13 +1831,38 @@ async fn bootstrap<'js>(
                 stack: None,
             })?;
         // Optional, and validated here rather than in `defineBot`: a project may
-        // declare `capabilities.timer` and define `onTimer` in either order, and
-        // an `onTimer` that is not callable is a programming error worth naming
-        // at boot, not a TypeError deep inside the first tick.
-        let timer = config
+        // declare `capabilities.timer` and define its hook in either order, and a
+        // hook that is not callable is a programming error worth naming at boot,
+        // not a TypeError deep inside the first tick.
+        //
+        // `onSchedule` and `onTimer` are **one execution path with two names**: the
+        // requirement calls the hook `onSchedule` (FR-15) while the first release
+        // called it `onTimer`, and inventing a second dispatch path for the rename
+        // would mean two sets of budgets, timeouts and failure semantics for one
+        // behaviour. Defining both is refused rather than silently preferring one —
+        // otherwise a project that renamed its hook but left the old one behind gets
+        // whichever branch the host happened to check first.
+        let schedule = config
+            .get::<_, Option<Function<'js>>>("onSchedule")
+            .map_err(js_error)?;
+        let legacy_timer = config
             .get::<_, Option<Function<'js>>>("onTimer")
-            .map_err(js_error)?
-            .map(|function| Persistent::save(ctx, function));
+            .map_err(js_error)?;
+        let timer = match (schedule, legacy_timer) {
+            (Some(_), Some(_)) => {
+                return Err(CodeError::JsException {
+                    message: format!(
+                        "{entry}: defineBot({{ ... }}) defines both `onSchedule` and `onTimer`. \
+                         它们是一条执行路径的两个名字（`onTimer` 是旧名）：留一个，删掉另一个"
+                    ),
+                    stack: None,
+                });
+            }
+            (Some(function), None) | (None, Some(function)) => {
+                Some(Persistent::save(ctx, function))
+            }
+            (None, None) => None,
+        };
         // 同上，作业钩子也是可选的。缺它时不是开机错误：清单可能先声明了作业类型
         // 而代码还没写钩子，那时第一次派发会报一条点名 `onJob` 的错（见 run_job）。
         let job = config
@@ -1986,7 +2013,7 @@ async fn run_timer<'js>(
         // the hook" and a mute tick the user can never diagnose.
         let error = CodeError::JsException {
             message: format!(
-                "定时器 `{name}` 到点了，但项目的默认导出没有 `onTimer` 函数（defineBot 里要写 `async onTimer(ctx, name)`）"
+                "定时器 `{name}` 到点了，但项目的默认导出没有 `onSchedule` 函数（defineBot 里要写 `async onSchedule(ctx, name)`；`onTimer` 是同一条路径的旧名）"
             ),
             stack: None,
         };
@@ -2131,7 +2158,7 @@ async fn run_job<'js>(
 /// 跑一次生命周期钩子：{BT}onStart{BT}（失败即启动失败）或 {BT}onStop{BT}（失败只留痕）。
 ///
 /// 缺钩子不报错：清单里没有「声明生命周期钩子」这一项，所以「没写」是最常见的情况。
-/// 与 {BT}onTimer{BT} / {BT}onJob{BT} 的「点名缺钩子」不同 —— 那两个是清单说了有、代码没实现。
+/// 与 `onTimer` / `onJob` 的「点名缺钩子」不同 —— 那两个是清单说了有、代码没实现。
 #[allow(clippy::too_many_arguments)]
 async fn run_lifecycle<'js>(
     ctx: &Ctx<'js>,

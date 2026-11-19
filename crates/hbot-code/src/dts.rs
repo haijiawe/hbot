@@ -208,23 +208,34 @@ declare module 'hbot' {
   /**
    * 入口配置。
    *
-   * `onMessage` 必填。`onTimer` 可选：只有在 `hbot.json` 的
-   * `capabilities.timer` 里声明了计划、并且确实定义了它，定时器到点才会调到你；
+   * `onMessage` 必填。`onSchedule` 可选（旧名 `onTimer`，两者是同一条执行路径的
+   * 两个名字，**只许写一个**，都写会被拒绝）：只有在 `hbot.json` 的
+   * `capabilities.timer` 里声明了计划、并且确实定义了这个钩子，到点才会调到你；
    * 声明了却没定义的话，每次到点都会记一条说明缺钩子的错误日志。
-   * 生命周期钩子仍未实现，故不声明（见 docs/07 §4.1 的顺序表）。
+   * 其余钩子（`onJob` / `onResume` / `onWebhook` / `onStart` / `onStop`）见 `docs/07` §4.1。
    */
   export interface BotConfig {
     /** 收到消息时调用；可以返回 Promise。 */
     onMessage(ctx: MessageCtx): void | Promise<void>;
     /**
-     * 定时器到点时调用，`name` 是 `hbot.json` 里那条计划的 `name`。
+     * 定时计划到点时调用，`name` 是 `hbot.json` 里那条计划的 `name`。
      *
-     * 与消息事件共用 `ctx.reply` / `ctx.log` / `ctx.sleep` / `ctx.kv` / `ctx.ai`，
-     * 但**没有**入站字段（没有 `text`、没有 `conversationId`）：定时器背后没有
-     * 会话。因此 `ctx.device.*` 与 `ctx.history()` 在定时器里一律被拒
-     * （`HBOT_DEVICE_FAILED` / `HBOT_STATE_INVALID`），不会去读上一条消息的会话。
+     * 上下文**比消息上下文窄**：只有 `name` / `reply` / `log` / `sleep` / `ai`。
+     * 没有入站字段（没有 `text`、没有 `conversationId`）：计划背后没有会话，
+     * 所以 `ctx.kv` / `ctx.history()` / `ctx.device.*` 在这里一概不存在，
+     * 不会去读上一条消息的会话。要持久状态就把动作建模成消息驱动的那一侧。
+     *
+     * `ctx.reply` 只在计划里声明了 `conversation` 时可用，否则抛
+     * `HBOT_TIMER_NO_TARGET`（宿主没有依据猜该发给谁）。
      */
-    onTimer(ctx: TimerCtx, name: string): void | Promise<void>;
+    onSchedule(ctx: TimerCtx, name: string): void | Promise<void>;
+    /**
+     * `onSchedule` 的旧名，与它是**同一条执行路径**（同样的预算、超时与失败语义）。
+     *
+     * 两个名字只许写一个：都写会在启动时报错，而不是静默挑一个。新项目写
+     * `onSchedule`。
+     */
+    onTimer?(ctx: TimerCtx, name: string): void | Promise<void>;
     /**
      * 作业被宿主取到时调用，`name` 是 `hbot.json` 里那条 `capabilities.jobs` 的名字。
      *
@@ -1474,7 +1485,6 @@ mod drift {
         // `onStart` / `onStop` 已落地（2026-11-19，`C1.lifecycle`）：宽泛条目按 `AGENTS.md` §8.7
         // 必须**整条删**，否则它会在能力实现后继续假装「这个没做」。仍在缺的那一项单独列出。
         for absent in [
-            "onSchedule",
             "sendFile(",
             "sendImage(",
             "notifyFile(",

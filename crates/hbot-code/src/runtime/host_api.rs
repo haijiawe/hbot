@@ -398,8 +398,16 @@ export function defineBot(config) {
   if (typeof config.onMessage !== 'function') {
     throw new TypeError('defineBot(config): config.onMessage must be a function');
   }
+  if (config.onSchedule !== undefined && typeof config.onSchedule !== 'function') {
+    throw new TypeError('defineBot(config): config.onSchedule must be a function when given');
+  }
   if (config.onTimer !== undefined && typeof config.onTimer !== 'function') {
     throw new TypeError('defineBot(config): config.onTimer must be a function when given');
+  }
+  if (typeof config.onSchedule === 'function' && typeof config.onTimer === 'function') {
+    throw new TypeError(
+      'defineBot(config): onSchedule and onTimer are one hook with two names; keep only one',
+    );
   }
   return config;
 }

@@ -98,7 +98,7 @@ pub struct Capabilities {
     /// 智能能力（C5）：`ctx.ai.complete`。
     #[serde(default)]
     pub ai: bool,
-    /// 事件能力（C1）：`onTimer(ctx, name)` 的具名计划表。
+    /// 事件能力（C1）：`onSchedule(ctx, name)`（旧名 `onTimer`）的具名计划表。
     ///
     /// 与 `ai` / `state.kv` 不同，这里不是布尔而是**数组**：定时器必须有名字与规则，
     /// "true" 无法回答"几点触发"。空数组 = 没声明。
