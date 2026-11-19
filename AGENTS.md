@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–4 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`）、`C3.send`/`C3.notify` 、`C1.webhook` 与 `onStart`/`onStop` 全部落地**（1820 个 Rust 测试 / 119 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook` 与 `onStart`/`onStop` 全部落地**（1861 个 Rust 测试 / 120 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -464,6 +464,16 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     没有任何路径能让它恢复。正确形状：`compiled()` 失败只 `warn` 一行并返回 `Ok`，让 bot 起着、
     消息留在未处理、改好代码自动重试（与坑 24 同一条纪律）。**通用判据**：任何接在 `bot_start`
     路径上的新步骤，都要先想「用户代码坏了会不会把它永久挡住」。
+
+89. **生成代码可写的持久状态只有三个口子，`sql` 的隔离靠「一个 bot 一个库文件」而不是 `WHERE bot_id = ?`**（2026-11-20，`C2.sql` 落地时定）。表名前缀或 `WHERE bot_id = ?` 都要求「每一处都记得加」，漏一处就是**静默**跨 bot 越权：A 的 `DELETE FROM users` 抹掉 B 的数据，日志里只看到一句正常 SQL。现在库文件是 `<data_dir>/bot_sql/<bot_id>.db`，别的 bot 的表根本不在这个连接的命名空间里，越权在**物理上**不可能。代价是每 bot 一个文件，相对越权可以忽略。
+
+90. **运行时禁 DDL，表结构只能来自项目里的 `migrations/*.sql`**（2026-11-20）。`ctx.sql.exec` 只接受五种动词（`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`WITH`），`CREATE`/`ALTER`/`DROP`/`ATTACH`/`PRAGMA`/`VACUUM`/`REINDEX` 一律 `HBOT_SQL_DENIED`。迁移在 `bot_start` 里、`onStart` **之前**由宿主执行一次，按文件名去重并记在 `schema_meta(name, applied_at)`。**迁移失败不阻断启动**（与坑 24/88 同一纪律）：写错的 `CREATE TABLE` 不该让 bot 永远起不来，落一行 error 让它起着、改好再重启。
+
+91. **`query` 只能读、`exec` 才能写，判据是动词不是「有没有副作用」**（2026-11-20）。`SqlVerb::is_read()` 只认 `Select`：`WITH … DELETE` 的动词是 `With`，所以它在 `query` 里被拒、必须走 `exec`。别为了「WITH 看起来像查询」把它放行 —— 那会让读接口变成写接口，而读接口的调用点通常没有写的心智准备。
+
+92. **JS 侧不区分整数与浮点，绑定到 SQLite 时必须区分**（2026-11-20）。JS 里 `7` 也是 double，直接绑定会让 `INTEGER PRIMARY KEY` 的比较走类型亲和性，出现「明明插进去了却查不到」。做法：整数值且 `|v| < 2^53` 绑定成 `Integer`，其余成 `Real`；参数只收五种标量（null / 布尔 / 数字 / 字符串 / Blob），**拒绝对象与数组**而不是 `JSON.stringify` —— 静默转换会把「传错类型」变成「看起来成功的写入」，错误发生在很久以后、离调用点很远。
+
+93. **写语句必须「先 rollback 再报错」**（2026-11-20）。`BotSqlSchemas::exec` 在事务里跑，受影响行数超 `MAX_SQL_AFFECTED`（10000）时先 `rollback()` 再返回 `Denied`。顺序反了就是「报了错但数据已经落了」—— 已经写下去的行没法撤回一部分，判据只能放在提交之前。
 
 ---
 

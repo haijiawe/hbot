@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-19 20:15**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 全部落地 —— **M7 第 1–5 步完成**。
+> 本快照时间：**2026-11-20 00:30**（docs 待提交）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`、`C2.sql` 全部落地 —— **M7 第 1–5.5 步完成**。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1820 passed / 0 failed / 119 target
+cargo test -j 2 --workspace              # 当前 1861 passed / 0 failed / 120 target
 pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 ```
 
-现状：**六道全绿**（2026-11-19 20:10 实测）。`apps/web/src/generated/*.ts` **要入库**；
+现状：**六道全绿**（2026-11-20 00:27 实测）。`apps/web/src/generated/*.ts` **要入库**；
 改 `dto` 后必须 `gen`（还要 `gen --check`）再提交。
 纯文档提交不需要跑全闸，但要在提交信息里说明"仅文档"。
 
@@ -78,10 +78,10 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 
 | crate | 职责 |
 |---|---|
-| `hbot-core` | 纯契约与端口（`bot_state.rs` / `bot_ai.rs` / `bot_timer.rs` / `device.rs` / `debug.rs` / `command.rs` / `ports.rs` / `redact.rs`） |
-| `hbot-store` | SQLite、迁移（`0001`–`0007`）、仓储（每条 SQL 只出现在 `repositories/`） |
+| `hbot-core` | 纯契约与端口（`bot_state.rs` / `bot_ai.rs` / `bot_timer.rs` / `bot_sql.rs` / `device.rs` / `debug.rs` / `command.rs` / `ports.rs` / `redact.rs`） |
+| `hbot-store` | SQLite、迁移（`0001`–`0007`）、仓储（每条 SQL 只出现在 `repositories/`）、每 bot 的 `bot_sql/*.db`（`bot_sql.rs`） |
 | `hbot-workspace` | 项目文件、路径守卫、搜索、符号 |
-| `hbot-code` | SWC 编译、QuickJS isolate、沙箱、宿主 API（`runtime/{host,state,ai,device}_api.rs`）、插桩与调试 |
+| `hbot-code` | SWC 编译、QuickJS isolate、沙箱、宿主 API（`runtime/{host,state,ai,device,sql}_api.rs`）、插桩与调试 |
 | `hbot-bot` | 事件 JSON、会话、有界队列、supervisor |
 | `hbot-adapters` | 平台适配器（`onebot11` / `qq_official` / `local`） |
 | `hbot-command` | 命令隔离（Windows Job/受限令牌、Linux Landlock、CPU/内存/进程数/IO 限额） |
@@ -112,12 +112,13 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | `C3.send` / `C3.notify` | **已实现（2026-11-19，`docs/07` §3.4）** |
 | `C1.webhook` | **已实现（2026-11-19，`docs/07` §3.5）** |
 | `onStart` / `onStop` | **已实现（2026-11-19，`docs/07` §4.6）** |
-| `onSchedule` / `C2.sql` | **未开始** ← 下一步 |
+| `C2.sql`（`ctx.sql.query` / `ctx.sql.exec`） | **已实现（2026-11-20，`docs/07` §5.3；每 bot 一个库文件）** |
+| `onSchedule` | **未开始** ← 下一步（与 `onTimer` 不是同一件事） |
 | `E1` npm 打包 / 云端宿主 | **未开始** |
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 88 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 93 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -169,6 +170,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | M7 第 3 步 | 完成 | `C1.timer`（2026-11-18）+ `C4.jobs`（2026-11-19，`bot_jobs` 表 / `onJob` / 重试退避 / `bot_stop` 取消 / 重启恢复） |
 | M7 第 4 步 | 完成 | `C2.session`（2026-11-19，`bot_waits` 表 / `ctx.session.prompt` / `onResume` / 超时结算 / `bot_stop` 取消） |
 | M7 第 5 步 | 完成 | `C3.send` / `C3.notify`（2026-11-19）+ `C1.webhook`（2026-11-19，`WebhookServer` 手写 HTTP/1.1 / 三种鉴权失败统一 401 / 返回值即应答） |
+| M7 第 5.5 步 | 完成 | `onStart`/`onStop`（2026-11-19，`docs/07` §4.6）+ `C2.sql`（2026-11-20，`docs/07` §5.3，每 bot 一个 `<data_dir>/bot_sql/<bot_id>.db` / 运行时禁 DDL / 迁移不阻断启动） |
 
 ---
 
@@ -218,12 +220,18 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 **刚落地的那两件（`onStart` / `onStop`，`docs/07` §4.6）**：失败语义**相反** —— `onStart` 抛错就是
 启动失败（回滚到 stopped），`onStop` 抛错只落一行 error 日志；预算也不同（`onStart` 用 `handlerMs`，
 `onStop` 用 5 秒）。**编译失败时两个钩子都跳过**，绝不能让 `bot_start` 因此失败（坑 88）。
-还剩：`shutdown` / `crash` 两种原因的触发点未接（形状已就位）、`onSchedule`、`C2.sql`、`E1` 打包、
+还剩：`shutdown` / `crash` 两种原因的触发点未接（形状已就位）、`onSchedule`、`E1` 打包、
 设备完整版、云端宿主、`M6`。
+
+**刚落地的 `C2.sql`（`docs/07` §5.3）**：隔离靠**一个 bot 一个库文件**（`<data_dir>/bot_sql/<bot_id>.db`），
+不是 `WHERE bot_id = ?` —— 后者漏一处就是静默跨 bot 越权（坑 89）。运行时**禁 DDL**，表只能来自
+项目 `migrations/*.sql`，在 `bot_start` 里、`onStart` 之前执行一次、按文件名去重（坑 90）；
+迁移失败**不阻断启动**（坑 24/88 同一纪律）。`query` 只认 `SELECT`（`WITH … DELETE` 也算写，坑 91），
+JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行先 `rollback()` 再报错（坑 93）。
 
 ### D. 其它未做（不阻塞主线）
 
-- `onStart` / `onStop`（生命周期钩子，`docs/07` §4.1 目标形状里已有）；
+- `onStart` / `onStop` —— **已落地（2026-11-19，`docs/07` §4.6）**，别再重做；
 - `onSchedule`（与 `onTimer` 不是同一件事）；
 - 设备完整版：混合 DPI 跨屏拼图、按窗口截图、中文以外的 OCR 语言包；
 - `E1` npm 打包、云端执行宿主（`docs/08` §9 / ADR-0006）。
@@ -249,14 +257,14 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 
 ```powershell
 cd E:\HBot-Next
-git log --oneline -5                                     # 确认 HEAD 是 3ded642 或更新
+git log --oneline -5                                     # 确认 HEAD 是 29ff308 或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1820 passed / 119 target
+cargo test -j 2 --workspace                              # 基线：1861 passed / 120 target
 ```
 
-1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §5.2 session + §11 落地顺序**（这是本轮的施工图）。
-2. **M7 第 1–5 步已经全部完成**（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`send`/`notify`/`webhook`）。
-   下一段按本文 §7 的 **D** 挑：`onStart`/`onStop`/`onSchedule` 是小件；`C2.sql` 与 `E1` npm 打包是中等件；
+1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。
+2. **M7 第 1–5.5 步已经全部完成**（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`/`send`/`notify`/`webhook`/`onStart`/`onStop`）。
+   下一段按本文 §7 的 **D** 挑：`onSchedule` 是小件；`E1` npm 打包是中等件；
    云端宿主（`M9`）与 `M6` 迁移需要有外部条件。先冻结 `hbot-core` 侧契约并写单测，
    再决定哪些部分派子代理 —— 参考 §2 第 4 条：**核心那一侧自己写**。
    注意子代理这条路的实测结果：2026-11-19 派的两个（`runlog-virtual` / `device-window`）一个没交终报、

@@ -74,7 +74,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | | `lifecycle` | `onStart` / `onStop` | `已实现`（2026-11-19，见 §4.6） |
 | | `device` | 屏幕变化、输入事件（预留，见 §9） | `未做` |
 | **C2 状态** | `kv` | 每 bot 命名空间的键值（JSON 值、TTL、批量原子写） | `已实现`（2026-11-18） |
-| | `sql` | 每 bot 一套表（迁移文件定义，只允许参数化 DML） | `设计` |
+| | `sql` | 每 bot 一套表（迁移文件定义，只允许参数化 DML） | `已实现`（2026-11-19，§5.3） |
 | | `history` | 最近 N 条消息（只读） | `已实现`（2026-11-18） |
 | | `session` | 会话状态机 + "等下一条消息" | `设计` |
 | **C3 出口** | `reply` | 被动回复（绑定入站消息） | `已实现` |
@@ -92,11 +92,11 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | 形态 | 触发 | 状态 | 出口 | 还需要 | 今天能做吗 |
 |---|---|---|---|---|---|
 | **聊天**（人设/多轮/情感） | `message` | `history` `kv` | `reply` | `ai` | **能**：`history`/`kv`/`ai` 都已落地 |
-| **游戏性**（签到/抽卡/排行榜/国战） | `message` `timer` | `kv` `sql` | `reply` `send` | `jobs`（长结算） | **一半**：定时、主动 `send`、`jobs` 都已落地，缺 `sql` |
-| **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **一半**：`webhook` / `session` / `notify` / `ai` / `send` 都已落地，只缺 `sql` |
-| **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面与定时都有，缺 `sql` 与长作业 |
+| **游戏性**（签到/抽卡/排行榜/国战） | `message` `timer` | `kv` `sql` | `reply` `send` | `jobs`（长结算） | **齐了** |
+| **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **齐了** |
+| **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面、定时、`sql`、`jobs` 都有，缺 `wasm` |
 
-> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C2.kv/history/session + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.onSchedule`、`C2.sql`、`C3.file`，见 §11 的落地顺序。
+> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C1.webhook + C1.lifecycle + C2.kv/history/session/sql + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.onSchedule`、`C3.file`，见 §11 的落地顺序。
 
 ### 3.2 能力怎么声明
 
@@ -460,7 +460,7 @@ export default defineBot({
 | 能力 | 语义 | 关键约束 |
 |---|---|---|
 | `kv` | `ctx.kv.get/set/delete/list`，值为 JSON，可选 TTL | 每 bot 一个命名空间；`setMany` 要原子；并发写要串行（走 store 的单 writer 线程） |
-| `sql` | `ctx.sql.query/exec`，只允许参数化语句 | schema 由项目里的 `migrations/*.sql` 定义，**运行时不许 DDL**；每 bot 独立 schema 前缀 |
+| `sql` | `ctx.sql.query/exec`，只允许参数化语句 | schema 由项目里的 `migrations/*.sql` 定义，**运行时不许 DDL**；**每 bot 一个库文件**（§5.3） |
 | `history` | `ctx.history(n)` 返回最近 n 条（含自己发过的） | 只读；由 supervisor 维护，来自 `inbound`/`outbound` 表 |
 | `session` | `ctx.session.prompt(key, text, options)` + `onResume`（**注册而非阻塞**，见 §5.2） | **归属键必须是 `(bot_id, conversation_id, sender_id)`**，且落库；同会话只允许一个未结等待 |
 
@@ -492,7 +492,7 @@ export default defineBot({
 
 **存储形态**：`bot_kv(bot_id, key, value_json, updated_at, expires_at)`，主键 `(bot_id, key)`；过期是**读语义**不是删除动作（读路径要能跑只读连接，所以 `WHERE expires_at IS NULL OR expires_at > now`，行不删）。KV 的读也走 store 的单写者线程 —— `set` 返回后紧接着的 `get` 必须看得见（与 `setMany` 同一理由）。
 
-> `kv` 是全库唯一的"生成代码可写的持久状态"口子。`sql`（§5 表里第二行）尚未实现，`hbot.json` 里写 `capabilities.state.sql` 会 `unknown field` 加载失败 —— 这是故意的（见 §3.2 规则 1）。
+> `kv`、`sql` 与 `history` 是生成代码碰持久状态的全部口子（`sql` 见 §5.3）。清单里写不认识的能力名会 `unknown field` 加载失败 —— 这是故意的（见 §3.2 规则 1）。
 
 ### 5.1 `session.await` 是旧项目 P0 的直接教训
 
@@ -585,6 +585,83 @@ key, prompt, scope, state, deadline, fulfilled_message_id, created_at, updated_a
 **还没做**：`ctx.session.prompt` 的超时**重发提示**（现在只落一行 error，要继续得再问一次）；
 等待状态的 UI 面板；跨会话的「转人工」这类需要把等待交给另一个 bot 的形态。
 
+### 5.3 已落地：每 bot 一个 SQL 库（`C2.sql`，2026-11-19）
+
+```jsonc
+// hbot.json —— 开这项能力（它是 state 的子项）
+{ "capabilities": { "state": { "sql": true } } }
+```
+
+```sql
+-- migrations/0001_init.sql —— 表结构只在这里定义，启动时由宿主执行一次
+CREATE TABLE IF NOT EXISTS users (
+  id    INTEGER PRIMARY KEY,
+  name  TEXT NOT NULL
+);
+```
+
+```ts
+export default defineBot({
+  async onMessage(ctx) {
+    // 只允许参数化语句：占位符数量必须与参数数量相等
+    const changed = await ctx.sql.exec('INSERT INTO users (name) VALUES (?)', ['Ann']);
+    ctx.log(`affected:` + changed.affected);
+
+    const rows = await ctx.sql.query('SELECT id, name FROM users WHERE id > ?', [0]);
+    ctx.reply(JSON.stringify(rows.rows));
+  },
+})
+```
+
+**为什么一个 bot 一个库文件，而不是一张表加 `bot_id` 列**：前缀或 `WHERE bot_id = ?` 都要求
+「每一处都记得加」，漏一处就是**静默**跨 bot 越权（A 的 `DELETE FROM users` 抹掉 B 的数据，
+日志里只看到一句正常 SQL）。一个 bot 一个库文件（`<data_dir>/bot_sql/<bot_id>.db`）让越权在
+**物理上**不可能 —— 别的 bot 的表根本不在这个连接的命名空间里。代价是每 bot 一个文件，
+相对越权可以忽略。
+
+| 层 | 判据 | 位置 | 没过的症状 |
+|---|---|---|---|
+| 声明层 | 清单 `capabilities.state.sql`（每次调用现读） | `hbot-code` 的 `SqlSlot::gate()` | `HBOT_SQL_NOT_DECLARED` |
+| 参数层（语句） | 只认五种动词、单语句、禁 DDL | `hbot-core::bot_sql::normalize`（**唯一一份**） | `HBOT_SQL_DENIED`（写错参数是 `HBOT_SQL_INVALID`） |
+| 参数层（绑定） | 占位符数 == 参数数、参数数 ≤ 256 | `hbot-core::bot_sql::validate` | `HBOT_SQL_DENIED`（文案点名「不要拼接字符串」） |
+| 读路径层 | `query` 只接受读语句（`WITH … DELETE` 也算写） | `hbot-core::bot_sql::validate_query` | `HBOT_SQL_DENIED`（文案指向 `ctx.sql.exec`） |
+| 身份层 | 槽位里必须有 bot 身份 | `SqlSlot::gate()` | `HBOT_SQL_INVALID`，定时器/作业/生命周期事件里调用会明说原因 |
+| 装配层 | 宿主有没有 `set_sql` | `SqlSlot::gate()` | `HBOT_SQL_UNAVAILABLE` |
+| 规模层 | 结果 ≤ 500 行；影响 ≤ 10000 行 | `hbot-store::bot_sql` 的 `MAX_SQL_ROWS` / `MAX_SQL_AFFECTED` | 读路径置 `truncated: true`；写路径 **rollback** 后报 `HBOT_SQL_DENIED` |
+
+**七条设计决定与理由**：
+
+1. **运行时禁 DDL**（`CREATE`/`ALTER`/`DROP`/`ATTACH`/`PRAGMA`/`VACUUM`/`REINDEX`）。表结构由项目
+   的 `migrations/*.sql` 在 `bot_start` 时由宿主执行一次，记在 `schema_meta(name, applied_at)`
+   里、按文件名去重。理由：迁移是**可审阅的文本**，而运行时 DDL 是「代码决定库长什么样」，
+   一次写错就再也改不回来（SQLite 的 `DROP COLUMN` 有版本限制）。
+2. **`Denied` 与 `Invalid` 分开**。`Invalid` = 参数打错了（补救是改参数）；`Denied` = 这件事
+   不许做（补救是改设计）。合成一个码，用户会一直在参数里找问题。
+3. **`BotSql` port 收已过闸的 `SqlStatement` 而不是裸 `&str`**。否则每个实现都要再判一次动词，
+   判据就有第二份，而第二份迟早与第一份不一致。
+4. **参数只收五种标量**（`null` / 布尔 / 数字 / 字符串 / Blob），**拒绝对象与数组**而不是
+   `JSON.stringify`。静默转换会把「传错了类型」变成「看起来成功的写入」，读回来却是字符串，
+   而错误发生在很久以后、离调用点很远。
+5. **JS 侧不区分 int 与 double，SQLite 侧必须区分**。JS 里 `7` 也是 double，直接绑定会让
+   `INTEGER PRIMARY KEY` 的比较走类型亲和性。所以整数且 |v| < 2^53 的绑定成 `Integer`，
+   其余成 `Real`。
+6. **二进制不走 JS 桥**。rquickjs 的 `ArrayBuffer` 两向转换各有一套 API，为它多写一条路径
+   不值得；约定是**存 base64 字符串**。输出侧若真拿到 BLOB，以数字数组交给 JS（不猜编码）。
+7. **写语句在事务里跑，超上限就 rollback**。已经写下去的行没法「撤回一部分」，判据只能放在
+   提交之前；而且必须先 `rollback()` 再报错，否则报错时数据已经落了。
+
+**迁移失败不阻断启动**（与编译失败同一纪律，见 `AGENTS.md` 坑 24/88）：一个写错的
+`CREATE TABLE` 不该让 bot 永远起不来。失败落一行 error 进 run log，bot 起着、改好再重启。
+
+**实测**：`hbot-rpc` 的 `tests/sql_capability.rs` 6 条（全走 `Dispatcher` 真派发 + 真 SQLite）：
+没声明 → `HBOT_SQL_NOT_DECLARED`；声明后 `exec` 插入 + `query` 读回；**两个 bot 互不可见**
+（同表名，B 读到 0 行）；运行时 `CREATE TABLE` → `HBOT_SQL_DENIED`；占位符与参数数量不符 →
+`HBOT_SQL_DENIED`；没有迁移文件 → `HBOT_SQL_FAILED` 且错误里能看出表名。存储层另有 7 条
+（含「迁移只跑一次」「跨 bot 隔离」「超上限回滚」「结果截断标记」）。
+
+**还没做**：`ctx.sql` 的**只读连接**（现在读写同一条 lazy 连接，读也会占写锁）；
+查询计划与慢 SQL 上报；`migrations/` 的**回滚**（现在只有前进）；把 `sql` 与 `kv` 合成
+「一个能存东西的口子」（见 §13 未决 2）。
 ---
 
 ## 6. 扩展：三档，按代价递增
@@ -743,7 +820,7 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | V3 | 同一会话严格串行、跨会话并行 | 已有 parity #1 覆盖 |
 | V4 | 每会话队列满时背压且消息不丢 | 已有 parity #13 覆盖 |
 | V5 | `kv` 的 `setMany` 原子 | 中途失败后旧值不变 |
-| V6 | `sql` 拒绝运行时 DDL | 断言 `CREATE TABLE` 被拒 |
+| V6 | `sql` 拒绝运行时 DDL | ✅ 已实测：`tests/sql_capability.rs` 的 `ddl_is_denied_at_runtime` |
 | V7 | 会话等待只被归属键匹配的消息唤醒 | 群里 B 发言不唤醒 A（旧项目 P0-3 的回归）：**已测**，`repositories::waits` 的 `a_different_sender_cannot_answer_a_sender_scoped_wait` |
 | V8 | 等待在重启后恢复、超时由定时器结算 | 等待落库（`bot_waits`），重启后仍是 `pending`；超时由 `tick_waits` 用绝对 `deadline` 结算，**不等新消息**（存储层 `expire_due_marks_only_the_waits_that_are_past_their_deadline`） |
 | V9 | 作业重启后恢复、至少一次、幂等键生效 | 杀进程后重启，断言作业跑完且副作用只一次（**已测**：`resume_interrupted_jobs` 把 `running` 退回 `pending`；`tests/jobs_capability.rs` 断言同幂等键只留一行只跑一次） |
@@ -768,11 +845,12 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | 3 | `C1.timer` + `C4.jobs` | 每日重置、主动推送、长结算 | `C1.timer` **已落地 2026-11-18**（§4.4）；`C4.jobs` **已落地 2026-11-19**（§4.5） |
 | 4 | `C2.session`（含 `bot_waits` 落库） | 多轮表单、客服工单 | **已落地 2026-11-19**（§5.2） |
 | 5 | `C1.webhook` + `C3.send/notify` | 客服接外部系统 | **全部已落地 2026-11-19**（`send`/`notify` 见 §3.4，`webhook` 见 §3.5） |
+| 5.5 | `C1.lifecycle` + `C2.sql` | 启动初始化/停机收尾；排行榜、工单、存档 | **全部已落地 2026-11-19**（`onStart`/`onStop` 见 §4.6，`sql` 见 §5.3） |
 | 6 | `E1` npm 打包 | 生态接入（见 `docs/08` §5） | 未开始 |
 | 7 | `C6.device`（桌面三平台） | 玩游戏的 bot；见 §9，里程碑 `M10` | **窄版已落地 2026-11-17**（Windows，见 `docs/09`）；完整版未做 |
 | 8 | 云端执行宿主 | 见 `docs/08` §9 与 `ADR-0006`，里程碑 `M9` | 未开始 |
 
-> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 4 → 5 → 7 完成，6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3），定时器已落地，剩下的只是把等待表接上。
+> 第 7 步被提前做了（用户 2026-11-16 明确「能力上限要拉满」），所以现在实际是「1 → 2 → 3 → 4 → 5 → 5.5 → 7 完成，6 → 8 未开始」。**注意第 4 步依赖第 3 步**：`session.await` 的超时必须由定时器结算（§5.1 规则 3）—— 已按此实现（`tick_waits`）。
 
 ---
 
@@ -790,8 +868,8 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 
 ## 13. 未决问题
 
-1. `sql` 能力的 schema 由谁管：项目里的 `migrations/*.sql` 由 Agent 写，还是由宿主提供固定表？（倾向后者：Agent 只写查询，降低迁移风险）
-2. `kv` 与 `sql` 是否要合并成"一个能存东西的口子"？（分开更清楚，但 Agent 可能选错）
+1. ~~`sql` 能力的 schema 由谁管？~~ **2026-11-19 已定**：由项目里的 `migrations/*.sql` 定义、`bot_start` 时由宿主执行一次并记 `schema_meta`；Agent 可以写迁移（它就在项目里、可 review），但**运行时不许 DDL**（§5.3）。
+2. ~~`kv` 与 `sql` 是否合并？~~ **2026-11-19 已定：不合并**。`kv` 是「一个键一个 JSON」，`sql` 是「一套有 schema 的表」；合并后必然要么丢掉事务与索引，要么让简单键值也要写迁移。
 3. ~~`jobs` 的预算上限按平台还是按 bot 声明？~~ **2026-11-19 已定**：预算按**行**冻结（入队时抄一份 `budgetMs`），重试次数按清单现读；平台级上限（手机 30 秒）仍待 `docs/08` 落，届时在装配层与声明值取小。
 4. `history` 的窗口是条数还是 token 数？（聊天 bot 需要 token 口径）
 5. `webhook` 入口在手机上怎么到达（无公网 IP）——见 `docs/08` §4.4。
