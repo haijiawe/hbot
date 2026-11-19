@@ -81,7 +81,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | | `send` | 主动推送到指定会话 | `已实现`（2026-11-19，见 §3.4） |
 | | `notify` | 通知人（管理员/工单） | `已实现`（2026-11-19，见 §3.4） |
 | | `http` | 出站 HTTP（清单授权） | `已实现`（`ctx.http.get`） |
-| | `file` | 项目内读写（经宿主，不是裸 `fs`） | `部分`（Agent 有工具，bot 代码没有） |
+| | `file` | 项目内读写（经宿主，不是裸 `fs`） | `已实现`（2026-11-20，见 §3.6） |
 | **C4 计算** | `jobs` | 后台作业（脱离 handler 预算、持久化、崩溃恢复） | `已实现`（2026-11-19，见 §4.5） |
 | | `wasm` | WASM 扩展（重计算/第三方算法） | `未做` |
 | **C5 智能** | `ai` | `ctx.ai.complete()`：用应用已配好的模型，key 不出核心 | `已实现`（2026-11-18，见 §3.3） |
@@ -96,7 +96,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **齐了** |
 | **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面、定时、`sql`、`jobs` 都有，缺 `wasm` |
 
-> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C1.webhook + C1.lifecycle + C2.kv/history/session/sql + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.onSchedule`、`C3.file`，见 §11 的落地顺序。
+> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer + C1.webhook + C1.lifecycle + C2.kv/history/session/sql + C3.reply/send/notify/http + C4.jobs + C5.ai + C6.device 这几个口子**，缺的是 `C1.onSchedule`，见 §11 的落地顺序。
 
 ### 3.2 能力怎么声明
 
@@ -265,6 +265,56 @@ export default defineBot({
 **实测**（`hbot-rpc` 的 `tests/webhook_capability.rs`，8 条，真 TCP + 真派发 + 真库）：路由没声明 → 401；环境变量没设 → 401；密钥不匹配 → 401；正确密钥 → handler 的返回值成为应答体（`ctx.bodyJson` 拿到解析后的 JSON，`ctx.log` 落库）；`return null` → 204 空体；信封 `{status: 418, body: 'teapot'}` → 418；`GET` → 405；`bot_stop` 之后同一路径 → 404；`Content-Length` 超上限 → 413（读体之前就拒）。契约层另有 25 条（路径穿越、环境变量名写错、超限、CRLF 注入、非 UTF-8 拒绝替换、信封 status 不做字符串强转）。
 
 **还没做**：`GET` 探活与 `HEAD`；响应体流式（现在整段进内存，上限 256 KiB）；路由级超时（现在统一用 handler 预算）；反向代理/公网暴露（`docs/08` §4.4 说明手机做不到，桌面/无头交给用户的代理）。
+### 3.6 已落地：项目内文件（`C3.file`，2026-11-20）
+
+```jsonc
+// hbot.json —— 读与写分开声明：存档要写，报表只读就够了
+{
+  "capabilities": {
+    "state": {
+      "files": { "read": true, "write": true }
+    }
+  }
+}
+```
+
+```ts
+export default defineBot({
+  async onMessage(ctx) {
+    // 全部相对项目根，/ 分隔；写会自动建父目录
+    await ctx.files.write(`saves/u42.json`, JSON.stringify({ hp: 3 }));
+    const file = await ctx.files.read(`saves/u42.json`);   // { path, text, bytes, truncated }
+    reply(`hp=` + JSON.parse(file.text).hp);
+
+    for (const entry of await ctx.files.list(`saves`)) {  // { path, kind: #S#file#S# | #S#dir#S#, size }
+      ctx.log(entry.path);
+    }
+  },
+});
+```
+
+| 层 | 判据 | 失败码 |
+|---|---|---|
+| 声明层 | 清单里 `capabilities.state.files.read` / `.write` 现读（每个新 isolate 装一次） | `HBOT_FILE_NOT_DECLARED`（`capability` 是 `read` 或 `write`） |
+| 参数层 | 文本 ≤ 1 MiB、读 ≤ 256 KiB、单段 ≤ 64 字节、全路径 ≤ 256 字节、列表 ≤ 200 条 | `HBOT_FILE_INVALID` |
+| 路径层 | 只接受相对路径；`..`、`.`、盘符、ADS、前导 `/`、`\`、控制字符一律拒 | `HBOT_FILE_DENIED` |
+| 装配层 | 宿主没有后端（测试、bench、`hbot serve` 之外的入口） | `HBOT_FILE_UNAVAILABLE` |
+| 文件层 | 不存在 / 是目录 / 非 UTF-8 / 目录非空 | `HBOT_FILE_NOT_FOUND` / `_INVALID` / `_INVALID` / `_DENIED` |
+| 规模层 | 单次读超过 `maxBytes` **截断并标 `truncated`**（不是报错）；单次写超过 1 MiB 报错 | 见上 |
+
+**六条设计决定与理由**：
+
+1. **不给裸 `fs`，只给四个动词**（`read`/`write`/`list`/`remove`）。生成代码没有 `process`/`require`，但一个"能传任意路径的读函数"等价于把整台机器交出去；四个动词各自带参数闸，判据只有一份。
+2. **路径钉在项目根，符号链接也再验一次**。`normalize_path` 只挡字面上的 `..`；`a/b` 若是指向项目外的链接，字面归一化看不出问题。所以后端对**已存在的每一段**都 `canonicalize` 后要求 `starts_with(root)`，不存在的段只接受 `Component::Normal`。
+3. **读与写分开声明**。一个只会读报表的 bot 不该能删存档；合成一个 `files: true` 会让"我只给了读权限"变成一句无法兑现的话。
+4. **只读写文本，二进制请自己 base64**。rquickjs 的 `ArrayBuffer` 两向 API 不一致，为一条旁路多写一套转换不值得；而 base64 字符串在 `kv`/`sql` 里本来就是可存可读的。读到的非 UTF-8 **直接报错**，不替换成 U+FFFD（悄悄替换等于给用户一段被改过的数据）。
+5. **`remove` 只删空目录**，不做递归。递归删目录在生成代码手里等于一次静默的批量数据丢失；真要清空就让代码自己列出来逐个删，那样每一步都留下可审计的调用。
+6. **超量读截断、超量写报错**。读是"我想看一部分"，截断 + `truncated` 让调用方自己决定要不要按 `maxBytes` 分段；写是"我要保存这一份"，静默截断就等于存了半份文件而看着成功。
+
+**实测（2026-11-20）**：`hbot-core` 14 条（路径穿越、盘符、ADS、超长段、非法控制字符、错误码前缀）；`hbot-code` 槽位 11 条（声明闸先于装配闸、只读声明拒写、端口故障原样上浮、清身份不继承）；JS 桥 2 条 + `s3` 之外的行为由端到端覆盖；`hbot-rpc` 后端 6 条（往返、越界、缺失、排序、非空目录、截断）；端到端 7 条（未声明 / 只读声明拒写 / 往返 / `..` 与绝对路径 / 缺失 / 列目录只报相对路径 / 非 UTF-8 拒绝）。
+
+**还没做**：把文件当附件发出去（`ctx.send` 仍只推文本）；二进制直读（现在是 base64 约定）；目录递归删除；每 bot 的磁盘配额（现在只有单次体积上限）；读时按行范围（现在只能按字节截断）。
+
 ---
 
 ## 4. 生命周期与并发

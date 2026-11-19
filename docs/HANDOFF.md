@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 02:45**（工作树还有文档改动待提交）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql` 全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）—— **M7 第 1–5.5 步完成**。
+> 本快照时间：**2026-11-20 05:30**（工作树还有文档改动待提交）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file` 全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）—— **M7 第 1–5.5 步完成**。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1866 passed / 0 failed / 120 target
+cargo test -j 2 --workspace              # 当前 1905 passed / 0 failed / 121 target
 pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 ```
 
-现状：**六道全绿**（2026-11-20 00:27 实测）。`apps/web/src/generated/*.ts` **要入库**；
+现状：**六道全绿**（2026-11-20 05:24 实测）。`apps/web/src/generated/*.ts` **要入库**；
 改 `dto` 后必须 `gen`（还要 `gen --check`）再提交。
 纯文档提交不需要跑全闸，但要在提交信息里说明"仅文档"。
 
@@ -113,12 +113,13 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | `C1.webhook` | **已实现（2026-11-19，`docs/07` §3.5）** |
 | `onStart` / `onStop` | **已实现（2026-11-19，`docs/07` §4.6）；`shutdown` 原因 2026-11-20 接上** |
 | `C2.sql`（`ctx.sql.query` / `ctx.sql.exec`） | **已实现（2026-11-20，`docs/07` §5.3；每 bot 一个库文件）** |
+| `C3.file`（`ctx.files`） | **已实现（2026-11-20，`docs/07` §3.6；读写分开声明、路径钉项目根）** |
 | `onSchedule` | **未开始** ← 下一步（与 `onTimer` 不是同一件事） |
 | `E1` npm 打包 / 云端宿主 | **未开始** |
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 95 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 99 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -170,7 +171,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | M7 第 3 步 | 完成 | `C1.timer`（2026-11-18）+ `C4.jobs`（2026-11-19，`bot_jobs` 表 / `onJob` / 重试退避 / `bot_stop` 取消 / 重启恢复） |
 | M7 第 4 步 | 完成 | `C2.session`（2026-11-19，`bot_waits` 表 / `ctx.session.prompt` / `onResume` / 超时结算 / `bot_stop` 取消） |
 | M7 第 5 步 | 完成 | `C3.send` / `C3.notify`（2026-11-19）+ `C1.webhook`（2026-11-19，`WebhookServer` 手写 HTTP/1.1 / 三种鉴权失败统一 401 / 返回值即应答） |
-| M7 第 5.5 步 | 完成 | `onStart`/`onStop`（2026-11-19，`docs/07` §4.6，含 2026-11-20 接上的 `shutdown` 触发点）+ `C2.sql`（2026-11-20，`docs/07` §5.3，每 bot 一个 `<data_dir>/bot_sql/<bot_id>.db` / 运行时禁 DDL / 迁移不阻断启动） |
+| M7 第 5.5 步 | 完成 | `C3.file`（2026-11-20，`docs/07` §3.6，项目内文件读写 / 路径钉根 / 只删空目录）+ `onStart`/`onStop`（2026-11-19，`docs/07` §4.6，含 2026-11-20 接上的 `shutdown` 触发点）+ `C2.sql`（2026-11-20，`docs/07` §5.3，每 bot 一个 `<data_dir>/bot_sql/<bot_id>.db` / 运行时禁 DDL / 迁移不阻断启动） |
 
 ---
 
@@ -233,10 +234,16 @@ bot 上。真要接得先给 supervisor 加「读循环意外结束」的信号�
 迁移失败**不阻断启动**（坑 24/88 同一纪律）。`query` 只认 `SELECT`（`WITH … DELETE` 也算写，坑 91），
 JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行先 `rollback()` 再报错（坑 93）。
 
+**刚落地的 `C3.file`（`docs/07` §3.6）**：`capabilities.state.files.{read,write}` **读写分开**（坑 97），
+路径判据只在槽位层（坑 96）、后端只补符号链接逃逸；四个动词 `read`/`write`/`list`/`remove` 不给裸 fs；
+读超限截断并标 `truncated`、写超 1 MiB 报错、非 UTF-8 报错、`remove` 只删空目录（坑 98）。
+还没做：附件发送、二进制直读（约定存 base64）、递归删除、每 bot 配额、按行范围读。
+
 ### D. 其它未做（不阻塞主线）
 
 - `onStart` / `onStop`（含 `shutdown` 原因）—— **已落地（2026-11-19 / 2026-11-20，`docs/07` §4.6）**，别再重做；
   `crash` 这个原因**暂时没人发**是刻意的（理由见上面 §7 C 段末尾）；
+- `C3.file` 的收尾件：附件发送、二进制直读、递归删除、每 bot 配额、按行范围读（主链路 2026-11-20 已落地，见 `docs/07` §3.6）；
 - `onSchedule`（与 `onTimer` 不是同一件事）；
 - 设备完整版：混合 DPI 跨屏拼图、中文以外的 OCR 语言包（按窗口截图 2026-11-20 已落地，见 `docs/09` §11.1）；
 - `E1` npm 打包、云端执行宿主（`docs/08` §9 / ADR-0006）。
@@ -264,7 +271,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1866 passed / 120 target
+cargo test -j 2 --workspace                              # 基线：1905 passed / 121 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。

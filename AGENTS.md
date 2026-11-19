@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook` 与 `onStart`/`onStop` 全部落地**（1866 个 Rust 测试 / 120 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（1905 个 Rust 测试 / 121 个 target / web 417 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -493,6 +493,30 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
     实现细节里两个判据：`PrintWindow` 的返回值**不作数**，要看位图是否全零（全零再退窗口 DC 的 `BitBlt`，仍空报 `FAILED` 而不是给全黑图）；
     **已最小化的窗口必须直接拒**（`HBOT_DEVICE_HOST_LIMIT`）—— 最小化窗口的矩形是 `-32000` 那一带的占位值，抓出来的东西没有意义。
     JS 侧 `screen({ window })` 与 `monitor` 互斥（两个都给当场拒），返回值里**没给的那个字段保持 `undefined`**，不要用 `0` 冒充"主屏"（`0` 是合法主屏序号，冒充就再也分不出"主屏"与"没给"）。
+
+96. **`ctx.files` 的路径判据只在槽位层，后端不要再判一遍**（2026-11-20，`C3.file` 写测试时踩到）。
+    `hbot-core` 的 `normalize_file_path` 已经拒了绝对路径、盘符、ADS（`:`）、前导 `/`、`\`、`.` 与 `..`，
+    所以 `ProjectFiles`（`crates/hbot-rpc/src/app/runtime/files.rs`）收到的**永远是归一后的相对路径**；
+    它只负责后半件事：逐段 `canonicalize` 并要求落在项目根里（字面归一挡不住指向根外的符号链接）。
+    我一开始写了 `files.write("/etc/x", …)` 期望 `DENIED`，实际它被当成 `etc/x` 落在根里 —— 这不是漏洞
+    （槽位层根本不会把这个路径传下来），而是**判据放错了层**。规则：一个判据只在一层落地，另一层只做补足。
+
+97. **文件能力读写分开声明，别合成一个布尔**（2026-11-20）。判据是 `capabilities.state.files.{read,write}`，
+    `FilesCapability::is_declared()` 只是"两半里有没有真的"，闸上必须按方向取（`allows_read` / `allows_write`），
+    且 `HBOT_FILE_NOT_DECLARED` 的 `capability` 字段要说清是哪一半 —— 只说"没声明"用户会去加错那一半。
+    一个只会读报表的 bot 不该能删存档；合成 `files: true` 会让"我只给了读权限"变成无法兑现的话。
+
+98. **文件的三个边界语义别反着写**（2026-11-20）：① 读超过 `maxBytes` **截断并标 `truncated`**（读是"我想看一部分"，
+    让调用方自己决定要不要分段）；② 写超过 1 MiB **报错**（写是"保存这一份"，静默截断等于存了半份而看着成功）；
+    ③ 非 UTF-8 读**报错**而不是替换成 U+FFFD（悄悄替换等于给用户一段被改过的数据）；④ `remove` **只删空目录**，
+    不做递归（递归删目录在生成代码手里就是一次静默的批量数据丢失）。
+
+99. **e2e 里按"旧长度"当索引取回复会拿到上一条**（2026-11-20，`files_capability` 两条用例红在这）。
+    `Store::list_logs` 是**新的在前**，所以 `let before = replies().len(); inject(); replies().nth(before)`
+    在第二次调用时取到的正是上一次那条。做法：发送前存快照 `Vec<String>`，等到"出现不在快照里的回复"，
+    再取第一条不在快照里的（`find(|reply| !before.contains(reply))`）。同族：任何"等新行"的断言都要比
+    **内容差集**，不要比长度再按下标取。
+
 ---
 
 ## 8. 新增 X 的步骤
