@@ -89,6 +89,10 @@ enum StoreOp {
         conversation: Conversation,
         reply: Reply<()>,
     },
+    InsertConversationIfAbsent {
+        conversation: Conversation,
+        reply: Reply<bool>,
+    },
     InsertInbound {
         message: NewInbound,
         sender_id: String,
@@ -476,6 +480,20 @@ impl Store {
     pub fn insert_conversation(&self, conversation: &Conversation) -> Result<()> {
         let conversation = conversation.clone();
         self.submit(|reply| StoreOp::InsertConversation {
+            conversation,
+            reply,
+        })
+    }
+
+    /// 幂等插入会话：`(bot_id, external_id)`（或主键）已存在时返回 `Ok(false)`，不报错。
+    ///
+    /// 出站主动消息的常态是「这个会话从没被平台推过」：`outbound.conversation_id` 有外键，
+    /// 缺行就在写入时撞 `FOREIGN KEY constraint failed` —— 而那时 `ctx.send` 早就返回成功
+    /// 了，用户只会看到「发出去了但对方没收到」。所以发送前先把行补上（会话 ID 由
+    /// `hbot_bot::conversation_id_for` 确定性派生，重复补建幂等）。
+    pub fn insert_conversation_if_absent(&self, conversation: &Conversation) -> Result<bool> {
+        let conversation = conversation.clone();
+        self.submit(|reply| StoreOp::InsertConversationIfAbsent {
             conversation,
             reply,
         })
@@ -1423,6 +1441,15 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::conversation::insert(&connection, &conversation),
+                );
+            }
+            StoreOp::InsertConversationIfAbsent {
+                conversation,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::conversation::insert_if_absent(&connection, &conversation),
                 );
             }
             StoreOp::InsertInbound {

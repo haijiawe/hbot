@@ -23,6 +23,27 @@ pub(crate) fn insert(conn: &Connection, conversation: &Conversation) -> Result<(
     Ok(())
 }
 
+/// 幂等插入会话：主键或 `(bot_id, external_id)` 已存在时不报错，返回是否真的插入了。
+///
+/// 与 [`insert`] 的分工：那个是「重复即失败」（调用方要自己判冲突，靠错误文本嗅探，
+/// 见 `hbot-bot` 的 `is_conversation_conflict`）；这个是「重复即无事发生」，用 SQL 的
+/// `INSERT OR IGNORE` 把判据交给唯一约束本身 —— 出站主动消息要发给一个从没见过的
+/// 会话时走这条（外键要求 `conversations` 行先存在）。
+pub(crate) fn insert_if_absent(conn: &Connection, conversation: &Conversation) -> Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO conversations (id, bot_id, external_id, kind, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            conversation.id.to_string(),
+            conversation.bot_id.to_string(),
+            conversation.external_id,
+            conversation.kind,
+            conversation.created_at,
+        ],
+    )?;
+    Ok(inserted > 0)
+}
+
 /// 按主键读会话；不存在返回 `Ok(None)`。
 pub(crate) fn get(conn: &Connection, id: &ConversationId) -> Result<Option<Conversation>> {
     let sql = format!("SELECT {CONVERSATION_COLUMNS} FROM conversations WHERE id = ?1");

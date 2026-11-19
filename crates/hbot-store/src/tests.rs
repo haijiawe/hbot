@@ -842,6 +842,51 @@ fn conversations_are_readable_by_id_and_external_key() {
     );
 }
 
+/// `insert_conversation_if_absent⟧BT⟧ 是幂等的：第二次返回 `false⟧BT⟧ 且**不覆盖**已有行。
+///
+/// 出站主动消息要发给「平台从没推过」的会话时靠它补行（`outbound.conversation_id⟧BT⟧ 有外键），
+/// 所以判据必须交给唯一约束本身，而不是调用方先查后插（那中间有窗口）。
+#[test]
+fn inserting_a_conversation_twice_is_idempotent() {
+    let dir = TempDir::new("conversation-idempotent");
+    let store = open_store(&dir);
+
+    let conversation = Conversation {
+        id: crate::ConversationId::from_uuid(fixed_uuid(50)),
+        bot_id: bot_id(),
+        external_id: "ghost-42".to_owned(),
+        kind: "group".to_owned(),
+        created_at: 7,
+    };
+    assert!(
+        store
+            .insert_conversation_if_absent(&conversation)
+            .expect("first insert"),
+        "第一次必须真的插入"
+    );
+
+    // 同 `(bot_id, external_id)⟧BT⟧，但主键与类型都不同：幂等键挡住，已有行不许被改写。
+    let conflicting = Conversation {
+        id: crate::ConversationId::from_uuid(fixed_uuid(51)),
+        bot_id: bot_id(),
+        external_id: "ghost-42".to_owned(),
+        kind: "private".to_owned(),
+        created_at: 8,
+    };
+    assert!(
+        !store
+            .insert_conversation_if_absent(&conflicting)
+            .expect("second insert"),
+        "第二次必须报告没有插入"
+    );
+
+    let stored = store
+        .get_conversation_by_external(&bot_id(), "ghost-42")
+        .expect("read")
+        .expect("row");
+    assert_eq!(stored.id, conversation.id, "幂等插入不许换主键");
+    assert_eq!(stored.kind, "group", "幂等插入不许覆盖已有类型");
+}
 /// `list_conversations_for_bot` 只返回该 bot 的行、顺序固定为 `(kind, external_id)`，
 /// 且重复调用逐行相同（UI 每次刷新看到同一个顺序，测试不会 flaky）。
 #[test]
