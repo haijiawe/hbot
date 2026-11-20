@@ -140,12 +140,13 @@ pnpm -C apps/web build           # 产物能构建
 
 | 检查 | 状态 | 证据 |
 |---|---|---|
-| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `125 suites / 1978 passed / 0 failed`（`rustc 1.100.0`） |
-| `apps/web` 的 `check`/`test` | ✅ 本地实跑通过 | `45 文件 / 400 用例` |
+| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `125 suites / 1979 passed / 0 failed`（`rustc 1.100.0`） |
+| `apps/web` 的 `check`/`test` | ✅ 本地实跑通过 | `47 文件 / 427 用例` |
 | `xtask deps` / `gen --check` | ✅ 本地实跑通过 | `0 violation(s)`、生成物一致 |
-| CI `gates` / `web` / `bundle (ubuntu)` | ✅ runner 上通过 | run `44678063739`（head `dfbd54f`）三步 success |
-| CI `rust (ubuntu-latest)` / `rust (windows-latest)` | ⚠️ 曾红，已修 | 同一处停在 `clippy`：`clippy::result_large_err`（`GatewayError` 168 字节）。本地 clippy 1.96 不报、CI 的 1.100.0 报 —— 见 `docs/pitfalls.md` 坑 115 |
-| CI `bundle (windows, nsis)` | ⏳ 未跑完 | 同一 run 里仍停在 `install tauri-cli`，首次冷启动约 12–18 分钟 |
+| CI `gates` / `web` / `bundle (ubuntu)` | ✅ runner 上通过 | run `44685861792`（head `7ea9900`）三步 success |
+| CI `rust` 的 `fmt` / `clippy` 两平台 | ✅ runner 上通过 | 同一 run：`rust (ubuntu-latest)` 与 `rust (windows-latest)` 的 `clippy` 都是 success。此前红过的两处（`clippy::result_large_err`、Linux-only `unused import`）已修，见 `docs/pitfalls.md` 坑 115 |
+| CI `rust` 的 `test` 步 | ⚠️ 曾红两处，已修 | ① ubuntu：runner 磁盘耗尽（`signal 7 [Bus error]` + `Free space left: 19 MB`），已加腾磁盘步 + `CARGO_PROFILE_DEV_DEBUG=0`（坑 118）；② windows：设置 watcher 的 mtime 盲点（坑 117），判据已改成比文件字节 |
+| CI `bundle (windows, nsis)` | ✅ runner 上通过 | run `44685861792` success（冷启动约 9 分钟） |
 | CI `bundle (macos, dmg)` | ❌ 未验 | run 里该 job 直接 `cancelled`；无 Mac 本机 |
 | Linux target 编译（`hbot-core`/`hbot-command`/`hbot-workspace`/`hbot-parity`） | ✅ 交叉 `cargo check` 通过 | 直接验证了 `confinement_linux.rs`（libc/Landlock）与 `paths.rs`（XDG）确实能编 |
 | Linux target 编译（其余 crate） | ✅ 由 CI 覆盖 | `rust (ubuntu-latest)` 在真 Linux runner 上编全 workspace（本地仍做不到：`ring`/`psm` 需要目标平台 C 工具链） |
