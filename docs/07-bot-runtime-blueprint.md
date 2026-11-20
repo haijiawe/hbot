@@ -945,8 +945,8 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 
 | # | 验收 | 怎么测 | 状态（2026-11-20 对账） |
 |---|---|---|---|
-| V1 | 没声明的能力在 d.ts 里不出现 | 生成 d.ts 后断言不含该符号 | **判据改判**：d.ts 是静态产物，能力是运行时授权，符号永远在。真正的不变量是「存在≠授权」，由 `the_*_surface_says_presence_is_not_authorization` 钉住 |
-| V2 | 没声明的能力调用返回 `denied` 且**不进审批** | 断言 approver 调用次数 = 0 | 已实测：每个能力的 `HBOT_*_NOT_DECLARED` 端到端用例；设备侧另有 approver 计数 = 0 的用例（`crates/hbot-rpc/tests/device_commands.rs`） |
+| V1 | 没声明的能力在 d.ts 里不出现 | 生成 d.ts 后断言不含该符号 | **判据改判**：d.ts 是静态产物，能力是运行时授权，符号永远在。真正的不变量是「存在≠授权」，由 `crates/hbot-code/src/dts.rs` 的 `the_ai_surface_says_presence_is_not_authorization` 与 `the_state_surface_says_presence_is_not_authorization` 钉住（全仓只有这两条；`device` 侧没有同名用例，它的等价断言是 V12 那两条） |
+| V2 | 没声明的能力调用返回 `denied` 且**不进审批** | 断言 approver 调用次数 = 0 | 已实测：每个能力的 `HBOT_*_NOT_DECLARED` 端到端用例 —— `crates/hbot-rpc/tests/` 的 `files_capability.rs`、`sql_capability.rs`、`session_capability.rs`、`jobs_capability.rs`、`timer_capability.rs`、`send_capability.rs`（send/notify 各一条）、`webhook_capability.rs`、`state_capability.rs`、`ai_capability.rs`；设备侧的等价证据是 `crates/hbot-rpc/src/app/device/capabilities.rs` 的 `the_gateway_refuses_read_screen_at_the_capability_step`（断言失败点停在 `GatewayStep::Capability`、**没有走到** `GatewayStep::Approval`） |
 | V3 | 同一会话严格串行、跨会话并行 | 已有 parity #1 覆盖 | 已实测（parity） |
 | V4 | 每会话队列满时背压且消息不丢 | 已有 parity #13 覆盖 | 已实测（parity） |
 | V5 | `kv` 的 `setMany` 原子 | 中途失败后旧值不变 | 已实测：`crates/hbot-store/src/repositories/kv.rs` 的 `set_many_is_atomic_and_rolls_back_the_whole_batch` |
@@ -956,13 +956,14 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 | V9 | 作业重启后恢复、至少一次、幂等键生效 | 杀进程后重启，断言作业跑完且副作用只一次（**已测**：`resume_interrupted_jobs` 把 `running` 退回 `pending`；`tests/jobs_capability.rs` 断言同幂等键只留一行只跑一次） | 已实测 |
 | V10 | 能力受限时返回 `HOST_LIMIT` 而非静默降级 | 手机上跑 `jobs`，断言错误码与上限值 | **部分**：桌面宿主有 `HBOT_DEVICE_HOST_LIMIT`（`crates/hbot-core/src/device.rs` 的默认实现 + 一条「没有这个后端就说不，而不是 panic」的单测）；手机宿主不存在 → 未做，等 `M10` |
 | V11 | 同一份 bot 代码在桌面与手机都能编译、`onMessage` 路径行为一致 | 两端各跑同一份 fixture | **未做**：只有桌面宿主，没有第二个宿主可对比（`M10`） |
-| V12 | 没在清单里声明 `device.input` 时，键鼠调用返回 `denied` 且 **approver 调用次数 = 0** | 断言错误码 + 计数 | 已实现（`crates/hbot-rpc/src/app/device/grants.rs`），端到端在 `tests/device_commands.rs` |
-| V13 | 声明了但设置里没开，返回 `HOST_LIMIT` 并给出要打开哪个开关（不是空错误） | 断言错误 `data.toggle` 字段 | 已实现（`crates/hbot-rpc/src/app/device/settings.rs`），端到端在 `tests/device_commands.rs` |
-| V14 | 设备会话到期后所有设备调用立即 `denied`；撤销后新会话也起不来 | 起会话 → 等超时 → 断言；再撤销 → 断言 | 已实现（会话授权表 + `grants.rs` 的到期判据），端到端在 `tests/device_commands.rs` |
+| V12 | 没在清单里声明 `device.input` 时，键鼠调用返回 `denied` 且 **approver 调用次数 = 0** | 断言错误码 + 计数 | 已实测：`crates/hbot-rpc/src/app/device/capabilities.rs` 的 `the_gateway_refuses_read_screen_at_the_capability_step`（失败点停在 `GatewayStep::Capability`，`!reached(Approval)` 且 `!reached(Execute)` —— 这就是「不进审批」的可执行证据）与 `an_undeclared_capability_is_refused_as_not_declared`（`HBOT_DEVICE_NOT_DECLARED`、`toggle() == None`）；`tests/device_commands.rs` 覆盖的是会话/设置两层（`grants.rs`），不是这一条 |
+| V13 | 声明了但设置里没开，返回一个**带开关提示**的错误（不是空错误） | 断言错误 `data.toggle` 字段 | 已实测，**但码不是 `HOST_LIMIT`**：是 `HBOT_DEVICE_NOT_ENABLED`，`toggle` 取 `device.enabled` / `device.capabilities` 两值 —— `crates/hbot-rpc/src/app/device/gate.rs` 的 `the_gates_own_codes_pass_through_unchanged`（三种码原样透出，含 `toggle: "device.enabled"`）与 `crates/hbot-rpc/src/app/device/mod.rs` 的 `error.toggle() == Some("device.capabilities")` 断言；`tests/device_commands.rs` 的 `grant_is_refused_when_the_settings_switch_is_off`（文案含 `device.enabled`）与 `grant_is_refused_when_the_settings_capability_list_is_empty`（文案含 `device.capabilities`）覆盖设置层 |
+| V14 | 设备会话到期后所有设备调用立即 `denied`；撤销后新会话也起不来 | 起会话 → 等超时 → 断言；再撤销 → 断言 | 已实测：`crates/hbot-rpc/tests/device_commands.rs` 的 `sweep_expired_settles_the_session_after_the_deadline`（到期由 tick 结算，不等下一条消息）、`revoke_turns_the_session_revoked`、`revoke_is_idempotent_even_without_a_live_session`、`a_second_grant_replaces_the_previous_session` |
 | V15 | 前台窗口不在 `allowedApps` 时拒绝注入，且不产生任何输入 | 白名单只放 A，前台切到 B，断言 B 未收到按键 | **只有实现没有自动化**：`crates/hbot-device/src/windows.rs` 在注入前比对前台窗口，但「切前台再断言没收到」需要真机 GUI，不能进 CI |
-| V16 | 截图与 OCR 原文不进日志；审计只记动作与窗口 | 断言 `logs` 里没有像素/文本，只记元数据 | 已实现（审计只记元数据，见 `docs/09`），端到端在 `tests/device_commands.rs` |
+| V16 | 截图与 OCR 原文不进日志；审计只记动作与窗口 | 断言 `logs` 里没有像素/文本，只记元数据 | 已实测：`crates/hbot-store/src/device_tests.rs` 的 `device_audit_rejects_content_columns`（把 `device_audit` 的列清单**冻结**成 `id/at/bot_id/actor/action/target/outcome`，并对 `content`/`text`/`png`/`image`/`ocr`/`clipboard`/`payload`/`bytes`/`pixel`/`blob`/`data` 十一个关键字逐个断言不出现）与 `crates/hbot-rpc/src/app/device/mod.rs` 的 `an_agent_tool_call_audits_which_bot_granted_it`（只落 `actor`/`action`/`outcome`） |
 **对账结论（2026-11-20）**：V1 原来的写法不成立（静态 d.ts 里符号永远在），已改成「存在≠授权」并用测试钉住；
-V3–V9 与 V12–V14、V16 有自动化证据；**V10 只覆盖桌面侧、V11 完全没有第二宿主、V15 只有实现没有自动化** ——
+V3–V9 与 V12–V14、V16 有自动化证据，**每一格都写到了能被 grep 到的用例名**（2026-11-20 二次对账时发现 V2 与 V12–V16 原本只写「端到端在 `tests/device_commands.rs`」，而那个文件里 `approv` / `HostLimit` / `toggle` / `audit` 全是 0 命中 —— 引用是空的，已逐条换成真实用例；V13 的错误码也写错了，不是 `HOST_LIMIT` 而是 `HBOT_DEVICE_NOT_ENABLED`）；
+**V10 只覆盖桌面侧、V11 完全没有第二宿主、V15 只有实现没有自动化** ——
 这三条都依赖手机/真机宿主（`M10`），不要因为表格里出现就打勾。
 
 ---

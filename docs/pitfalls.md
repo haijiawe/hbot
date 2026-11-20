@@ -628,3 +628,16 @@
     排在「落库成功」之后的计数器天然比副作用本身晚；③ 与坑 121 同族（那里是 `mark_processed` 晚于
     `executor.on_message`），一处竞态就要全仓扫同类读法（`grep "snapshot().outbox"` / `"list_unprocessed_inbound"`），
     别等 CI 一条一条报。
+
+129. **文档里的「端到端在 `某文件`」不算证据，验收表必须写到能被 grep 到的用例名**（2026-11-20，P6 对账时发现）。
+    `docs/07` §10 的验收表里，V2 写着「设备侧另有 approver 计数 = 0 的用例（`crates/hbot-rpc/tests/device_commands.rs`）」，
+    V12–V16 一律写「端到端在 `tests/device_commands.rs`」—— 而那个文件里 `approv` / `HostLimit` / `toggle` / `audit`
+    **全是 0 命中**：引用是空的，验收表看起来「已实测」，实际一条对应的断言都没有。同一次对账还发现 V13 的
+    错误码写成了 `HOST_LIMIT`，真实实现给的是 `HBOT_DEVICE_NOT_ENABLED`（带 `toggle: device.enabled` / `device.capabilities`）。
+    这类错误的危害不是「文档不精确」，而是**下一个人会拿它当"这块已经验过"的依据，于是不再验**。
+    做法三条：① 验收表的每一格都要写**函数名**（`the_gateway_refuses_read_screen_at_the_capability_step`），
+    不写「在 `x.rs` 里」；② 写完立刻 `grep` 一遍这些名字，0 命中就说明引用是编的；
+    ③ 表格里的**错误码**与**字段名**也要对着实现核一遍（`toggle` 的取值、`HBOT_*` 的拼写），
+    它们是契约的一部分，写错比缺失更容易误导。
+    判据：任何「已实测 / 已覆盖」的字样，旁边必须有一个**能被执行器点名的测试**；
+    只有实现没有自动化的（如 V15 真机 GUI）就明写「只有实现没有自动化」，不要混进「已实测」那一列。
