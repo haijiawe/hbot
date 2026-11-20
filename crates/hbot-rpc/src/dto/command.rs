@@ -198,6 +198,31 @@ pub enum Command {
         bot_id: BotId,
     },
 
+    /// 列最近的后台作业（`bot_jobs` 表），**新的在前**。
+    ///
+    /// `data` 是 [`JobView`](super::JobView) 的数组。终态行也回：面板要能看到
+    /// 「刚才那条失败了」这类结果，只列 pending/running 等于让失败悄无声息。
+    ///
+    /// 这是**只读快照**，不派发、不改状态；`limit` 有上限（超了按上限算，不报错），
+    /// 因为面板只需要最近若干条。
+    BotJobs {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 最多返回多少条。
+        limit: usize,
+    },
+
+    /// 列最近的会话等待（`bot_waits` 表），**新的在前**。
+    ///
+    /// `data` 是 [`WaitView`](super::WaitView) 的数组。与 `BotJobs` 同口径：
+    /// 终态行（`fulfilled` / `expired` / `cancelled`）一起回，由 UI 决定怎么显示。
+    BotWaits {
+        /// Bot ID。
+        bot_id: BotId,
+        /// 最多返回多少条。
+        limit: usize,
+    },
+
     /// 查某个 bot 的设备会话状态。
     ///
     /// `data` 是 [`DeviceStatus`](super::DeviceStatus)；从没有过会话时 `state` 为
@@ -395,6 +420,8 @@ impl Command {
             Self::BotInject { .. } => "bot_inject",
             Self::BotList => "bot_list",
             Self::BotConversations { .. } => "bot_conversations",
+            Self::BotJobs { .. } => "bot_jobs",
+            Self::BotWaits { .. } => "bot_waits",
             Self::DeviceStatus { .. } => "device_status",
             Self::DeviceGrant { .. } => "device_grant",
             Self::DeviceRevoke { .. } => "device_revoke",

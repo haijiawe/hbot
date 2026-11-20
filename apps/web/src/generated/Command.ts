@@ -154,7 +154,23 @@ text: string, } | { "type": "bot_list" } | { "type": "bot_conversations",
 /**
  * Bot ID。
  */
-botId: BotId, } | { "type": "device_status", 
+botId: BotId, } | { "type": "bot_jobs", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 最多返回多少条。
+ */
+limit: number, } | { "type": "bot_waits", 
+/**
+ * Bot ID。
+ */
+botId: BotId, 
+/**
+ * 最多返回多少条。
+ */
+limit: number, } | { "type": "device_status", 
 /**
  * Bot ID。
  */

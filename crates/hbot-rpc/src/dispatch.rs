@@ -135,6 +135,8 @@ impl Dispatcher {
             | Command::BotInject { .. }
             | Command::BotList
             | Command::BotConversations { .. }
+            | Command::BotJobs { .. }
+            | Command::BotWaits { .. }
             | Command::LogsTail { .. } => crate::app::commands::bots::handle(state, command).await,
             Command::AgentSend { .. }
             | Command::AgentCancel { .. }
@@ -307,6 +309,14 @@ mod tests {
             },
             Command::BotList,
             Command::BotConversations { bot_id: parse(BOT) },
+            Command::BotJobs {
+                bot_id: parse(BOT),
+                limit: 50,
+            },
+            Command::BotWaits {
+                bot_id: parse(BOT),
+                limit: 50,
+            },
             Command::DeviceStatus { bot_id: parse(BOT) },
             Command::DeviceGrant {
                 bot_id: parse(BOT),
@@ -381,7 +391,7 @@ mod tests {
         let commands = sample_commands();
         assert_eq!(
             commands.len(),
-            35,
+            37,
             "命令数与 Command 变体数不一致：新增/删除命令时同步这张表"
         );
         for command in commands {

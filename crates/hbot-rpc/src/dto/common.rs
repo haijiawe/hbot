@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use hbot_core::{BotId, BotStatus, ConversationId, HbotError, Timestamp};
+use hbot_core::{BotId, BotStatus, ConversationId, HbotError, JobId, Timestamp, WaitId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -524,6 +524,61 @@ pub struct FixtureRunReport {
     pub errors: u32,
     /// 逐条明细。
     pub entries: Vec<FixtureEntry>,
+}
+
+/// `BotJobs` 命令的 data 元素：一条后台作业的只读快照（`bot_jobs` 一行）。
+///
+/// 字段全是**开放字符串**（`state` 不是枚举）：状态集合在 `hbot_core::bot_jobs` 里
+/// 还会长，UI 遇到不认识的值要当「未知状态」原样显示，不能 throw。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct JobView {
+    /// 作业行主键。
+    pub id: JobId,
+    /// 作业类型名（清单里 `capabilities.jobs` 的那一条的 `name`）。
+    pub name: String,
+    /// 状态原样字符串：`pending` / `running` / `done` / `failed` / `cancelled`。
+    pub state: String,
+    /// 已经跑过几次（含当前这一次）；重试策略按它判。
+    pub attempts: u32,
+    /// 入队当时冻结的单次预算（毫秒）。
+    pub budget_ms: u64,
+    /// 回复目标的平台会话 `externalId`；`null` = 只能记日志。
+    pub conversation: Option<String>,
+    /// 下一次可派发的时刻（Unix 毫秒）。
+    pub next_at: i64,
+    /// 最近一次失败正文；没失败过或已成功为 `null`。
+    pub last_error: Option<String>,
+    /// 入队时刻（Unix 毫秒）。
+    pub created_at: i64,
+}
+
+/// `BotWaits` 命令的 data 元素：一条会话等待的只读快照（`bot_waits` 一行）。
+///
+/// 与 [`JobView`] 同一口径：`state` / `scope` 是开放字符串，不认识的按原样显示。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitView {
+    /// 等待行主键。
+    pub id: WaitId,
+    /// 等待键（`onResume` 的 `ctx.waitKey`）。
+    pub key: String,
+    /// 注册时发给用户的提示文本（面板原样显示，**不再**重发）。
+    pub prompt: String,
+    /// 谁可以回答：`sender` / `conversation`。
+    pub scope: String,
+    /// 状态原样字符串：`pending` / `fulfilled` / `expired` / `cancelled`。
+    pub state: String,
+    /// 会话的平台外部 ID（回复目标）。
+    pub conversation: String,
+    /// 到这个时刻还没人回答就算超时（Unix 毫秒）。
+    pub deadline: i64,
+    /// 还能重发几次提示（0 = 到点就 expired）。
+    pub reminders_left: u8,
+    /// 每一轮等多久（毫秒）；重发时用它推后 `deadline`。
+    pub timeout_ms: i64,
+    /// 注册时刻（Unix 毫秒）。
+    pub created_at: i64,
 }
 
 /// 命令的返回结果。

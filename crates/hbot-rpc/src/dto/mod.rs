@@ -30,7 +30,7 @@
 //! # 命令 → `data` 形状
 //!
 //! [`Command`] 的返回值统一是 `Response::Ok { data }`；`data` 为空时是 `null`。
-//! [`crate::dispatch`] 必须按这张表实现，不要各自猜形状。32 条命令都已落地
+//! [`crate::dispatch`] 必须按这张表实现，不要各自猜形状。34 条命令都已落地
 //! （`crates/hbot-rpc/src/app/commands/`）；**加字段/改形状必须同时改这一行**，
 //! 否则 UI 侧看到的就只是生成物，而这份"唯一真源"会悄悄说谎。
 //!
@@ -66,6 +66,8 @@
 //! | `DeviceSettingsGet` / `DeviceSettingsSet` | [`DeviceSettings`]（宿主设置；不是某个 bot 的会话） |
 //! | `DeviceRevoke` | `null`（幂等；状态变更经 `device.status`） |
 //! | `DeviceRequest` | `null`（**不是授权**：只是把请求抛给用户，结果经 `device.status`） |
+//! | `BotJobs` | `Vec<`[`JobView`]`>`（**新的在前**，最多 `limit` 条；终态行也回，UI 自己决定显不显示） |
+//! | `BotWaits` | `Vec<`[`WaitView`]`>`（同上；`pending` 与终态的行都在，`state` 是开放字符串） |
 //! | `LogsTail` | `Vec<`[`RunLog`]`>` |
 //!
 //! 只有"一次性快照"类命令返回 `data`；所有流式/异步结果都走事件，避免同一条
@@ -79,8 +81,8 @@ pub use command::Command;
 pub use common::{
     ApiError, AppInfo, BotSummary, ConversationSummary, DebugBreakpoint, DebugScope,
     DeviceSettings, DeviceStatus, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile,
-    FileChangeKind, FileContent, FixtureEntry, FixtureRunReport, LogLevel, ProjectOpenResult,
-    ProjectSummary, ReplayEntry, ReplayReplyChange, ReplayReport, Response, RiskLevel, RunLog,
-    SavedFixture, SearchMatch, StackFrame, StepKind,
+    FileChangeKind, FileContent, FixtureEntry, FixtureRunReport, JobView, LogLevel,
+    ProjectOpenResult, ProjectSummary, ReplayEntry, ReplayReplyChange, ReplayReport, Response,
+    RiskLevel, RunLog, SavedFixture, SearchMatch, StackFrame, StepKind, WaitView,
 };
 pub use event::Event;

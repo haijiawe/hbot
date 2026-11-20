@@ -59,7 +59,9 @@ use crate::app::runtime::sql::StoreSqlBackend;
 use crate::app::runtime::waits::StoreWaitQueue;
 use crate::app::runtime::{AdapterPorts, conversation_kind_from_str, conversation_kind_str};
 use crate::app::store_failed;
-use crate::dto::{BotSummary, Command, ConversationSummary, Event, LogLevel, Response, RunLog};
+use crate::dto::{
+    BotSummary, Command, ConversationSummary, Event, JobView, LogLevel, Response, RunLog, WaitView,
+};
 
 /// `bot_inject` 伪造的发送者 id。
 ///
@@ -69,6 +71,11 @@ pub const INJECT_SENDER: &str = "inject";
 
 /// `logs_tail` 单次最多返回多少行（防止 UI 传个巨大的 limit 把内存打满）。
 pub const MAX_LOG_LIMIT: usize = 1000;
+
+/// `bot_jobs` / `bot_waits` 单次最多回多少条（面板只需要最近若干条，不接一万行）。
+///
+/// 超了按上限算而不是报错：面板轮询时传什么值都不该让整块 UI 变红。
+pub const MAX_VIEW_LIMIT: usize = 200;
 
 /// 按命令分发到各 handler（`dispatch.rs` 是本模块唯一调用方）。
 pub async fn handle(state: &AppState, command: Command) -> Response {
@@ -83,6 +90,8 @@ pub async fn handle(state: &AppState, command: Command) -> Response {
         Command::LogsTail { bot_id, limit } => logs_tail(state, bot_id, limit).await,
         Command::BotList => bot_list(state).await,
         Command::BotConversations { bot_id } => bot_conversations(state, bot_id).await,
+        Command::BotJobs { bot_id, limit } => bot_jobs(state, bot_id, limit).await,
+        Command::BotWaits { bot_id, limit } => bot_waits(state, bot_id, limit).await,
         other => unimplemented(other.kind()),
     }
 }
@@ -764,6 +773,95 @@ pub async fn bot_conversations(state: &AppState, bot_id: BotId) -> Response {
         Ok(value) => Response::with_data(value),
         Err(error) => failed(HbotError::internal(format!(
             "bot_conversations 序列化失败：{error}"
+        ))),
+    }
+}
+
+/// 列一个 bot 最近的作业行（**新的在前**），给作业面板用。
+///
+/// 只读：不派发、不改状态、不跑 handler。`bot` 必须存在 —— 对一个不存在的 bot
+/// 返回空数组会让面板显示「这个 bot 什么都没跑过」，而真相是这个 id 写错了（`-32001`）。
+pub async fn bot_jobs(state: &AppState, bot_id: BotId, limit: usize) -> Response {
+    let capped = u32::try_from(limit.min(MAX_VIEW_LIMIT)).unwrap_or(u32::MAX);
+    let store = Arc::clone(state.store());
+    let rows = match state
+        .blocking(move || {
+            if store.get_bot(&bot_id).map_err(store_failed)?.is_none() {
+                return Err(HbotError::not_found("bot", bot_id.to_string()));
+            }
+            store
+                .list_recent_jobs_for_bot(&bot_id, capped)
+                .map_err(store_failed)
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return failed(error),
+    };
+
+    let views: Vec<JobView> = rows
+        .into_iter()
+        .map(|row| JobView {
+            id: row.id,
+            name: row.name,
+            state: row.state,
+            attempts: row.attempts,
+            budget_ms: row.budget_ms,
+            conversation: row.conversation,
+            next_at: row.next_at,
+            last_error: row.last_error,
+            created_at: row.created_at,
+        })
+        .collect();
+
+    match serde_json::to_value(views) {
+        Ok(value) => Response::with_data(value),
+        Err(error) => failed(HbotError::internal(format!("bot_jobs 序列化失败：{error}"))),
+    }
+}
+
+/// 列一个 bot 最近的等待行（**新的在前**），等待面板用。
+///
+/// 与 [`bot_jobs`] 同口径：只读快照、终态行也回、bot 不存在时 `-32001`。
+/// 这里**不**重发提示、也不结算超时 —— 那是 tick 的活，面板读一眼不该改任何状态。
+pub async fn bot_waits(state: &AppState, bot_id: BotId, limit: usize) -> Response {
+    let capped = u32::try_from(limit.min(MAX_VIEW_LIMIT)).unwrap_or(u32::MAX);
+    let store = Arc::clone(state.store());
+    let rows = match state
+        .blocking(move || {
+            if store.get_bot(&bot_id).map_err(store_failed)?.is_none() {
+                return Err(HbotError::not_found("bot", bot_id.to_string()));
+            }
+            store
+                .list_recent_waits_for_bot(&bot_id, capped)
+                .map_err(store_failed)
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return failed(error),
+    };
+
+    let views: Vec<WaitView> = rows
+        .into_iter()
+        .map(|row| WaitView {
+            id: row.id,
+            key: row.key,
+            prompt: row.prompt,
+            scope: row.scope,
+            state: row.state,
+            conversation: row.conversation,
+            deadline: row.deadline,
+            reminders_left: row.reminders_left,
+            timeout_ms: row.timeout_ms,
+            created_at: row.created_at,
+        })
+        .collect();
+
+    match serde_json::to_value(views) {
+        Ok(value) => Response::with_data(value),
+        Err(error) => failed(HbotError::internal(format!(
+            "bot_waits 序列化失败：{error}"
         ))),
     }
 }

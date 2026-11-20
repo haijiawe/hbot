@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hbot_core::{
     ApprovalDecision, ApprovalId, BotId, BotStatus, ConversationId, ConversationKind, EditId,
-    InboundId, MessageId, OutboundId, OutboundState, ProjectId, SandboxMode, SearchId, SessionId,
-    Timestamp, ToolCall, ToolCallStatus,
+    InboundId, JobId, MessageId, OutboundId, OutboundState, ProjectId, SandboxMode, SearchId,
+    SessionId, Timestamp, ToolCall, ToolCallStatus, WaitId,
 };
 use ts_rs::{Config, TS};
 
@@ -16,9 +16,9 @@ use super::{GeneratedFile, HEADER, INDEX_FILE, TsGenError};
 use crate::dto::{
     ApiError, AppInfo, BotSummary, Command, ConversationSummary, DebugBreakpoint, DebugScope,
     DeviceSettings, DeviceStatus, Diagnostic, DiagnosticSeverity, DiffHunk, DirEntry, EditFile,
-    Event, FileChangeKind, FileContent, FixtureEntry, FixtureRunReport, LogLevel,
+    Event, FileChangeKind, FileContent, FixtureEntry, FixtureRunReport, JobView, LogLevel,
     ProjectOpenResult, ProjectSummary, ReplayEntry, ReplayReplyChange, ReplayReport, Response,
-    RiskLevel, RunLog, SavedFixture, SearchMatch, StackFrame, StepKind,
+    RiskLevel, RunLog, SavedFixture, SearchMatch, StackFrame, StepKind, WaitView,
 };
 
 /// 渲染结果：文件本身 + 它 import 的依赖（供悬空 import 检查）。
@@ -79,6 +79,12 @@ pub fn generated_files() -> Result<Vec<GeneratedFile>, TsGenError> {
         // 产品面最容易继续长的一处，加一种子能力不该逼着 UI 重新生成一遍枚举。
         // 代价是前端要自己把未知值当"不认识的能力"忽略，不能 throw。
         DeviceStatus,
+        // `bot_jobs` / `bot_waits` 的行：作业与等待面板的快照。
+        //
+        // `state` / `scope` 同样是开放字符串：作业状态集合还会长，UI 遇到不认识的值
+        // 按原样显示即可，不能 throw（与 DeviceStatus 同一口径）。
+        JobView,
+        WaitView,
     );
     // 宿主级设备设置（`device_settings_get` / `device_settings_set` 的载荷）。
     export!(DeviceSettings);
@@ -109,6 +115,8 @@ pub fn generated_files() -> Result<Vec<GeneratedFile>, TsGenError> {
         ApprovalId,
         EditId,
         SearchId,
+        JobId,
+        WaitId,
     );
 
     rendered.sort_by(|a, b| a.file.path.cmp(&b.file.path));
