@@ -71,7 +71,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | **C1 事件** | `message` | 收到消息（已归一化） | `已实现` |
 | | `timer` | 固定间隔 / 每天某时刻（`onTimer(ctx, name)`） | `已实现`（2026-11-18，见 §4.4） |
 | | `webhook` | 外部系统打进来（HTTP 入口） | `已实现`（2026-11-19，见 §3.5） |
-| | `lifecycle` | `onStart` / `onStop` | `已实现`（2026-11-19，见 §4.6） |
+| | `lifecycle` | `onStart` / `onStop` | `已实现`（2026-11-19；`crash` 触发点 2026-11-20，见 §4.6） |
 | | `device` | 屏幕变化、输入事件（预留，见 §9） | `未做` |
 | **C2 状态** | `kv` | 每 bot 命名空间的键值（JSON 值、TTL、批量原子写） | `已实现`（2026-11-18） |
 | | `sql` | 每 bot 一套表（迁移文件定义，只允许参数化 DML） | `已实现`（2026-11-19，§5.3） |
@@ -528,7 +528,7 @@ export default defineBot({
 
 > **2026-11-20 补：作业面板已落地。** 底部面板多了一个「作业」页签（`apps/web/src/features/run/jobs-panel.tsx`），数据来自两条只读命令 `bot_jobs` / `bot_waits`（`docs/07` §4.5 与 §5.2 共用一个面板）。三条判据：① 命令是**只读快照** —— 不派发 handler、不改状态、不重发提示、不结算超时；② 终态行也返回（面板要能看见「刚才那条失败了」），过滤交给 UI，`state`/`scope` 是**开放字符串**（遇到未知值显示「未知（原值）」，绝不 throw）；③ `bot_id` 不存在时返回 `-32001` 而不是空数组（空数组会让「id 写错」看起来像「什么都没跑过」），`limit` 超过 200 按 200 算不报错（轮询不该让 UI 变红）。
 
-### 4.6 已落地：生命周期钩子（`C1.lifecycle`，2026-11-19）
+### 4.6 已落地：生命周期钩子（`C1.lifecycle`，2026-11-19；`crash` 触发点 2026-11-20）
 
 ```ts
 export default defineBot({
@@ -543,29 +543,32 @@ export default defineBot({
 })
 ```
 
-**四道判据**：
+**五道判据**：
 
 | 层 | 判据 | 位置 | 没过的症状 |
 |---|---|---|---|
 | 钩子层 | `defineBot` 的 `onStart` / `onStop` | `hbot-code` 的 `Hooks.start` / `Hooks.stop`（boot 时取） | **没有钩子不是错误**（清单里没有对应声明项），静默跳过 |
 | 时刻层 | `onStart` 在 `supervisor.start()` 之后、登记之前；`onStop` 在注销 webhook 与取消作业之前 | `hbot-rpc` 的 `commands::bots::start_inner` / `stop_with_reason` | 顺序错了会「消息先于初始化被消费」或「停机时执行器已经拆掉」 |
-| 原因层 | `user`（用户点停止）／`shutdown`（切项目、Ctrl-C、桌面端退出） | `commands::bots::stop` → `User`；`AppState::shutdown()` → `Shutdown` | 一律报成 `user` 会让 handler 的「存档并退出」在正常关机路径上不跑 |
+| 原因层 | `user`（用户点停止）／`shutdown`（切项目、Ctrl-C、桌面端退出）／`crash`（适配器订阅意外断了、这个 bot 再也收不到消息） | `commands::bots::stop` → `User`；`AppState::shutdown()` → `Shutdown`；`Supervisor::wait_read_loop_exit()` 看到意外结束 → `Crash` | 一律报成 `user` 会让 handler 的「存档并退出」在正常关机路径上不跑；把崩溃报成 `user` 会让存档逻辑读到不可信状态 |
 | 预算层 | `onStart` 用 `limits.handlerMs`；`onStop` 用 `hbot_core::STOP_BUDGET`（**5 秒**） | `hbot-code` 的 `run_lifecycle` | 超时按 `HBOT_TIMEOUT` 中断，`onStart` 会因此让启动失败 |
 | 失败层 | `onStart` 失败 = 启动失败；`onStop` 失败 = 一行 error 日志 | `hbot-rpc` 的 `run_lifecycle` 调用点 | 前者回滚到 stopped；后者不影响 `bot_stop` 的返回值 |
 
-**四条设计决定与理由**：
+**六条设计决定与理由**：
 
 1. **`onStart` 失败就是启动失败**。不报错会让「bot 起来了但没初始化完」变成一种状态，而后续每条消息都会在这个半初始化状态里跑 —— 那种 bug 只在真机上出现，且日志里看不出。
 2. **`onStop` 只给 5 秒，且失败不报错**。停机路径上有人在等（`bot_stop` 的返回、进程退出），所以它必须有一个比任何业务动作都短的硬上界；而给它一个返回值只会诱使调用方去判断「停得好不好」，那件事无法恢复。
 3. **编译失败时跳过两个钩子，而不是让 `bot_start` 失败**。这是 `AGENTS.md` 坑 24 的同一条纪律：编译错误是用户代码的问题，正确形状是「bot 起着、消息留在未处理、改好代码自动重试」。把 `onStart` 接成硬失败会让一个 typo 永久挡住启动。
 4. **生命周期钩子的 ctx 比所有事件都窄**：只有 `phase` / `reason` 与 `log` / `sleep` / `ai`。没有 `reply`（启动时没有会话、停机时没有任何东西保证消息发得出去），也没有 `kv` / `history` / `device` / `jobs` / `session` —— 它们都要一个 bot 身份，而钩子恰恰在身份建立之前、拆除之后跑。
 5. **`reason` 由调用点给，不由钩子猜**。三个停机入口各说各的：`bot_stop` 是 `user`；切项目、`hbot serve` 收到 Ctrl-C / SIGTERM、桌面端退出都走 `AppState::shutdown()` → `shutdown`。为什么不让收尾路径复用裸的 `bots().stop_all()`：那会跳过 `onStop`，于是「Ctrl-C 之后什么都没保存」变成一类无法解释的现象。`parse` 不认识的字符串直接报错、**不默认成 `User`** —— 把崩溃报成用户点的停止会让存档逻辑读到不可信状态。
+6. **`crash` 的判据只由读循环自己给，且只对「读循环真的结束了」触发**。三种意外结束（适配器订阅被关、入站落库失败、入队失败）的共同后果是「bot 还登记为 `Running`，但再也收不到任何消息」，而这**不改变任何计数器**（消息没进来、handler 没失败），所以任何从外部观察的启发式都只能靠猜。做法：`read_loop` 把退出原因作为返回值 + 写进 `ReadExitSlot`（`Notify`，先结束再等待也不会漏），`Supervisor::wait_read_loop_exit()` 是唯一读口；`hbot-rpc` 的 `start_inner` 起一个收尾任务等它。**刻意不把「isolate 崩溃」算进来**：那有 last-good 兜底（`AGENTS.md` 坑 24）、bot 还活着，那一刻调 `onStop(crash)` 会让用户的清理逻辑跑在一个活着的 bot 上。
 
 **实测**（`hbot-rpc` 的 `tests/lifecycle_capability.rs`，6 条，全走 `Dispatcher` 真派发 + 真库）：`onStart` 启动时真跑一次且只一次；`onStart` 抛错时 `bot_start` 返回错误、抛错前的 `ctx.log` 仍落库、错误点名 `onStart`；`onStop` 的第二个参数与 `ctx.reason` 都是 `user`；`onStop` 抛错时 `bot_stop` 仍成功且错误点名 `onStop`；没写钩子时既不报错也不留点名钩子的日志；`AppState::shutdown()` 之后 `onStop` 收到的是 `shutdown` 且 bot 已从登记表摘掉。契约层另有 3 条（原因字符串往返、预算值、阶段名）。
 
-**还没做**：`crash` 的**触发点**（枚举与渲染已就位，但**没有可靠检测**「supervisor 自己死了」的地方 —— 详情见下）；`onStart` 里写状态的正式形状（现在只有 `log`/`sleep`/`ai`，要持久化得在建连之后由消息驱动）。
+**`crash` 那一段的实测**（`crates/hbot-bot` 2 条 + `crates/hbot-rpc` 2 条）：`read_loop` 在订阅被关掉时报 `ReadLoopExit::SubscriptionClosed` 且 `is_unexpected()`、状态降到 `Degraded`（`crates/hbot-bot/tests/runtime.rs`）；正常停机报 `StopRequested` 且**不算**意外（同文件，先 spawn 等待再 stop —— 顺序反了会因为 `stop()` 等读循环而死锁）。端到端（`crates/hbot-rpc/tests/crash_capability.rs`，注入一个订阅通道握在测试手里的假适配器 —— 真 OneBot 客户端断线后会无限重连，造不出这个场景）：松开通道 → `onStop` 收到 `crash`（第二个参数与 `ctx.reason` 两处）→ 落一行点名「读循环意外结束」的 error → 库里的状态变成 `stopped`；对照组 `bot_stop` 仍是 `user` 且不留崩溃日志。
 
-> `crash` 为什么还空着：现在唯一的「崩」是 isolate 崩溃，而它有 last-good 版本兜底（`AGENTS.md` 坑 24），bot 仍然在跑 —— 在那一刻调 `onStop(crash)` 会让用户的清理逻辑跑在一个还活着的 bot 上（关连接、删临时文件），然后每条新消息都在被清空的环境里继续执行。真要接，得先给 supervisor 加一个「读循环意外结束」的信号，那是另一件事。**宁可让这个原因暂时没人发，也不要发错**。
+**还没做**：`onStart` 里写状态的正式形状（现在只有 `log`/`sleep`/`ai`，要持久化得在建连之后由消息驱动）；`onStop(crash)` 的**真机验证**（现在只在注入假适配器的端到端里成立：真实平台断线要能触发它，还得有平台侧「放弃重连」的判据 —— OneBot 客户端目前是无限重连，见 `crates/hbot-adapters/src/platforms/onebot/client.rs` 的 backoff 循环）。
+
+> `crash` 现在由谁发：只有 `Supervisor::wait_read_loop_exit()` 报出「意外结束」时，`hbot-rpc` 的收尾任务才会调 `stop_with_reason(..., Crash)`。**isolate 崩溃仍然不算 crash**：它有 last-good 版本兜底（`AGENTS.md` 坑 24），bot 还活着 —— 在那一刻调 `onStop(crash)` 会让用户的清理逻辑跑在一个活着的 bot 上（关连接、删临时文件），然后每条新消息都在被清空的环境里继续执行。**宁可让这个原因少发，也不要发错**。
 
 ---
 

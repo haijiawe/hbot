@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 22:10**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`（含每 bot 磁盘配额）、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。
+> 本快照时间：**2026-11-20 23:00**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`（含每 bot 磁盘配额）、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。同日又接上 **`onStop(crash)` 的触发点**：supervisor 的读循环意外结束（订阅被关 / 入队失败）会经 `ReadLoopExit` + `ReadExitSlot` 传出，rpc 侧按 `StopReason::Crash` 停机并跑 `onStop`（`crates/hbot-rpc/tests/crash_capability.rs`）—— `docs/07` §4.6 里「枚举与渲染就位、但没有可靠检测」的那个缺口已关闭。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 57 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 2006 passed / 0 failed / 125 target
+cargo test -j 2 --workspace              # 当前 2010 passed / 0 failed / 126 target
 pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 ```
 
-现状：**六道全绿**（2026-11-20 18:40 实测，`rustc 1.100.0`，2006 passed / 125 target / web 47 文件 427 用例）。
+现状：**六道全绿**（2026-11-20 22:50 实测，`rustc 1.100.0`，2010 passed / 126 target / web 47 文件 427 用例）。
 **Rust 版本已钉死**：`rust-toolchain.toml` 的 `channel = "1.100.0"` 与 `ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`
 必须一起改（原来两处都写 `stable`，导致 CI 的 clippy 比本地新、只报在 CI，见 `docs/pitfalls.md` 坑 115）。
 `apps/web/src/generated/*.ts` **要入库**；
@@ -122,7 +122,7 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 131 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 132 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -238,9 +238,12 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 `onStop` 用 5 秒）。**编译失败时两个钩子都跳过**，绝不能让 `bot_start` 因此失败（坑 88）。
 `shutdown` 触发点**已接**（2026-11-20）：切项目、`hbot serve` 收到 Ctrl-C、桌面端退出一律走
 `AppState::shutdown()` → `stop_all_with_reason(Shutdown)`，绝不裸调 `bots().stop_all()`（那会跳过
-`onStop` 与 webhook 注销，坑 94）。`crash` 仍未接，且**暂时不该接**：现在唯一的「崩」是 isolate 崩溃，
-而它有 last-good 兜底（坑 24）、bot 还活着 —— 那一刻调 `onStop(crash)` 会让用户的清理逻辑跑在活着的
-bot 上。真要接得先给 supervisor 加「读循环意外结束」的信号。
+`onStop` 与 webhook 注销，坑 94）。**`crash` 触发点已接（2026-11-20）**：`read_loop` 现在把退出原因
+（正常停机 / 订阅断开 / 入站落库失败 / 入队失败）作为 `ReadLoopExit` 返回并写进 `ReadExitSlot`，
+`Supervisor::wait_read_loop_exit()` 是唯一读口，`hbot-rpc` 的 `start_inner` 起一个收尾任务等它、
+看到「意外」就落一行 error + 按 `StopReason::Crash` 停机（坑 132）。**isolate 崩溃仍然不算 crash**：
+它有 last-good 兜底（坑 24）、bot 还活着，那一刻调 `onStop(crash)` 会让清理逻辑跑在活着的 bot 上。
+真机侧还没验（OneBot 客户端断线是无限重连，造不出这个事件）。
 还剩：`E1` 打包、设备完整版、云端宿主、`M6`。
 
 **刚落地的 `C2.sql`（`docs/07` §5.3）**：隔离靠**一个 bot 一个库文件**（`<data_dir>/bot_sql/<bot_id>.db`），
@@ -268,8 +271,8 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 
 ### D. 其它未做（不阻塞主线）
 
-- `onStart` / `onStop`（含 `shutdown` 原因）—— **已落地（2026-11-19 / 2026-11-20，`docs/07` §4.6）**，别再重做；
-  `crash` 这个原因**暂时没人发**是刻意的（理由见上面 §7 C 段末尾）；
+- `onStart` / `onStop`（含 `shutdown` 与 `crash` 三个原因）—— **已落地（2026-11-19 / 2026-11-20，`docs/07` §4.6）**，别再重做；
+  `crash` 只由「读循环意外结束」触发，**不把 isolate 崩溃算进来**是刻意的（理由见上面 §7 C 段末尾）；
 - `C3.file` 的收尾件：只剩附件发送（主链路、按行读写、二进制读、递归删除、**每 bot 磁盘配额** 2026-11-20 都已落地，见 `docs/07` §3.6）；
 - `onSchedule` —— **已落地（2026-11-20，`docs/07` §4.4.1）**：它就是 `onTimer` 的正式名，同一条派发路径、同一个 `capabilities.timer`；两个名字都写会启动失败。别再按「另起一条路径」实现；
 - 设备完整版：混合 DPI 跨屏拼图、中文以外的 OCR 语言包（按窗口截图 2026-11-20 已落地，见 `docs/09` §11.1）；
@@ -298,7 +301,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：2006 passed / 125 target
+cargo test -j 2 --workspace                              # 基线：2010 passed / 126 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。
