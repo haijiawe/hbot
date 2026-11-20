@@ -326,9 +326,20 @@ async fn inject_executes_the_generated_code_and_writes_the_reply_to_the_run_log(
 
     assert_ok(&harness.inject(conversation.id, "你好").await);
 
-    wait_for("回复出现在 run log 里", || {
-        harness.replies().iter().any(|text| text == "收到：你好")
-    })
+    // 等两个条件：`RecordingHandler` 是「先执行 handler（回复落日志），再
+    // mark_processed」，只等回复会让下面那条"未处理队列为空"偶发为假
+    // （同族竞态见 docs/pitfalls.md 坑 121）。
+    wait_for(
+        "回复出现在 run log 里且 inbound 已标记处理",
+        || {
+            harness.replies().iter().any(|text| text == "收到：你好")
+                && harness
+                    .store()
+                    .list_unprocessed_inbound(64)
+                    .expect("读未处理 inbound")
+                    .is_empty()
+        },
+    )
     .await;
 
     let replies = harness.replies();

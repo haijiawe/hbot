@@ -527,8 +527,10 @@
     `inbox.mark_processed(&message_id)` 写 `processed_at`。于是
     `crates/hbot-bot/tests/runtime.rs` 的 `unprocessed_inbound_is_replayed_on_start` 只等
     `seen().len() == 1`，下一行断言 `list_unprocessed_inbound(10).is_empty()` 就偶发为假（本机 15 次全绿、
-    CI 上红）。判据：**等待条件要覆盖后面所有断言的因果前置**，把「库里已空」并进 `wait_until`，
-    而不是在等待之后断言一个还没发生的副作用；不放松语义（最终仍必须为空）。
+    CI 上红）。**同一个文件里还有第二条同族**：`replay_continues_past_one_batch_without_losing_messages`
+    只等 `seen().len() == total` 再断言未处理行为空，修完第一条的下一轮 CI（ubuntu）就红在它上面 ——
+    说明「一处竞态 = 全仓扫同类」比逐条等 CI 报要省一轮。判据：**等待条件要覆盖后面所有断言的因果前置**，
+    把「库里已空」并进 `wait_until`，而不是在等待之后断言一个还没发生的副作用；不放松语义（最终仍必须为空）。
 
 122. **Windows 文件系统语义的用例，在 POSIX 上必须按平台门控**（2026-11-20，CI 的 ubuntu 红）。
     `crates/hbot-redteam/tests/a_path_escape.rs` 有四条用例无条件要求「必须拒绝」：`a04` 的

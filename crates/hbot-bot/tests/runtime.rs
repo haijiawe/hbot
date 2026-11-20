@@ -350,9 +350,20 @@ async fn replay_continues_past_one_batch_without_losing_messages() {
     }
 
     supervisor.start().await.expect("restart");
-    wait_until("every replayed message executed", || {
-        fixture.executor.seen().len() == total
-    })
+    // 等两个条件，不是只等执行：`RecordingHandler` 是「先 executor.on_message，再
+    // mark_processed」，`seen` 满额那一刻最后一条的 `processed_at` 可能还没落库。
+    // 只等 seen 会让下面那条"剩余行必须继续重放"偶发为假（CI 的 ubuntu 上就红过）。
+    wait_until(
+        "every replayed message executed and marked processed",
+        || {
+            fixture.executor.seen().len() == total
+                && fixture
+                    .store
+                    .list_unprocessed_inbound(1_000)
+                    .expect("list")
+                    .is_empty()
+        },
+    )
     .await;
     assert!(
         fixture
