@@ -12,8 +12,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use hbot_rpc::Dispatcher;
+use hbot_core::EventSink;
 use hbot_rpc::ws::{WsConfig, WsServer};
+use hbot_rpc::{Dispatcher, Event, EventBus};
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::cli::ServeArgs;
@@ -182,6 +184,18 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // 留一份 `Arc` 给收尾用：`Dispatcher` 拿走之后还要能调 `AppState::shutdown()`，
     // 否则 Ctrl-C 只能关掉 WS，bot 的 `onStop` 永远不会跑。
     let state = Arc::new(state);
+
+    // 事件桥：业务代码把事件发到 `AppState` 的 `EventBus` 上，而 WS 只认
+    // `WsServer::event_sink()`，两边之间必须有人转一趟。桌面壳是每个窗口一条事件泵
+    // （`crates/hbot-desktop/src/lib.rs` 的 `spawn_event_pump`），无头宿主就是这一条。
+    //
+    // 漏掉它的症状不是报错：客户端能连上、能发命令、能拿到命令的 `result`，但
+    // **一个事件帧都收不到**；数据与日志都正常落库，所以表现为「面板永远不刷新」。
+    // 压测就是这么抓到的：注入 30 条消息、库里 31 行回复，客户端 `run.log` 事件 0 条。
+    let sink = server.event_sink();
+    let bus = Arc::clone(state.events());
+    let pump = tokio::spawn(forward_events(bus, sink));
+
     let phase = Phase::start("serve_dispatcher");
     let dispatcher = Arc::new(Dispatcher::new().with_state(Arc::clone(&state)));
     phase.done();
@@ -215,11 +229,35 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     wait_for_shutdown().await;
     info!("收到关闭信号，开始收尾");
     handle.shutdown().await;
+    // WS 已经关了，桥没有出口可写；不 abort 会留一个空转任务到进程退出。
+    pump.abort();
     // WS 关掉之后才停 bot：信号窗口里正在处理的命令先跑完，否则会在「命令执行到一半」
     // 时拆掉它依赖的执行器。`AppState::shutdown` 会给每个 `onStop` 传 `shutdown`。
     state.shutdown().await;
     info!("hbot serve 已退出");
     Ok(())
+}
+
+/// `EventBus` → WS 事件出口。
+///
+/// 语义与桌面壳的事件泵一致：广播不补发（订阅之前发生的事件拿不到，客户端连上后
+/// 先用快照命令补齐状态）；订阅落后（`Lagged`）只记一条警告并继续，因为 WS 层自己还有
+/// 每连接的关键/普通两级队列在决定哪些事件不能丢（见 `crates/hbot-rpc/src/ws.rs` 模块文档）。
+async fn forward_events(bus: Arc<EventBus>, sink: Arc<dyn EventSink<Event>>) {
+    let mut receiver = bus.subscribe();
+
+    loop {
+        match receiver.recv().await {
+            Ok(event) => sink.emit(event),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "事件订阅落后，旧事件已丢弃");
+            }
+            // 总线没了（进程收尾时 sender 被释放）：没有出口可写，退出。
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+
+    info!("事件桥结束");
 }
 
 /// 数据目录：算法只有一份，在 [`hbot_core::paths`]。
@@ -267,6 +305,54 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 事件桥：总线上的事件必须真的走到 WS 出口。
+    ///
+    /// 这条是压测抓到的 bug 的回归（2026-11-21）：[P]hbot serve[P] 以前只装配
+    /// [P]Dispatcher::with_state[P]，没有把 [P]EventBus[P] 接到 [P]WsServer::event_sink()[P]，于是客户端
+    /// 能连、能发命令、能拿 [P]result[P]，但**一个事件帧都收不到**——库里日志与回复都好好的，
+    /// 面板却永远不刷新。漏接不会报错，只能靠这条测试钉住。
+    #[tokio::test]
+    async fn the_event_bridge_carries_bus_events_to_the_ws_sink() {
+        struct Capturing {
+            seen: tokio::sync::mpsc::UnboundedSender<Event>,
+        }
+
+        impl EventSink<Event> for Capturing {
+            fn emit(&self, event: Event) {
+                // 桥是同步 [P]emit[P]；测试这边用无界通道收，断言再异步等。
+                let _ = self.seen.send(event);
+            }
+        }
+
+        let bus = Arc::new(EventBus::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink<Event>> = Arc::new(Capturing { seen: tx });
+        let pump = tokio::spawn(forward_events(Arc::clone(&bus), sink));
+
+        // 订阅是桥启动时才建立的（广播不补发，与桌面壳的事件泵同一语义），
+        // 所以先让出一拍再发，避免这条测试变成时序碰运气。
+        tokio::task::yield_now().await;
+
+        let sent = bus.send(Event::RunLog {
+            bot_id: hbot_core::BotId::from_uuid(uuid::Uuid::new_v4()),
+            level: hbot_rpc::LogLevel::Info,
+            line: "soak-1".to_owned(),
+            at: hbot_core::Timestamp::from_unix_millis(1),
+        });
+        assert_eq!(sent, 1, "桥上应当有一个订阅者");
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("2 秒内应当收到转发的事件")
+            .expect("通道不该关");
+        match got {
+            Event::RunLog { line, .. } => assert_eq!(line, "soak-1"),
+            other => panic!("收到的事件类型不对：{other:?}"),
+        }
+
+        pump.abort();
+    }
 
     #[test]
     fn generated_token_is_64_hex_chars() {
