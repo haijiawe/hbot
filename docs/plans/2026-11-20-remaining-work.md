@@ -2,6 +2,14 @@
 
 > 这是工作排期，不是规范。规范仍是 `AGENTS.md` + `docs/04-implementation-plan.md`。
 > 批准后我按 P0 → P6 推进；每段自己过六道闸门、按 crate 拆 commit、回填文档，中途不再回来问。
+>
+> **收尾状态（2026-11-20 21:00）：P0–P6 全部完成。** P0 GitHub 备份（`haijiawe/hbot`，private）；
+> P1 `C3.file` 全链路；P2 `onSchedule`；P3 三个示例项目（`examples/chat|game|support`）与 `packaging/`；
+> P4 `M9` 本地可写部分（`hbot token` / 非回环拒启 / TLS 拒启 / `GET /healthz`）；P5 session 超时提示（`reminders`）；
+> P6 验收对账（`docs/07` §10 的 V1–V16 逐条对到能被 grep 到的用例名）+ 文档收口。
+> 期间的额外一段：**让 CI 首次真跑起来并转绿** —— 首跑抓出 10 处红点（1 处产品代码、1 处工具链未钉版本、8 处测试自身的平台/时序/夹具假设，见 `docs/pitfalls.md` 坑 115–128），
+> 修完后 run `44730056833` / `44735231807` / `44738414777` 连续三次七个 job 全绿。
+> 本文件自此只作**历史排期记录**，当前状态以 `docs/HANDOFF.md` 为准。
 
 ---
 
@@ -42,13 +50,13 @@
 
 | 阶段 | 内容 | 谁做 | 规模 | 验收判据 |
 |---|---|---|---|---|
-| **P0** | GitHub 私有仓备份 | 我 | 小 | `git remote -v` 有地址、`git ls-remote` 能看到 144 个 commit |
-| **P1** | `C3.file` 全链路（core 契约 → code 槽位与 JS 桥 → dts → rpc 装配 → e2e） | 我 | 中 | 新增 e2e ≥6 条：未声明 / 越界路径 / 超限 / 读回 / 覆盖 / 不存在 |
-| **P2** | `onSchedule` 全链路（core 计划类型 → store 复用 `schedules` → code 钩子 → rpc tick → e2e） | 我 | 中 | 新增 e2e ≥4 条：具名计划触发 / 未声明 / 缺钩子点名 / 重启后仍按 deadline |
-| **P3** | 三个示例项目 + 1 个打包件（**4 个子代理并行**） | 子代理 | 中 | 每个示例 `hbot check` 退出 0；P6 我再加一条冒烟 e2e 真派发 |
-| **P4** | `M9` 本地可写部分（token 子命令、bind 确认、TLS 拒绝、`/healthz`） | 我 | 大 | 新 e2e：非 loopback 无 `--allow-remote` 拒启、无 TLS 拒启、`/healthz` 200、token 撤销后握手失败 |
-| **P5** | session 等待超时的**可配置提示**（超时结算时往会话发一句话 + run log 记一行） | 我 | 小 | e2e：超时后会话收到提示、提示文案可被清单关掉 |
-| **P6** | 验收对账 + 文档收口（`docs/07` §10 的 V1–V11 逐条填证据、docs/11` 决策记录、`README` / `AGENTS.md` / `HANDOFF`） | 我 | 中 | 六道闸门全绿 + V1–V9 每条都有指向测试的名字 |
+| **P0** ✅ | GitHub 私有仓备份 | 我 | 小 | 已达成：`git remote -v` 有 `haijiawe/hbot`（private），CI 在跑 |
+| **P1** ✅ | `C3.file` 全链路（core 契约 → code 槽位与 JS 桥 → dts → rpc 装配 → e2e） | 我 | 中 | 新增 e2e ≥6 条：未声明 / 越界路径 / 超限 / 读回 / 覆盖 / 不存在 |
+| **P2** ✅ | `onSchedule` 全链路（core 计划类型 → store 复用 `schedules` → code 钩子 → rpc tick → e2e） | 我 | 中 | 新增 e2e ≥4 条：具名计划触发 / 未声明 / 缺钩子点名 / 重启后仍按 deadline |
+| **P3** ✅ | 三个示例项目 + 1 个打包件（`examples/chat|game|support` + `packaging/`） | 子代理 | 中 | 每个示例 `hbot check` 退出 0；P6 我再加一条冒烟 e2e 真派发 |
+| **P4** ✅ | `M9` 本地可写部分（token 子命令、bind 确认、TLS 拒绝、`/healthz`） | 我 | 大 | 新 e2e：非 loopback 无 `--allow-remote` 拒启、无 TLS 拒启、`/healthz` 200、token 撤销后握手失败 |
+| **P5** ✅ | session 等待超时的**可配置提示**（`reminders: 0..=3`） | 我 | 小 | e2e：超时后会话收到提示、提示文案可被清单关掉 |
+| **P6** ✅ | 验收对账 + 文档收口（`docs/07` §10 的 V1–V16 逐条填证据、`README` / `AGENTS.md` / `HANDOFF`） | 我 | 中 | 六道闸门全绿 + V1–V9 每条都有指向测试的名字 |
 
 顺序：**P0 → P1 → P2 → P3（并行，与 P4 交错）→ P4 → P5 → P6**。
 P3 的子代理一启动我就能同时写 P4，两条线不碰同一批文件。
@@ -104,7 +112,7 @@ P3 的子代理一启动我就能同时写 P4，两条线不碰同一批文件�
 
 | 需要什么 | 卡住什么 | 现在怎么办 |
 |---|---|---|
-| **GitHub 仓库（或授权我建）** | P0 备份 | 我等你一句话；建私有仓 + 推 master，一分钟的事 |
+| ~~GitHub 仓库~~ | ~~P0 备份~~ | **已解**：`haijiawe/hbot`（private）已建并推完，CI 连续三次全绿 |
 | 一台云主机 / VPS | `M9` 的「24h 不断线」验收 | 只做本地可写的一半，验收口径写清「未在真机验证」 |
 | 真 NapCat 扫码登录 | `M2` 的 OneBot 真机证据 | 需要你先把自己的 QQ 退出客户端（二维码会过期） |
 | macOS / Linux 机器 | `M10` 平台移植、`M4` 的 Landlock 真跑 | 只在文档里标「仅交叉编译」 |
