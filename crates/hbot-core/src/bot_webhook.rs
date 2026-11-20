@@ -21,6 +21,8 @@
 //! 环境变量**常数时间**比较。密钥不写进清单：清单是项目文件，会入库、会被分享。
 //! 环境变量没设时**一律拒绝**（fail-closed），不退化成「没配密钥就放行」。
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -45,6 +47,18 @@ pub const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
 /// 写超时约束，所以这个上限只防「一次应答把内存吃光」。
 pub const MAX_WEBHOOK_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// 路由级超时的下限（毫秒）。
+///
+/// 允许到 10ms：探活/健康检查这类 handler 本来就该在个位数毫秒内回答，给它们一个
+/// 明确的上界比让它们占着 handler 槽位更有意义。
+pub const MIN_WEBHOOK_TIMEOUT_MS: u64 = 10;
+
+/// 路由级超时的上限（毫秒）。
+///
+/// 与 `limits.handlerMs` 的硬上限一致：路由只能**收紧**自己的预算，不能比宿主愿意
+/// 为一个事件花的钱还多（否则一条路由就能把 handler 槽位占满）。
+pub const MAX_WEBHOOK_TIMEOUT_MS: u64 = 2_000;
+
 /// 请求头里携带密钥的那个名字（小写，传输层按小写查）。
 pub const WEBHOOK_SECRET_HEADER: &str = "x-hbot-secret";
 
@@ -61,6 +75,12 @@ pub struct WebhookRoute {
     pub path: String,
     /// 从哪个环境变量读这条路由的密钥。
     pub secret_env: String,
+    /// 这条路由自己的 handler 预算（毫秒）；`None` = 用宿主默认。
+    ///
+    /// 只允许比宿主上限更短：长请求该走作业（`ctx.jobs.enqueue`），而不是让一个
+    /// 在等 HTTP 响应的外部系统超时之后还在烧 isolate。
+    #[serde(default, rename = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
 }
 
 impl WebhookRoute {
@@ -70,7 +90,14 @@ impl WebhookRoute {
         Self {
             path: path.into(),
             secret_env: secret_env.into(),
+            timeout_ms: None,
         }
+    }
+
+    /// 这条路由的 handler 预算；没声明就是宿主默认。
+    #[must_use]
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout_ms.map(Duration::from_millis)
     }
 }
 
@@ -320,6 +347,13 @@ pub fn validate_routes(routes: &[WebhookRoute]) -> Result<(), String> {
             .map_err(|error| format!("routes[{index}].path 不合法：{error}"))?;
         validate_secret_env(&route.secret_env)
             .map_err(|error| format!("routes[{index}].secretEnv 不合法：{error}"))?;
+        if let Some(timeout_ms) = route.timeout_ms
+            && !(MIN_WEBHOOK_TIMEOUT_MS..=MAX_WEBHOOK_TIMEOUT_MS).contains(&timeout_ms)
+        {
+            return Err(format!(
+                "routes[{index}].timeoutMs 必须在 {MIN_WEBHOOK_TIMEOUT_MS}..={MAX_WEBHOOK_TIMEOUT_MS} 之间，收到 {timeout_ms}；路由只能收紧预算，不做静默压缩"
+            ));
+        }
         if routes[..index].iter().any(|seen| seen.path == route.path) {
             return Err(format!("路由 `{}` 重复声明", route.path));
         }
@@ -703,6 +737,45 @@ mod tests {
                 "{} 不以码开头：{error}",
                 error.code()
             );
+        }
+    }
+
+    #[test]
+    fn a_route_without_timeout_uses_the_host_budget() {
+        let route = route("tickets", "SECRET");
+        assert_eq!(route.timeout_ms, None, "不写 timeoutMs 就是 None");
+        assert_eq!(route.timeout(), None);
+        assert!(validate_routes(&[route]).is_ok());
+    }
+
+    #[test]
+    fn a_route_timeout_is_parsed_from_camel_case_and_mapped_to_a_duration() {
+        let parsed: WebhookRoute =
+            serde_json::from_str(r#"{"path":"tickets","secretEnv":"SECRET","timeoutMs":250}"#)
+                .expect("应能解析");
+        assert_eq!(parsed.timeout(), Some(Duration::from_millis(250)));
+        assert!(validate_routes(&[parsed]).is_ok());
+    }
+
+    #[test]
+    fn out_of_range_route_timeouts_are_refused_rather_than_clamped() {
+        for bad in [0, MIN_WEBHOOK_TIMEOUT_MS - 1, MAX_WEBHOOK_TIMEOUT_MS + 1] {
+            let mut route = route("tickets", "SECRET");
+            route.timeout_ms = Some(bad);
+            let error = validate_routes(&[route]).expect_err("{bad} 必须被拒");
+            assert!(error.contains("timeoutMs"), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "{MIN_WEBHOOK_TIMEOUT_MS}..={MAX_WEBHOOK_TIMEOUT_MS}"
+                )),
+                "报错要写出允许区间：{error}"
+            );
+        }
+        // 两端闭区间。
+        for good in [MIN_WEBHOOK_TIMEOUT_MS, MAX_WEBHOOK_TIMEOUT_MS] {
+            let mut route = route("tickets", "SECRET");
+            route.timeout_ms = Some(good);
+            assert!(validate_routes(&[route]).is_ok(), "{good} 应被接受");
         }
     }
 }

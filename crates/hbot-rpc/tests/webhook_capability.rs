@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use hbot_adapters::SystemClock;
 use hbot_core::{BotId, WEBHOOK_SECRET_HEADER};
@@ -84,6 +85,13 @@ export default defineBot({
     if (ctx.route === 'empty') {
       return null;
     }
+    if (ctx.route === 'slow') {
+      // 不能用 ctx.sleep：它会被夹到剩余预算、然后正常返回（`docs/pitfalls.md` 坑 58）。
+      // 忙等才测得出「预算到点把 handler 掐掉」这一条。
+      const started = Date.now();
+      while (Date.now() - started < 1500) { /* 忙等，不夹预算 */ }
+      return { ok: true };
+    }
     if (ctx.route === 'notify') {
       // 收件人来自清单：这一路只能'提醒'，不能指定发到哪。
       try {
@@ -137,6 +145,13 @@ fn manifest_with_notify(routes: &[(&str, &str)], notify: Option<(&str, &str)>) -
     format!(
         "{{\"name\":\"hook-bot\",\"platform\":{{\"kind\":\"local\"}},\"capabilities\":{{{}}}}}\n",
         capabilities.join(",")
+    )
+}
+
+/// 清单：一条带自己 `timeoutMs` 的路由。
+fn manifest_with_timeout(path: &str, secret_env: &str, timeout_ms: u64) -> String {
+    format!(
+        "{{\"name\":\"hook-bot\",\"platform\":{{\"kind\":\"local\"}},\"capabilities\":{{\"webhook\":[{{\"path\":\"{path}\",\"secretEnv\":\"{secret_env}\",\"timeoutMs\":{timeout_ms}}}]}}}}\n"
     )
 }
 
@@ -637,6 +652,37 @@ async fn a_head_probe_answers_the_headers_without_a_body() {
     assert!(
         declared > 0,
         "HEAD 的 Content-Length 必须按 GET 的体长报，实际头：{head}"
+    );
+
+    server.shutdown().await;
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+// ---------------------------------------------------------------------------
+// ⑫ 路由级超时：一条慢路由不该占着 handler 槽位
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_route_timeout_cuts_a_slow_handler_short() {
+    let env = "HBOT_TEST_HOOK_SLOW";
+    set_secret(env, "s3cret");
+    let harness = Harness::new("slow", &manifest_with_timeout("slow", env, 200)).await;
+    assert_ok(&harness.start().await, "bot_start");
+    let server = harness.serve().await;
+    let addr = server.addr().expect("拿到端口");
+
+    let started = Instant::now();
+    let (status, body) =
+        call_with_secret(addr, &format!("/hook/{BOT_UUID}/slow"), "s3cret", "{}").await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        status, 504,
+        "路由预算 200ms、handler 睡 1500ms：必须 504，实际体：{body}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "必须在路由预算附近就返回，实测 {elapsed:?}"
     );
 
     server.shutdown().await;

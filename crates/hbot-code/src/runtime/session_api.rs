@@ -22,11 +22,13 @@
 //! 重启后等待就消失，正是旧项目 P0-3 的失败形状），清单没声明时抛
 //! `HBOT_SESSION_NOT_DECLARED`。
 
-use std::sync::Arc;
+use std::sync::PoisonError;
+use std::sync::{Arc, Mutex};
 
 use rquickjs::prelude::{Async, Opt};
 use rquickjs::{Ctx, Exception, Function, Object, Value};
 
+use super::host_api::HostOutput;
 use crate::error::CodeError;
 use crate::session::SessionSlot;
 use hbot_core::{SessionError, WaitHit, WaitScope, WaitSpec};
@@ -41,11 +43,16 @@ pub(crate) const SESSION_BINDING_KEYS: &[&str] = &["prompt", "current", "cancel"
 pub(crate) fn install<'js>(
     ctx: &Ctx<'js>,
     slot: &Arc<SessionSlot>,
+    // 提示文本要经这里落进本次事件的 `reply` 缓冲：**不能**把 JS 的 `reply`
+    // 函数捕获进 `Async` 闭包 —— 那会让 JS 函数对象比运行时活得久，退出时
+    // 撞 `list_empty(&rt->gc_obj_list)`（`docs/pitfalls.md` 坑 53）。
+    output: Arc<Mutex<HostOutput>>,
 ) -> Result<Object<'js>, CodeError> {
     let object = Object::new(ctx.clone()).map_err(super::js_error)?;
 
     let prompt = {
         let slot = Arc::clone(slot);
+        let output = Arc::clone(&output);
         Function::new(
             ctx.clone(),
             Async(
@@ -58,15 +65,29 @@ pub(crate) fn install<'js>(
                       options: Opt<Value<'js>>| {
                     let prepared = parse_prompt(&handle, &key, &text, options.0.as_ref());
                     let slot = Arc::clone(&slot);
+                    let output = Arc::clone(&output);
                     async move {
                         let spec = match prepared {
                             Ok(spec) => spec,
                             Err(message) => return IdReply(Err(message)).into_js(&handle),
                         };
                         // 端口是阻塞的（写库），挪到阻塞线程池；isolate 线程只跑 JS。
+                        let prompt_text = spec.prompt.clone();
                         let outcome = tokio::task::spawn_blocking(move || slot.prompt(&spec)).await;
                         let result = match outcome {
-                            Ok(result) => result.map_err(|error| error.to_string()),
+                            // 注册成功就把提示发出去：等待是「注册」不是「阻塞」，
+                            // handler 立刻返回之后，用户能看到的**唯一**一份问题文案
+                            // 就是这里发出去的这一条（`docs/07` §5.2）。少发一次，
+                            // 用户就一直等一个从没人问过他的问题；等到重发额度
+                            // 用尽，等待还会直接过期。
+                            Ok(Ok(id)) => {
+                                output
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .push_reply(prompt_text);
+                                Ok(id)
+                            }
+                            Ok(Err(error)) => Err(error.to_string()),
                             Err(error) => Err(format!("会话等待的任务没能跑完：{error}")),
                         };
                         IdReply(result).into_js(&handle)

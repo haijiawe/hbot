@@ -174,7 +174,9 @@ declare module 'hbot' {
      * **只认项目内的相对路径**：绝对路径、`..`、盘符、反斜杠一律 `HBOT_FILE_DENIED`。
      * 值的大小有上限（读 256 KiB / 写 1 MiB），超了 `HBOT_FILE_TOO_LARGE`，请分块。
      *
-     * 只读文本：非 UTF-8 内容被拒（`HBOT_FILE_INVALID`），二进制请自己转 base64 字符串。 */
+     * 文本读（`read`）要求内容真的是 UTF-8，否则 `HBOT_FILE_INVALID`；二进制走
+     * `readBytes`，它不校验编码、回来的是原样字节的 base64。按行读写见
+     * `FileReadOptions` / `FileWriteOptions`。 */
     readonly files: FilesApi;
 
     /* 出口能力面（C3）。
@@ -596,6 +598,12 @@ declare module 'hbot' {
     sleep(ms: number): Promise<void>;
     /** 智能能力面，与消息事件同一份实现。 */
     readonly ai: AiApi;
+    /** 这个 bot 自己的 SQL 库，与消息事件同一份实现（`HBOT_SQL_*`）。
+     *  按 bot 绑定、不靠事件身份，所以恢复事件里也能落库 —— 等待被唤醒之后
+     *  最该做的事就是把用户那句话存下来。 */
+    readonly sql: SqlApi;
+    /** 项目的文件沙箱，与消息事件同一份实现（`HBOT_FILE_*`）。同样按 bot 绑定。 */
+    readonly files: FilesApi;
   }
   /** `ctx.send` 的第三个参数。 */
   export interface SendOptions {
@@ -700,6 +708,41 @@ declare module 'hbot' {
     readonly truncated: boolean;
   }
 
+  /** `ctx.files.readBytes` 的结果 —— 原样字节的 base64。 */
+  export interface FileBinary {
+    /** 相对项目根的路径。 */
+    readonly path: string;
+    /** 读到的字节的 base64（标准字母表，带 `=` 补齐）。 */
+    readonly base64: string;
+    /** 实际读到的字节数（已编码前的长度）。 */
+    readonly bytes: number;
+    /** 后面还有没给你的字节（**不是错误**）：撞到 `maxBytes`。 */
+    readonly truncated: boolean;
+  }
+
+  /** `ctx.files.readBytes` 的选项。 */
+  export interface FileReadBytesOptions {
+    /** 最多读多少字节，1..=262144，缺省 262144。 */
+    maxBytes?: number;
+  }
+
+  /** `ctx.files.write` 的选项（按行替换）。 */
+  export interface FileWriteOptions {
+    /**
+     * 要替换掉的第一行（1 起）。与 `endLine` 一起用时替换整个闭区间。
+     * 只给 `startLine` 就只替换这一行。
+     */
+    startLine?: number;
+    /** 要替换掉的最后一行（含，必须 >= startLine）。 */
+    endLine?: number;
+  }
+
+  /** `ctx.files.remove` 的选项。 */
+  export interface FileRemoveOptions {
+    /** 递归删除（默认 false：只允许删文件与空目录）。 */
+    recursive?: boolean;
+  }
+
   /** `ctx.files.read` 的选项。 */
   export interface FileReadOptions {
     /** 最多读多少字节，1..=262144，缺省 262144。 */
@@ -723,12 +766,17 @@ declare module 'hbot' {
   export interface FilesApi {
     /** 读一个文本文件。不存在 `HBOT_FILE_NOT_FOUND`，不是 UTF-8 `HBOT_FILE_INVALID`。 */
     read(path: string, options?: FileReadOptions): Promise<FileText>;
-    /** 覆盖写一个文本文件（父目录不存在会建）。超过 1 MiB `HBOT_FILE_TOO_LARGE`。 */
-    write(path: string, text: string): Promise<FileEntry>;
+    /** 读一个二进制文件（图片、zip、protobuf…）：不做 UTF-8 校验，回来的是 base64。 */
+    readBytes(path: string, options?: FileReadBytesOptions): Promise<FileBinary>;
+    /** 覆盖写一个文本文件（父目录不存在会建）。超过 1 MiB `HBOT_FILE_TOO_LARGE`。
+     *  给了 `startLine` / `endLine` 就只替换那几行，其余行原样保留（行尾也保留）。 */
+    write(path: string, text: string, options?: FileWriteOptions): Promise<FileEntry>;
     /** 列一个目录（不递归）；不传路径就是项目根。 */
     list(path?: string, options?: FileListOptions): Promise<FileEntry[]>;
-    /** 删一个文件或空目录；不存在 `HBOT_FILE_NOT_FOUND`。 */
-    remove(path: string): Promise<void>;
+    /** 删一个文件或目录（递归要显式 `recursive: true`），返回删掉的条目数。
+     *  不存在 `HBOT_FILE_NOT_FOUND`；非空目录不递归 `HBOT_FILE_DENIED`；
+     *  递归遇到符号链接一律拒绝，不跟进。 */
+    remove(path: string, options?: FileRemoveOptions): Promise<number>;
   }
   /** 注册入口，原样返回 config（只做校验，不包装）。 */
   export function defineBot(config: BotConfig): BotConfig;

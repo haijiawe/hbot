@@ -717,6 +717,7 @@ impl Sandbox {
         method: &str,
         content_type: Option<&str>,
         body: &str,
+        budget_ms: Option<u64>,
     ) -> Result<(EventOutcome, Option<serde_json::Value>), EventFailure> {
         let (reply, result) = std::sync::mpsc::channel();
         self.send(Command::Webhook {
@@ -724,6 +725,7 @@ impl Sandbox {
             method: method.to_owned(),
             content_type: content_type.map(str::to_owned),
             body: body.to_owned(),
+            budget_ms,
             reply,
         })
         .map_err(EventFailure::without_output)?;
@@ -1195,6 +1197,8 @@ enum Command {
         content_type: Option<String>,
         /// 请求体（传输层已按 UTF-8 校验过，这里不会拿到半截字符）。
         body: String,
+        /// 这条路由自己的预算（毫秒）；`None` = 用 `limits.handlerTimeout`。
+        budget_ms: Option<u64>,
         reply: Sender<Result<(EventOutcome, Option<serde_json::Value>), EventFailure>>,
     },
     /// 跑一次生命周期钩子（`onStart` / `onStop`）。
@@ -1602,6 +1606,7 @@ fn serve(
                 method,
                 content_type,
                 body,
+                budget_ms,
                 reply,
             } => {
                 let raw = {
@@ -1613,7 +1618,9 @@ fn serve(
                     let control = &control;
                     let ai = &ai;
                     let content_type = content_type.as_deref();
-                    let budget = limits.handler_timeout;
+                    let host_budget = limits.handler_timeout;
+                    let budget = budget_ms
+                        .map_or(host_budget, |ms| Duration::from_millis(ms).min(host_budget));
                     local.block_on(&runtime, async move {
                         context
                             .async_with(async |ctx| {
@@ -2650,6 +2657,12 @@ fn build_resume_event<'js>(
     resume_event.set("log", host.get::<_, Function<'js>>("log")?)?;
     resume_event.set("sleep", host.get::<_, Function<'js>>("sleep")?)?;
     resume_event.set("ai", host.get::<_, Object<'js>>("ai")?)?;
+    // `sql` 与 `files` 是**按 bot 绑定**的，不借事件身份，所以恢复 ctx 里可以有：
+    // 一条等待被唤醒之后最该做的事就是「把用户那句话存下来」，少了它这个能力
+    // 只剩一句口头回复。`kv` / `history` / `device` / `jobs` 仍然不挂 —— 它们
+    // 靠的是事件身份（会话、发送者、窗口），恢复事件不该替它们猜。
+    resume_event.set("sql", host.get::<_, Object<'js>>("sql")?)?;
+    resume_event.set("files", host.get::<_, Object<'js>>("files")?)?;
     Ok(resume_event)
 }
 /// 交给 `onJob` 的 ctx，作业名同时作为第二个参数。

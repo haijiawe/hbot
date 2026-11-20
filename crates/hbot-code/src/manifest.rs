@@ -48,6 +48,18 @@ pub const DEFAULT_HEAP_MB: u64 = 32;
 /// Hard cap for `limits.heapMb` (`docs/02-architecture.md` §6.1).
 pub const MAX_HEAP_MB: u64 = 64;
 
+/// Default ceiling on a bot's unfinished jobs, matching
+/// [`hbot_core::MAX_JOBS_PER_BOT`].
+///
+/// 缺省值与核心常量相同：清单不写这一项时，行为和引入这个开关之前完全一致。
+pub const DEFAULT_MAX_PENDING_JOBS: u32 = hbot_core::MAX_JOBS_PER_BOT as u32;
+
+/// Hard cap for `limits.maxPendingJobs`.
+///
+/// 允许调高到 1024（一个 bot 的作业表不会无限长，但批处理项目确实需要比 256 更深的
+/// 队列）；再高就要求宿主侧的内存与磁盘预算，那是另一个设计，先不给。
+pub const MAX_PENDING_JOBS: u32 = 1024;
+
 /// Reserved bot name used by [`scaffold`] when the caller has no better idea.
 pub const FALLBACK_NAME: &str = "my-bot";
 
@@ -337,6 +349,12 @@ pub struct ManifestLimits {
     /// Isolate heap ceiling in MiB.
     #[serde(default = "default_heap_mb", rename = "heapMb")]
     pub heap_mb: u64,
+    /// Ceiling on this bot's unfinished jobs (`pending` + `running`).
+    ///
+    /// 满了之后 `ctx.jobs.enqueue` 报 `HBOT_JOBS_FULL`：有上界才叫背压，没上界就是
+    /// 「跑到内存/磁盘满才开始丢」。缺省 [`DEFAULT_MAX_PENDING_JOBS`]。
+    #[serde(default = "default_max_pending_jobs", rename = "maxPendingJobs")]
+    pub max_pending_jobs: u32,
 }
 
 impl Default for ManifestLimits {
@@ -344,6 +362,7 @@ impl Default for ManifestLimits {
         Self {
             handler_ms: DEFAULT_HANDLER_MS,
             heap_mb: DEFAULT_HEAP_MB,
+            max_pending_jobs: DEFAULT_MAX_PENDING_JOBS,
         }
     }
 }
@@ -367,6 +386,10 @@ const fn default_handler_ms() -> u64 {
 
 const fn default_heap_mb() -> u64 {
     DEFAULT_HEAP_MB
+}
+
+const fn default_max_pending_jobs() -> u32 {
+    DEFAULT_MAX_PENDING_JOBS
 }
 
 /// Render a path the way the manifest spells it: `/` separators, no `\\`.
@@ -520,6 +543,16 @@ impl ManifestLimits {
                     "`limits.handlerMs` 必须在 1..={MAX_HANDLER_MS} 之间，收到 {}；\
                      超过宿主硬上限直接报错，不做静默压缩",
                     self.handler_ms
+                ),
+            ));
+        }
+        if self.max_pending_jobs == 0 || self.max_pending_jobs > MAX_PENDING_JOBS {
+            return Err(invalid(
+                manifest_path,
+                format!(
+                    "`limits.maxPendingJobs` 必须在 1..={MAX_PENDING_JOBS} 之间，收到 {}；\
+                     超过宿主硬上限直接报错，不做静默压缩",
+                    self.max_pending_jobs
                 ),
             ));
         }
@@ -852,6 +885,31 @@ mod tests {
         assert_eq!(MAX_HANDLER_MS, Limits::default().handler_timeout_ms());
     }
 
+    /// 作业池上限的缺省值必须与核心常量一致：两处常量化之后，「清单不写这一项」
+    /// 的行为才不会随哪一处单独调整而漂移。
+    #[test]
+    fn max_pending_jobs_defaults_to_the_core_ceiling_and_can_only_tighten() {
+        let scratch = Scratch::new("jobs-limit");
+        scratch.write(MANIFEST_FILE, MINIMAL);
+        scratch.write(ENTRY_MODULE, "export default {};\n");
+
+        let manifest = load(&scratch.0).expect("应能加载");
+        assert_eq!(manifest.limits.max_pending_jobs, DEFAULT_MAX_PENDING_JOBS);
+        assert_eq!(
+            DEFAULT_MAX_PENDING_JOBS,
+            u32::try_from(hbot_core::MAX_JOBS_PER_BOT).expect("上限应能用 u32 表示"),
+            "缺省值必须等于核心的 MAX_JOBS_PER_BOT"
+        );
+
+        scratch.write(
+            MANIFEST_FILE,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":"ws://h"},
+                "limits":{"maxPendingJobs":3}}"#,
+        );
+        let tightened = load(&scratch.0).expect("调低应通过");
+        assert_eq!(tightened.limits.max_pending_jobs, 3);
+    }
+
     #[test]
     fn entry_must_be_inside_the_project_and_exist() {
         let scratch = Scratch::new("entry");
@@ -934,6 +992,12 @@ mod tests {
             ("heapMb", MAX_HEAP_MB + 1, MAX_HEAP_MB),
             ("handlerMs", 0, MAX_HANDLER_MS),
             ("heapMb", 0, MAX_HEAP_MB),
+            (
+                "maxPendingJobs",
+                u64::from(MAX_PENDING_JOBS) + 1,
+                u64::from(MAX_PENDING_JOBS),
+            ),
+            ("maxPendingJobs", 0, u64::from(MAX_PENDING_JOBS)),
         ] {
             scratch.write(
                 MANIFEST_FILE,
@@ -973,6 +1037,7 @@ mod tests {
         let limits = Limits::from(ManifestLimits {
             handler_ms: u64::MAX,
             heap_mb: u64::MAX,
+            max_pending_jobs: MAX_PENDING_JOBS,
         });
         assert_eq!(limits.handler_timeout_ms(), MAX_HANDLER_MS);
         assert_eq!(

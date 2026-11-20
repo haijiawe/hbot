@@ -280,6 +280,29 @@ async fn an_undeclared_session_capability_reports_not_declared() {
     assert_ok(&harness.stop().await, "bot_stop");
 }
 
+/// 注册那一下就要把问题发出去（`prompt` 是注册不是阻塞）。
+///
+/// 少发这一次，用户会一直等一个从没人问过他的问题：症状是「bot 不回消息」，
+/// 而等待行明明 pending、日志里一条错都没有。断言的正是这个顺序：提示先于
+/// handler 自己的 `reply`（`replies()` 新的在前）。
+#[tokio::test]
+async fn the_prompt_reaches_the_user_the_moment_the_wait_is_registered() {
+    let harness = Harness::new("prompt-sent", waiting_handler(), &manifest(true)).await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    assert_ok(&harness.inject("hello").await, "bot_inject");
+    wait_for("两条回复都到齐", || harness.replies().len() >= 2).await;
+
+    let replies = harness.replies();
+    assert_eq!(replies.len(), 2, "一条消息只该有两条回复：{replies:?}");
+    assert_eq!(replies[0], "asked", "handler 的回复该在最后：{replies:?}");
+    assert_eq!(
+        replies[1], "请把订单号发给我",
+        "注册等待时必须把提示发出去：{replies:?}"
+    );
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
 // ---------------------------------------------------------------------------
 // ② 声明了 → prompt 落库、current 读得到
 // ---------------------------------------------------------------------------

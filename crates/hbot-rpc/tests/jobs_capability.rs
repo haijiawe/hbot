@@ -561,3 +561,76 @@ export default defineBot({
 });
 "#
 }
+
+/// 一次消息里连排两条作业，每条都回报结果（用来观察容量闸）。
+fn double_enqueue_handler() -> &'static str {
+    r#"
+import { defineBot, reply } from 'hbot';
+
+export default defineBot({
+  async onMessage(ctx) {
+    for (const round of [1, 2]) {
+      try {
+        await ctx.jobs.enqueue('settle-war', { round }, { idempotencyKey: 'k' + round });
+        reply('queued:' + round);
+      } catch (error) {
+        reply('jobs-error:' + error.message);
+      }
+    }
+  },
+  async onJob(ctx, name) {
+    ctx.reply('job:' + name);
+  },
+});
+"#
+}
+
+/// `hbot.json`：带 `limits.maxPendingJobs` 的版本。
+fn manifest_with_limit(specs: &str, limit: u32) -> String {
+    format!(
+        "{{\"name\":\"jobs-bot\",\"platform\":{{\"kind\":\"local\"}},\"capabilities\":{{\"jobs\":[{specs}]}},\"limits\":{{\"maxPendingJobs\":{limit}}}}}\n"
+    )
+}
+
+#[tokio::test]
+async fn max_pending_jobs_in_the_manifest_caps_the_queue() {
+    let harness = Harness::new(
+        "limit",
+        double_enqueue_handler(),
+        &manifest_with_limit(&spec("settle-war", 60_000, 0), 1),
+    )
+    .await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    let before = harness.replies().len();
+    assert_ok(&harness.inject("go").await, "bot_inject");
+    wait_for("两条入队结果都回来", || {
+        harness.replies().len() >= before + 2
+    })
+    .await;
+
+    let replies = harness.replies();
+    assert!(
+        replies.iter().any(|line| line == "queued:1"),
+        "第一条必须入队成功，实际：{replies:?}"
+    );
+    let full = replies
+        .iter()
+        .find(|line| line.starts_with("jobs-error:"))
+        .expect("第二条必须被容量闸拒掉");
+    assert!(
+        full.contains("HBOT_JOBS_FULL"),
+        "容量满要报 HBOT_JOBS_FULL，实际：{full}"
+    );
+    assert!(
+        full.contains("上限 1"),
+        "错误文案要点名清单里的上限值（1），实际：{full}"
+    );
+    assert_eq!(
+        harness.jobs().len(),
+        1,
+        "被拒的那条不许落库，实际：{:?}",
+        harness.jobs()
+    );
+    assert_ok(&harness.stop().await, "bot_stop");
+}

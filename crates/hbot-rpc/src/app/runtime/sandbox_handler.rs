@@ -1624,14 +1624,15 @@ impl SandboxHandler {
         content_type: Option<&str>,
         body: &str,
     ) -> Result<hbot_core::WebhookResponse, hbot_core::WebhookError> {
-        if !declared_webhook(&self.project_root)
-            .iter()
-            .any(|declared| declared.path == route)
-        {
+        // 路由声明里除了密钥还有这条路由自己的预算：一次查找同时拿到两者，避免
+        // 「判存在」与「取预算」之间清单被改出一个新的中间态。
+        let declared = declared_webhook(&self.project_root);
+        let Some(declared_route) = declared.iter().find(|declared| declared.path == route) else {
             return Err(hbot_core::WebhookError::NoRoute {
                 route: route.to_owned(),
             });
-        }
+        };
+        let budget_ms = declared_route.timeout_ms;
         let (fingerprint, project) =
             self.compiled()
                 .await
@@ -1663,6 +1664,7 @@ impl SandboxHandler {
                 &method_owned,
                 content_type_owned.as_deref(),
                 &body_owned,
+                budget_ms,
             )
         })
         .await

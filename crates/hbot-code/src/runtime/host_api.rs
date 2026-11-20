@@ -251,7 +251,9 @@ pub(crate) fn install<'js>(
     let jobs_object = super::jobs_api::install(ctx, &jobs)?;
     // 会话等待同样不需要预算参数：`prompt` 是一次库写（`spawn_blocking` 里等），
     // 不是一次模型调用 —— 它没有可抵账的墙钟。
-    let session_object = super::session_api::install(ctx, &session)?;
+    // 把输出缓冲也传进去：`ctx.session.prompt` 注册成功之后要立刻把提示写进
+    // 本次事件的 reply 缓冲，否则用户永远看不到自己被问了什么（见 session_api）。
+    let session_object = super::session_api::install(ctx, &session, Arc::clone(&output))?;
     // 出站同样不需要预算：一次出站入队是往 supervisor 的有界通道里放一条，不是
     // 一次模型调用 —— 通道满时它等的是 worker 的进度，不是 handler 的墙钟。
     let (send_function, notify_function) = super::send_api::install(ctx, &send)?;
@@ -670,15 +672,17 @@ export const sql = {
 };
 
 /**
- * 文件（C3）。`files.read(path, options?)` / `files.write(path, text)` /
- * `files.list(path?, options?)` / `files.remove(path)`。
+ * 文件（C3）。`files.read(path, options?)` / `files.readBytes(path, options?)` /
+ * `files.write(path, text, options?)` / `files.list(path?, options?)` / `files.remove(path, options?)`。
  *
  * 三条硬规则：
  * ① **只认项目内的相对路径**：绝对路径、`..`、盘符、反斜杠一律 `HBOT_FILE_DENIED`；
  * ② **读写分开声明**：`capabilities.files.read` 与 `.write` 是两半，只读的项目拿不到删除权限；
  * ③ **单次有体积上限**：读默认 256 KiB、写 1 MiB，超了报 `HBOT_FILE_TOO_LARGE`，请分块。
  *
- * 只读文本：非 UTF-8 内容会被拒（`HBOT_FILE_INVALID`），二进制请存 base64 字符串。
+ * 文本读（`read`）要求内容真的是 UTF-8，否则 `HBOT_FILE_INVALID`；二进制走 `readBytes`，
+ * 它不校验编码，回来的就是原来的字节（base64 编码）。按行读写见 `FileReadOptions` /
+ * `FileWriteOptions`：行号 1 起、两端都含。
  *
  * Presence is not authorization: `ctx.files` 出现在 `hbot.d.ts` 里只说明项目声明了
  * `capabilities.files`；宿主没装配后端时抛 `HBOT_FILE_UNAVAILABLE`。
@@ -687,14 +691,17 @@ export const files = {
   read(path, options) {
     return host.files.read(path, options);
   },
-  write(path, text) {
-    return host.files.write(path, text);
+  readBytes(path, options) {
+    return host.files.readBytes(path, options);
+  },
+  write(path, text, options) {
+    return host.files.write(path, text, options);
   },
   list(path, options) {
     return host.files.list(path, options);
   },
-  remove(path) {
-    return host.files.remove(path);
+  remove(path, options) {
+    return host.files.remove(path, options);
   },
 };
 

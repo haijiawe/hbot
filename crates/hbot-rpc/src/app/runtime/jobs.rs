@@ -9,7 +9,8 @@
 //! 沙箱侧已经过了参数闸与声明闸（名字必在 `hbot.json` 的 `capabilities.jobs` 里），
 //! 所以这里只做落库前还剩的三件事：
 //!
-//! 1. **容量闸**：这个 bot 的未完成作业到 `MAX_JOBS_PER_BOT` 就报 `HBOT_JOBS_FULL`，
+//! 1. **容量闸**：这个 bot 的未完成作业到清单里的 `limits.maxPendingJobs`（缺省 256，
+//!    与 `hbot_core::MAX_JOBS_PER_BOT` 相同）就报 `HBOT_JOBS_FULL`，
 //!    而不是让行无限长下去（有上界才叫背压，没上界就是"跑到内存满才开始丢"）；
 //! 2. **预算冻结**：从清单里现读这条作业类型的 `budgetMs`，写进**行**里。之后改清单
 //!    不会让已经排队的那条作业换预算 —— 换语义是排障时最费时间的一类问题；
@@ -25,10 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hbot_code::jobs::JobQueue;
-use hbot_core::{
-    BotId, Clock, DEFAULT_JOB_BUDGET_MS, IdGenerator, JobError, JobRequest, JobSpec,
-    MAX_JOBS_PER_BOT,
-};
+use hbot_core::{BotId, Clock, DEFAULT_JOB_BUDGET_MS, IdGenerator, JobError, JobRequest, JobSpec};
 use hbot_store::{NewJob, Store};
 
 use crate::app::store_failed;
@@ -65,21 +63,32 @@ impl StoreJobQueue {
 
 impl JobQueue for StoreJobQueue {
     fn enqueue(&self, request: &JobRequest) -> Result<(), String> {
+        // 一次读清单同时取「这个 bot 能排多深」与「这个类型给多少预算」：两次 load
+        // 会在两次之间看到两个版本的清单，容量闸与预算就可能来自不同的文件。
+        let manifest = hbot_code::manifest::load(&self.project_root).map_err(|error| {
+            JobError::Failed {
+                message: format!("读不到清单，无法确认 limits.maxPendingJobs 与作业预算：{error}"),
+            }
+            .to_string()
+        })?;
+        let limit = manifest.limits.max_pending_jobs;
         let active = self
             .store
             .count_active_jobs_for_bot(&self.bot_id)
             .map_err(|error| store_failed(error).to_string())?;
-        if active >= u32::try_from(MAX_JOBS_PER_BOT).unwrap_or(u32::MAX) {
+        if active >= limit {
             return Err(JobError::Full {
                 message: format!(
-                    "这个 bot 已有 {active} 条未完成作业（上限 {MAX_JOBS_PER_BOT}）：\
-                     等它们跑完再入队，或把批量操作拆开"
+                    "这个 bot 已有 {active} 条未完成作业（上限 {limit}，来自 hbot.json 的 \
+                     limits.maxPendingJobs）：等它们跑完再入队，或把批量操作拆开"
                 ),
             }
             .to_string());
         }
 
-        let budget_ms = declared_jobs(&self.project_root)
+        let budget_ms = manifest
+            .capabilities
+            .jobs()
             .iter()
             .find(|spec| spec.name == request.name)
             .map_or(DEFAULT_JOB_BUDGET_MS, |spec| spec.budget_ms);
