@@ -142,7 +142,7 @@ pnpm -C apps/web build           # 产物能构建
 
 也就是 private 仓库的 Actions 计费问题，**不是代码问题**。处理方式：把仓库改成 public（public 仓库的 Actions 不计费），之后同一 run 的第 2 次尝试（head `00305a5`）七个 job 里六个 success、`bundle (macos, dmg)` 仍 `cancelled`。判读这类失败的快捷方式是 `GET /repos/<owner>/<repo>/check-runs/<job_id>/annotations` —— 它连日志都没有，翻日志只会得到 `BlobNotFound`。
 
-**历史上 CI 已经真跑并且连续六次全绿**（remote = `https://github.com/haijiawe/hbot.git`，2026-11-21 起是 public）：run `44730056833`（head `b9dc9ba`，首次全绿）、run `44735231807`（head `d0662e4`）、run `44738414777`（head `9648800`）、run `44747851031`（head `20caba5`，每 bot 磁盘配额那次）、run `44756454957`（head `9a035b8`，`onStop(crash)` 触发点那次）与 run `44771911890` 的第 2 次尝试（head `00305a5`，附件出站那次）的六个真实 job 全 success（`bundle (macos, dmg)` 仍 `cancelled`，矩阵里没有 macOS runner，属正常）。下表是"本地能验的"与"只能靠 CI/真机验的"的分界：
+**历史上 CI 已经真跑并且连续七次全绿**（截至 head `b45d1f3` 的 run `44774206452`；remote = `https://github.com/haijiawe/hbot.git`，2026-11-21 起是 public）：run `44730056833`（head `b9dc9ba`，首次全绿）、run `44735231807`（head `d0662e4`）、run `44738414777`（head `9648800`）、run `44747851031`（head `20caba5`，每 bot 磁盘配额那次）、run `44756454957`（head `9a035b8`，`onStop(crash)` 触发点那次）与 run `44771911890` 的第 2 次尝试（head `00305a5`，附件出站那次）的六个真实 job 全 success（`bundle (macos, dmg)` 仍 `cancelled`，矩阵里没有 macOS runner，属正常）。下表是"本地能验的"与"只能靠 CI/真机验的"的分界：
 
 | 检查 | 状态 | 证据 |
 |---|---|---|
