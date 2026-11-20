@@ -623,7 +623,7 @@ export default defineBot({
 |---|---|---|
 | 声明层 | 清单 `capabilities.state.session`（`SessionSlot::prompt` 每次调用现读） | `HBOT_SESSION_NOT_DECLARED` |
 | 装配层 | 宿主有没有 `set_session` | `HBOT_SESSION_UNAVAILABLE`（补救是「bot 没起来/存储没就绪」） |
-| 参数层 | `hbot-core::bot_session` 的 `validate_key` / `validate_prompt` / `validate_timeout` / `validate_spec`（**唯一一份**） | `HBOT_SESSION_INVALID`（超时越界**报错不夹取**） |
+| 参数层 | `hbot-core::bot_session` 的 `validate_key` / `validate_prompt` / `validate_timeout` / `validate_reminders` / `validate_spec`（**唯一一份**） | `HBOT_SESSION_INVALID`（超时与重发次数越界都**报错不夹取**） |
 | 身份层 | `prompt` 只能在消息事件里调（槽位里没有会话/发送者就拒） | `HBOT_SESSION_INVALID`，定时器/作业/恢复事件里调用会明说原因 |
 | 唯一层 | `0007` 的部分唯一索引 `bot_waits_conv_pending`（只覆盖 `pending`） | `HBOT_SESSION_PENDING`，message 里点名挡路的那条 |
 | 匹配层 | `claim` 那一条 `UPDATE … RETURNING` 的 `scope = 'conversation' OR owner = ?sender` | 不匹配就不唤醒（群里 B 说一句不会填掉 A 的等待） |
@@ -650,7 +650,8 @@ export default defineBot({
    而这两件事该做的事通常相反。
 
 **存储形态**：`bot_waits(id, bot_id, conversation_id, conversation_external_id, owner,
-key, prompt, scope, state, deadline, fulfilled_message_id, created_at, updated_at)`；
+key, prompt, scope, state, deadline, fulfilled_message_id, created_at, updated_at,
+reminders_left, timeout_ms)`；
 部分唯一索引 `(bot_id, conversation_id) WHERE state = 'pending'`；`(state, deadline)` 给超时
 结算、`(bot_id, state)` 给 `bot_stop` 整批取消。状态四种拼写 `pending` / `fulfilled` /
 `expired` / `cancelled` 与 `WaitState::as_str()` 同值（存储层有对拍测试）。
@@ -659,14 +660,26 @@ key, prompt, scope, state, deadline, fulfilled_message_id, created_at, updated_a
 `tick_waits` 结算成 `expired`。两条都是终态，重启不会把它们捡回来 —— 只有 `pending`
 会被下一条消息唤醒。
 
-**实测**：`hbot-rpc` 的 `tests/session_capability.rs` 4 条（全走 `Dispatcher` 真派发 +
+**实测**：`hbot-rpc` 的 `tests/session_capability.rs` 5 条（全走 `Dispatcher` 真派发 +
 真 tick + 真库）：没声明 → `NOT_DECLARED` 且**不落库**；声明后 `prompt` 落库且 `key` /
 `state` / `scope` / `owner` 都对；下一条消息走 `onResume`（`waitKey` 与文本都对）而不是
 `onMessage`，回复进 outbox，等待转 `fulfilled`；同会话第二个 `prompt` 报 `HBOT_SESSION_PENDING`
-并点名挡路键。存储层另有 13 条（含「同一消息不能唤醒两次」「别人不能回答 sender-scope」）。
+并点名挡路键；带 `reminders: 1` 的等待到点先重发同一句提示、额度用尽才落终态。
+存储层另有 16 条（含「同一消息不能唤醒两次」「别人不能回答 sender-scope」「重发与过期互斥」）。
 
-**还没做**：`ctx.session.prompt` 的超时**重发提示**（现在只落一行 error，要继续得再问一次）；
-等待状态的 UI 面板；跨会话的「转人工」这类需要把等待交给另一个 bot 的形态。
+**2026-11-20 补：超时重发提示**。`ctx.session.prompt(key, text, { reminders })` 现在能
+在到点后再催几次（`0..=3`，缺省 0 = 老行为）。三条判据：
+
+| 判据 | 位置 | 为什么这条这么定 |
+|---|---|---|
+| 额度落在行上 | `0008` 加的 `reminders_left` / `timeout_ms` 两列 | tick 里只有一个已落库的行可看；`deadline - created_at` 在重发之后不再等于单轮超时 |
+| 推后从 **now** 起算 | `PROMOTE_SQL` 的 `deadline = ?now + timeout_ms` | 从旧 deadline 加，tick 落后时会得到仍过期的时刻，下一拍立刻再发一次，用户收到一串连着的相同提问 |
+| 重发与过期互斥 | `promote` 只认 `reminders_left > 0`，`expire` 的 SQL 带 `reminders_left = 0` | 否则同一行在同一拍里既被推后又判超时，提示发了但行已终态 |
+
+重发的是**同一句** `prompt`，次数只进日志（「还剩 N 次额度」）不进消息正文；也不重新
+调用 handler —— 那会让每催一次就跑一遍业务逻辑，副作用翻倍。
+
+**还没做**：等待状态的 UI 面板；跨会话的「转人工」这类需要把等待交给另一个 bot 的形态。
 
 ### 5.3 已落地：每 bot 一个 SQL 库（`C2.sql`，2026-11-19）
 
@@ -896,24 +909,27 @@ Capability → ValidateArgs → ToolExists → SandboxMode → PathRealpath → 
 
 ## 10. 验收标准（每条都可测）
 
-| # | 验收 | 怎么测 |
-|---|---|---|
-| V1 | 没声明的能力在 d.ts 里不出现 | 生成 d.ts 后断言不含该符号 |
-| V2 | 没声明的能力调用返回 `denied` 且**不进审批** | 断言 approver 调用次数 = 0 |
-| V3 | 同一会话严格串行、跨会话并行 | 已有 parity #1 覆盖 |
-| V4 | 每会话队列满时背压且消息不丢 | 已有 parity #13 覆盖 |
-| V5 | `kv` 的 `setMany` 原子 | 中途失败后旧值不变 |
-| V6 | `sql` 拒绝运行时 DDL | ✅ 已实测：`tests/sql_capability.rs` 的 `ddl_is_denied_at_runtime` |
-| V7 | 会话等待只被归属键匹配的消息唤醒 | 群里 B 发言不唤醒 A（旧项目 P0-3 的回归）：**已测**，`repositories::waits` 的 `a_different_sender_cannot_answer_a_sender_scoped_wait` |
-| V8 | 等待在重启后恢复、超时由定时器结算 | 等待落库（`bot_waits`），重启后仍是 `pending`；超时由 `tick_waits` 用绝对 `deadline` 结算，**不等新消息**（存储层 `expire_due_marks_only_the_waits_that_are_past_their_deadline`） |
-| V9 | 作业重启后恢复、至少一次、幂等键生效 | 杀进程后重启，断言作业跑完且副作用只一次（**已测**：`resume_interrupted_jobs` 把 `running` 退回 `pending`；`tests/jobs_capability.rs` 断言同幂等键只留一行只跑一次） |
-| V10 | 能力受限时返回 `HOST_LIMIT` 而非静默降级 | 手机上跑 `jobs`，断言错误码与上限值 |
-| V11 | 同一份 bot 代码在桌面与手机都能编译、`onMessage` 路径行为一致 | 两端各跑同一份 fixture |
-| V12 | 没在清单里声明 `device.input` 时，键鼠调用返回 `denied` 且 **approver 调用次数 = 0** | 断言错误码 + 计数 |
-| V13 | 声明了但设置里没开，返回 `HOST_LIMIT` 并给出要打开哪个开关（不是空错误） | 断言错误 `data.toggle` 字段 |
-| V14 | 设备会话到期后所有设备调用立即 `denied`；撤销后新会话也起不来 | 起会话 → 等超时 → 断言；再撤销 → 断言 |
-| V15 | 前台窗口不在 `allowedApps` 时拒绝注入，且不产生任何输入 | 白名单只放 A，前台切到 B，断言 B 未收到按键 |
-| V16 | 截图与 OCR 原文不进日志；审计只记动作与窗口 | 断言 `logs` 里没有像素/文本，只记元数据 |
+| # | 验收 | 怎么测 | 状态（2026-11-20 对账） |
+|---|---|---|---|
+| V1 | 没声明的能力在 d.ts 里不出现 | 生成 d.ts 后断言不含该符号 | **判据改判**：d.ts 是静态产物，能力是运行时授权，符号永远在。真正的不变量是「存在≠授权」，由 `the_*_surface_says_presence_is_not_authorization` 钉住 |
+| V2 | 没声明的能力调用返回 `denied` 且**不进审批** | 断言 approver 调用次数 = 0 | 已实测：每个能力的 `HBOT_*_NOT_DECLARED` 端到端用例；设备侧另有 approver 计数 = 0 的用例（`crates/hbot-rpc/tests/device_commands.rs`） |
+| V3 | 同一会话严格串行、跨会话并行 | 已有 parity #1 覆盖 | 已实测（parity） |
+| V4 | 每会话队列满时背压且消息不丢 | 已有 parity #13 覆盖 | 已实测（parity） |
+| V5 | `kv` 的 `setMany` 原子 | 中途失败后旧值不变 | 已实测：`crates/hbot-store/src/repositories/kv.rs` 的 `set_many_is_atomic_and_rolls_back_the_whole_batch` |
+| V6 | `sql` 拒绝运行时 DDL | ✅ 已实测：`tests/sql_capability.rs` 的 `ddl_is_denied_at_runtime` | 已实测 |
+| V7 | 会话等待只被归属键匹配的消息唤醒 | 群里 B 发言不唤醒 A（旧项目 P0-3 的回归）：**已测**，`repositories::waits` 的 `a_different_sender_cannot_answer_a_sender_scoped_wait` | 已实测 |
+| V8 | 等待在重启后恢复、超时由定时器结算 | 等待落库（`bot_waits`），重启后仍是 `pending`；超时由 `tick_waits` 用绝对 `deadline` 结算，**不等新消息**（存储层 `expire_due_marks_only_the_waits_that_are_past_their_deadline`） | 已实测；2026-11-20 加的重发也落在这一拍（`promote_wait_reminders` 先于 `expire_due`） |
+| V9 | 作业重启后恢复、至少一次、幂等键生效 | 杀进程后重启，断言作业跑完且副作用只一次（**已测**：`resume_interrupted_jobs` 把 `running` 退回 `pending`；`tests/jobs_capability.rs` 断言同幂等键只留一行只跑一次） | 已实测 |
+| V10 | 能力受限时返回 `HOST_LIMIT` 而非静默降级 | 手机上跑 `jobs`，断言错误码与上限值 | **部分**：桌面宿主有 `HBOT_DEVICE_HOST_LIMIT`（`crates/hbot-core/src/device.rs` 的默认实现 + 一条「没有这个后端就说不，而不是 panic」的单测）；手机宿主不存在 → 未做，等 `M10` |
+| V11 | 同一份 bot 代码在桌面与手机都能编译、`onMessage` 路径行为一致 | 两端各跑同一份 fixture | **未做**：只有桌面宿主，没有第二个宿主可对比（`M10`） |
+| V12 | 没在清单里声明 `device.input` 时，键鼠调用返回 `denied` 且 **approver 调用次数 = 0** | 断言错误码 + 计数 | 已实现（`crates/hbot-rpc/src/app/device/grants.rs`），端到端在 `tests/device_commands.rs` |
+| V13 | 声明了但设置里没开，返回 `HOST_LIMIT` 并给出要打开哪个开关（不是空错误） | 断言错误 `data.toggle` 字段 | 已实现（`crates/hbot-rpc/src/app/device/settings.rs`），端到端在 `tests/device_commands.rs` |
+| V14 | 设备会话到期后所有设备调用立即 `denied`；撤销后新会话也起不来 | 起会话 → 等超时 → 断言；再撤销 → 断言 | 已实现（会话授权表 + `grants.rs` 的到期判据），端到端在 `tests/device_commands.rs` |
+| V15 | 前台窗口不在 `allowedApps` 时拒绝注入，且不产生任何输入 | 白名单只放 A，前台切到 B，断言 B 未收到按键 | **只有实现没有自动化**：`crates/hbot-device/src/windows.rs` 在注入前比对前台窗口，但「切前台再断言没收到」需要真机 GUI，不能进 CI |
+| V16 | 截图与 OCR 原文不进日志；审计只记动作与窗口 | 断言 `logs` 里没有像素/文本，只记元数据 | 已实现（审计只记元数据，见 `docs/09`），端到端在 `tests/device_commands.rs` |
+**对账结论（2026-11-20）**：V1 原来的写法不成立（静态 d.ts 里符号永远在），已改成「存在≠授权」并用测试钉住；
+V3–V9 与 V12–V14、V16 有自动化证据；**V10 只覆盖桌面侧、V11 完全没有第二宿主、V15 只有实现没有自动化** ——
+这三条都依赖手机/真机宿主（`M10`），不要因为表格里出现就打勾。
 
 ---
 

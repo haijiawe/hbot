@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 06:00**（工作树还有文档改动待提交）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）—— **M7 第 1–5.5 步完成，能力面已无缺口**。
+> 本快照时间：**2026-11-20 08:15**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、以及 `ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**。
 
 ---
 
@@ -62,7 +62,7 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1911 passed / 0 failed / 122 target
+cargo test -j 2 --workspace              # 当前 1928 passed / 0 failed / 122 target
 pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 ```
 
@@ -108,7 +108,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | `C1.timer`（`onTimer`） | 已实现（2026-11-18，`docs/07` §4.4） |
 | `C6.device` | 窄版已实现（Windows，`docs/09`）；按窗口截图 2026-11-20 补齐 |
 | `C4.jobs`（`ctx.jobs` / `onJob`） | **已实现（2026-11-19，`docs/07` §4.5）** |
-| `C2.session`（`bot_waits`） | **已实现（2026-11-19，`docs/07` §5.2）** |
+| `C2.session`（`bot_waits`） | **已实现（2026-11-19，`docs/07` §5.2）；超时重发提示 `reminders` 2026-11-20 补齐** |
 | `C3.send` / `C3.notify` | **已实现（2026-11-19，`docs/07` §3.4）** |
 | `C1.webhook` | **已实现（2026-11-19，`docs/07` §3.5）** |
 | `onStart` / `onStop` | **已实现（2026-11-19，`docs/07` §4.6）；`shutdown` 原因 2026-11-20 接上** |
@@ -119,7 +119,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `AGENTS.md` 的 100 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 103 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -201,7 +201,9 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 - `onResume` 的 ctx 是第三个上下文，不挂 `kv`/`history`/`device`/`jobs`/`session`（坑 77）；
 - `IdGenerator` 加了 `wait_id`，三处测试替身要一起改（坑 78）。
 
-**还没做的三件**：超时**重发提示**（现在只落一行 error）；等待状态面板；把等待转交给别的 bot。
+**还没做的两件**：等待状态面板；把等待转交给别的 bot。
+
+**2026-11-20 补：超时重发提示已落地**（`reminders: 0..=3`，缺省 0 = 旧行为）。三个判据：额度与单轮超时落在行上（`0008` 的 `reminders_left` / `timeout_ms`）；新 `deadline` 从 **now** 起算（从旧值加会得到仍过期的时刻，下一拍立刻再发一遍）；`promote` 只认 `reminders_left > 0`、`expire` 带 `AND reminders_left = 0`，同一行不会在同一拍既重发又判超时。
 
 ### C. M7 第 5 步 —— **全部已落地 2026-11-19**（`C3.send`/`C3.notify` + `C1.webhook`，不要再重做）
 
@@ -271,7 +273,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1911 passed / 122 target
+cargo test -j 2 --workspace                              # 基线：1928 passed / 122 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。
