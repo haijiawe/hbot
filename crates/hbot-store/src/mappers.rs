@@ -34,8 +34,10 @@ pub(crate) const INBOUND_COLUMNS: &str =
     "id, bot_id, external_id, conversation_id, sender_id, payload_json, received_at";
 
 /// `outbound` 表的显式列清单（顺序见 [`row_to_outbound`]）。
-pub(crate) const OUTBOUND_COLUMNS: &str =
-    "id, bot_id, conversation_id, target_json, text, reply_to, attempts, created_at";
+pub(crate) const OUTBOUND_COLUMNS: &str = concat!(
+    "id, bot_id, conversation_id, target_json, text, reply_to, kind, attachment_json, ",
+    "attempts, created_at"
+);
 
 /// `logs` 表的显式列清单（顺序见 [`row_to_log`]）。
 pub(crate) const LOG_COLUMNS: &str = "id, bot_id, level, line, at, source";
@@ -115,9 +117,11 @@ pub(crate) fn row_to_outbound(row: &Row<'_>) -> rusqlite::Result<OutboundRow> {
         target_json: row.get(3)?,
         text: row.get(4)?,
         reply_to: row.get(5)?,
+        kind: row.get(6)?,
+        attachment_json: row.get(7)?,
         // attempts 是 INTEGER；越界（外部工具写坏）按 u32::MAX 上报而不是截断成 0。
-        attempts: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
-        created_at: row.get(7)?,
+        attempts: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(u32::MAX),
+        created_at: row.get(9)?,
     })
 }
 

@@ -71,6 +71,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0009_bot_file_usage",
         sql: include_str!("migrations/0009_bot_file_usage.sql"),
     },
+    Migration {
+        version: 10,
+        name: "0010_outbound_attachments",
+        sql: include_str!("migrations/0010_outbound_attachments.sql"),
+    },
 ];
 
 /// 本二进制支持的最新版本。

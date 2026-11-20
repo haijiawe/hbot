@@ -100,6 +100,10 @@ pub struct NewOutbound {
 pub struct OutboundTarget {
     pub target_json: String,
     pub reply_to: Option<String>,
+    /// 附件的 JSON 描述（`{"kind":"image","path":"…"}`）；`None` = 纯文本（0001 起的语义）。
+    ///
+    /// 与 `target_json` 一样由适配器/领域层解释，store 不解析它的内部结构。
+    pub attachment_json: Option<String>,
 }
 
 impl OutboundTarget {
@@ -108,6 +112,7 @@ impl OutboundTarget {
         Self {
             target_json: target_json.into(),
             reply_to,
+            attachment_json: None,
         }
     }
 
@@ -116,7 +121,15 @@ impl OutboundTarget {
         Self {
             target_json: "{}".to_owned(),
             reply_to: None,
+            attachment_json: None,
         }
+    }
+
+    /// 带一个附件（`attachment_json` 是 `hbot_core::AttachmentRef::to_json()` 的结果）。
+    #[must_use]
+    pub fn with_attachment(mut self, attachment_json: impl Into<String>) -> Self {
+        self.attachment_json = Some(attachment_json.into());
+        self
     }
 }
 
@@ -137,6 +150,10 @@ pub struct OutboundRow {
     pub text: String,
     /// 被动回复引用的平台消息 ID；`None` = 主动消息。
     pub reply_to: Option<String>,
+    /// 出站种类：`text` / `image` / `file`（`kind` 列）。
+    pub kind: String,
+    /// 附件的 JSON 描述；`None` = 不带附件。
+    pub attachment_json: Option<String>,
     /// 已尝试次数（含首次）。
     pub attempts: u32,
     pub created_at: i64,
@@ -209,6 +226,12 @@ pub struct NewAgentLog {
     pub line: String,
     pub at: i64,
 }
+
+/// 出站种类：纯文本（0001 起每一行的语义）。
+pub const OUTBOUND_KIND_TEXT: &str = "text";
+/// 出站种类：带附件。真正的分类（image / file）在 `attachment_json` 里，
+/// 因为它是领域概念，store 不解释它。
+pub const OUTBOUND_KIND_ATTACHMENT: &str = "attachment";
 
 /// 出站消息状态：刚入队，等待发送。
 pub const OUTBOUND_STATE_PENDING: &str = "pending";

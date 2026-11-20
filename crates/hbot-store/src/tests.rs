@@ -677,6 +677,52 @@ fn pending_outbound_is_listed_in_production_order_and_limited() {
     assert_eq!(limited_ids, vec![outbound_id(12), outbound_id(11)]);
 }
 
+/// 带附件的出站行：`kind` 与 `attachment_json` 必须原样往返。
+///
+/// 这条钉的是「附件与纯文本共用同一条出站表与续发路径」：如果附件走了第二张表，
+/// 重启后的 `list_pending_outbound` 就会漏掉它 —— 用户会看到「文件发一半没了」。
+#[test]
+fn an_attachment_outbound_round_trips_through_the_pending_scan() {
+    let dir = TempDir::new("outbound-attachment");
+    let store = open_store(&dir);
+
+    let reference = hbot_core::AttachmentRef::new(
+        hbot_core::AttachmentKind::Image,
+        "C:\\proj\\assets\\logo.png",
+    );
+    let attachment_json = reference.to_json();
+    store
+        .enqueue_outbound_with_target(
+            new_outbound(21),
+            outbound_target("{\"group\":\"42\"}", None).with_attachment(attachment_json.clone()),
+        )
+        .expect("enqueue attachment outbound");
+    // 同一张表里再放一条纯文本，证明判据是行上的 kind 而不是表。
+    store
+        .enqueue_outbound(new_outbound(22))
+        .expect("enqueue text outbound");
+
+    let pending = store.list_pending_outbound(10).expect("list pending");
+    assert_eq!(pending.len(), 2);
+
+    let attachment = &pending[0];
+    assert_eq!(attachment.kind, crate::OUTBOUND_KIND_ATTACHMENT);
+    assert_eq!(
+        attachment.attachment_json.as_deref(),
+        Some(attachment_json.as_str()),
+        "附件描述必须原样往返（路径已在入队前解析好，续发不该重新解析）"
+    );
+    assert_eq!(
+        hbot_core::AttachmentRef::from_json(attachment_json.as_str()).expect("parse back"),
+        reference,
+        "落库的 JSON 必须能被领域层解析回同一个引用"
+    );
+
+    let text = &pending[1];
+    assert_eq!(text.kind, crate::OUTBOUND_KIND_TEXT);
+    assert!(text.attachment_json.is_none(), "纯文本行不带附件描述");
+}
+
 /// 恢复顺序：`created_at` 相同（同一毫秒）时按插入顺序，不同时按时间升序。
 ///
 /// 这是 `D4` 的核心断言：UUID 主键 + 同一毫秒的连续回复，只有 `rowid` 能保住生产顺序。
@@ -1481,8 +1527,8 @@ fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
     let store = Store::open(dir.db_path()).expect("open and upgrade v4 store");
     assert_eq!(
         store.schema_version().expect("schema version"),
-        9,
-        "从 0004 打开必须一路升到 0009_bot_file_usage（不是只升到 0008）"
+        10,
+        "从 0004 打开必须一路升到 0010_outbound_attachments"
     );
     assert_eq!(
         store.journal_mode().expect("journal mode"),
@@ -1513,7 +1559,7 @@ fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
     let user_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user_version");
-    assert_eq!(user_version, 9, "user_version 必须推进到最新一版");
+    assert_eq!(user_version, 10, "user_version 必须推进到最新一版");
 
     let recorded: Vec<(i64, String)> = conn
         .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
@@ -1522,7 +1568,7 @@ fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
         .expect("query schema_migrations")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect schema_migrations");
-    assert_eq!(recorded.len(), 9, "0001–0009 各登记一行");
+    assert_eq!(recorded.len(), 10, "0001–0010 各登记一行");
     assert_eq!(
         recorded[4],
         (5, "0005_bot_kv".to_owned()),
@@ -1547,6 +1593,11 @@ fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
         recorded[8],
         (9, "0009_bot_file_usage".to_owned()),
         "第 9 行必须是 0009_bot_file_usage"
+    );
+    assert_eq!(
+        recorded[9],
+        (10, "0010_outbound_attachments".to_owned()),
+        "第 10 行必须是 0010_outbound_attachments"
     );
 
     // 表结构：列名/顺序/非空与 TTL 可空性都按契约；主键已承担 (bot_id, key) 唯一索引，

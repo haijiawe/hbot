@@ -6,8 +6,8 @@ use crate::error::Result;
 use crate::ids::OutboundId;
 use crate::mappers::{OUTBOUND_COLUMNS, row_to_outbound};
 use crate::models::{
-    NewOutbound, OUTBOUND_STATE_FAILED, OUTBOUND_STATE_PENDING, OUTBOUND_STATE_SENT, OutboundRow,
-    OutboundTarget,
+    NewOutbound, OUTBOUND_KIND_ATTACHMENT, OUTBOUND_KIND_TEXT, OUTBOUND_STATE_FAILED,
+    OUTBOUND_STATE_PENDING, OUTBOUND_STATE_SENT, OutboundRow, OutboundTarget,
 };
 
 /// 入队一条出站消息：初始状态 `pending`、`attempts = 0`、`sent_at = NULL`。
@@ -16,10 +16,18 @@ pub(crate) fn enqueue(
     message: &NewOutbound,
     target: &OutboundTarget,
 ) -> Result<()> {
+    // 有附件描述就是附件行；没有就是纯文本。两种行共用同一条发送、重试、死信路径，
+    // 差别只在适配器怎么翻译载荷（文本段 vs 媒体段）。
+    let kind = if target.attachment_json.is_some() {
+        OUTBOUND_KIND_ATTACHMENT
+    } else {
+        OUTBOUND_KIND_TEXT
+    };
     conn.execute(
         "INSERT INTO outbound
-             (id, bot_id, conversation_id, target_json, text, reply_to, state, attempts, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+             (id, bot_id, conversation_id, target_json, text, reply_to, kind, attachment_json,
+              state, attempts, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
         params![
             message.id.to_string(),
             message.bot_id.to_string(),
@@ -27,6 +35,8 @@ pub(crate) fn enqueue(
             target.target_json,
             message.text,
             target.reply_to,
+            kind,
+            target.attachment_json,
             OUTBOUND_STATE_PENDING,
             message.created_at
         ],

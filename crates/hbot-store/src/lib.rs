@@ -87,6 +87,6 @@ pub use models::{
     Bot, BotStatusRow, Conversation, DeviceAuditRow, DeviceSessionRow, HistoryRow,
     InboundReplayRow, InboundRow, JobRow, KvRow, LogRow, NewAgentLog, NewDeviceAudit,
     NewDeviceSession, NewInbound, NewJob, NewKvEntry, NewLog, NewOutbound, NewWait,
-    OUTBOUND_STATE_FAILED, OUTBOUND_STATE_PENDING, OUTBOUND_STATE_SENT, OutboundRow,
-    OutboundTarget, Project, WaitRow, is_valid_bot_status,
+    OUTBOUND_KIND_ATTACHMENT, OUTBOUND_KIND_TEXT, OUTBOUND_STATE_FAILED, OUTBOUND_STATE_PENDING,
+    OUTBOUND_STATE_SENT, OutboundRow, OutboundTarget, Project, WaitRow, is_valid_bot_status,
 };
