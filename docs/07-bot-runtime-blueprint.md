@@ -501,7 +501,9 @@ export default defineBot({
 
 **实测**：`hbot-rpc` 的 `tests/jobs_capability.rs` 6 条，全走 `Dispatcher` 真派发 + 真 tick + 真库：没声明 → `NOT_DECLARED` 且**不落库**；声明后入队 → 落库 → 下一拍认领 → `onJob` 真跑 → `done` → 回复进 outbox；同幂等键入队两次只留一行、只跑一次；缺 `onJob` 时每次派发记一行点名钩子的 error；`bot_stop` 之后 `pending` 落 `cancelled` 且不再派发；作业体抛异常时 `retries: 0` 直接落 `failed` 并写 `last_error` + error 日志。存储层另有 12 条（含 per-bot claim 不越界、`resume` 退回 `pending`、级联删除）。
 
-**还没做**：`jobs` 的宿主级预算上限（手机上 30 秒这类"平台取小"还在 `docs/08` 的设计里，当前只有清单写的值）；作业状态的 UI 面板；作业池的"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
+**还没做**：`jobs` 的宿主级预算上限（手机上 30 秒这类"平台取小"还在 `docs/08` 的设计里，当前只有清单写的值）；作业池的"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
+
+> **2026-11-20 补：作业面板已落地。** 底部面板多了一个「作业」页签（`apps/web/src/features/run/jobs-panel.tsx`），数据来自两条只读命令 `bot_jobs` / `bot_waits`（`docs/07` §4.5 与 §5.2 共用一个面板）。三条判据：① 命令是**只读快照** —— 不派发 handler、不改状态、不重发提示、不结算超时；② 终态行也返回（面板要能看见「刚才那条失败了」），过滤交给 UI，`state`/`scope` 是**开放字符串**（遇到未知值显示「未知（原值）」，绝不 throw）；③ `bot_id` 不存在时返回 `-32001` 而不是空数组（空数组会让「id 写错」看起来像「什么都没跑过」），`limit` 超过 200 按 200 算不报错（轮询不该让 UI 变红）。
 
 ### 4.6 已落地：生命周期钩子（`C1.lifecycle`，2026-11-19）
 
@@ -538,7 +540,7 @@ export default defineBot({
 
 **实测**（`hbot-rpc` 的 `tests/lifecycle_capability.rs`，6 条，全走 `Dispatcher` 真派发 + 真库）：`onStart` 启动时真跑一次且只一次；`onStart` 抛错时 `bot_start` 返回错误、抛错前的 `ctx.log` 仍落库、错误点名 `onStart`；`onStop` 的第二个参数与 `ctx.reason` 都是 `user`；`onStop` 抛错时 `bot_stop` 仍成功且错误点名 `onStop`；没写钩子时既不报错也不留点名钩子的日志；`AppState::shutdown()` 之后 `onStop` 收到的是 `shutdown` 且 bot 已从登记表摘掉。契约层另有 3 条（原因字符串往返、预算值、阶段名）。
 
-**还没做**：`crash` 的**触发点**（枚举与渲染已就位，但**没有可靠检测**「supervisor 自己死了」的地方 —— 详情见下）；`onStart` 里写状态的正式形状（现在只有 `log`/`sleep`/`ai`，要持久化得在建连之后由消息驱动）；`onSchedule`（与 `onTimer` 不是同一件事）。
+**还没做**：`crash` 的**触发点**（枚举与渲染已就位，但**没有可靠检测**「supervisor 自己死了」的地方 —— 详情见下）；`onStart` 里写状态的正式形状（现在只有 `log`/`sleep`/`ai`，要持久化得在建连之后由消息驱动）。
 
 > `crash` 为什么还空着：现在唯一的「崩」是 isolate 崩溃，而它有 last-good 版本兜底（`AGENTS.md` 坑 24），bot 仍然在跑 —— 在那一刻调 `onStop(crash)` 会让用户的清理逻辑跑在一个还活着的 bot 上（关连接、删临时文件），然后每条新消息都在被清空的环境里继续执行。真要接，得先给 supervisor 加一个「读循环意外结束」的信号，那是另一件事。**宁可让这个原因暂时没人发，也不要发错**。
 
@@ -685,7 +687,9 @@ reminders_left, timeout_ms)`；
 重发的是**同一句** `prompt`，次数只进日志（「还剩 N 次额度」）不进消息正文；也不重新
 调用 handler —— 那会让每催一次就跑一遍业务逻辑，副作用翻倍。
 
-**还没做**：等待状态的 UI 面板；跨会话的「转人工」这类需要把等待交给另一个 bot 的形态。
+**还没做**：跨会话的「转人工」这类需要把等待交给另一个 bot 的形态。
+
+> **2026-11-20 补：等待面板已落地**，与作业面板是同一个「作业」页签（上面 §4.5 那段的三条判据同样适用）。面板列：键 / 状态 / 谁可以回答（`sender` / `conversation`）/ 提示原文 / 目标会话 / 截止时间（只有 `pending` 显示）/ 剩余重发次数（`1（每轮 60,000 ms）` 这种形状，0 就只写 `0`）。
 
 ### 5.3 已落地：每 bot 一个 SQL 库（`C2.sql`，2026-11-19）
 

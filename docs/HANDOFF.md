@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 08:55**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的。
+> 本快照时间：**2026-11-20 09:20**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的。
 
 ---
 
@@ -62,8 +62,8 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1931 passed / 0 failed / 123 target
-pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
+cargo test -j 2 --workspace              # 当前 1951 passed / 0 failed / 124 target
+pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 ```
 
 现状：**六道全绿**（2026-11-20 06:08 实测）。`apps/web/src/generated/*.ts` **要入库**；
@@ -119,7 +119,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 105 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 106 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -189,8 +189,10 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 - `cancel_jobs_for_bot` 只动 `pending`/`running`，终态不碰（坑 73）；
 - `hbot_core::JobId` 与 `hbot_store::JobId` 是两个类型，转换用 `from_uuid(*id.as_uuid())`（坑 71）。
 
-**还没做的三件**（不阻塞主线）：宿主级预算上限（手机 30 秒"平台取小"仍在 `docs/08` 的设计里）；
-作业状态面板；作业池"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
+**还没做的两件**（不阻塞主线）：宿主级预算上限（手机 30 秒"平台取小"仍在 `docs/08` 的设计里）；
+作业池"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
+
+> **2026-11-20 补：作业状态面板已落地**（底部面板「作业」页签，数据来自只读命令 `bot_jobs`/`bot_waits`）。
 
 ### B. `C2.session` —— **已落地 2026-11-19**（不要再重做）
 
@@ -202,7 +204,8 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 - `onResume` 的 ctx 是第三个上下文，不挂 `kv`/`history`/`device`/`jobs`/`session`（坑 77）；
 - `IdGenerator` 加了 `wait_id`，三处测试替身要一起改（坑 78）。
 
-**还没做的两件**：等待状态面板；把等待转交给别的 bot。
+**还没做的**：把等待转交给别的 bot。
+> 等待状态面板 2026-11-20 已落地（与作业面板同一个「作业」页签，见上）。
 
 **2026-11-20 补：超时重发提示已落地**（`reminders: 0..=3`，缺省 0 = 旧行为）。三个判据：额度与单轮超时落在行上（`0008` 的 `reminders_left` / `timeout_ms`）；新 `deadline` 从 **now** 起算（从旧值加会得到仍过期的时刻，下一拍立刻再发一遍）；`promote` 只认 `reminders_left > 0`、`expire` 带 `AND reminders_left = 0`，同一行不会在同一拍既重发又判超时。
 
@@ -218,7 +221,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 - `Ctx::json_parse` 吃 `Value` 不吃 `String`（坑 85）；`WebhookServer` 的 listener 一旦 move 进接受循环，
   `addr()` 就得靠绑定时存下的 `SocketAddr`（坑 86）。
 
-**还没做的四件**（都不阻塞主线）：`GET`/`HEAD` 探活、应答体流式（现整段进内存，上限 256 KiB）、
+**还没做的三件**（都不阻塞主线）：应答体流式（现整段进内存，上限 256 KiB）、
 路由级超时（现在统一用 handler 预算）、反向代理/公网暴露（手机做不到，见 `docs/08` §4.4）。
 
 **刚落地的那两件（`onStart` / `onStop`，`docs/07` §4.6）**：失败语义**相反** —— `onStart` 抛错就是
@@ -276,12 +279,13 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1931 passed / 123 target
+cargo test -j 2 --workspace                              # 基线：1951 passed / 124 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。
-2. **M7 第 1–5.5 步已经全部完成**（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`/`send`/`notify`/`webhook`/`onStart`/`onStop`）。
-   下一段按本文 §7 的 **D** 挑：`E1` npm 打包是中等件；
+2. **M7 第 1–5.5 步已经全部完成**（`kv`/`history`/`ai`/`timer`/`jobs`/`session`/`sql`/`send`/`notify`/`webhook`/`onStart`/`onStop`），
+   作业与等待的只读面板也已落地（底部面板「作业」页签，`bot_jobs`/`bot_waits`）。
+   下一段按本文 §7 的 **D** 挑：**`E1` npm 打包已定为不做**（ADR-0007），别再把工期算到它上面；
    云端宿主（`M9`）与 `M6` 迁移需要有外部条件。先冻结 `hbot-core` 侧契约并写单测，
    再决定哪些部分派子代理 —— 参考 §2 第 4 条：**核心那一侧自己写**。
    注意子代理这条路的实测结果：2026-11-19 派的两个（`runlog-virtual` / `device-window`）一个没交终报、
