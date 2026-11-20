@@ -209,6 +209,12 @@ static OCR_ENGINE_PROBE: OnceLock<Result<(), String>> = OnceLock::new();
 ///
 /// 这**不是**产品代码里的全局可变状态：`#[cfg(not(test))]` 分支里 [`bump`] 是空函数，
 /// 计数器在正式构建里根本不存在。
+///
+/// **它是进程级的**：同一个测试二进制里任何一条真走 Win32 的用例（`input()` 路径上的
+/// `ensure_default_input_desktop` / `foreground_process_name` / `send_inputs`，以及
+/// `virtual_key_of` 里那次 `VkKeyScanW`）都会让它涨。所以断言只能比**增量**
+/// （调用前后的差），不能比绝对值：2026-11-20 的 CI 上 `count() == 0` 就是这样红的
+/// （并行跑到一半被别的用例抬到 6）。
 mod win32_probe {
     #[cfg(test)]
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -225,11 +231,6 @@ mod win32_probe {
     /// 正式构建：什么也不做（没有全局状态）。
     #[cfg(not(test))]
     pub(super) fn bump() {}
-
-    #[cfg(test)]
-    pub(super) fn reset() {
-        WIN32_CALLS.store(0, Ordering::Relaxed);
-    }
 
     #[cfg(test)]
     pub(super) fn count() -> usize {
@@ -2019,7 +2020,6 @@ fn foreground_process_name() -> Option<String> {
 /// 编码）；其它字符查 `VkKeyScanW` —— 那是**当前键盘布局**的权威答案，打不出来的字符
 /// 会返回 -1，此时明确失败而不是注入一个猜的键。
 fn virtual_key_of(key: ComboKey) -> Result<(VIRTUAL_KEY, bool), DeviceError> {
-    bump();
     let plain = match key {
         ComboKey::Enter => Some(VK_RETURN),
         ComboKey::Tab => Some(VK_TAB),
@@ -2044,6 +2044,10 @@ fn virtual_key_of(key: ComboKey) -> Result<(VIRTUAL_KEY, bool), DeviceError> {
                     ),
                 });
             }
+            // 只有真去问布局才算"碰了 Win32"：上面的字母/数字/超 BMP 分支都是纯查表，
+            // 记在这里而不是函数开头，否则 `combo_keys_map_to_their_virtual_key_codes`
+            // 那条纯查表的用例也会把进程级计数器抬 6。
+            bump();
             // SAFETY: 纯查询当前键盘布局，不改变任何状态。
             let scan = unsafe { VkKeyScanW(character as u16) };
             if scan == -1 {
@@ -2462,7 +2466,9 @@ mod tests {
     #[test]
     fn empty_allow_list_is_rejected_before_any_win32_call() {
         let _guard = input_call_guard();
-        win32_probe::reset();
+        // 比增量而不是比 0：计数器是进程级的，别的用例（`virtual_key_of` 那条纯查表的）
+        // 也在涨它，并行跑时绝对值毫无意义。
+        let before = win32_probe::count();
         let result = WindowsBackend::new().input(
             &InputAction::Click {
                 x: 10,
@@ -2480,7 +2486,7 @@ mod tests {
         );
         assert_eq!(
             win32_probe::count(),
-            0,
+            before,
             "空白名单必须在任何 Win32 调用之前返回（不许先查桌面/前台进程）"
         );
     }
@@ -2488,7 +2494,7 @@ mod tests {
     #[test]
     fn a_non_matching_allow_list_is_rejected_after_checking_the_foreground_window() {
         let _guard = input_call_guard();
-        win32_probe::reset();
+        let before = win32_probe::count();
         // 这个名字永远不可能匹配，所以下面无论当前前台是什么程序都会被拒 ——
         // 不会真的注入任何东西。
         let allow = vec!["hbot-device-never-a-real-process.exe".to_string()];
@@ -2510,7 +2516,7 @@ mod tests {
             other => panic!("非空且不匹配的白名单必须被拒，实际是 {other:?}"),
         }
         assert!(
-            win32_probe::count() > 0,
+            win32_probe::count() > before,
             "非空名单必须真的去查了桌面与前台进程"
         );
     }

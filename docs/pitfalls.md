@@ -586,3 +586,32 @@
     判据：① `io_error` 这种「IO → 领域错误」的映射函数，每加一个 `ErrorKind` 分支都要问「另一个平台给的是不是同一个 kind」；
     ② 兜底 `_ => Internal` 只该接真正的宿主故障，**用户能改的输入不许落到这里**；
     ③ 这类红本地（Windows）永远看不见，只能靠 CI 或交叉编译 + 读码 —— 见坑 119 的判读纪律。
+126. **「时间下界」类断言的前提，可能被启动路径自己悄悄满足掉**（2026-11-20，CI 的 ubuntu 红，差 12.78ms）。
+    `crates/hbot-rpc/tests/hot_reload_e2e.rs` 的 `hot_reload_latency_after_saving_main_ts` 断言
+    「保存 → 生效」的延迟 ≥ 由 metadata TTL 推出的下界，推导前提是「上一次 stat 就发生在预热那条消息里」。
+    但每个 trial 的 `restart_ok()` 会调 `bot_start`，而 `crates/hbot-rpc/src/app/commands/bots.rs:279` 的
+    `start_bot` 要跑 `run_lifecycle(Start)`，`run_lifecycle`（`sandbox_handler.rs:1742`）**第一句就是 `compiled()`**
+    —— 也就是先算一次指纹、stat 一次。于是预热那条消息落在 TTL 内、**根本不 stat**，真正"上一次 stat"在
+    `bot_start` 里，比 `warm_started` 早若干毫秒；下界因此被高估。本机 stat 快、预热回程 11–12ms，抵减后
+    还留得住；CI 的预热回程 12.27ms 就把余量吃光了（`生效 1.9747s < 下界 1.9875s`），而且是 trial 1 绿、
+    trial 2 红 —— 典型的"阈值卡在噪声上"。
+    做法：预热之前先 `tokio::time::sleep(DEFAULT_METADATA_TTL + WARM_SETTLE)`，把 `bot_start` 那次 stat
+    推到 TTL 之外，预热那条消息才成为真正"上一次 stat"。**不是**放宽断言、也不是删断言（它钉的是
+    「指纹缓存真的按 TTL 才刷新」这一产品行为）。
+    判据：① 任何"某件事必须发生在 X 之后"的时间断言，先把 X 之前所有会做同一件事的路径数一遍
+    （启动钩子、预热、健康检查都爱顺手 stat / 编译一次）；② 本机绿 + CI 红、且差值只有几毫秒到几十毫秒时，
+    先怀疑**前提**被满足，别先怀疑产品行为变了；③ 观测粒度（轮询间隔、日志落库）要显式写进推导，
+    不要靠"反正够快"垫着。
+127. **进程级测试计数器不能断言绝对值**（2026-11-20，CI 的 windows 红：`left: 6, right: 0`）。
+    `crates/hbot-device/src/windows.rs` 的 `win32_probe` 是 `#[cfg(test)] static AtomicUsize`，
+    用来证明「`allowed_apps` 为空时一个 Win32 调用都不许有」。但它是**进程级**的：同一个测试二进制里
+    任何真走 Win32 的用例都在涨它，而 `cargo test` 默认并行跑。于是
+    `empty_allow_list_is_rejected_before_any_win32_call` 的 `assert_eq!(count(), 0)` 会被邻居抬到 6 ——
+    本机连跑 15 次全绿、CI 才红，典型的"串扰型 flake"。
+    做法三条：① 断言改成比**增量**（`let before = count(); … assert_eq!(count(), before)`），
+    「这次调用没有增加计数」才是这条测试真正要钉的语义，绝对值从来不是；② `bump()` 只放在**真的发起
+    Win32 调用**的那一行 —— 它原来在 `virtual_key_of` 函数开头，于是纯查表的
+    `combo_keys_map_to_their_virtual_key_codes` 也会抬 6，白送一次串扰；③ 没人用了的 `reset()` 删掉，
+    留着只会诱使下一个人继续写"先归零再比 0"。
+    判据：任何 `static Atomic*` / `static Mutex<Vec<_>>` 型测试探针，先问「谁会在我之外碰它」，
+    再决定比绝对值还是比增量；同一进程里**没有任何**测试探针能靠 `reset()` 拿到独占。

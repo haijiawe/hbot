@@ -29,10 +29,15 @@
 //!   上一份指纹（`:186-191`），**一个文件内容都不读**。所以「写完文件」到「新版本被编译」
 //!   之间至少要等一次 stat，而那次 stat 距上一次 stat 至少 `DEFAULT_METADATA_TTL`。
 //! - 每个 trial 先 `bot_stop` + `bot_start`：这会把 `SandboxHandler`（连同它的
-//!   `FingerprintCache`）换成全新的，`signature_at = None` 命中 `_ => true` 分支，
-//!   所以**预热那一条消息必定做 stat**。记这条消息的开始时刻与回程时刻，就能把
-//!   "上一次 stat 的时刻"夹在 `[warm_started, warm_reply_seen]` 里 —— 于是
-//!   `latency >= TTL - (warm_turnaround + 写文件前的空隙)` 是可证明的，不是经验值。
+//!   `FingerprintCache`）换成全新的，`signature_at = None` 命中 `_ => true` 分支。
+//! - **但 `bot_start` 自己就会 stat 一次**：`start_bot` 调 `run_lifecycle(Start)`，
+//!   而 `run_lifecycle` 第一句就是 `compiled()`（先编译、再判有没有 `onStart`）。
+//!   于是紧接着预热的那条消息会命中 TTL、**不做 stat**，"上次 stat 的时刻"其实落在
+//!   `bot_start` 内部，比 `warm_started` 早若干毫秒。2026-11-20 的 CI 就栽在这里：
+//!   `trial 2：生效 1.9747s < 下界 1.9875s`，差 12.78ms；本机快，所以一直没露头。
+//! - 所以每个 trial 在预热之前先**睡过 TTL**（`WARM_SETTLE`）：预热那条消息才会
+//!   真的做 stat，"上一次 stat 的时刻"才被夹在 `[warm_started, warm_reply_seen]` 里，
+//!   `latency >= TTL - (warm_turnaround + 写文件前的空隙)` 才是可证明的、不是经验值。
 //! - 「写文件后的第一条消息仍是旧版本」只在 `距上次 stat 不足 TTL` 时成立，所以那条断言
 //!   带一个显式前提检查（前提不成立就报出实测值并失败，而不是默默放过）。
 //!
@@ -78,6 +83,12 @@ const LOG_LIMIT: u32 = 256;
 
 /// 生效延迟的采样次数（任务书要求 ≥5）。
 const TRIALS: usize = 5;
+
+/// 预热之前要多睡的那点余量（叠在 `DEFAULT_METADATA_TTL` 上）。
+///
+/// 只用来把「`bot_start` 内部那次 stat」推到 TTL 之外，让预热那条消息成为**真正**的
+/// 「上一次 stat」；它不对任何产品行为做断言，250ms 只是给调度抖动留余量。
+const WARM_SETTLE: Duration = Duration::from_millis(250);
 
 /// 语法错误的 `src/main.ts`：`defineBot({` 与 `onMessage` 都没闭合。
 ///
@@ -434,7 +445,12 @@ async fn hot_reload_latency_after_saving_main_ts() {
 
         harness.restart_ok().await;
 
-        // 预热：全新缓存 ⇒ 这条消息必定 stat（`signature_at = None` → `_ => true`），
+        // 先把 `bot_start` 内部那次 stat（`run_lifecycle` → `compiled()`）推到 TTL 之外：
+        // 否则预热这条消息会命中 TTL 不做 stat，真正"上一次 stat"落在 bot_start 里，
+        // 下界推导就不再成立（2026-11-20 的 CI 就是这样差 12.78ms 红的）。
+        tokio::time::sleep(DEFAULT_METADATA_TTL + WARM_SETTLE).await;
+
+        // 预热：全新缓存且已过 TTL ⇒ 这条消息必定 stat（`signature_at = None` → `_ => true`），
         // 它的回程时刻把"上一次 stat 的时刻"夹住。
         let warm_started = Instant::now();
         let warm_reply = harness.inject_expecting(previous).await;
@@ -674,6 +690,9 @@ async fn first_message_right_after_save_is_served_by_the_cached_version() {
     harness.write_version(1);
     harness.start_ok().await;
 
+    // 与用例 1 同一个理由：`bot_start` 里的 `run_lifecycle` → `compiled()` 已经 stat 过，
+    // 先睡过 TTL 才能让预热这条消息成为"上一次 stat"，前提检查才有意义。
+    tokio::time::sleep(DEFAULT_METADATA_TTL + WARM_SETTLE).await;
     let warm_started = Instant::now();
     harness.inject_expecting(1).await;
     let warm_turnaround = warm_started.elapsed();
