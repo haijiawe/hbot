@@ -446,3 +446,17 @@
     `examples/support` 的 `onResume` 调 `ctx.sql.exec` 直接抛 `cannot read property 'exec' of undefined`，只有真跑示例才会发现。
     判据：**narrow ctx 只该砍掉「靠事件身份才能安全工作」的面**（`kv` / `history` / `device` / `jobs` / `session`）；
     按 bot 绑定的面（`sql` / `files`）没有这条顾虑，砍掉就是无谓的残缺。
+115. **本地闸门全绿 ≠ CI 绿：`channel = "stable"` 意味着本地与 CI 各拿各的版本**（2026-11-20）。
+    首次 push 后 CI 的 `rust (ubuntu-latest)` / `rust (windows-latest)` 都停在 `clippy` 一步红：
+    `error: the Err-variant returned from this function is very large --> crates/hbot-agent/src/gateway.rs:357:10`
+    （`-D clippy::result_large_err`，`GatewayError` 168 字节）。而本地 `rustc 1.96.0 / clippy 0.1.96` 跑同一条命令 **EXIT=0**：
+    CI 那份 stable 是 **1.100.0**，比本地新 4 个小版本，这条 lint 只在它那里报。`rust-toolchain.toml` 原本写的是
+    `channel = "stable"` —— 那不是「钉版本」，是「各机器拿各自的最新 stable」，所以本地闸门在结构上就不可能等于 CI。
+    **根因修法**：`rust-toolchain.toml` 写死 `channel = "1.100.0"`，`.github/workflows/ci.yml` 的 4 处
+    `dtolnay/rust-toolchain@stable` 全改成 `@1.100.0`（这个 action 的 `@rev` 就是版本号）。改完在仓库根跑
+    `cargo --version` / `cargo clippy --version`，那里显示的才是本地闸门真正用的版本。
+    **红点本身的修法**：① 大结构别塞进 `Result::Err`，照 `crates/hbot-code/src/dispatch.rs:34` 的 `pub error: Box<CodeError>` 先例装箱；
+    ② 加一条**与 lint 同口径**的守卫单测（`gateway::tests::gateway_error_stays_within_the_large_err_budget`，
+    `size_of::<GatewayError>() < 128` —— clippy 的判据是「至少 128 字节」就红，所以守卫必须用严格小于），
+    这样本地就能提前红，不用等 push；
+    ③ 判读 CI 红点时先看它停在**哪一步**：`fmt`/`clippy`/`test` 分步跑，停在 `clippy` 且本地绿 = 版本差，不是代码坏了。

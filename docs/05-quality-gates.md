@@ -134,22 +134,27 @@ pnpm -C apps/web build           # 产物能构建
 
 **`bundle-linux` 为什么不出 deb/appimage**：这条路径从未在 Linux 宿主上实测过；与其在 CI 里塞一条没验证过的打包步骤（红了不知道是代码问题还是打包配置问题），不如先留在 `docs/spikes/S5-packaging.md` §9 的「未验证」清单里。现在系统依赖清单已经明确（同上），要开只需在 `bundle-linux` 加同一段 apt + `cargo tauri build --bundles deb,appimage`。
 
-### 5.1 当前实际验证状态（别把这当成"CI 已绿"）
+### 5.1 当前实际验证状态
 
-**本仓库没有 git remote，15 个提交全在本地，所以 `ci.yml` 从未被执行过一次。** 下表是"本地能验的"与"只能靠 CI/真机验的"的分界：
+**CI 已经在真跑**（remote = `https://github.com/haijiawe/hbot.git`，private）。下表是"本地能验的"与"只能靠 CI/真机验的"的分界：
 
 | 检查 | 状态 | 证据 |
 |---|---|---|
-| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `674 passed / 0 failed`（上一批；本批改动待重跑） |
-| `apps/web` 的 `check`/`test` | ✅ 本地实跑通过 | `13 文件 101 用例` |
-| `xtask deps` / `gen --check` | ✅ 本地实跑通过 | `0 violation(s)`、`40 个文件一致` |
+| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `125 suites / 1978 passed / 0 failed`（`rustc 1.100.0`） |
+| `apps/web` 的 `check`/`test` | ✅ 本地实跑通过 | `45 文件 / 400 用例` |
+| `xtask deps` / `gen --check` | ✅ 本地实跑通过 | `0 violation(s)`、生成物一致 |
+| CI `gates` / `web` / `bundle (ubuntu)` | ✅ runner 上通过 | run `44678063739`（head `dfbd54f`）三步 success |
+| CI `rust (ubuntu-latest)` / `rust (windows-latest)` | ⚠️ 曾红，已修 | 同一处停在 `clippy`：`clippy::result_large_err`（`GatewayError` 168 字节）。本地 clippy 1.96 不报、CI 的 1.100.0 报 —— 见 `docs/pitfalls.md` 坑 115 |
+| CI `bundle (windows, nsis)` | ⏳ 未跑完 | 同一 run 里仍停在 `install tauri-cli`，首次冷启动约 12–18 分钟 |
+| CI `bundle (macos, dmg)` | ❌ 未验 | run 里该 job 直接 `cancelled`；无 Mac 本机 |
 | Linux target 编译（`hbot-core`/`hbot-command`/`hbot-workspace`/`hbot-parity`） | ✅ 交叉 `cargo check` 通过 | 直接验证了 `confinement_linux.rs`（libc/Landlock）与 `paths.rs`（XDG）确实能编 |
-| Linux target 编译（其余 crate） | ❌ **未验** | 被 `ring`（rustls）与 `psm`（SWC 的 `stacker`）挡住：两者在构建期需要**目标平台的 C 编译器/汇编器**，本机只有 MSVC。`cargo install cargo-zigbuild` 已装但 `zigbuild` 只提供 `build` 不含 `check`，未继续 |
-| Linux 上**运行**任何测试 | ❌ 未验 | 同上，且需要真实 Linux 宿主 |
-| macOS 编译与 dmg | ❌ 未验 | 无 Mac 机器；`bundle-macos` job 从未执行 |
+| Linux target 编译（其余 crate） | ✅ 由 CI 覆盖 | `rust (ubuntu-latest)` 在真 Linux runner 上编全 workspace（本地仍做不到：`ring`/`psm` 需要目标平台 C 工具链） |
+| Linux 上**运行**测试 | ✅ 由 CI 覆盖 | 同上 job 的 `cargo test --workspace` |
 | `scripts/check.sh` 在**干净机器**上 | ❌ 未验 | 本机有 `node_modules`，`check.sh` 会走 web 分支；干净机器上会走 skip 分支，未实测 |
 
-> **结论**：M0 出口的「CI 至少 Linux + Windows 编译通过」当前**不成立**（Windows 本地成立、Linux 未成立）。要真正闭合只有两条路：① 加一个 remote 让 CI 跑一次；② 给一台 Linux 机器（或能跑 WSL2 的环境 / 完整交叉工具链）。
+> **工具链必须钉死**：`rust-toolchain.toml` 写 `channel = "1.100.0"`，`ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`。
+> 之前两边都写 `stable`，等于「各机器拿各自的最新 stable」，于是 CI 的 clippy 比本地新、只报在 CI（坑 115）。
+> 升级 Rust 时**两个文件一起改**，并在仓库根用 `cargo --version` 确认。
 
 ---
 

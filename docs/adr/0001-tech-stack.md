@@ -183,7 +183,8 @@
 ### 4.5 版本策略
 
 - Node：24 LTS，`.node-version` 固定；不使用实验特性。
-- Rust：stable，`rust-toolchain.toml` 固定；不追 nightly。
+- Rust：**写死具体版本**（`rust-toolchain.toml` 的 `channel` 与 `ci.yml` 的 `dtolnay/rust-toolchain@<版本>` 两处同改），不写 `stable`、不追 nightly。
+  写 `stable` 等于「每台机器各拿各自的最新 stable」，本地闸门与 CI 结构上就不等（`docs/pitfalls.md` 坑 115 是首次 push 撞到的实证）。
 - Tauri：2.x；升级前跑三平台 smoke。
 - React/TypeScript/Vite：跟随 stable；每季度评估一次，不在功能分支里顺手升级。
 - 依赖：`pnpm-lock.yaml` 入库；新增依赖需要在 PR 说明“为什么标准库/现有依赖不够”。
