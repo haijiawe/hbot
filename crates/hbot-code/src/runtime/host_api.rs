@@ -56,8 +56,22 @@ use crate::state::StateSlot;
 /// exports of [`HOST_MODULE_SOURCE`] and with the declarations in `hbot.d.ts`,
 /// so a binding added here without its two declarations is a test failure.
 pub(crate) const HOST_BINDING_KEYS: &[&str] = &[
-    "log", "reply", "sleep", "http", "device", "kv", "history", "ai", "jobs", "session", "send",
-    "notify", "sql", "files",
+    "log",
+    "reply",
+    "sleep",
+    "http",
+    "device",
+    "kv",
+    "history",
+    "ai",
+    "jobs",
+    "session",
+    "send",
+    "sendFile",
+    "sendImage",
+    "notify",
+    "sql",
+    "files",
 ];
 
 /// Upper bound on captured `log`/`reply` entries per event.
@@ -256,7 +270,7 @@ pub(crate) fn install<'js>(
     let session_object = super::session_api::install(ctx, &session, Arc::clone(&output))?;
     // 出站同样不需要预算：一次出站入队是往 supervisor 的有界通道里放一条，不是
     // 一次模型调用 —— 通道满时它等的是 worker 的进度，不是 handler 的墙钟。
-    let (send_function, notify_function) = super::send_api::install(ctx, &send)?;
+    let send_bindings = super::send_api::install(ctx, &send)?;
     // SQL 不需要预算参数：每条语句在一次 `spawn_blocking` 里跑完，isolate 只等结果。
     let sql_object = super::sql_api::install(ctx, &sql)?;
     let files_object = super::file_api::install(ctx, &files)?;
@@ -273,8 +287,13 @@ pub(crate) fn install<'js>(
     host.set("jobs", jobs_object).map_err(super::js_error)?;
     host.set("session", session_object)
         .map_err(super::js_error)?;
-    host.set("send", send_function).map_err(super::js_error)?;
-    host.set("notify", notify_function)
+    host.set("send", send_bindings.send)
+        .map_err(super::js_error)?;
+    host.set("sendFile", send_bindings.send_file)
+        .map_err(super::js_error)?;
+    host.set("sendImage", send_bindings.send_image)
+        .map_err(super::js_error)?;
+    host.set("notify", send_bindings.notify)
         .map_err(super::js_error)?;
     host.set("sql", sql_object).map_err(super::js_error)?;
     host.set("files", files_object).map_err(super::js_error)?;
@@ -442,6 +461,33 @@ export function reply(text) {
  */
 export function send(conversationId, text, options) {
   return host.send(conversationId, text, options);
+}
+
+/**
+ * 主动发一个**图片**文件给指定会话。
+ *
+ * `path` 是**相对项目根目录**的路径（与 `ctx.files` 同一套坐标系），例如
+ * `'assets/logo.png'`。绝对路径、带 `..` 的路径一律 `HBOT_SEND_INVALID` ——
+ * 附件不是读任意文件的口子。宿主在入队前会把它解析成绝对路径、确认它落在项目根内、
+ * 确认文件存在且不超过大小上限；任何一条不满足都失败而不是"只发正文"。
+ *
+ * 图片在平台侧以图片段发出（OneBot 是 `{"type":"image"}`），是否显示成图片由接收方
+ * 决定；本方法只保证"按图片发"。
+ *
+ * 需要 `hbot.json` 的 `capabilities.send: true`。没声明报 `HBOT_SEND_NOT_DECLARED`，
+ * 宿主没接出站队列报 `HBOT_SEND_UNAVAILABLE`，参数或路径不合法报 `HBOT_SEND_INVALID`。
+ */
+export function sendImage(conversationId, path, options) {
+  return host.sendImage(conversationId, path, options);
+}
+
+/**
+ * 主动发一个**普通文件**给指定会话（`{"type":"file"}`）。
+ *
+ * 路径规则、错误码与 `sendImage` 完全一致，只是平台侧按文件段发出。
+ */
+export function sendFile(conversationId, path, options) {
+  return host.sendFile(conversationId, path, options);
 }
 
 /**
@@ -705,7 +751,7 @@ export const files = {
   },
 };
 
-export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session, send, notify, sql, files };
+export default { defineBot, log, reply, sleep, http, device, kv, history, ai, jobs, session, send, sendImage, sendFile, notify, sql, files };
 "#;
 
 #[cfg(test)]

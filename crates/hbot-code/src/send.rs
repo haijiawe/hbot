@@ -26,8 +26,9 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use hbot_core::{
-    ConversationKind, NotifyError, NotifyRequest, NotifyTarget, SendError, SendRequest,
-    validate_notify, validate_notify_target, validate_send,
+    AttachmentKind, AttachmentRequest, ConversationKind, NotifyError, NotifyRequest, NotifyTarget,
+    SendError, SendRequest, validate_attachment, validate_notify, validate_notify_target,
+    validate_send,
 };
 
 /// 宿主没装配出站队列时的说明（`HBOT_*_UNAVAILABLE` 前缀由各自的错误类型加）。
@@ -61,6 +62,19 @@ pub trait SendQueue: Send + Sync {
     /// 目标类型无法确定时报 [`SendFailure::NoTarget`]，其余失败报
     /// [`SendFailure::Failed`]。
     fn send(&self, request: &SendRequest) -> Result<(), SendFailure>;
+
+    /// 发一条带附件的消息。
+    ///
+    /// 与 [`Self::send`] 走**同一条**出站路径（同一个 outbound 表、同一套重试与死信），
+    /// 差别只在载荷。`request.path` 到了这里还是**相对项目的路径**：解析成绝对路径、
+    /// 校验它在项目根内、检查文件存在与大小上限，都是宿主在这个方法里做的事 ——
+    /// 只靠参数闸会漏掉符号链接。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Self::send`] 同：目标类型无法确定报 [`SendFailure::NoTarget`]，其余失败
+    /// 报 [`SendFailure::Failed`]。
+    fn send_attachment(&self, request: &AttachmentRequest) -> Result<(), SendFailure>;
 }
 
 /// 槽位内部状态。
@@ -149,6 +163,42 @@ impl SendSlot {
         })
     }
 
+    /// 主动发一条带附件的消息：参数闸 -> 声明闸 -> 装配闸 -> 端口。
+    ///
+    /// 附件也算主动消息，所以过的是同一道 capabilities.send 闸 —— 不另开一个
+    /// capabilities.attachments：多一个开关只会多一种「文本能发、文件不能发」的
+    /// 半残状态，而它们最终是同一条 outbound 行。
+    pub(crate) fn send_attachment(
+        &self,
+        conversation: &str,
+        kind: Option<ConversationKind>,
+        attachment: AttachmentKind,
+        path: &str,
+    ) -> Result<(), SendError> {
+        let mut request = AttachmentRequest::new(conversation, attachment, path);
+        request.kind = kind;
+        validate_attachment(&request)?;
+
+        let (declared, queue) = {
+            let state = self.lock();
+            (state.send_declared, state.queue.clone())
+        };
+        if !declared {
+            return Err(SendError::NotDeclared);
+        }
+        let Some(queue) = queue else {
+            return Err(SendError::Unavailable {
+                reason: UNASSEMBLED.to_owned(),
+            });
+        };
+        queue
+            .send_attachment(&request)
+            .map_err(|failure| match failure {
+                SendFailure::NoTarget { conversation } => SendError::NoTarget { conversation },
+                SendFailure::Failed { reason } => SendError::Failed { message: reason },
+            })
+    }
+
     /// 发一条通知：正文闸 -> 声明闸 -> 目标闸 -> 装配闸 -> 端口。
     ///
     /// 目标来自清单，所以这里**没有** `kind` 参数，也没有「猜目标」的分支。
@@ -224,6 +274,7 @@ mod tests {
     #[derive(Default)]
     struct Recording {
         requests: Mutex<Vec<SendRequest>>,
+        attachments: Mutex<Vec<AttachmentRequest>>,
         failure: Mutex<Option<SendFailure>>,
     }
 
@@ -239,12 +290,35 @@ mod tests {
                 .clone()
         }
 
+        fn taken_attachments(&self) -> Vec<AttachmentRequest> {
+            self.attachments
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
         fn fail_with(&self, failure: SendFailure) {
             *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(failure);
         }
     }
 
     impl SendQueue for Recording {
+        fn send_attachment(&self, request: &AttachmentRequest) -> Result<(), SendFailure> {
+            self.attachments
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.clone());
+            match self
+                .failure
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+            {
+                Some(failure) => Err(failure),
+                None => Ok(()),
+            }
+        }
+
         fn send(&self, request: &SendRequest) -> Result<(), SendFailure> {
             self.requests
                 .lock()
@@ -288,6 +362,71 @@ mod tests {
             requests[0].effective_kind(),
             Some(ConversationKind::Private)
         );
+    }
+
+    #[test]
+    fn send_attachment_passes_the_request_to_the_port() {
+        let (slot, port) = assembled();
+        slot.send_attachment(
+            "123456",
+            Some(ConversationKind::Private),
+            AttachmentKind::Image,
+            "assets/logo.png",
+        )
+        .expect("声明了且有端口就必须发得出去");
+        let requests = port.taken_attachments();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].conversation, "123456");
+        assert_eq!(requests[0].attachment, AttachmentKind::Image);
+        // 槽位不碰路径：相对项目的路径要原样交给宿主去核验（它才知道根在哪）。
+        assert_eq!(requests[0].path, "assets/logo.png");
+        assert_eq!(
+            requests[0].effective_kind(),
+            Some(ConversationKind::Private)
+        );
+        assert!(port.taken().is_empty(), "附件不该走纯文本那条端口方法");
+    }
+
+    #[test]
+    fn an_attachment_is_refused_before_it_is_declared() {
+        let slot = SendSlot::new();
+        let error = slot
+            .send_attachment("123456", None, AttachmentKind::File, "report.pdf")
+            .expect_err("没声明就不能发");
+        assert_eq!(error.code(), "HBOT_SEND_NOT_DECLARED");
+    }
+
+    #[test]
+    fn a_bad_attachment_path_is_invalid_even_when_not_declared() {
+        // 与纯文本同口径：路径坏了就该报 INVALID，别把用户引去清单加 send。
+        let slot = SendSlot::new();
+        let error = slot
+            .send_attachment("123456", None, AttachmentKind::File, "../../etc/passwd")
+            .expect_err("越界路径必须被拒");
+        assert_eq!(error.code(), "HBOT_SEND_INVALID");
+    }
+
+    #[test]
+    fn an_attachment_is_unavailable_when_the_host_has_no_queue() {
+        let slot = SendSlot::new();
+        slot.set_send_declared(true);
+        let error = slot
+            .send_attachment("123456", None, AttachmentKind::Image, "assets/logo.png")
+            .expect_err("没有端口就必须报不可用");
+        assert_eq!(error.code(), "HBOT_SEND_UNAVAILABLE");
+    }
+
+    #[test]
+    fn an_attachment_port_failure_becomes_send_failed() {
+        let (slot, port) = assembled();
+        port.fail_with(SendFailure::Failed {
+            reason: "附件读不出来".into(),
+        });
+        let error = slot
+            .send_attachment("123456", None, AttachmentKind::File, "report.pdf")
+            .expect_err("端口失败必须上报");
+        assert_eq!(error.code(), "HBOT_SEND_FAILED");
+        assert!(error.to_string().contains("附件读不出来"), "{error}");
     }
 
     #[test]

@@ -2959,6 +2959,8 @@ fn build_event<'js>(
     // 出站是**平铺**在 ctx 上的两个函数（与 reply / history 同形），不是对象：
     // `dts` 的 message_ctx_functions 按「4 空格缩进且含左括号」收集它们。
     event.set("send", host.get::<_, Function<'js>>("send")?)?;
+    event.set("sendFile", host.get::<_, Function<'js>>("sendFile")?)?;
+    event.set("sendImage", host.get::<_, Function<'js>>("sendImage")?)?;
     event.set("notify", host.get::<_, Function<'js>>("notify")?)?;
     event.set("sql", host.get::<_, Object<'js>>("sql")?)?;
     event.set("files", host.get::<_, Object<'js>>("files")?)?;

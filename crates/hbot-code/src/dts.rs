@@ -192,10 +192,20 @@ declare module 'hbot' {
      *
      * 目标缺失是独立的一种失败：`send` 没给 `options.kind` 时宿主会去 `conversations`
      * 查这个会话，查不到报 `HBOT_SEND_NO_TARGET`，**不猜**类型 —— 猜错就是发给另一个人。
+     *
+     * 附件（`sendImage` / `sendFile`）与文本走同一条出站路径、同一个 `capabilities.send`
+     * 开关，只是载荷不同。附件路径是**相对项目根目录**的：沙箱拿不到项目根，也读不了
+     * 文件，所以读文件与大小校验由宿主在入队前做一次；这里只拒绝明显越界的形状。
      */
 
     /** 主动发一条消息到指定会话（平台侧会话 id，不是库里的 UUID）。 */
     send(conversationId: string, text: string, options?: SendOptions): Promise<void>;
+    /** 主动发一个图片文件：`path` 是**相对项目根目录**的路径，不是绝对路径。
+     *  绝对路径 / `..` 一律 `HBOT_SEND_INVALID`；宿主还会确认它落在项目根内、文件存在、
+     *  大小在上限内。需要 `capabilities.send`。 */
+    sendImage(conversationId: string, path: string, options?: SendOptions): Promise<void>;
+    /** 主动发一个普通文件，规则与 `sendImage` 一致，只是平台侧按文件段发出。 */
+    sendFile(conversationId: string, path: string, options?: SendOptions): Promise<void>;
     /** 发到清单 `capabilities.notify` 钉死的那个会话；目标不来自参数。 */
     notify(text: string): Promise<void>;
 
@@ -790,6 +800,18 @@ declare module 'hbot' {
   export function send(
     conversationId: string,
     text: string,
+    options?: SendOptions,
+  ): Promise<void>;
+  /** 发送图片文件，等同 `ctx.sendImage`；`path` 相对项目根。 */
+  export function sendImage(
+    conversationId: string,
+    path: string,
+    options?: SendOptions,
+  ): Promise<void>;
+  /** 发送普通文件，等同 `ctx.sendFile`；`path` 相对项目根。 */
+  export function sendFile(
+    conversationId: string,
+    path: string,
     options?: SendOptions,
   ): Promise<void>;
   /** 发到清单钉死的会话，等同 `ctx.notify`。 */
@@ -1540,9 +1562,9 @@ mod drift {
         // deleted instead of narrowed, and would take the whole check with it.
         //
         // `send(` was removed when C3.send shipped (2026-11-19): it is false by design now.
-        // What is still missing on the egress side is **attachments** — text is all a caller
-        // can push — so the entries below are the precise remainder instead of the broad one
-        // (`AGENTS.md` §8.7: a broad entry must be deleted, not kept).
+        // `sendFile(` / `sendImage(` 在附件出站落地时按同一条规矩**整条删掉**
+        // （2026-11-20）：宽泛条目在能力实现后继续留在表里，就等于继续假装「这个没做」。
+        // 出站侧仍未做的只剩「发到清单目标的文件」这一种组合，所以保留下面的精确条目。
         //
         // `kv.` was removed for the same reason: `ctx.kv` shipped with C2, so
         // "`kv.` must not appear" is now false by design. What is still missing is
@@ -1551,8 +1573,6 @@ mod drift {
         // `onStart` / `onStop` 已落地（2026-11-19，`C1.lifecycle`）：宽泛条目按 `AGENTS.md` §8.7
         // 必须**整条删**，否则它会在能力实现后继续假装「这个没做」。仍在缺的那一项单独列出。
         for absent in [
-            "sendFile(",
-            "sendImage(",
             "notifyFile(",
             "http.post",
             "http.fetch",

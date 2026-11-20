@@ -158,10 +158,20 @@ declare module 'hbot' {
      *
      * 目标缺失是独立的一种失败：`send` 没给 `options.kind` 时宿主会去 `conversations`
      * 查这个会话，查不到报 `HBOT_SEND_NO_TARGET`，**不猜**类型 —— 猜错就是发给另一个人。
+     *
+     * 附件（`sendImage` / `sendFile`）与文本走同一条出站路径、同一个 `capabilities.send`
+     * 开关，只是载荷不同。附件路径是**相对项目根目录**的：沙箱拿不到项目根，也读不了
+     * 文件，所以读文件与大小校验由宿主在入队前做一次；这里只拒绝明显越界的形状。
      */
 
     /** 主动发一条消息到指定会话（平台侧会话 id，不是库里的 UUID）。 */
     send(conversationId: string, text: string, options?: SendOptions): Promise<void>;
+    /** 主动发一个图片文件：`path` 是**相对项目根目录**的路径，不是绝对路径。
+     *  绝对路径 / `..` 一律 `HBOT_SEND_INVALID`；宿主还会确认它落在项目根内、文件存在、
+     *  大小在上限内。需要 `capabilities.send`。 */
+    sendImage(conversationId: string, path: string, options?: SendOptions): Promise<void>;
+    /** 主动发一个普通文件，规则与 `sendImage` 一致，只是平台侧按文件段发出。 */
+    sendFile(conversationId: string, path: string, options?: SendOptions): Promise<void>;
     /** 发到清单 `capabilities.notify` 钉死的那个会话；目标不来自参数。 */
     notify(text: string): Promise<void>;
 
@@ -756,6 +766,18 @@ declare module 'hbot' {
   export function send(
     conversationId: string,
     text: string,
+    options?: SendOptions,
+  ): Promise<void>;
+  /** 发送图片文件，等同 `ctx.sendImage`；`path` 相对项目根。 */
+  export function sendImage(
+    conversationId: string,
+    path: string,
+    options?: SendOptions,
+  ): Promise<void>;
+  /** 发送普通文件，等同 `ctx.sendFile`；`path` 相对项目根。 */
+  export function sendFile(
+    conversationId: string,
+    path: string,
     options?: SendOptions,
   ): Promise<void>;
   /** 发到清单钉死的会话，等同 `ctx.notify`。 */
