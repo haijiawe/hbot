@@ -6,6 +6,8 @@ on:
     # 这是本轮顺手修掉的一个触发器问题；两个名字都留着，将来改名不用再动）。
     branches: [main, master]
   pull_request:
+  # macOS 打包只手动触发（见 bundle-macos 的 if），所以这里必须留一个手动入口。
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -199,6 +201,12 @@ jobs:
   # 这台仓库没有 Mac 本机，dmg 只能在 runner 上验；所以这里是"第一次真正的 dmg 实测"。
   bundle-macos:
     name: bundle (macos, dmg)
+    # 这台账号没有 macOS runner 容量：macos-14 被判
+    # 「The configuration 'macos-14-arm64-us-default' is not supported」，macos-13 则
+    # 一直 queued（实测 35 分钟等不到 runner）。所以 macOS 打包默认不跑，避免每次 push
+    # 都拖住整轮 CI；要验 dmg 时在 Actions 页面手动 Run workflow，或在仓库
+    # Settings → Secrets and variables → Actions → Variables 里设 ENABLE_MACOS_BUNDLE=true。
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_MACOS_BUNDLE == 'true'
     runs-on: macos-13
     timeout-minutes: 40
     steps:

@@ -762,3 +762,21 @@
     ② 让 handler 把耗时写进 `ctx.kv` 或回复正文（那要额外能力，测预算时反而绕远）；
     ③ 改成断言**可分辨的结果**而不是时长 —— 例如「超预算 → 落 failed 且结束行不存在」，这正是
     坑 137 那条测试的形状。测量之前先确认那个数字真的是被测量的那一侧写下来的。
+
+140. CI 的 job 一直 `queued` ≠ 它慢，是这台账号没有那种 runner 的容量（2026-11-21）
+
+    `bundle (macos, dmg)` 在这仓库里一直是 `cancelled`，长期被当成「矩阵里没有 macOS runner，正常」。
+    仓库 public 化之后第一次去读 `GET /repos/<owner>/<repo>/check-runs/<job_id>/annotations`，
+    才看到真实原因：`The configuration 'macos-14-arm64-us-default' is not supported` —— 标签解析
+    到的 runner 配置这台账号根本没有（一次都没真跑过）。
+
+    换成 `macos-13`（Intel）之后不再报「不支持」，但 job **排队 35 分钟等不到 runner**
+    （`runner_name` 一直是空的）。两者要分开判读：
+
+    - **几秒内 `cancelled`/失败 + 有 annotation 说配置不支持** → 标签/配置不可用，换标签或换计划。
+    - **一直 `queued`、`runner_name` 为空** → 容量问题（免费额度、机池紧张、镜像退役），等下去只会
+      拖到 `timeout-minutes` 才失败，而且**每次 push 都会重演**，把整轮 CI 卡住。
+
+    处理方式：把这类 job 改成手动触发（`if: github.event_name == 'workflow_dispatch' || vars.ENABLE_MACOS_BUNDLE == 'true'`），
+    默认 push 时它是 `skipped` 而不是 `cancelled` —— 这两者的区别在报告里必须写清楚：
+    `skipped` 是「没跑」，不是「通过」。别为了让整轮变绿把 `continue-on-error` 加上去。
