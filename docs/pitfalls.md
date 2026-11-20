@@ -383,3 +383,16 @@
      实际写成了 `assert!(x.is_empty(); )` 附近漏个括号 / 用了 `.expect("…");`，编译器报
      `E0600 cannot apply unary operator '!' to type Vec<WaitRow>` 加一条 `unexpected string literal` 在不同行。
      两条错误看着像两处问题，其实是同一处的语法错位 —— 先看报错行附近的标点，别急着改类型。
+
+104. **示例项目必须入库，用户夹具必须忽略 —— 两者不能共用目录**（2026-11-20）。
+     `projects/` 被 `.gitignore` 整目录忽略（`bots.json` 里有真实平台 `token` / `clientSecret`），
+     于是「三类示例项目各一个」这条出口标准在仓库里**一个可跑的项目都没有**，新克隆的人无从下手。
+     做法：示例搬进 `examples/`（只写 `"platform": { "kind": "local" }`，不带 `bots.json`），
+     并让 `crates/hbot-cli/tests/examples.rs` 断死「名字恰好是这三类 + 每个都过 `check_project` + 目录里没有 `bots.json`」。
+     判据：**示例是代码，夹具是数据**；一份文件同时当两者，必然是凭据进库或标准无从验证。
+
+105. **生成物有几份就要刷新几份：`cargo xtask gen` 现在也管 `examples/*/hbot.d.ts`**（2026-11-20）。
+     `hbot.d.ts` 是**每个项目一份**的副本（Monaco 与 `hbot check` 都读它），加示例就等于多三份随宿主 API 漂移的文件。
+     `gen --check` 只比 `apps/web/src/generated/` 时，漂移的后果是「用户打开示例，Monaco 报得莫名其妙」而不是 CI 红。
+     做法：`xtask` 依赖 `hbot-code`（读同一份 `dts.rs`），`gen` 写、`gen --check` 比对，一次覆盖全部含 `hbot.json` 的示例目录。
+     同族：新增任何「每个项目一份」的生成物，都要问一句「闸门扫得到它吗」。

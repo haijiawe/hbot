@@ -256,7 +256,14 @@
 | **M8 Android 宿主** | 拆 `hbot-mobile` crate、vendor rquickjs bindings、APK 能装能跑、前台服务 + 常驻通知、能力矩阵裁剪 | 真机装上；`local` bot 能跑、`onebot11` 能连局域网协议端、`bot_inject` 有回复；体积 ≤ 25 MB；`08` 的 H1–H7 全绿 |
 | **M11 iOS 宿主**（可选） | macOS + Xcode 构建、IPA、WKWebView 控制台、**仅前台运行** | TestFlight 可装、前台跑通同一链路；按 4.7 备齐审核材料 |
 
-**M7 的实际进度（2026-11-18）**：`07` §11 的第 1、2 步已落地 —— `C2.kv` 与 `C2.history` 从 `hbot.json` 声明到 isolate 内的 `ctx.kv.*` / `ctx.history(n)` 全链路可用（`bot_kv` 表、三道判据、参数闸唯一一份，细节见 `07` §5.0）；`C5.ai`（`ctx.ai.complete`）也已打通（声明层/装配层/参数层/预算层四道判据，每事件 4 次 / 60 秒预算，key 不出核心，见 `07` §3.3）；第 3 步的 `C1.timer`（`onTimer(ctx, name)` + 清单 `capabilities.timer`）也已落地 —— 网格对齐、休眠只补一次、回复目标必须显式声明、tick 挂在 `BotRegistry::aux`（见 `07` §4.4）。**同一步的 `C4.jobs` 未开始**，第 4–5 步（`session`/`webhook`/`send`/`notify`）仍是设计状态，所以上表 M7 的出口标准（三类示例项目 + V1–V11）**尚未满足**，`M7` 也不能整体标完成。
+**M7 的实际进度（2026-11-20 更新）**：`07` §11 的 1–5 步**全部落地** —— `C2.kv` / `C2.history` / `C5.ai.complete`（§5.0、§3.3）、`C1.timer`（§4.4）、`C4.jobs`（§4.3）、`C2.session` 含超时重发（§5.2）、`C1.webhook` + `C3.send` / `C3.notify`（§6）、`C3.file` 与 `onStart` / `onStop` 都在跑。
+
+出口标准的两半现在**都可判定**：
+
+- **三类示例项目**：`examples/chat`、`examples/game`、`examples/support` 入库（无平台凭据，统一 `platform.kind = local`）。`crates/hbot-cli/tests/examples.rs` 逐个跑 `check_project`（清单合规 → 入口编译 → `hbot.d.ts` 未漂移），并断言名字就是这三类；`cargo xtask gen` 负责刷新它们的 `hbot.d.ts`，`gen --check` 拦漂移。**「全部能在桌面跑通」仍只有自动化那一半有证据**：真起 bot 投递消息的 e2e 在各能力自己的测试里（`crates/hbot-rpc/tests/*_capability.rs`），没有一条「打开示例 → 发消息 → 看到回复」的整体回归。
+- **V1–V11**：2026-11-20 在 `07` §10 逐条对账，V12–V16 一并补上；`V10`（设备能力跨宿主）、`V11`（第二宿主）、`V15`（真机 GUI）**没有自动化证据**，挂在 `M10` 上，不许打勾。
+
+结论：M7 的能力面可以标「已落地」，**整条里程碑仍不能标完成** —— 缺的是上面那一条整体 e2e 与 V10/V11/V15 的宿主侧证据，它们属于 M9/M10 的验收范围。
 
 **顺序理由**：`M7` 是所有形态的共同底座（四类 bot 都用）；`M9` 排手机前面，因为它补的认证与部署是**所有远程场景**都要用的（手机端局域网直连也吃这套）；`M10` 单独排在最后，实现量最大且只有一类 bot 需要，但**不再可省略**；手机端（`M8`/`M11`）90% 是宿主移植、10% 是能力裁剪，底座没做就移植等于把半成品复制三份。
 

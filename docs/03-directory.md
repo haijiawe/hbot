@@ -81,6 +81,7 @@ hbot-bot 只依赖 hbot-core + hbot-store（自己定义它需要的平台端口
 9. **ID 只有一份**：`hbot-core::ids`。`hbot-store` 重导出 core 的 ID 类型，不自己定义。
 10. **行级 DTO 与领域实体分层**：`hbot-store` 出的是行级 DTO（`config_json: String`、`enabled: bool` 这类落库形状），`hbot-core::domain` 是领域实体；两者之间的 `row_to_domain` 映射放在**使用方**（`hbot-bot`/`hbot-rpc`），不放 store、也不放 core（store 不认识领域规则，core 不认识 SQL）。
 11. **写 inbound 前必须有 bot 行与会话行**（外键开着，`PRAGMA foreign_keys=ON`）；适配器落地顺序固定 `bot → conversation → inbound → 入队`，顺序错了就是 `FOREIGN KEY constraint failed`。
+12. **`xtask` 是开发期工具**，只许依赖 `hbot-rpc` / `hbot-core` / `hbot-code`（代码生成要读 `dts.rs` 的同一份契约）；产品 crate 一律不许依赖它，也不许把它塞进运行时。
 
 ### 2.2 每个 crate 的内部结构
 
@@ -316,6 +317,7 @@ target/                 Rust 构建
 node_modules/           UI 依赖
 dist/                   UI 构建
 apps/web/src/generated/ 生成但入库（便于 review 与离线构建）
+examples/*/hbot.d.ts     生成但入库（每个示例一份，`cargo xtask gen` 刷新）
 .hbot/                  运行数据（每项目）
 *.db *.db-wal *.db-shm
 ```

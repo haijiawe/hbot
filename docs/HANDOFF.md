@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 08:15**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、以及 `ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**。
+> 本快照时间：**2026-11-20 08:45**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、以及 `ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的。
 
 ---
 
@@ -62,7 +62,7 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1928 passed / 0 failed / 122 target
+cargo test -j 2 --workspace              # 当前 1931 passed / 0 failed / 123 target
 pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 ```
 
@@ -119,7 +119,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 103 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 105 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -172,6 +172,7 @@ pnpm --dir apps/web run check            # 当前 46 文件 / 417 用例
 | M7 第 4 步 | 完成 | `C2.session`（2026-11-19，`bot_waits` 表 / `ctx.session.prompt` / `onResume` / 超时结算 / `bot_stop` 取消） |
 | M7 第 5 步 | 完成 | `C3.send` / `C3.notify`（2026-11-19）+ `C1.webhook`（2026-11-19，`WebhookServer` 手写 HTTP/1.1 / 三种鉴权失败统一 401 / 返回值即应答） |
 | M7 第 5.5 步 | 完成 | `C3.file`（2026-11-20，`docs/07` §3.6，项目内文件读写 / 路径钉根 / 只删空目录）+ `onStart`/`onStop`（2026-11-19，`docs/07` §4.6，含 2026-11-20 接上的 `shutdown` 触发点）+ `C2.sql`（2026-11-20，`docs/07` §5.3，每 bot 一个 `<data_dir>/bot_sql/<bot_id>.db` / 运行时禁 DDL / 迁移不阻断启动） |
+| M7 出口标准（示例项目） | 自动化那一半完成 | `examples/chat` / `examples/game` / `examples/support`（无平台凭据，`platform.kind = local`）；`crates/hbot-cli/tests/examples.rs` 逐个跑 `check_project`（清单 → 编译 → `hbot.d.ts` 未漂移）并钉死名字；`cargo xtask gen` 刷新它们的 `hbot.d.ts`、`gen --check` 拦漂移。**整体 e2e（打开示例 → 发消息 → 看到回复）仍缺**，与 V10/V11/V15 一起归 M9/M10 |
 
 ---
 
@@ -273,7 +274,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1928 passed / 122 target
+cargo test -j 2 --workspace                              # 基线：1931 passed / 123 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。
