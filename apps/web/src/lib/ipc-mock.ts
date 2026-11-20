@@ -22,10 +22,12 @@ import type {
   DeviceStatus,
   Event as CoreEvent,
   FixtureRunReport,
+  JobView,
   ReplayEntry,
   ReplayReport,
   RunLog,
   SavedFixture,
+  WaitView,
 } from '../generated'
 import type {
   BotStatus,
@@ -455,6 +457,77 @@ const mockRunLogs: Array<RunLog & { botId: string }> = []
 
 /** mock 的运行日志缓冲上界：与真机的 `logs_tail` 语义对齐（只留最近的一段）。 */
 const MOCK_RUN_LOG_LIMIT = 5_000
+
+/**
+ * 作业与等待面板的演示数据（`bot_jobs` / `bot_waits` 的数据源）。
+ *
+ * mock 里**没有作业引擎**（没有 isolate、没有 tick、没有 SQLite），所以这些行只能是
+ * 演示：形状与真机一致，状态取几条典型值，用来在浏览器里把面板画出来。
+ * 别把它接到 `bot.start` 上假装"作业真的会跑" —— 那会让 mock 下的面板骗人。
+ */
+const mockViewStart = Date.now()
+const MOCK_JOBS: JobView[] = [
+  {
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+    name: 'digest',
+    state: 'pending',
+    attempts: 0,
+    budgetMs: 60_000,
+    conversation: 'local:default',
+    nextAt: mockViewStart - 1_000,
+    lastError: null,
+    createdAt: mockViewStart - 30_000,
+  },
+  {
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2',
+    name: 'daily-report',
+    state: 'running',
+    attempts: 1,
+    budgetMs: 120_000,
+    conversation: null,
+    nextAt: mockViewStart,
+    lastError: null,
+    createdAt: mockViewStart - 90_000,
+  },
+  {
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
+    name: 'digest',
+    state: 'failed',
+    attempts: 3,
+    budgetMs: 60_000,
+    conversation: 'local:default',
+    nextAt: mockViewStart - 600_000,
+    lastError: 'HBOT_JOBS_FAILED: 清单里没有 onJob 钩子',
+    createdAt: mockViewStart - 900_000,
+  },
+]
+
+const MOCK_WAITS: WaitView[] = [
+  {
+    id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1',
+    key: 'order-no',
+    prompt: '请把订单号发给我',
+    scope: 'conversation',
+    state: 'pending',
+    conversation: 'local:default',
+    deadline: mockViewStart + 60_000,
+    remindersLeft: 1,
+    timeoutMs: 60_000,
+    createdAt: mockViewStart - 5_000,
+  },
+  {
+    id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2',
+    key: 'shipping-address',
+    prompt: '收货地址发我一下',
+    scope: 'sender',
+    state: 'expired',
+    conversation: 'local:default',
+    deadline: mockViewStart - 120_000,
+    remindersLeft: 0,
+    timeoutMs: 60_000,
+    createdAt: mockViewStart - 300_000,
+  },
+]
 
 /**
  * 把注入的文本变成 bot 的回复行：**每行一条**，前缀 `[reply] `。
@@ -915,6 +988,16 @@ export async function mockDispatch(command: Command): Promise<CommandOutputs[Com
       })
       return null
     }
+
+    // 作业与等待：mock 只有演示数据（没有作业引擎），所以这里回固定几条。
+    // 未知 bot 一律抛错，与 `bot_conversations` 同一条纪律：界面拿错 ID 时不该看到数据。
+    case 'bot_jobs':
+      if (command.botId !== BOT_ID) throw new Error(`bot_jobs: 未知 bot（${command.botId}）`)
+      return command.limit > 0 ? MOCK_JOBS.slice(0, command.limit) : MOCK_JOBS
+
+    case 'bot_waits':
+      if (command.botId !== BOT_ID) throw new Error(`bot_waits: 未知 bot（${command.botId}）`)
+      return command.limit > 0 ? MOCK_WAITS.slice(0, command.limit) : MOCK_WAITS
 
     // mock 没有 SQLite：只回本进程里试跑过的那批 run log（真机按 bot 过滤查数据库）。
     case 'logs.tail': {

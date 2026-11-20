@@ -20,6 +20,8 @@
  *   **空数组是合法结果**（这个 bot 还没有会话），所以走 `callWire` 而不是 void 变体；
  * - `bot_inject` → `bot_inject`（同名）：只回 `data: null`，本地平台的回复由
  *   `run.log` 事件逐行推来（`[reply] ` 前缀），命令本身没有返回值；
+ * - `bot_jobs` / `bot_waits` → 同名（下划线）：`data` 是作业 / 等待的**只读快照**
+ *   （新→旧，**空数组合法**），所以走 `callWire`；核心不派发、不结算，轮询安全；
  * - `agent.send` → `agent_send`（`sessionId: null` 表示新建会话，核心回 `data.sessionId`）；
  * - `agent.approve` / `edit.apply` / `edit.reject` → 同名 snake_case 命令；
  * - `search.start` / `search.cancel` → `search_start` / `search_cancel`，两者都只回
@@ -51,11 +53,13 @@ import type {
   Event as CoreEvent,
   FileContent,
   FixtureRunReport,
+  JobView,
   ProjectSummary,
   ReplayReport,
   Response,
   RunLog,
   SavedFixture,
+  WaitView,
 } from '../generated'
 import type { Command, FileNode, ProjectOpenResult, ReadFileResult, WriteFileResult } from './ipc'
 
@@ -463,6 +467,20 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
         botId: command.botId,
         conversationId: command.conversationId,
         text: command.text,
+      })
+    // 作业与等待面板（`features/run/jobs-panel.tsx`）：只读快照、新→旧、
+    // 空数组合法（这个 bot 还没跑过作业），所以走 `callWire` 而不是 void 变体。
+    case 'bot_jobs':
+      return callWire<JobView[]>('bot_jobs', {
+        type: 'bot_jobs',
+        botId: command.botId,
+        limit: command.limit,
+      })
+    case 'bot_waits':
+      return callWire<WaitView[]>('bot_waits', {
+        type: 'bot_waits',
+        botId: command.botId,
+        limit: command.limit,
       })
     case 'logs.tail':
       // `botId: null` 是全项目日志（含 Agent 行）；核心按从旧到新返回。

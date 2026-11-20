@@ -25,12 +25,14 @@ import type {
   Diagnostic as DiagnosticDto,
   Event as CoreEventDto,
   FixtureRunReport as FixtureRunReportDto,
+  JobView as JobViewDto,
   ProjectOpenResult as ProjectOpenResultDto,
   ProjectSummary as ProjectSummaryDto,
   ReplayReport as ReplayReportDto,
   RunLog as RunLogDto,
   SavedFixture as SavedFixtureDto,
   StepKind as StepKindDto,
+  WaitView as WaitViewDto,
 } from '../generated'
 import { dispatchViaTauri, isTauriRuntime, subscribeCoreEvents } from './ipc-tauri'
 import { mockDispatch, subscribeMockEvents } from './ipc-mock'
@@ -85,6 +87,21 @@ export type BotSummary = BotSummaryDto
  * 试跑要用的是 `conversationId`（`bot_inject` 的目标），不是平台侧的 `externalId`。
  */
 export type ConversationSummary = ConversationSummaryDto
+
+/**
+ * 一条后台作业的只读快照（`bot_jobs` 的 `data` 元素；生成物，勿手改）。
+ *
+ * `state` 是**开放字符串**（`pending` / `running` / `done` / `failed` / `cancelled`）：
+ * 状态集合还会长，面板遇到不认识的值按原样显示，不能 throw。
+ */
+export type JobView = JobViewDto
+
+/**
+ * 一条会话等待的只读快照（`bot_waits` 的 `data` 元素；生成物，勿手改）。
+ *
+ * `state` / `scope` 与 `JobView.state` 同一口径：开放字符串，不认识的按原样显示。
+ */
+export type WaitView = WaitViewDto
 
 /**
  * 一条诊断（问题面板的一行）。
@@ -182,6 +199,18 @@ export interface CommandInputs {
    * 命令只回 `data: null`，试跑的"回复"要从 `run.log` 事件里读（见 `features/tryrun/replies.ts`）。
    */
   bot_inject: { botId: string; conversationId: string; text: string }
+  /**
+   * 列出某个 bot 最近的**后台作业**（wire `bot_jobs`）。
+   *
+   * 这是一份**只读快照**：新→旧、`limit` 由核心夹到 200（`MAX_VIEW_LIMIT`），
+   * 不派发作业、不改状态、也不结算超时 —— 所以轮询它是安全的。
+   * **空数组是合法结果**（这个 bot 还没跑过作业），不能当成"没有数据"的错误。
+   */
+  bot_jobs: { botId: string; limit: number }
+  /**
+   * 列出某个 bot 最近的**会话等待**（wire `bot_waits`）。口径与 `bot_jobs` 完全一致。
+   */
+  bot_waits: { botId: string; limit: number }
   /**
    * 读运行日志。
    *
@@ -319,6 +348,10 @@ export interface CommandOutputs {
   bot_conversations: ConversationSummary[]
   /** 注入只回"命令已接受"（`data: null`）；bot 的回复走 `run.log` 事件。 */
   bot_inject: null
+  /** 作业快照（新→旧）；**空数组是合法结果**。 */
+  bot_jobs: JobViewDto[]
+  /** 等待快照（新→旧）；同样空数组合法。 */
+  bot_waits: WaitViewDto[]
   /** 日志行（核心按从旧到新返回，最新一行在末尾；面板按原顺序渲染）。 */
   'logs.tail': RunLogDto[]
   'agent.send': AgentSendResult

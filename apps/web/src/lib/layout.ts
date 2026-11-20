@@ -54,7 +54,8 @@ export type SidebarView = 'explorer' | 'settings'
 /**
  * 底部面板当前页签（同样随布局一起持久化）。
  * `tryrun` 是「本地试跑」面板，`device` 是「设备能力」面板（docs/09-device-capability.md），
- * `replay` 是「事件回放」面板（用当前代码重跑历史入站事件并逐条对账）。
+ * `replay` 是「事件回放」面板（用当前代码重跑历史入站事件并逐条对账），
+ * `jobs` 是「作业与等待」面板（后台作业 `C4.jobs` 与会话等待 `C2.session` 的只读快照）。
  */
 export type BottomPanelTab =
   | 'logs'
@@ -64,6 +65,7 @@ export type BottomPanelTab =
   | 'tryrun'
   | 'device'
   | 'replay'
+  | 'jobs'
 
 /** 可持久化的布局状态（只存"用户意图"，不存像素级派生值）。 */
 export interface LayoutState {
