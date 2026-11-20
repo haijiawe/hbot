@@ -169,6 +169,35 @@ fn runner() -> PlatformRunner {
     PlatformRunner::system()
 }
 
+/// 本平台上的「解释器」程序，以及让它执行一段命令所需的参数。
+///
+/// `b03` 钉的是**命令层不判断名字危不危险**这个事实，与解释器叫什么无关：Windows 上是
+/// `cmd /c <脚本>`，POSIX 上是 `sh -c <脚本>`。把 `cmd` 写死会让这条用例在 Linux 上先撞
+/// `ProgramNotFound`（`cmd` 不存在），于是它测的就不再是"命令层不兜底"而是"这台机器有没有
+/// `cmd`" —— 判据跑偏，红得也看不懂（2026-11-20 CI 实测）。
+fn platform_shell() -> (&'static str, Vec<String>) {
+    if cfg!(windows) {
+        (
+            "cmd",
+            vec!["/c".to_owned(), "echo PWNED>marker.txt".to_owned()],
+        )
+    } else {
+        (
+            "sh",
+            vec!["-c".to_owned(), "echo PWNED>marker.txt".to_owned()],
+        )
+    }
+}
+
+/// 同 [`platform_shell`]，但脚本只打印一行（不需要产生副作用时用）。
+fn platform_shell_echo() -> (&'static str, Vec<String>) {
+    if cfg!(windows) {
+        ("cmd", vec!["/c".to_owned(), "echo hi".to_owned()])
+    } else {
+        ("sh", vec!["-c".to_owned(), "echo hi".to_owned()])
+    }
+}
+
 // ── 1. 空白名单 = fail-closed ────────────────────────────────────────────────
 
 /// 防的是：**空白名单被当成"不限制"**。那样只要沙箱档是 `danger`，任何命令都能跑，
@@ -251,19 +280,20 @@ fn b02_参数里的元字符必须原样传递而不是被shell解释() {
 #[test]
 fn b03_允许cmd等于把shell装回来自证() {
     let tree = TempTree::new("b03");
-    let mut spec = CommandSpec::new("cmd", tree.path());
-    spec.allowed_programs = vec!["cmd".to_owned()];
+    let (shell, args) = platform_shell();
+    let mut spec = CommandSpec::new(shell, tree.path());
+    spec.allowed_programs = vec![shell.to_owned()];
     spec.sandbox = SandboxMode::Danger;
-    spec.args = vec!["/c".to_owned(), "echo PWNED>marker.txt".to_owned()];
+    spec.args = args;
     spec.timeout = Duration::from_secs(15);
 
     let output = runner()
         .run(spec)
-        .expect("`cmd` 在允许清单里时应当能跑（这正是风险所在）");
+        .expect("解释器在允许清单里时应当能跑（这正是风险所在）");
     let _ = output;
     assert!(
         tree.exists("marker.txt"),
-        "允许 `cmd` 却没有执行重定向 —— 若实现改成拒绝解释器，本用例连同 RT-05 一起更新"
+        "允许解释器却没有执行重定向 —— 若实现改成拒绝解释器，本用例连同 RT-05 一起更新"
     );
 }
 
@@ -401,10 +431,11 @@ fn b07_工作目录在项目外必须被拒() {
 
     // ③ 工具层：`run_command` 的 `cwd: ".."` 必须是拒绝，而不是"跑起来但落在根外"。
     //    这里必须先把 `cmd` 放进允许清单，否则会先撞上"程序不在清单内"而测不到 cwd 守卫。
+    let (shell, args) = platform_shell_echo();
     let ctx = tool_ctx(&tree);
-    let tool = RunCommandTool::with_allowed_programs(["cmd"]);
+    let tool = RunCommandTool::with_allowed_programs([shell]);
     let result = block_on(tool.run(
-        serde_json::json!({"command": "cmd", "args": ["/c", "echo hi"], "cwd": ".."}),
+        serde_json::json!({"command": shell, "args": args, "cwd": ".."}),
         &ctx,
     ));
     let error = result.expect_err("根外 cwd 必须是 Err（不是可执行的 error 结果）");

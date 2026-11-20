@@ -395,8 +395,14 @@ unsafe extern "system" fn ocr_window_proc(
     }
 }
 
-/// 夹具字体的像素高度（负值 = 字符高度，见 `CreateFontW` 的 `cHeight`）。
-const FONT_HEIGHT: i32 = -96;
+/// 夹具字号的候选（像素高度，负值 = 字符高度，见 `CreateFontW` 的 `cHeight`），从大到小。
+///
+/// **为什么要一串候选而不是一个常量**：字号决定文本宽度，文本宽度决定窗口宽度，
+/// 而窗口只要有一角超出屏幕，超出的那部分就不会被合成进 `PrintWindow` 的位图 ——
+/// OCR 读到的是被裁过的文字（2026-11-20 的 CI 就是这样红的：本机屏幕够宽，
+/// `1121` 宽的窗口全绿；runner 的虚拟屏幕只有 `1024` 宽，末尾两个字符被裁成
+/// `"HBOT WIN OCR 77"`，且 5 次重试稳定复现）。所以按**当前屏幕**取第一个放得下的字号。
+const FONT_HEIGHT_CANDIDATES: [i32; 7] = [-96, -80, -72, -64, -48, -36, -28];
 
 /// 文本左上角在客户区里的位置。
 const TEXT_LEFT: i32 = 40;
@@ -408,13 +414,13 @@ const TEXT_TOP: i32 = 100;
 /// 留一段白边比"刚好放下"稳得多。
 const TEXT_MARGIN: i32 = 120;
 
-/// 建夹具字体：96px 粗体 Segoe UI。
+/// 建夹具字体：`font_height` 像素高的粗体 Segoe UI。
 ///
 /// **画字与量字必须用同一份字体**：窗口开多大是由 [`text_extent`] 量出来的宽度决定的，
 /// 两处字体不一致就会退回"宽度靠猜"。
 ///
 /// SAFETY: 返回的 `HFONT` 由调用方 `DeleteObject` 释放。
-unsafe fn window_font() -> windows_sys::Win32::Graphics::Gdi::HFONT {
+unsafe fn window_font(font_height: i32) -> windows_sys::Win32::Graphics::Gdi::HFONT {
     use windows_sys::Win32::Graphics::Gdi::{
         ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
         FF_DONTCARE, FW_BOLD, OUT_TT_PRECIS,
@@ -424,7 +430,7 @@ unsafe fn window_font() -> windows_sys::Win32::Graphics::Gdi::HFONT {
     // SAFETY: 字体名以 NUL 结尾、调用期间存活；其余参数都是按 Win32 契约填的常量。
     let font = unsafe {
         CreateFontW(
-            FONT_HEIGHT,
+            font_height,
             0,
             0,
             0,
@@ -444,14 +450,14 @@ unsafe fn window_font() -> windows_sys::Win32::Graphics::Gdi::HFONT {
     font
 }
 
-/// 量出 [`WINDOW_TEXT`] 在夹具字体下的像素尺寸。
+/// 量出 [`WINDOW_TEXT`] 在 `font_height` 号夹具字体下的像素尺寸。
 ///
 /// **为什么要量而不是写死窗口宽度**：96px 粗体的文本宽度随字体与 DPI 变化。
 /// 2026-11-20 的 CI（`windows-latest`）就是这样红的 —— 画进去的是
 /// `"HBOT WIN OCR 7788"`，OCR 只认到 `"HBOT WIN OCR 77"`，最后两个字符落在
 /// 写死的 1100×320 客户区之外被裁掉了；而同一份代码在本机（字体度量略窄）全绿。
 /// 这类"本机绿、CI 红"的夹具问题比业务 bug 更难查，所以窗口尺寸改成按实测宽度开。
-fn text_extent() -> (i32, i32) {
+fn text_extent(font_height: i32) -> (i32, i32) {
     use windows_sys::Win32::Foundation::SIZE;
     use windows_sys::Win32::Graphics::Gdi::{
         DeleteObject, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject,
@@ -467,7 +473,7 @@ fn text_extent() -> (i32, i32) {
     }
     // SAFETY: `dc` 非空；字体在 SelectObject 之后才用，用完换回并删除。
     let (width, height) = unsafe {
-        let font = window_font();
+        let font = window_font(font_height);
         let previous = SelectObject(dc, font);
         // SAFETY: `SIZE` 是 POD；`GetTextExtentPoint32W` 只在成功时写入。
         let mut size: SIZE = std::mem::zeroed();
@@ -482,7 +488,65 @@ fn text_extent() -> (i32, i32) {
     (width, height)
 }
 
-/// 往 `hdc` 上画：[`WINDOW_TEXT`]（黑字、白底、96px 粗体）。
+/// 一次夹具窗口的布局：选定的字号、文本位置、客户区尺寸。
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    font_height: i32,
+    text_left: i32,
+    text_top: i32,
+    width: i32,
+    height: i32,
+}
+
+/// 当前屏幕的分辨率（像素）。拿不到时给一个常见的小屏尺寸。
+fn screen_extent() -> (i32, i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    // SAFETY: 两个查询都只读系统指标，没有指针参数。
+    let (width, height) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    if width <= 0 || height <= 0 {
+        (1024, 768)
+    } else {
+        (width, height)
+    }
+}
+
+/// 选一个**在当前屏幕上放得下**的布局。
+///
+/// 判据是「窗口整个落在屏幕内」，不是「文本量得出来」：窗口超出屏幕的部分不会被合成进
+/// `PrintWindow` 的位图，OCR 读到的是被裁过的文字。所以从大字号往小试，第一个
+/// `宽高都不超过屏幕` 的就是答案；画字与建窗都用它，两者不会错位。
+fn current_layout() -> Layout {
+    let (screen_width, screen_height) = screen_extent();
+    for font_height in FONT_HEIGHT_CANDIDATES {
+        let (text_width, text_height) = text_extent(font_height);
+        let width = TEXT_LEFT + text_width + TEXT_MARGIN;
+        let height = TEXT_TOP + text_height + TEXT_MARGIN;
+        if width <= screen_width && height <= screen_height {
+            return Layout {
+                font_height,
+                text_left: TEXT_LEFT,
+                text_top: TEXT_TOP,
+                width,
+                height,
+            };
+        }
+    }
+    // 连最小字号都放不下（屏幕小到不合常理）：仍用最小字号，并把窗口与文本位置都夹进屏幕，
+    // 让"窗口被裁"这件事至少不会额外发生。这时 OCR 可能仍然认不全，失败信息里会带出布局。
+    let font_height = *FONT_HEIGHT_CANDIDATES.last().expect("字号候选列表非空");
+    let (text_width, text_height) = text_extent(font_height);
+    let text_left = TEXT_LEFT.min((screen_width / 8).max(1));
+    let text_top = TEXT_TOP.min((screen_height / 8).max(1));
+    Layout {
+        font_height,
+        text_left,
+        text_top,
+        width: (text_left + text_width + TEXT_MARGIN).min(screen_width),
+        height: (text_top + text_height + TEXT_MARGIN).min(screen_height),
+    }
+}
+
+/// 往 `hdc` 上画：[`WINDOW_TEXT`]（黑字、白底、粗体）。
 ///
 /// SAFETY: 调用方保证 `hwnd`/`hdc` 有效。
 unsafe fn paint_window_text(
@@ -501,6 +565,9 @@ unsafe fn paint_window_text(
     // SAFETY: `hwnd` 有效；`&mut rect` 指向栈上有效内存。
     unsafe { GetClientRect(hwnd, &mut rect) };
     let units: Vec<u16> = WINDOW_TEXT.encode_utf16().collect();
+    // 用**这个窗口建出来时选定的**字号与位置，而不是常量：两者必须一致，
+    // 否则"按 A 号字量出的窗口"里画的是 B 号字，要么贴边要么留白过多。
+    let layout = current_layout();
     // SAFETY: `hdc` 有效；画笔画完即删；字体由 `window_font` 建、用完即删；`units` 调用期间存活。
     unsafe {
         let brush = CreateSolidBrush(0x00FF_FFFF); // COLORREF：白
@@ -508,11 +575,17 @@ unsafe fn paint_window_text(
         let _ = FillRect(hdc, &rect, brush);
         DeleteObject(brush);
 
-        let font = window_font();
+        let font = window_font(layout.font_height);
         let previous = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT as i32);
         SetTextColor(hdc, 0x0000_0000); // COLORREF：黑
-        TextOutW(hdc, TEXT_LEFT, TEXT_TOP, units.as_ptr(), units.len() as i32);
+        TextOutW(
+            hdc,
+            layout.text_left,
+            layout.text_top,
+            units.as_ptr(),
+            units.len() as i32,
+        );
         SelectObject(hdc, previous);
         DeleteObject(font);
     }
@@ -544,13 +617,12 @@ impl TestWindow {
             .collect();
         let title_units: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
-        // **客户区按实测文本宽度开，不写死**：96px 粗体的文本宽度随字体与 DPI 变化。
-        // 2026-11-20 的 CI（`windows-latest`）就是这样红的 —— 画进去的是
-        // `"HBOT WIN OCR 7788"`，OCR 只认到 `"HBOT WIN OCR 77"`：最后两个字符落在
-        // 写死的 1100×320 之外被裁掉了，而本机（字体度量略窄）全绿。
-        let (text_width, text_height) = text_extent();
-        let window_width = TEXT_LEFT + text_width + TEXT_MARGIN;
-        let window_height = TEXT_TOP + text_height + TEXT_MARGIN;
+        // **客户区按"当前屏幕上放得下的实测文本尺寸"开，不写死**：文本宽度随字体、DPI
+        // 与字号变化，而窗口只要有一角在屏幕外，超出的部分就不会被合成进 `PrintWindow`
+        // 的位图。2026-11-20 的 CI（`windows-latest`）两轮都是这样红的：第一轮写死
+        // 1100×320，末尾两个字符被裁；第二轮按文本量出 1121 宽，仍然比 runner 的
+        // 1024 宽屏幕大，于是 5 次重试稳定认成 `"HBOT WIN OCR 77"`。
+        let layout = current_layout();
 
         // SAFETY: 所有指针都指向调用期间存活的、以 NUL 结尾的 UTF-16 缓冲区。
         unsafe {
@@ -577,10 +649,10 @@ impl TestWindow {
                 class_name.as_ptr(),
                 title_units.as_ptr(),
                 WS_POPUP, // 无标题栏：PrintWindow 抓到的就是纯客户区
-                100,
-                100,
-                window_width,
-                window_height,
+                0,        // 贴左上角：屏幕越小，能用的区域越应该留给窗口本身
+                0,
+                layout.width,
+                layout.height,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 instance,
@@ -702,7 +774,11 @@ fn window_ocr_reads_text_from_a_real_window() {
         }
         window.settle(); // 再抽一会儿消息，让 DWM 把这一帧合成出来
     }
-    panic!("窗口里画的字没认全：画的是 {WINDOW_TEXT:?}，认出来是 {last:?}");
+    panic!(
+        "窗口里画的字没认全：画的是 {WINDOW_TEXT:?}，认出来是 {last:?}；屏幕 {screen:?}、布局 {layout:?}",
+        screen = screen_extent(),
+        layout = current_layout(),
+    );
 }
 
 /// **最小化窗口不是可读窗口**：必须是明确错误，绝不返回空串冒充"窗口里没字"。

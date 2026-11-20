@@ -547,3 +547,26 @@
     ② 分流后的弱断言**不是放水**：改成「拒绝 **或** 落点仍在根内」（`reject_or_contained_for_windows_names`），
     逃逸仍然必红，只是不再要求「合法名字也必须拒」；③ Windows 分支保持原样（必须拒绝 + 文案关键字），
     别为了两边都能过就把断言删成 `let _ =`。
+
+123. **安全用例里的「解释器」不能写死某个平台的名字**（2026-11-20，CI 的 ubuntu 红）。
+    `crates/hbot-redteam/tests/b_command_injection.rs` 的 `b03`（钉「命令层不判断名字危不危险」）与
+    `b07` 第③段（钉「`run_command` 的 `cwd: ".."` 必须拒」）都把被测程序写成字面量 `"cmd"`。
+    Windows 上它存在，用例绿；Linux 上没有 `cmd`，于是 `b03` 红在 `ProgramNotFound { program: "cmd" }`、
+    `b07` 的③段还没走到 cwd 守卫就先撞「找不到可执行文件」（`b08` / `b09` 因为接受 `ProgramNotFound`
+    才幸免）。**这两条要钉的都不是「这台机器有没有 cmd」**，所以判据跑偏了。
+    做法：抽出 `platform_shell()` / `platform_shell_echo()` 返回 `(程序名, 参数)` ——
+    Windows 给 `("cmd", ["/c", 脚本])`，其它给 `("sh", ["-c", 脚本])`；断言口径一字不改。
+    判据：**安全用例的对照组要跨平台等价**，写死 `cmd`/`powershell`/`echo`/`/bin/sh` 都会在另一个平台
+    变成「测这台机器装了什么」。
+
+124. **夹具窗口「按文本量宽度」还不够，还要「整个落在屏幕内」**（2026-11-20，CI 的 windows 红，两轮）。
+    `crates/hbot-device/tests/windows_desktop.rs` 的按窗口 OCR 夹具第一轮写死 `1100×320` → CI 上末尾两个
+    字符被裁（认成 `"HBOT WIN OCR 77"`）；改成按 `GetTextExtentPoint32W` 实测文本宽度开窗（本机量到
+    `1121` 宽）→ **仍然红，且 5 次重试稳定复现**，因为 `windows-latest` runner 的虚拟屏幕只有 1024 宽，
+    窗口右边超出的部分**不会被合成进 `PrintWindow` 的位图**（`PrintWindow` 返回成功，但位图里就是没有）。
+    做法：字号改成候选列表 `FONT_HEIGHT_CANDIDATES = [-96,-80,-72,-64,-48,-36,-28]`，新增
+    `screen_extent()`（`GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`）与 `current_layout()` —— 从大字号往小试，
+    取第一个 `宽高都不超过屏幕` 的布局，**画字与建窗共用同一个 `Layout`**（否则「按 A 号字量、画 B 号字」），
+    窗口贴 `(0,0)` 而不是 `(100,100)`。失败信息里带出 `screen_extent()` 与实际布局，下一轮红就能直接看出是尺寸问题。
+    判据：**「稳定地少最后几个字」= 几何裁切，「偶发空串」= DWM 还没合成** —— 两者要分开处理（后者靠重试，
+    前者重试一万次也没用）。同族：任何「按内容量出尺寸」的夹具都要再夹一层「不超过宿主可视区域」。
