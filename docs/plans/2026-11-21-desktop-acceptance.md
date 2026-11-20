@@ -3,6 +3,8 @@
 > 用户 2026-11-21 02:51 指示：「你把他们做了吧，写执行文档吧，准备子代理开发吧」。
 > 本文是三个单元的**完整任务书**：每个单元自带背景、入口、判据、产出与禁止项，**不需要读别的对话**就能开工。
 > 决策权在 lead；子代理只在被指派单元内做决定，跨界必须先问。
+>
+> **执行状态（2026-11-21 05:45）：三个单元全部完成。** A → `docs/spikes/S14-desktop-acceptance.md`（安装包冒烟 11 项 PASS、五支 `scripts/verify-*.ps1` 全 0）；B → `scripts/soak-serve.ps1` + `scripts/soak-client.mjs` + `docs/spikes/S15-soak.md`（120 分钟九条判据全 PASS，首轮抓到无头宿主缺事件桥，已修 commit `5082afc`）；C → `docs/quickstart-desktop.md` + 两条零配置修复（新建项目自带 `bots.json`、`bot_list` 合并声明，commit `8009162`）。
 
 ## 0. 三个单元总览
 
