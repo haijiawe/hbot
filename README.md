@@ -70,8 +70,8 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | 技术栈 ADR | Proposed（`0002`；转 Accepted 还差 QuickJS 长跑、真 OneBot 网关、macOS 隔离） |
 | 架构 / 目录 / 计划 / 闸门 / IDE | Draft，已按实现回填实测口径（`02`–`06`） |
 | 代码 | **已落地 M0–M2 主体 + M3/M4/M5 绝大部分 + C6 设备能力窄版（Windows）+ M7 第 1–5.5 步全部（`ctx.kv` / `ctx.history` / `ctx.ai` / `onSchedule`（旧名 `onTimer`）/ `ctx.jobs` / `ctx.session` / `ctx.sql`）+ `ctx.send` / `ctx.notify` / `ctx.webhook`（`onWebhook`）+ `onStart` / `onStop` + `ctx.files` + `ctx.device.screen({ window })`（按窗口截图）**（`crates/` 下 16 个 crate + `xtask`，`apps/web` 可构建） |
-| 测试 | 最近一次 `cargo test --workspace`：**1978 passed / 0 failed**（125 个 target，`rustc 1.100.0`）；`apps/web`：47 文件 427 用例 |
-| CI | GitHub Actions 已真跑（`haijiawe/hbot`，private）：`gates` / `web` / `bundle (ubuntu)` 绿；`rust` 首次红在 `clippy::result_large_err`（CI 的 clippy 比本地新），已修并把 Rust 版本钉死到 `1.100.0`（`rust-toolchain.toml` + `ci.yml` 两处） |
+| 测试 | 最近一次 `cargo test --workspace`：**1979 passed / 0 failed**（125 个 target，`rustc 1.100.0`）；`apps/web`：47 文件 427 用例 |
+| CI | GitHub Actions 已真跑（`haijiawe/hbot`，private）：`gates` / `web` / `bundle (ubuntu)` / `bundle (windows)` 与 `rust` 的 `fmt`+`clippy`（两平台）全绿。首跑抓到的六处红点已修：`clippy::result_large_err`、工具链未钉版本（现 `1.100.0`）、Linux-only `unused import`、OCR 夹具写死像素尺寸、runner 磁盘耗尽、设置 watcher 的 mtime 盲点（见 `docs/pitfalls.md` 坑 115–118） |
 | 真机验证 | QQ 官方群/私聊被动回复已端到端跑通（`docs/spikes/S9-e2e-qq-official.md`）；Windows NSIS 安装包 9.14 MiB、安装冒烟 11/11；Windows 设备能力（截屏/原生 OCR/输入/多显示器）真机验证；DPI 声明 `unaware → per-monitor-v2` 实测 |
 | 未完成 | M6 迁移/影子（缺测试账号）、云端执行宿主（`M9` 只剩真机那一半：`wss`/多客户端 token/备份/24h 验收；本地可做的一半已落地，见 `docs/08` §9.3.1）、真 NapCat 登录（需扫码且二维码会过期）、Linux/macOS 运行（Landlock 只交叉编译过、一次没真跑）、设备混合 DPI 跨屏拼图/中文以外的 OCR 语言包、附件型出站（`ctx.sendFile`）与手机宿主 |
 
