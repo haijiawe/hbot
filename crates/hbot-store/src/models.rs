@@ -458,6 +458,10 @@ pub struct WaitRow {
     pub fulfilled_message_id: Option<String>,
     /// 注册时刻（Unix 毫秒）。
     pub created_at: i64,
+    /// 还能重发几次提示（0 = 到点就 expired）。
+    pub reminders_left: u8,
+    /// 每一轮等多久（Unix 毫秒）；重发时用它推后 `deadline`。
+    pub timeout_ms: i64,
 }
 
 /// 待注册的一条等待（[`crate::Store::register_wait`] 的入参）。
@@ -484,4 +488,8 @@ pub struct NewWait {
     pub deadline: i64,
     /// 注册时刻（Unix 毫秒）。
     pub created_at: i64,
+    /// 超时后还能重发几次提示（0 = 不重发，缺省语义）。
+    pub reminders_left: u8,
+    /// 每一轮等多久（Unix 毫秒）；重发时用它推后 `deadline`。
+    pub timeout_ms: i64,
 }

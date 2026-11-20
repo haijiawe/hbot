@@ -63,6 +63,8 @@ pub(crate) fn register(conn: &Connection, bot_id: &BotId, wait: &NewWait) -> Res
             wait.deadline,
             wait.created_at,
             wait.created_at,
+            i64::from(wait.reminders_left),
+            wait.timeout_ms,
         ],
     );
     match inserted {
@@ -135,6 +137,50 @@ pub(crate) fn expire_due(
         let mapped = statement.query_map(
             params![
                 STATE_EXPIRED,
+                now,
+                now,
+                bot_id.to_string(),
+                STATE_PENDING,
+                i64::from(limit),
+            ],
+            row_to_wait,
+        )?;
+        let mut waits = Vec::new();
+        for row in mapped {
+            waits.push(row?);
+        }
+        waits
+    };
+    transaction.commit()?;
+    Ok(rows)
+}
+
+/// 把到点但**还有重发额度**的等待推后一轮，返回推后之后的那些行。
+///
+/// 调用方（`tick_waits`）拿到返回的行就把 `prompt` 再发一遍。与 [`expire_due`] 分工：
+/// 这条只处理 `reminders_left > 0`，那边只处理 `reminders_left = 0` —— 两个判据互斥，
+/// 同一行不会在一条拍里既被重发又被判超时。
+///
+/// `deadline` 从 `now` 起算而不是从旧 `deadline` 起算：tick 落后时（进程被挂起、库忙）
+/// 从旧值加一轮会得到仍然过期的时刻，于是下一拍立刻再重发一次 —— 那是「补发」而不是
+/// 「重问」，用户会收到一串连着来的相同提问。从 `now` 起算最多损失一点精度，换的是
+/// 「每次重发之间真的隔了一轮」。
+///
+/// `limit == 0` 直接返回空表（同 [`expire_due`] 的口径）。
+pub(crate) fn promote_reminders(
+    conn: &Connection,
+    bot_id: &BotId,
+    now: i64,
+    limit: u32,
+) -> Result<Vec<WaitRow>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let transaction = conn.unchecked_transaction()?;
+    let rows = {
+        let mut statement = transaction.prepare(PROMOTE_SQL)?;
+        let mapped = statement.query_map(
+            params![
                 now,
                 now,
                 bot_id.to_string(),
@@ -239,11 +285,14 @@ fn row_to_wait(row: &rusqlite::Row<'_>) -> rusqlite::Result<WaitRow> {
         deadline: row.get(7)?,
         fulfilled_message_id: row.get(8)?,
         created_at: row.get(9)?,
+        reminders_left: u8::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+        timeout_ms: row.get(11)?,
     })
 }
 
 const SELECT_COLUMNS: &str = "SELECT id, key, prompt, owner, scope, state, \
-     conversation_external_id, deadline, fulfilled_message_id, created_at FROM bot_waits";
+     conversation_external_id, deadline, fulfilled_message_id, created_at, reminders_left, \
+     timeout_ms FROM bot_waits";
 
 /// 注册一条等待。
 ///
@@ -251,8 +300,8 @@ const SELECT_COLUMNS: &str = "SELECT id, key, prompt, owner, scope, state, \
 /// 的等待（超时的、被回答的）可以共存，只有「还开着的那条」唯一。
 const INSERT_SQL: &str = "\
 INSERT INTO bot_waits (id, bot_id, conversation_id, conversation_external_id, owner, key, \
-     prompt, scope, state, deadline, created_at, updated_at) \
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+     prompt, scope, state, deadline, created_at, updated_at, reminders_left, timeout_ms) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
 
 /// 读「挡路的那条 pending」的键（只在唯一索引冲突时用）。
 const PENDING_KEY_SQL: &str = "\
@@ -272,18 +321,31 @@ WHERE id = (\
     ORDER BY created_at DESC LIMIT 1\
 ) \
 RETURNING id, key, prompt, owner, scope, state, conversation_external_id, deadline, \
-          fulfilled_message_id, created_at";
+          fulfilled_message_id, created_at, reminders_left, timeout_ms";
 
 /// 超时结算：把 db 已到期的 pending 一批改成 expired 并返回。
 const EXPIRE_SQL: &str = "\
 UPDATE bot_waits SET state = ?1, updated_at = ?2 \
 WHERE id IN (\
     SELECT id FROM bot_waits \
-    WHERE bot_id = ?4 AND state = ?5 AND deadline <= ?3 \
+    WHERE bot_id = ?4 AND state = ?5 AND deadline <= ?3 AND reminders_left = 0 \
     ORDER BY deadline LIMIT ?6\
 ) \
 RETURNING id, key, prompt, owner, scope, state, conversation_external_id, deadline, \
-          fulfilled_message_id, created_at";
+          fulfilled_message_id, created_at, reminders_left, timeout_ms";
+
+/// 重发：把到点但还有额度的 pending 行推后一轮（`deadline = now + timeout_ms`），
+/// 额度减一，返回推后后的行。
+const PROMOTE_SQL: &str = "\
+UPDATE bot_waits SET deadline = ?1 + timeout_ms, reminders_left = reminders_left - 1, \
+     updated_at = ?2 \
+WHERE id IN (\
+    SELECT id FROM bot_waits \
+    WHERE bot_id = ?3 AND state = ?4 AND deadline <= ?2 AND reminders_left > 0 \
+    ORDER BY deadline LIMIT ?5\
+) \
+RETURNING id, key, prompt, owner, scope, state, conversation_external_id, deadline, \
+          fulfilled_message_id, created_at, reminders_left, timeout_ms";
 
 /// 取消一条等待（只动 pending）。
 const CANCEL_SQL: &str = "\
@@ -299,7 +361,8 @@ mod tests {
     use super::*;
     use crate::StoreError;
     use crate::test_support::{
-        TempDir, bot_id, conversation_id, new_wait, open_store, raw, wait_id,
+        TempDir, bot_id, conversation_id, new_wait, new_wait_with_reminders, open_store, raw,
+        wait_id,
     };
 
     /// 状态与 scope 常量必须与 core 的枚举拼写逐字一致 —— 跨 crate 的隐性契约。
@@ -585,5 +648,101 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM bot_waits", [], |row| row.get(0))
             .expect("count waits");
         assert_eq!(left, 0, "bot 行删掉后等待行必须级联消失");
+    }
+
+    /// 到点但还有额度的等待被**推后一轮**，而不是直接判超时。
+    #[test]
+    fn a_wait_with_reminders_is_pushed_back_instead_of_expiring() {
+        let dir = TempDir::new("waits-promote");
+        let store = open_store(&dir);
+        store
+            .register_wait(
+                &bot_id(),
+                &new_wait_with_reminders(7, "order-no", "u1", 1_000, 1),
+            )
+            .expect("register");
+
+        // 到点那一刻：先重发（不落 expired），行还在 pending、额度减一。
+        let promoted = store
+            .promote_wait_reminders(&bot_id(), 61_000, 8)
+            .expect("promote");
+        assert_eq!(promoted.len(), 1, "到点必须被重发一次");
+        assert_eq!(promoted[0].state, STATE_PENDING, "重发不是终态");
+        assert_eq!(promoted[0].reminders_left, 0, "额度用掉一次");
+        assert_eq!(
+            promoted[0].deadline,
+            61_000 + 60_000,
+            "按 now + timeout 推后一轮（不是从旧 deadline 加）"
+        );
+        assert!(
+            store
+                .expire_due_waits(&bot_id(), 61_000, 8)
+                .expect("expire")
+                .is_empty(),
+            "额度用尽之前的行不该被判超时"
+        );
+        let expired = store
+            .expire_due_waits(&bot_id(), 121_000, 8)
+            .expect("expire after the reminder");
+        assert_eq!(expired.len(), 1, "第二轮到点才落 expired");
+        assert_eq!(expired[0].state, STATE_EXPIRED);
+    }
+
+    /// 两个判据互斥：同一拍里 `promote` 拿走的行，`expire` 不会同时拿到。
+    #[test]
+    fn promote_and_expire_never_claim_the_same_row() {
+        let dir = TempDir::new("waits-promote-exclusive");
+        let store = open_store(&dir);
+        store
+            .register_wait(
+                &bot_id(),
+                &new_wait_with_reminders(7, "order-no", "u1", 1_000, 1),
+            )
+            .expect("register");
+        assert_eq!(
+            store
+                .promote_wait_reminders(&bot_id(), 61_000, 8)
+                .expect("promote")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .promote_wait_reminders(&bot_id(), 61_000, 8)
+                .expect("second promote")
+                .is_empty(),
+            "额度已经用尽，第二拍不该再推后"
+        );
+        assert!(
+            store
+                .expire_due_waits(&bot_id(), 61_000, 8)
+                .expect("expire")
+                .is_empty(),
+            "deadline 已经被推后，这一拍没到点"
+        );
+    }
+
+    /// 没有额度（缺省）的等待直接过期：老行为一字不改。
+    #[test]
+    fn a_wait_without_reminders_expires_at_once() {
+        let dir = TempDir::new("waits-no-reminders");
+        let store = open_store(&dir);
+        store
+            .register_wait(&bot_id(), &new_wait(7, "order-no", "u1", 1_000))
+            .expect("register");
+        assert!(
+            store
+                .promote_wait_reminders(&bot_id(), 61_000, 8)
+                .expect("promote")
+                .is_empty(),
+            "没额度就不该被推后"
+        );
+        assert_eq!(
+            store
+                .expire_due_waits(&bot_id(), 61_000, 8)
+                .expect("expire")
+                .len(),
+            1
+        );
     }
 }

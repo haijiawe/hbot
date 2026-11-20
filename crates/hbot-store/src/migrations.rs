@@ -61,6 +61,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "0007_bot_waits",
         sql: include_str!("migrations/0007_bot_waits.sql"),
     },
+    Migration {
+        version: 8,
+        name: "0008_bot_wait_reminders",
+        sql: include_str!("migrations/0008_bot_wait_reminders.sql"),
+    },
 ];
 
 /// 本二进制支持的最新版本。

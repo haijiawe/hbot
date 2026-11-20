@@ -362,6 +362,13 @@ enum StoreOp {
         limit: u32,
         reply: Reply<Vec<WaitRow>>,
     },
+    /// 重发：把到点但还有额度的等待推后一轮并返回它们。
+    PromoteWaitReminders {
+        bot_id: BotId,
+        now: i64,
+        limit: u32,
+        reply: Reply<Vec<WaitRow>>,
+    },
     /// 读这个会话当前未结的那条等待。
     CurrentWait {
         bot_id: BotId,
@@ -1113,6 +1120,22 @@ impl Store {
         })
     }
 
+    /// 把到点但还有重发额度的等待推后一轮，返回推后之后的那些行。
+    pub fn promote_wait_reminders(
+        &self,
+        bot_id: &BotId,
+        now: i64,
+        limit: u32,
+    ) -> Result<Vec<WaitRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::PromoteWaitReminders {
+            bot_id,
+            now,
+            limit,
+            reply,
+        })
+    }
+
     /// 读这个会话当前未结的那条等待；没有返回 `Ok(None)`。
     pub fn current_wait(
         &self,
@@ -1791,6 +1814,17 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::waits::expire_due(&connection, &bot_id, now, limit),
+                );
+            }
+            StoreOp::PromoteWaitReminders {
+                bot_id,
+                now,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::waits::promote_reminders(&connection, &bot_id, now, limit),
                 );
             }
             StoreOp::CurrentWait {

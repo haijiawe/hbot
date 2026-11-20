@@ -1481,8 +1481,8 @@ fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
     let store = Store::open(dir.db_path()).expect("open and upgrade v4 store");
     assert_eq!(
         store.schema_version().expect("schema version"),
-        7,
-        "从 0004 打开必须一路升到 0007_bot_waits（不是只升到 0006）"
+        8,
+        "从 0004 打开必须一路升到 0008_bot_wait_reminders（不是只升到 0007）"
     );
     assert_eq!(
         store.journal_mode().expect("journal mode"),
@@ -1513,7 +1513,7 @@ fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
     let user_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user_version");
-    assert_eq!(user_version, 7, "user_version 必须推进到最新一版");
+    assert_eq!(user_version, 8, "user_version 必须推进到最新一版");
 
     let recorded: Vec<(i64, String)> = conn
         .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
@@ -1522,7 +1522,7 @@ fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
         .expect("query schema_migrations")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect schema_migrations");
-    assert_eq!(recorded.len(), 7, "0001–0007 各登记一行");
+    assert_eq!(recorded.len(), 8, "0001–0008 各登记一行");
     assert_eq!(
         recorded[4],
         (5, "0005_bot_kv".to_owned()),
@@ -1537,6 +1537,11 @@ fn upgrading_from_0004_creates_bot_kv_and_keeps_existing_rows() {
         recorded[6],
         (7, "0007_bot_waits".to_owned()),
         "第 7 行必须是 0007_bot_waits"
+    );
+    assert_eq!(
+        recorded[7],
+        (8, "0008_bot_wait_reminders".to_owned()),
+        "第 8 行必须是 0008_bot_wait_reminders"
     );
 
     // 表结构：列名/顺序/非空与 TTL 可空性都按契约；主键已承担 (bot_id, key) 唯一索引，

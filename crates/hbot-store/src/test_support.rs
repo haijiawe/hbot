@@ -101,6 +101,23 @@ pub(crate) fn new_wait(id: u128, key: &str, owner: &str, at: i64) -> NewWait {
         scope: "sender".to_owned(),
         deadline: at + 60_000,
         created_at: at,
+        // 缺省不重发（与 `WaitSpec::reminders` 的缺省一致）。
+        reminders_left: 0,
+        timeout_ms: 60_000,
+    }
+}
+
+/// 造一条「到点后还能重发 `reminders` 次」的待注册等待（P5 的重发路径用它）。
+pub(crate) fn new_wait_with_reminders(
+    id: u128,
+    key: &str,
+    owner: &str,
+    at: i64,
+    reminders: u8,
+) -> NewWait {
+    NewWait {
+        reminders_left: reminders,
+        ..new_wait(id, key, owner, at)
     }
 }
 /// 一次测试独占的临时目录。
