@@ -264,6 +264,36 @@ enum StoreOp {
         now: i64,
         reply: Reply<()>,
     },
+    /// 读一个 bot 的文件占用（`C3.file` 的磁盘配额）。没有行 = 0。
+    ///
+    /// **必须与写同序**（走 db 线程而不是只读池）：写文件之前的「查额度」必须看到
+    /// 上一次写已经记上的账，否则同一拍里的两次写会都以为自己还有空间。
+    FileUsage {
+        bot_id: BotId,
+        reply: Reply<u64>,
+    },
+    /// 原子预留一段文件额度；超出上限返回 `None` 且**一行都不改**。
+    ReserveFileUsage {
+        bot_id: BotId,
+        delta: u64,
+        limit: u64,
+        now: i64,
+        reply: Reply<Option<u64>>,
+    },
+    /// 释放一段文件额度（删文件、覆盖写变短）；减到 0 时删行。
+    ReleaseFileUsage {
+        bot_id: BotId,
+        delta: u64,
+        now: i64,
+        reply: Reply<u64>,
+    },
+    /// 把占用直接设成某个值（对账用，生产热路径不调用）。
+    SetFileUsage {
+        bot_id: BotId,
+        bytes: u64,
+        now: i64,
+        reply: Reply<()>,
+    },
     /// 合成 `inbound` / `outbound` 的会话历史，最近 `limit` 条、升序。
     ///
     /// **生产读路径不走这个变体**：历史只追加、不回读刚写的行，所以
@@ -1079,6 +1109,60 @@ impl Store {
             reply,
         })
     }
+    /// 读一个 bot 当前的文件占用；没有行 = 0。
+    ///
+    /// 走 db 线程（不是只读池）的理由与 [`Store::get_kv`] 相同：**顺序可见性**。
+    /// 「写文件 → 记账 → 再写一个文件时查额度」这条链上，查必须看到刚记上的账。
+    pub fn file_usage(&self, bot_id: &BotId) -> Result<u64> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::FileUsage { bot_id, reply })
+    }
+
+    /// 原子预留 `delta` 字节的文件额度；成功返回预留之后的总占用。
+    ///
+    /// `limit == 0` 表示不限。超出上限返回 `Ok(None)` 且一行都不改 —— 调用方据此报
+    /// `HBOT_FILE_QUOTA`。**判据在一条 SQL 里**（见 `repositories/files_usage.rs` 的模块文档）：
+    /// 「先读再判再加」在跨会话并行下会让两个写都通过。
+    pub fn reserve_file_usage(
+        &self,
+        bot_id: &BotId,
+        delta: u64,
+        limit: u64,
+        now: i64,
+    ) -> Result<Option<u64>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ReserveFileUsage {
+            bot_id,
+            delta,
+            limit,
+            now,
+            reply,
+        })
+    }
+
+    /// 释放 `delta` 字节的文件额度；返回释放之后的总占用（减到 0 时行被删掉）。
+    pub fn release_file_usage(&self, bot_id: &BotId, delta: u64, now: i64) -> Result<u64> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ReleaseFileUsage {
+            bot_id,
+            delta,
+            now,
+            reply,
+        })
+    }
+
+    /// 把占用直接设成 `bytes`（对账用：用户在 IDE 里手工删了文件之后重算）。
+    ///
+    /// 生产热路径**不调用**它：配额账本只按写/删增减，扫树对账是显式动作。
+    pub fn set_file_usage(&self, bot_id: &BotId, bytes: u64, now: i64) -> Result<()> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::SetFileUsage {
+            bot_id,
+            bytes,
+            now,
+            reply,
+        })
+    }
 
     /// 注册一条会话等待（`ctx.session.prompt` 的落库动作）。
     ///
@@ -1745,6 +1829,43 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::kv::set_many(&connection, &bot_id, &entries, now),
+                );
+            }
+            StoreOp::FileUsage { bot_id, reply } => {
+                reply_send(reply, repositories::files_usage::used(&connection, &bot_id));
+            }
+            StoreOp::ReserveFileUsage {
+                bot_id,
+                delta,
+                limit,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::files_usage::reserve(&connection, &bot_id, delta, limit, now),
+                );
+            }
+            StoreOp::ReleaseFileUsage {
+                bot_id,
+                delta,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::files_usage::release(&connection, &bot_id, delta, now),
+                );
+            }
+            StoreOp::SetFileUsage {
+                bot_id,
+                bytes,
+                now,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::files_usage::set(&connection, &bot_id, bytes, now),
                 );
             }
             StoreOp::EnqueueJob { bot_id, job, reply } => {

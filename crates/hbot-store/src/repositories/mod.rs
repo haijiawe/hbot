@@ -6,6 +6,7 @@
 pub(crate) mod bot;
 pub(crate) mod conversation;
 pub(crate) mod device;
+pub(crate) mod files_usage;
 pub(crate) mod history;
 pub(crate) mod inbound;
 pub(crate) mod jobs;
