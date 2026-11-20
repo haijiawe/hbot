@@ -96,7 +96,7 @@ Agent 写代码；宿主只提供能力与约束；平台差异全部收在适�
 | **客服**（工单/知识库/转人工） | `message` `webhook` | `sql` `session` | `reply` `send` `http` | `ai` `notify` | **齐了** |
 | **玩游戏**（截图+键鼠） | `timer` | `sql` | `device` | `wasm`/`jobs` | **一半**：设备面、定时、`sql`、`jobs` 都有，缺 `wasm` |
 
-> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer/onSchedule + C1.webhook + C1.lifecycle + C2.kv/history/session/sql + C3.reply/send/notify/http/file + C4.jobs + C5.ai + C6.device 这几个口子**。截至 2026-11-20，`docs/07` 列出的能力面已全部开到位；剩下的不是能力缺口，而是**平台覆盖**（macOS/Linux 设备面、手机宿主）与**附件型出站**（`ctx.sendFile`），见 §11。
+> 这张表就是「为什么现在只能写一种 bot」的准确回答：**不是语言不够，是宿主只开了 C1.message + C1.timer/onSchedule + C1.webhook + C1.lifecycle + C2.kv/history/session/sql + C3.reply/send/notify/http/file + C4.jobs + C5.ai + C6.device 这几个口子**。截至 2026-11-20，`docs/07` 列出的能力面已全部开到位（含附件出站 `ctx.sendImage` / `ctx.sendFile`，见 §3.4.1）；剩下的不是能力缺口，而是**平台覆盖**（macOS/Linux 设备面、手机宿主、QQ 官方接口的媒体上传），见 §11。
 
 ### 3.2 能力怎么声明
 
@@ -208,7 +208,50 @@ export default defineBot({
 
 **实测**（`hbot-rpc` 的 `tests/send_capability.rs`，7 条，全走 `Dispatcher` 真派发 + 真库）：没声明 → `NOT_DECLARED`；声明后正文真的经 `replies` → `outbound` → `local` 适配器落成 `[reply] …` 日志行；库里查得到的会话不必给 `kind`；查不到又没给 `kind` → `NO_TARGET` 且**不留会话行**；显式 `kind: 'group'` 会补建 `conversations` 行且类型照调用点（不许猜成私聊）；只声明 `send` 时 `notify` 仍报 `NOT_DECLARED`；声明了 `notify` 目标后正文发到清单那个会话。存储层另有 1 条钉住幂等补建（第二次返回 `false` 且不覆盖已有行）。
 
-**还没做**：附件（`sendFile` / `sendImage`，正负清单里已换成这三条精确条目）；`ctx.send` 的返回值只到「交给出站队列」，平台侧回执由 sender 的重试与 `mark_outbound_sent` 记录、不回传 handler；`notify` 只有单一目标（管理员与工单分档未做）。
+**还没做**：`ctx.send` 的返回值只到「交给出站队列」，平台侧回执由 sender 的重试与 `mark_outbound_sent` 记录、不回传 handler；`notify` 只有单一目标（管理员与工单分档未做）；附件只覆盖 OneBot（QQ 官方接口没有媒体上传，要另开一条路，见 §3.4.1 末尾）。
+
+### 3.4.1 已落地：附件出站（`ctx.sendImage` / `ctx.sendFile`，2026-11-20）
+
+```ts
+export default defineBot({
+  async onMessage(ctx) {
+    // 路径相对项目根；宿主核验「根内 + 存在 + 普通文件 + ≤ 5 MiB」后才入队
+    await ctx.sendImage("group:987654", "assets/logo.png");
+    // 附件可以单独发（正文为空是合法的：用户只说「把这个发给张三」）
+    await ctx.sendFile("group:987654", "reports/day.csv");
+  },
+})
+```
+
+**六道判据，一层一份**：
+
+| 层 | 判据 | 位置 | 没过的症状 |
+|---|---|---|---|
+| 声明层 | 清单 `capabilities.send`（附件**不另开**开关） | `hbot-code` 的 `SendSlot::send_attachment` | `HBOT_SEND_NOT_DECLARED` |
+| 参数层 | 会话非空 ≤ 128 字节；路径非空 ≤ 512 字节、无 NUL、不是绝对路径、无 `..` 段；`kind` 只认 `image` / `file` | `hbot-core` 的 `validate_attachment`（唯一一份） | `HBOT_SEND_INVALID` |
+| 宿主层 | `canonicalize()` 之后仍在项目根内、存在、是普通文件、≤ `MAX_OUTBOUND_ATTACHMENT_BYTES`（5 MiB） | `hbot-rpc` 的 `StoreSendQueue::resolve_attachment` | `HBOT_SEND_FAILED`（文案说是不存在 / 越界 / 超限） |
+| 装配层 | 宿主有没有 `set_egress` | `SendSlot::is_assembled` | `HBOT_SEND_UNAVAILABLE` |
+| 通道层 | supervisor 的 `replies` 通道；落 `outbound` 行时 `kind = attachment` + `attachment_json` | `StoreSendQueue::send_attachment` → `Outbox::enqueue` | `HBOT_SEND_FAILED` |
+| 平台层 | 适配器读文件 → `base64://…` 段（`image` 段 / `file` 段 + `name`） | `hbot-adapters` 的 `attachment_segment`；`OneBotAdapter::send` 在 `spawn_blocking` 里编码 | sender 重试 → 死信（**不降级成只发正文**） |
+
+**七条设计决定与理由**：
+
+1. **请求与引用是两个类型**：`AttachmentRequest` 是用户给了什么（相对项目的路径），`AttachmentRef` 是宿主核验后是什么（绝对路径 + 类型）。合成一个类型就得在参数闸里假装路径已可信，或者在适配器里重新解析用户输入 —— 后者会让「读哪些文件」的判据散成两处。
+2. **只分 `image` / `file`，不猜 MIME**：按扩展名推断音视频/表情分类，是本项目反复拒绝的猜测（与 `MAX_JOB_*`、`ConversationKind` 同一条纪律）。平台要更细的分类时由适配器自己按 `kind` 选段类型。
+3. **`outbound.attachment_json` 存绝对路径**：续发（sender 重试、进程重启后的 `recover`）时项目根可能已经变了，存相对路径会把「发这个文件」变成「发另一个文件」或「文件不存在」。
+4. **参数闸只判形状，根内校验必须在宿主**：`hbot-code` 的沙箱拿不到项目根，也没有 `fs`；只靠参数闸会漏符号链接（`assets/link -> C:\Windows`）。所以「根内 + 存在 + 大小」在入队前做一次，失败当场报错 —— 否则 handler 返回成功后平台侧才失败，用户只看到「发了但对方没收到」。
+5. **`OutboundRequest` 带 `attachment: Option<AttachmentRef>`，而不是给 `enqueue` 加第二个参数**：出站请求要穿过 `mpsc<OutboundRequest>`（`SandboxHandler.replies`）才到 supervisor，旁路参数在这个通道里没有位置。曾被否过一次（想少改字面量），实测走不通后改回来了。
+6. **附件走同一条 `send` 闸，不另开 `capabilities.attachments`**：附件是「发消息」的一种，开关分成两个就会出现「声明了 send 没声明 attachments」时错误码指错文件的情况。
+7. **`kind` 列只有 `text` / `attachment`**：image 与 file 的区别已经写在 `attachment_json` 里，两处都写会漂移；出站表不关心平台段类型。
+
+**实测**（`hbot-rpc` 的 `tests/send_capability.rs` 12 条 + `hbot-adapters` 的 4 条单测 + `hbot-store` 1 条往返）：
+
+- 端到端 5 条新增：`assets/logo.png` 真的走到适配器（`local` 平台落 `[attachment] image logo.png` 行）；`C:/Windows/win.ini` → `HBOT_SEND_INVALID` 且没有附件行；`assets/../../outside.txt` → `HBOT_SEND_INVALID`；`assets/missing.png` → 文案含「不存在」；超 5 MiB → 文案含「上限」。**每一条都断言「被拒时附件没走到适配器」**。
+- 适配器 4 条：`image` 段带 `base64://iVBORw==`；空正文只出附件段且 `file` 段带 `name`；文件不存在是错误而不是降级成纯文本；超限报上限。错误文案只带文件名，**不带目录**（坑 47）。
+- 存储 1 条：`kind = attachment` 与 `attachment_json` 在 `list_pending_outbound` 里原样往返，同批的纯文本行仍是 `kind = text` 且 `attachment_json` 为 `NULL`。
+
+**还没做**：QQ 官方接口（`platforms/qq`）没有媒体上传能力，附件在那里仍只能发正文 —— 要落地得先确认它的上传接口与频率限制；多个附件、语音/视频/表情分类都不做（按 §3.4 决定 2 的理由）。
+
 
 
 ### 3.5 已落地：入站 webhook（`C1.webhook`，2026-11-19）

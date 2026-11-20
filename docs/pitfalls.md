@@ -693,3 +693,37 @@
     规矩：① 给大文件追加内容用 `fs.appendFile`（或工具的 `edit`，用末几行当 anchor），
     **不要**走 read→write；② 改完任何文档/大文件，立刻看 `git diff --stat`，出现成百上千
     行删除就是截断而不是「整理」；③ 这类事故的恢复点是父提交，别急着重写。
+
+## 135. 旁路参数塞不进一个「整个值」的通道（2026-11-21，C3.send 附件）
+
+    `ctx.sendImage` 的宿主端口要把「发什么」送进 supervisor，而中间只有一条
+    `mpsc<OutboundRequest>`（`crates/hbot-rpc/src/app/commands/bots.rs` 建通道、`sandbox_handler` 消费）。
+    第一版为了少改十几处结构体字面量，把附件做成 `Outbox::enqueue_with_attachment(request, attachment)`
+    的**第二个参数** —— 到接线时才发现 `OutboundRequest` 是这个通道唯一载荷，附件在那个位置没有落脚点，
+    只能要么再开一条通道，要么在通道里塞一个 `Option` 假装是正文的一部分。
+
+    最后改回「给 `OutboundRequest` 加 `attachment: Option<AttachmentRef>` 字段」，一次补完 10 处字面量。
+    判据：**凡是穿过队列/通道的值，判据就是「接收端能不能只凭这个值完成工作」**；
+    需要额外参数才能完成工作的，说明这个值不完整，加字段比加参数可靠（加参数时编译器不会
+    提醒你还有第二个调用点没传）。
+
+    两个附带的实测：① `#[serde(default)]` 不救结构体字面量，`E0063` 会逐个点名（这次漏了
+    `sandbox_handler.rs` 的两处，因为它们的注释文本与别处不同，grep 时被跳过了）；
+    ② 用 gzip 式「多次 `replace` 重构」后文件变小要复查 —— 这次 `send.rs` 从 ~8.6 KB 掉到 5.8 KB
+    是整块函数合并（`enqueue_inner` 消失），不是截断；判断方法是 grep 关键行还在不在。
+
+## 136. 附件的路径校验必须分两层：形状在 core，根内在宿主（2026-11-21）
+
+    `validate_attachment`（`crates/hbot-core/src/bot_egress.rs`）只能判形状：非空、长度上限、
+    无 NUL、不是绝对路径、没有 `..` 段。它**判不了**「解析到项目根内」—— 沙箱拿不到项目根、
+    也没有 `fs`，而符号链接（`assets/link -> C:\Windows\win.ini`）只有 `canonicalize()` 之后
+    才能看出越界。
+
+    所以第二层在宿主：`StoreSendQueue::resolve_attachment`（`crates/hbot-rpc/src/app/runtime/send.rs`）
+    做 `canonicalize()` → 比前缀 → `is_file()` → 比 5 MiB 上限，**在入队之前**做，失败当场返回错误。
+    放到适配器那一刻才失败是错的：`ctx.sendImage` 早已返回成功，用户只看到「发了但对方没收到」，
+    而且 sender 会把「文件不存在」当成可重试错误重试到死信。
+
+    同族的两个细节：① 落库与穿越队列的路径是**绝对路径**（`attachment_json`），因为续发时项目根
+    可能已经变了，相对路径会指向另一个文件；② 错误文案只带**文件名**不带目录（坑 47：这条 message
+    会进 run log 面板与模型上下文）。
