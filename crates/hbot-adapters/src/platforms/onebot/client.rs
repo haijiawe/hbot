@@ -282,11 +282,24 @@ impl ActionHandle {
         text: &str,
         reply_to: Option<&str>,
     ) -> Result<Value, AdapterError> {
+        self.send_group_message(group_id, outbound_json(text, reply_to))
+            .await
+    }
+
+    /// 发送群消息，`message` 已经是对 OneBot 合法的 JSON（字符串或段数组）。
+    ///
+    /// 附件走这条：段数组必须由 [`super::message::outbound_json_with_attachment`]
+    /// 造出来（它负责把文件读成 `base64://` 段），这里不再碰内容形状。
+    pub async fn send_group_message(
+        &self,
+        group_id: i64,
+        message: Value,
+    ) -> Result<Value, AdapterError> {
         self.send(
             "send_group_msg",
             json!({
                 "group_id": group_id,
-                "message": outbound_json(text, reply_to),
+                "message": message,
             }),
         )
         .await
@@ -299,11 +312,21 @@ impl ActionHandle {
         text: &str,
         reply_to: Option<&str>,
     ) -> Result<Value, AdapterError> {
+        self.send_private_message(user_id, outbound_json(text, reply_to))
+            .await
+    }
+
+    /// 发送私聊消息，`message` 已经是对 OneBot 合法的 JSON（字符串或段数组）。
+    pub async fn send_private_message(
+        &self,
+        user_id: i64,
+        message: Value,
+    ) -> Result<Value, AdapterError> {
         self.send(
             "send_private_msg",
             json!({
                 "user_id": user_id,
-                "message": outbound_json(text, reply_to),
+                "message": message,
             }),
         )
         .await

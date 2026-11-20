@@ -45,7 +45,10 @@ pub use client::{
     probe_connection, probe_session, validate_ws_url,
 };
 pub use event::{MessageType, OneBotEvent, PostType, Sender};
-pub use message::{MessagePayload, Segment, SegmentKind, build_outbound, outbound_json};
+pub use message::{
+    MAX_OUTBOUND_ATTACHMENT_BYTES, MessagePayload, SEGMENT_FILE, Segment, SegmentKind,
+    attachment_segment, build_outbound, outbound_json, outbound_json_with_attachment,
+};
 pub use normalize::{
     NormalizedInbound, fallback_external_id, fallback_fingerprint, fnv1a_64,
     is_synthetic_external_id, normalize,

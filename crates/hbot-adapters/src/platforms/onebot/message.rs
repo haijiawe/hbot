@@ -26,6 +26,11 @@
 //! - 原始事件 JSON 随 `NormalizedInbound::raw` 一起落库，需要时以它为准，
 //!   `text` 只是给 LLM / 日志用的可读视图。
 
+use std::path::Path;
+
+use hbot_core::{AttachmentKind, AttachmentRef};
+
+use crate::AdapterError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -39,6 +44,11 @@ pub const SEGMENT_IMAGE: &str = "image";
 pub const SEGMENT_FACE: &str = "face";
 /// 段类型：引用回复。
 pub const SEGMENT_REPLY: &str = "reply";
+/// 段类型：普通文件附件（图片以外的文件走这个段）。
+pub const SEGMENT_FILE: &str = "file";
+
+/// 出站附件的大小上限：5 MiB。base64 之后约 6.7 MiB 文本，仍能塞进一条 WS 帧。
+pub const MAX_OUTBOUND_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 
 /// 纯文本里 `at` 段渲染成 `@{qq}`；图片渲染成这个占位符。
 const IMAGE_PLACEHOLDER: &str = "[图片]";
@@ -253,6 +263,74 @@ pub fn outbound_json(text: &str, reply_to: Option<&str>) -> Value {
     })
 }
 
+/// 把宿主核验过的附件读成 OneBot 消息段。
+///
+/// 路径**已经是绝对路径**：宿主在入队前把用户给的相对路径解析并校验过（在项目根内、
+/// 文件存在、大小不超限），这里不再按用户输入重新解析 —— 再做一次相对路径解析只会
+/// 让「入队时合法、发送时越界」的两个判据打架。
+///
+/// 读文件失败 / 超限都返回 `Err`：**不许**静默降级成只发正文（用户会以为图发出去了）。
+/// 错误文案只给文件名，不带绝对路径（AGENTS.md 坑 47：这条 message 会进日志/模型上下文）。
+pub fn attachment_segment(attachment: &AttachmentRef) -> Result<Segment, AdapterError> {
+    let path = Path::new(&attachment.path);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment");
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| AdapterError::protocol(format!("附件不可读（{name}）：{error}")))?;
+    if metadata.len() > MAX_OUTBOUND_ATTACHMENT_BYTES {
+        return Err(AdapterError::Limit {
+            message: format!(
+                "附件 {name} 有 {} 字节，超过 {} 字节上限",
+                metadata.len(),
+                MAX_OUTBOUND_ATTACHMENT_BYTES
+            ),
+        });
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| AdapterError::protocol(format!("附件不可读（{name}）：{error}")))?;
+    // OneBot 11 的本地文件用 `base64://` 前缀内联，比让平台自己去读 `file://` 更可控：
+    // 后者要求平台进程能访问同一个路径（NapCat 与 HBot 可能不在同一台机器上）。
+    let encoded = format!("base64://{}", hbot_core::base64_encode(&bytes));
+    let mut data = Map::new();
+    data.insert("file".to_string(), Value::String(encoded));
+    let kind = match attachment.kind {
+        AttachmentKind::Image => SEGMENT_IMAGE,
+        AttachmentKind::File => {
+            // `file` 段没有文件名时多数实现在客户端显示成一串数字 id。
+            data.insert("name".to_string(), Value::String(name.to_string()));
+            SEGMENT_FILE
+        }
+    };
+    Ok(Segment::new(kind, data))
+}
+
+/// 出站消息（正文 + 可选附件）序列化成 OneBot `message` 字段。
+///
+/// 没有附件时行为与 [`outbound_json`] 完全一致（纯文本走字符串形式）。有附件时
+/// 一律用段数组：`reply` 段（若有）→ `text` 段（正文非空才加）→ 附件段。空正文 +
+/// 附件是合法的（用户只说「把这个发给张三」）。
+pub fn outbound_json_with_attachment(
+    text: &str,
+    reply_to: Option<&str>,
+    attachment: Option<&AttachmentRef>,
+) -> Result<Value, AdapterError> {
+    let Some(attachment) = attachment else {
+        return Ok(outbound_json(text, reply_to));
+    };
+    let mut segments = Vec::new();
+    if let Some(id) = reply_to.filter(|id| !id.is_empty()) {
+        segments.push(Segment::reply(id));
+    }
+    if !text.is_empty() {
+        segments.push(Segment::text(text));
+    }
+    segments.push(attachment_segment(attachment)?);
+    serde_json::to_value(MessagePayload::Segments(segments))
+        .map_err(|error| AdapterError::protocol(format!("出站消息序列化失败：{error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +373,90 @@ mod tests {
             let payload = segments(serde_json::json!([{ "type": "at", "data": { "qq": qq } }]));
             assert_eq!(payload.to_plain_text(), "@42");
         }
+    }
+
+    /// 附件段的字节来源是真实文件：`base64://` 前缀与内容是这里唯一的判据。
+    fn temp_file(label: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hbot-attach-{label}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, bytes).expect("写临时附件");
+        path
+    }
+
+    #[test]
+    fn an_image_attachment_becomes_a_base64_segment() {
+        let path = temp_file("image", b"\x89PNG");
+        let reference =
+            AttachmentRef::new(AttachmentKind::Image, path.to_string_lossy().into_owned());
+        let value = outbound_json_with_attachment("看图", None, Some(&reference)).expect("序列化");
+        let array = value.as_array().expect("有附件时必须是段数组");
+        assert_eq!(array.len(), 2, "正文段 + 附件段");
+        assert_eq!(array[0]["type"], "text");
+        assert_eq!(array[1]["type"], "image");
+        assert_eq!(array[1]["data"]["file"], "base64://iVBORw==");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_empty_body_still_sends_the_attachment_alone() {
+        let path = temp_file("bare", b"hi");
+        let reference =
+            AttachmentRef::new(AttachmentKind::File, path.to_string_lossy().into_owned());
+        let value = outbound_json_with_attachment("", None, Some(&reference)).expect("序列化");
+        let array = value.as_array().expect("段数组");
+        assert_eq!(array.len(), 1, "空正文不产生 text 段");
+        assert_eq!(array[0]["type"], "file");
+        assert_eq!(array[0]["data"]["file"], "base64://aGk=");
+        // 文件名进 `name`，否则多数客户端显示成一串 id。
+        assert!(
+            array[0]["data"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("hbot-attach-bare-"))
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_attachment_file_is_an_error_not_a_text_only_send() {
+        let reference = AttachmentRef::new(
+            AttachmentKind::Image,
+            std::env::temp_dir()
+                .join("hbot-attach-does-not-exist.png")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let error = outbound_json_with_attachment("看图", None, Some(&reference))
+            .expect_err("读不到就该失败");
+        let message = error.to_string();
+        assert!(
+            message.contains("hbot-attach-does-not-exist.png"),
+            "错误文案要带上文件名：{message}"
+        );
+        // 不许把绝对路径带出去（AGENTS.md 坑 47）。
+        assert!(
+            !message.contains(&*std::env::temp_dir().to_string_lossy()),
+            "错误文案不许带目录：{message}"
+        );
+    }
+
+    #[test]
+    fn an_attachment_over_the_cap_is_refused_with_the_limit() {
+        let oversized = vec![0u8; (MAX_OUTBOUND_ATTACHMENT_BYTES + 1) as usize];
+        let path = temp_file("huge", &oversized);
+        let reference =
+            AttachmentRef::new(AttachmentKind::File, path.to_string_lossy().into_owned());
+        let error =
+            outbound_json_with_attachment("", None, Some(&reference)).expect_err("超限就该失败");
+        let message = error.to_string();
+        assert!(message.contains("字节上限"), "错误文案要说上限：{message}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

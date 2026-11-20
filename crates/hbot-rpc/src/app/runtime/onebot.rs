@@ -217,17 +217,24 @@ impl BotAdapter for OneBotAdapter {
         let address = address_of(&envelope)?;
         // 被动回复要绑定到触发它的那条平台消息（§4.1）；`None` 是主动消息。
         let reply_to = envelope.reply_to.as_deref();
+        // 有附件时读文件 + base64 是阻塞 IO（几 MiB），必须离开 reactor；没有附件就是
+        // 一个纯 JSON 构造，仍然走同一个函数，免得两条路径的段顺序各写一遍。
+        let text = envelope.text.clone();
+        let attachment = envelope.attachment.clone();
+        let reply_to_owned = reply_to.map(str::to_string);
+        let message = tokio::task::spawn_blocking(move || {
+            hbot_adapters::onebot::outbound_json_with_attachment(
+                &text,
+                reply_to_owned.as_deref(),
+                attachment.as_ref(),
+            )
+        })
+        .await
+        .map_err(|error| HbotError::internal(format!("附件编码任务没有跑完：{error}")))?
+        .map_err(HbotError::from)?;
         let sent = match address {
-            Address::Group(group_id) => {
-                actions
-                    .send_group_msg(group_id, &envelope.text, reply_to)
-                    .await
-            }
-            Address::Private(user_id) => {
-                actions
-                    .send_private_msg(user_id, &envelope.text, reply_to)
-                    .await
-            }
+            Address::Group(group_id) => actions.send_group_message(group_id, message).await,
+            Address::Private(user_id) => actions.send_private_message(user_id, message).await,
         };
         sent.map(|_response| ()).map_err(|error| {
             tracing::warn!(
