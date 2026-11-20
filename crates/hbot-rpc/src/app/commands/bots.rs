@@ -46,7 +46,7 @@ use crate::app::AppState;
 use crate::app::bots::running_bot;
 use crate::app::commands::{done, failed, unimplemented};
 use crate::app::runtime::config::{BotConfig, read_bot_config};
-use crate::app::runtime::files::ProjectFiles;
+use crate::app::runtime::files::{ProjectFiles, declared_file_quota};
 use crate::app::runtime::jobs::StoreJobQueue;
 use crate::app::runtime::local;
 use crate::app::runtime::onebot::PLATFORM;
@@ -190,9 +190,21 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
             ))),
             // 文件能力：路径钉在项目根里（符号链接也要落在根内），读 / 写分开声明。
             // 不装配 = `ctx.files.*` 报 `HBOT_FILE_UNAVAILABLE`，明确失败。
-            files: Some(Arc::new(ProjectFiles::new(root.clone()).map_err(
-                |error| HbotError::internal(format!("项目根不可用，无法装配文件能力：{error}")),
-            )?)),
+            // 磁盘配额：上限从 `hbot.json` 的 `limits.quotaMb` 现读（`bots.json` 的
+            // `limits` 只有内存与 handler 超时，两处不是同一份配置），账本按 bot 记在
+            // `bot_file_usage` 表里。
+            files: Some(Arc::new(
+                ProjectFiles::new(root.clone())
+                    .map_err(|error| {
+                        HbotError::internal(format!("项目根不可用，无法装配文件能力：{error}"))
+                    })?
+                    .with_quota(
+                        bot_id,
+                        Arc::clone(state.store()),
+                        Arc::clone(state.clock()),
+                        declared_file_quota(&root),
+                    ),
+            )),
             jobs: Some(Arc::new(StoreJobQueue::new(
                 bot_id,
                 root.clone(),

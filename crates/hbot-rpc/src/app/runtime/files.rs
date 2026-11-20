@@ -12,30 +12,254 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hbot_core::{
-    FileEntry, FileError, FileStore, LineRange, MAX_FILE_REMOVE_ENTRIES, ReadBytes, ReadFile,
-    validate_file_list, validate_file_read, validate_file_write, validate_file_write_range,
+    BotId, Clock, FileEntry, FileError, FileStore, LineRange, MAX_FILE_REMOVE_ENTRIES, ReadBytes,
+    ReadFile, check_file_quota, validate_file_list, validate_file_read, validate_file_write,
+    validate_file_write_range,
 };
+use hbot_store::Store;
 
 /// 以项目根为唯一可写目录的文件后端。
-#[derive(Debug)]
 pub struct ProjectFiles {
     root: PathBuf,
+    /// 磁盘配额账本；`None` = 不记账（测试与不关心配额的宿主）。
+    quota: Option<FileQuota>,
+}
+
+/// 磁盘配额的三个输入：给谁记账、账本在哪、上限多少。
+///
+/// ## 为什么账本在库里而不是扫树
+///
+/// 配额判据在**每一次写**之前都要问一次「还放得下吗」。扫树是 O(项目) 的磁盘操作，
+/// 而热路径上只允许 O(1)（`docs/pitfalls.md` 坑 23）。代价是账本可能与真实磁盘有偏差
+/// （用户在 IDE 里手工改文件不经过这里），这是刻意的取舍：配额挡的是「生成代码把盘写满」，
+/// 不是安全边界（路径已经钉在项目根里了）。
+struct FileQuota {
+    bot_id: BotId,
+    store: Arc<Store>,
+    clock: Arc<dyn Clock>,
+    /// 上限（字节）；0 = 不限（与 `limits.quotaMb = 0` 同口径）。
+    limit: u64,
+}
+
+impl FileQuota {
+    /// 预留 `incoming` 字节；放不下时按 `HBOT_FILE_QUOTA` 报错。
+    ///
+    /// 判据在**一条 SQL** 里（`repositories/files_usage.rs` 的 `reserve`）：同一 bot 的不同
+    /// 会话是并行的，「先读占用、再判够不够、最后加」三步会让两个写都看到同一个旧值。
+    fn reserve(&self, path: &str, incoming: u64) -> Result<(), FileError> {
+        if incoming == 0 {
+            return Ok(());
+        }
+        let now = self.clock.now().unix_millis();
+        let reserved = self
+            .store
+            .reserve_file_usage(&self.bot_id, incoming, self.limit, now)
+            .map_err(|error| FileError::Failed {
+                message: format!("配额账本写入失败：{error}"),
+            })?;
+        if reserved.is_some() {
+            return Ok(());
+        }
+        // 账本说放不下：用 core 的判据造错误（错误形状只有一份，别在 rpc 再写一遍）。
+        let used = self.store.file_usage(&self.bot_id).unwrap_or(u64::MAX);
+        let verdict = check_file_quota(path, used, incoming, self.limit);
+        debug_assert!(
+            verdict.is_err(),
+            "账本说放不下（used={used} incoming={incoming} limit={}），core 判据却说放得下：两处判据已经不一致",
+            self.limit
+        );
+        verdict?;
+        Ok(())
+    }
+
+    /// 退掉 `amount` 字节（删除文件、覆盖写变短、写失败回滚）。
+    fn release(&self, amount: u64) -> Result<(), FileError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let now = self.clock.now().unix_millis();
+        self.store
+            .release_file_usage(&self.bot_id, amount, now)
+            .map(|_remaining| ())
+            .map_err(|error| FileError::Failed {
+                message: format!("配额账本回退失败：{error}"),
+            })
+    }
+}
+
+/// 一次写的配额调整结果，用来在写失败时原样撤销。
+///
+/// 预留与退账都可能发生（覆盖写变短就是退账），所以撤销不是单向的：预留过的要退回去，
+/// 退过的要补回来。两者互斥。
+#[derive(Debug, Default, Clone, Copy)]
+struct QuotaAdjust {
+    reserved: u64,
+    released: u64,
+}
+
+impl std::fmt::Debug for ProjectFiles {
+    /// 手写而不是 derive：`Arc<dyn Clock>` 没有 `Debug`，而把账本整个打出来也没有意义。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectFiles")
+            .field("root", &self.root)
+            .field("quota_limit", &self.quota.as_ref().map(|quota| quota.limit))
+            .finish()
+    }
 }
 
 impl ProjectFiles {
     /// 用项目根建一个后端；根必须已经存在（调用方在拿到项目根时才建它）。
+    ///
+    /// 不带配额：不记账也就不会因为累计体积拒绝写入。生产装配走 [`Self::with_quota`]。
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = fs::canonicalize(root.into())?;
-        Ok(Self { root })
+        Ok(Self { root, quota: None })
+    }
+
+    /// 接上磁盘配额（`limit == 0` = 不限，但仍然记账 —— 账本本身对排障有用）。
+    #[must_use]
+    pub fn with_quota(
+        mut self,
+        bot_id: BotId,
+        store: Arc<Store>,
+        clock: Arc<dyn Clock>,
+        limit: u64,
+    ) -> Self {
+        self.quota = Some(FileQuota {
+            bot_id,
+            store,
+            clock,
+            limit,
+        });
+        self
     }
 
     /// 已规范化的项目根（绝对路径）。
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 按「写前 / 写后」的实际大小记账：涨了预留差值，跌了退回差值。
+    ///
+    /// 与 [`Self::reserve_quota`] 的分工：这里的 `after` 是**已知**的最终大小（整文件
+    /// 覆盖写），所以不必写完再对账；`write_range` 的最终大小写前算不出来，走另一条路。
+    fn adjust_quota(&self, path: &str, before: u64, after: u64) -> Result<QuotaAdjust, FileError> {
+        let Some(quota) = &self.quota else {
+            return Ok(QuotaAdjust::default());
+        };
+        if after > before {
+            let incoming = after - before;
+            quota.reserve(path, incoming)?;
+            return Ok(QuotaAdjust {
+                reserved: incoming,
+                released: 0,
+            });
+        }
+        if before > after {
+            let shrinking = before - after;
+            quota.release(shrinking)?;
+            return Ok(QuotaAdjust {
+                reserved: 0,
+                released: shrinking,
+            });
+        }
+        Ok(QuotaAdjust::default())
+    }
+
+    /// 撤销一次 [`Self::adjust_quota`]：写失败了，磁盘上的内容还是原来那份。
+    fn undo_quota(&self, adjust: &QuotaAdjust, cause: &FileError) {
+        let Some(quota) = &self.quota else {
+            return;
+        };
+        let undo = if adjust.reserved > 0 {
+            quota.release(adjust.reserved)
+        } else if adjust.released > 0 {
+            // 回滚预留时路径只进错误文案，给个能看懂的占位而不是原路径（原路径这时
+            // 可能已经被写成半截，写进错误里只会误导）。
+            quota.reserve("<回滚>", adjust.released)
+        } else {
+            return;
+        };
+        if let Err(error) = undo {
+            tracing::warn!(
+                reserved = adjust.reserved,
+                released = adjust.released,
+                %error,
+                original = %cause,
+                "文件写失败之后配额回滚也失败：这个 bot 的账本会偏离实际，重启后可用 set_file_usage 对账"
+            );
+        }
+    }
+
+    /// 写完把账本对齐到实际大小。
+    ///
+    /// `reserved` 是写前预留的量（上界），`before` / `actual` 是写前写后的真实大小。
+    /// 需要补的净变化是 `actual - before`，已经记了 `reserved`，所以只处理差额：
+    /// 差额为负就退回去（预留多了、或文件变短了），为正说明上界算错 —— 记 error 留证据，
+    /// **不**为了对齐去动一个已经写完的文件。
+    fn settle_quota(&self, path: &str, before: u64, reserved: u64, actual: u64) {
+        let Some(quota) = &self.quota else {
+            return;
+        };
+        let target = i128::from(actual) - i128::from(before);
+        let applied = i128::from(reserved);
+        let diff = target - applied;
+        if diff < 0 {
+            let refund = u64::try_from(-diff).unwrap_or(u64::MAX);
+            if let Err(error) = quota.release(refund) {
+                tracing::warn!(%error, path, refund, "配额对账退账失败：账本会偏高");
+            }
+        } else if diff > 0 {
+            tracing::error!(
+                path,
+                before,
+                reserved,
+                actual,
+                "按上界预留的配额被实际增长超过：上界算错了，账本会偏低"
+            );
+        }
+    }
+
+    /// 现有文件的字节数；不存在按 0（新建文件不占旧空间）。
+    fn existing_bytes(&self, path: &Path) -> Result<u64, FileError> {
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    return Err(FileError::Invalid {
+                        message: format!(
+                            "{} 是目录，不是文件：写文件请给一个文件路径",
+                            self.display(path)
+                        ),
+                    });
+                }
+                Ok(metadata.len())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(self.failed(path, error)),
+        }
+    }
+
+    /// 删完之后退账：文件按自身大小，目录按整棵树的文件大小之和。
+    ///
+    /// 账本回退失败只记 warn、不报错：文件**真的已经删掉了**，这时返回错误会让调用方
+    /// 以为删除失败、进而去重试一个不存在的路径。账本偏高是保守方向（少放行，不会多占盘），
+    /// 需要精确值时可走 `set_file_usage` 对账。
+    fn release_after_remove(&self, path: &str, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let Some(quota) = &self.quota else {
+            return;
+        };
+        if let Err(error) = quota.release(bytes) {
+            tracing::warn!(bytes, path, %error, "文件已删除，但配额账本回退失败：账本会偏高");
+        }
     }
 
     /// 把一条已归一的相对路径接到根上，并验证真实位置仍在根内。
@@ -102,8 +326,10 @@ impl ProjectFiles {
         }
     }
 
-    /// 数一棵树有多少条（含根），顺带拒绝符号链接与超上限。
-    fn count_tree(&self, path: &Path, count: &mut u32) -> Result<(), FileError> {
+    /// 数一棵树有多少条（含根）、文件一共多少字节，顺带拒绝符号链接与超上限。
+    ///
+    /// 目录本身不占配额，只有文件占 —— 账本记的是「这个 bot 写了多少字节」。
+    fn count_tree(&self, path: &Path, count: &mut u32, bytes: &mut u64) -> Result<(), FileError> {
         *count += 1;
         if *count as usize > MAX_FILE_REMOVE_ENTRIES {
             return Err(FileError::TooMany {
@@ -119,8 +345,10 @@ impl ProjectFiles {
             let reader = fs::read_dir(path).map_err(|error| self.failed(path, error))?;
             for entry in reader {
                 let entry = entry.map_err(|error| self.failed(path, error))?;
-                self.count_tree(&entry.path(), count)?;
+                self.count_tree(&entry.path(), count, bytes)?;
             }
+        } else {
+            *bytes = (*bytes).saturating_add(metadata.len());
         }
         Ok(())
     }
@@ -473,7 +701,15 @@ impl FileStore for ProjectFiles {
                 fs::create_dir_all(parent).map_err(|error| self.failed(parent, error))?;
             }
         }
-        fs::write(&resolved, text.as_bytes()).map_err(|error| self.failed(&resolved, error))?;
+        // 整文件覆盖：写后大小已知，按**差值**记账 —— 覆盖写只占新增的那部分，改短反而退账。
+        let before = self.existing_bytes(&resolved)?;
+        let after = text.len() as u64;
+        let adjust = self.adjust_quota(path, before, after)?;
+        if let Err(error) = fs::write(&resolved, text.as_bytes()) {
+            let failure = self.failed(&resolved, error);
+            self.undo_quota(&adjust, &failure);
+            return Err(failure);
+        }
         self.entry_of(&resolved)
     }
 
@@ -485,7 +721,19 @@ impl FileStore for ProjectFiles {
     ) -> Result<FileEntry, FileError> {
         validate_file_write_range(path, text, range)?;
         let resolved = self.resolve(path)?;
-        write_line_range(&resolved, path, text, range)?;
+        // 最终大小写前算不出来（替换段与原文的行数、行尾都可能不同），所以按上界预留：
+        // 新文本 + 最多两字节行尾；写完再按实际大小对账退回多留的那部分。
+        let before = self.existing_bytes(&resolved)?;
+        let upper = before.saturating_add(text.len() as u64).saturating_add(2);
+        let adjust = self.adjust_quota(path, before, upper)?;
+        if let Err(failure) = write_line_range(&resolved, path, text, range) {
+            self.undo_quota(&adjust, &failure);
+            return Err(failure);
+        }
+        match self.existing_bytes(&resolved) {
+            Ok(actual) => self.settle_quota(path, before, adjust.reserved, actual),
+            Err(error) => tracing::warn!(%error, path, "写完之后读不到文件大小：配额账本会偏高"),
+        }
         self.entry_of(&resolved)
     }
 
@@ -519,13 +767,18 @@ impl FileStore for ProjectFiles {
                 })?;
                 return Ok(1);
             }
-            // 先数一遍再删：中途发现链接或超上限时树还是完整的。
+            // 先数一遍再删：中途发现链接或超上限时树还是完整的，账本也还没动。
+            // 计数与字节在同一次遍历里拿到 —— 删掉之后字节数就量不到了。
             let mut count = 0_u32;
-            self.count_tree(&resolved, &mut count)?;
+            let mut bytes = 0_u64;
+            self.count_tree(&resolved, &mut count, &mut bytes)?;
             self.delete_tree(&resolved)?;
+            self.release_after_remove(path, bytes);
             Ok(count)
         } else {
+            let bytes = metadata.len();
             fs::remove_file(&resolved).map_err(|error| self.failed(&resolved, error))?;
+            self.release_after_remove(path, bytes);
             Ok(1)
         }
     }
@@ -561,6 +814,18 @@ pub fn declared_files(root: &Path) -> hbot_core::FilesCapability {
     hbot_code::manifest::load(root)
         .map(|manifest| manifest.capabilities.files())
         .unwrap_or_default()
+}
+
+/// 清单里的磁盘配额（字节）；`0` = 不限。
+///
+/// 读不到清单时按 0（不限）而不是报错：这个函数在 `start_bot` 里装配后端时调用，
+/// 而清单读不了的情况已经由 `declared_files` / 编译那一路报过了 —— 在这里再造一个
+/// 失败点只会让「项目根没问题但清单暂时坏掉」变成起不来。
+#[must_use]
+pub fn declared_file_quota(root: &Path) -> u64 {
+    hbot_code::manifest::load(root)
+        .map(|manifest| manifest.limits.file_quota_bytes())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -816,5 +1081,202 @@ mod tests {
         // 拒绝发生在删除之前：树与链接目标都还在。
         assert!(root.0.join("dir/link").exists());
         assert!(outside.0.join("secret.txt").exists());
+    }
+
+    // ---- 磁盘配额（`limits.quotaMb`） ----------------------------------------
+
+    /// 带账本的后端：`bot_file_usage` 有外键，所以库里必须先有项目行与 bot 行。
+    struct QuotaFixture {
+        root: TempRoot,
+        store: Arc<Store>,
+        project_id: hbot_store::ProjectId,
+        bot_id: BotId,
+    }
+
+    impl QuotaFixture {
+        fn new() -> Self {
+            let root = TempRoot::new();
+            let store = Arc::new(Store::open(root.0.join("hbot.db")).expect("open store"));
+            let project_id = hbot_store::ProjectId::from_uuid(uuid::Uuid::from_u128(0x9abc));
+            let bot_id = BotId::from_uuid(uuid::Uuid::from_u128(0x9abd));
+            store
+                .insert_project(&hbot_store::Project {
+                    id: project_id,
+                    name: "quota".to_owned(),
+                    path: root.0.to_string_lossy().into_owned(),
+                    created_at: 1,
+                })
+                .expect("insert project");
+            store
+                .insert_bot(&hbot_store::Bot {
+                    id: bot_id,
+                    project_id,
+                    name: "quota-bot".to_owned(),
+                    platform: "local".to_owned(),
+                    config_json: "{}".to_owned(),
+                    enabled: true,
+                    created_at: 2,
+                })
+                .expect("insert bot");
+            Self {
+                root,
+                store,
+                project_id,
+                bot_id,
+            }
+        }
+
+        fn backend(&self, bot_id: BotId, limit: u64) -> ProjectFiles {
+            ProjectFiles::new(&self.root.0)
+                .expect("backend")
+                .with_quota(
+                    bot_id,
+                    Arc::clone(&self.store),
+                    Arc::new(hbot_adapters::SystemClock),
+                    limit,
+                )
+        }
+
+        fn files(&self, limit: u64) -> ProjectFiles {
+            self.backend(self.bot_id, limit)
+        }
+
+        fn used(&self, bot_id: BotId) -> u64 {
+            self.store.file_usage(&bot_id).expect("read usage")
+        }
+    }
+
+    #[test]
+    fn a_write_beyond_the_quota_is_refused_and_nothing_is_written() {
+        let fixture = QuotaFixture::new();
+        let files = fixture.files(10);
+        files
+            .write("a.txt", "0123456789")
+            .expect("write fills the quota");
+        assert_eq!(fixture.used(fixture.bot_id), 10);
+
+        let error = files.write("b.txt", "x").unwrap_err();
+        assert!(error.to_string().contains("HBOT_FILE_QUOTA"), "{error}");
+        assert_eq!(fixture.used(fixture.bot_id), 10, "被拒的写不该记账");
+        assert!(
+            !fixture.root.0.join("b.txt").exists(),
+            "拒绝要发生在写盘之前"
+        );
+    }
+
+    #[test]
+    fn an_overwrite_that_shrinks_gives_the_difference_back() {
+        let fixture = QuotaFixture::new();
+        let files = fixture.files(10);
+        files
+            .write("a.txt", "0123456789")
+            .expect("write fills the quota");
+        files.write("a.txt", "ab").expect("覆盖写变短不需要新额度");
+        assert_eq!(fixture.used(fixture.bot_id), 2, "改短要退账");
+        files
+            .write("b.txt", "01234567")
+            .expect("退回来的额度可以再用");
+        assert_eq!(fixture.used(fixture.bot_id), 10);
+    }
+
+    #[test]
+    fn removing_a_file_gives_its_bytes_back() {
+        let fixture = QuotaFixture::new();
+        let files = fixture.files(8);
+        files
+            .write("a.txt", "01234567")
+            .expect("write fills the quota");
+        assert_eq!(files.remove("a.txt", false).expect("remove"), 1);
+        assert_eq!(fixture.used(fixture.bot_id), 0);
+        files
+            .write("a.txt", "01234567")
+            .expect("删除之后额度回来了");
+    }
+
+    #[test]
+    fn removing_a_directory_gives_back_the_whole_tree() {
+        let fixture = QuotaFixture::new();
+        let files = fixture.files(6);
+        files.write("tmp/a.txt", "aa").expect("write a");
+        files.write("tmp/sub/b.txt", "bbbb").expect("write b");
+        assert_eq!(fixture.used(fixture.bot_id), 6);
+        // 条目数含目录本身：tmp、tmp/a.txt、tmp/sub、tmp/sub/b.txt。
+        assert_eq!(files.remove("tmp", true).expect("remove tree"), 4);
+        assert_eq!(
+            fixture.used(fixture.bot_id),
+            0,
+            "目录按整棵树的文件字节退账"
+        );
+    }
+
+    #[test]
+    fn a_failed_line_range_write_does_not_eat_the_quota() {
+        let fixture = QuotaFixture::new();
+        let files = fixture.files(16);
+        files.write("log.txt", "only\n").expect("write");
+        assert_eq!(fixture.used(fixture.bot_id), 5);
+
+        // 行号越界：写前已经按上界预留，失败必须原样撤销。
+        let error = files
+            .write_range("log.txt", "x", LineRange::new(5, 6))
+            .unwrap_err();
+        assert!(error.to_string().contains("HBOT_FILE_INVALID"), "{error}");
+        assert_eq!(fixture.used(fixture.bot_id), 5, "失败的写不该吃掉额度");
+    }
+
+    #[test]
+    fn a_line_range_write_settles_to_the_real_file_size() {
+        let fixture = QuotaFixture::new();
+        let files = fixture.files(64);
+        files.write("log.txt", "l1\nl2\nl3\n").expect("write");
+        assert_eq!(fixture.used(fixture.bot_id), 9);
+
+        files
+            .write_range("log.txt", "X", LineRange::new(2, 2))
+            .expect("write range");
+        // 上界预留 9 + 1 + 2 = 12，写完的真实大小是 8（`l2` 换成了 `X`），
+        // 所以既要把多留的 4 字节退回去，也要把变短的 1 字节退掉：账本落到 8。
+        assert_eq!(fixture.used(fixture.bot_id), 8, "按实际大小对账");
+    }
+
+    #[test]
+    fn a_quota_of_zero_is_unlimited_but_still_ledgered() {
+        let fixture = QuotaFixture::new();
+        let files = fixture.files(0);
+        let big = "x".repeat(4096);
+        files.write("big.txt", &big).expect("0 = 不限");
+        assert_eq!(fixture.used(fixture.bot_id), 4096, "不限也记账（排障要看）");
+    }
+
+    #[test]
+    fn another_bot_does_not_share_the_ledger() {
+        let fixture = QuotaFixture::new();
+        let other_id = BotId::from_uuid(uuid::Uuid::from_u128(0x9abe));
+        fixture
+            .store
+            .insert_bot(&hbot_store::Bot {
+                id: other_id,
+                project_id: fixture.project_id,
+                name: "other".to_owned(),
+                platform: "local".to_owned(),
+                config_json: "{}".to_owned(),
+                enabled: true,
+                created_at: 3,
+            })
+            .expect("insert other bot");
+
+        fixture
+            .files(10)
+            .write("a.txt", "0123456789")
+            .expect("write fills the first bot quota");
+        assert_eq!(fixture.used(fixture.bot_id), 10);
+        assert_eq!(fixture.used(other_id), 0, "账本按 bot 分，不能串");
+
+        let other = fixture.backend(other_id, 4);
+        other
+            .write("b.txt", "abcd")
+            .expect("另一只 bot 有自己的额度");
+        assert_eq!(fixture.used(other_id), 4);
+        assert_eq!(fixture.used(fixture.bot_id), 10);
     }
 }

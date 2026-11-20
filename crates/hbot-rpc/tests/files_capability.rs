@@ -19,7 +19,9 @@
 //! 9. **`readBytes` 回原样字节的 base64**，不做 UTF-8 校验；
 //! 10. **按行写只替换那几行**，未触碰的行原样保留；
 //! 11. **递归删除返回条目数**，非递归遇到非空目录仍拒；
-//! 12. **行号越界在 JS 边界报错**。
+//! 12. **行号越界在 JS 边界报错**；
+//! 13. **超过清单里的 `limits.quotaMb` 时写被拒**（`HBOT_FILE_QUOTA`，且账本与磁盘都没动）；
+//! 14. **删掉文件之后额度真的回来了**（同一个 bot 接着能再写）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -144,6 +146,28 @@ export default defineBot({
         reply('nonrecursive-allowed:' + count);
         return;
       }
+      if (what === 'quotafill') {
+        await ctx.files.write('notes/fill.txt', 'x'.repeat(1048576));
+        reply('quotafill-ok');
+        return;
+      }
+      if (what === 'quotaover') {
+        await ctx.files.write('notes/over.txt', 'y');
+        reply('quotaover-allowed');
+        return;
+      }
+      if (what === 'quotarecycle') {
+        let blocked = 'no';
+        try {
+          await ctx.files.write('notes/blocked.txt', 'y');
+        } catch (error) {
+          blocked = error.message.includes('HBOT_FILE_QUOTA') ? 'quota' : 'other';
+        }
+        await ctx.files.remove('notes/fill.txt');
+        await ctx.files.write('notes/after.txt', 'y');
+        reply('quotarecycle:' + blocked);
+        return;
+      }
       reply('unknown');
     } catch (error) {
       reply('files-error:' + error.message);
@@ -153,8 +177,14 @@ export default defineBot({
 "#
 }
 
-/// `declare`：None = 不声明；Some((read, write)) = 声明读写两半。
-fn manifest(declare: Option<(bool, bool)>) -> String {
+/// 写清单。`declare`：None = 不声明；Some((read, write)) = 声明读写两半。
+///
+/// `quota_mb`：`limits.quotaMb`，`None` = 不写这个字段（走默认值 0 = 不限）。
+///
+/// 配额的单位是 MB，所以端到端用例最小也只能测到 1 MiB —— 一次 `write` 的上限
+/// （`MAX_FILE_WRITE_BYTES`）恰好也是 1 MiB，于是「写满一次、再写一个字节被拒」
+/// 正好卡在这个粒度上，不需要更大的文件。
+fn manifest_with_quota(declare: Option<(bool, bool)>, quota_mb: Option<u64>) -> String {
     let mut manifest = serde_json::json!({
         "name": "files-bot",
         "platform": { "kind": "local" },
@@ -163,6 +193,9 @@ fn manifest(declare: Option<(bool, bool)>) -> String {
         manifest["capabilities"] = serde_json::json!({
             "state": { "files": { "read": read, "write": write } }
         });
+    }
+    if let Some(quota_mb) = quota_mb {
+        manifest["limits"] = serde_json::json!({ "quotaMb": quota_mb });
     }
     manifest.to_string()
 }
@@ -187,11 +220,24 @@ struct Harness {
 
 impl Harness {
     async fn new(label: &str, declare: Option<(bool, bool)>, binary: bool) -> Self {
+        Self::new_with_quota(label, declare, binary, None).await
+    }
+
+    async fn new_with_quota(
+        label: &str,
+        declare: Option<(bool, bool)>,
+        binary: bool,
+        quota_mb: Option<u64>,
+    ) -> Self {
         let dir = TempDir::new(label);
         let project = dir.path().join("project");
         std::fs::create_dir_all(project.join("src")).expect("创建 src");
         std::fs::write(project.join("src").join("main.ts"), files_handler()).expect("写 handler");
-        std::fs::write(project.join("hbot.json"), manifest(declare)).expect("写 hbot.json");
+        std::fs::write(
+            project.join("hbot.json"),
+            manifest_with_quota(declare, quota_mb),
+        )
+        .expect("写 hbot.json");
         std::fs::write(project.join("bots.json"), bots_json()).expect("写 bots.json");
         if binary {
             std::fs::create_dir_all(project.join("notes")).expect("创建 notes");
@@ -422,5 +468,59 @@ async fn a_non_recursive_remove_still_refuses_a_non_empty_directory() {
     assert!(
         harness.project.join("tmp").join("a.txt").exists(),
         "被拒绝的删除不应该动到里面的文件"
+    );
+}
+
+#[tokio::test]
+async fn a_write_beyond_the_declared_quota_is_refused() {
+    // 1 MB 配额：先写满 1 MiB（等于上限，放行），再写 1 字节必须被拒。
+    let harness = Harness::new_with_quota("quotaover", Some((true, true)), false, Some(1)).await;
+    assert_ok(&harness.start().await, "bot_start");
+    assert_eq!(harness.say("quotafill").await, "quotafill-ok");
+    assert_eq!(
+        harness.state.store().file_usage(&bot_id()).expect("读账本"),
+        1024 * 1024,
+        "写满一次 1 MiB 之后账本要记到上限"
+    );
+    let reply = harness.say("quotaover").await;
+    assert!(
+        reply.contains("HBOT_FILE_QUOTA"),
+        "超过配额要报配额码而不是别的错，实际：{reply}"
+    );
+    assert!(
+        reply.contains("quotaMb"),
+        "错误文案要指出是清单里的哪个字段，实际：{reply}"
+    );
+    assert!(
+        !harness.project.join("notes").join("over.txt").exists(),
+        "被配额拒绝的写不能落盘"
+    );
+    assert_eq!(
+        harness.state.store().file_usage(&bot_id()).expect("读账本"),
+        1024 * 1024,
+        "被拒的写不该改账本"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_file_gives_the_quota_back() {
+    let harness = Harness::new_with_quota("quotarecycle", Some((true, true)), false, Some(1)).await;
+    assert_ok(&harness.start().await, "bot_start");
+    // 先把额度写满（1 MiB），再由同一条消息里的三步验证回收：
+    // 满额时写不动 → 删掉 fill.txt → 再写 1 字节必须成功。
+    assert_eq!(harness.say("quotafill").await, "quotafill-ok");
+    assert_eq!(harness.say("quotarecycle").await, "quotarecycle:quota");
+    assert!(
+        !harness.project.join("notes").join("fill.txt").exists(),
+        "删掉的文件要真的不在"
+    );
+    assert!(
+        harness.project.join("notes").join("after.txt").exists(),
+        "删掉 1 MiB 之后额度要能再用"
+    );
+    assert_eq!(
+        harness.state.store().file_usage(&bot_id()).expect("读账本"),
+        1,
+        "退账之后账本只剩 after.txt 那 1 字节"
     );
 }
