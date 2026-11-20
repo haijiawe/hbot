@@ -510,3 +510,22 @@
     同族的判读纪律：**本地 Windows 全绿 ≠ Linux 绿**。编译期问题能靠
     `cargo check -p hbot-command --target x86_64-unknown-linux-gnu --all-targets` 抓到（本机 9.62 s 能过，
     不需要 Linux C 工具链 —— 只有 `ring`/`psm` 这类需要 cc 的 crate 才卡住），**运行期语义只能靠 CI**。
+
+120. **别把某一平台的实现细节写成跨平台测试的断言**（2026-11-20，CI 的 ubuntu 红）。
+    `crates/hbot-device/tests/api.rs` 的 `the_backend_is_usable_as_a_trait_object` 断言
+    「任何平台都该报告 `window` / `clipboard` 能力」，本机 Windows 全绿；
+    CI 的 ubuntu 上 `platform_backend()` 是 `UnsupportedBackend`（`crates/hbot-device/src/unsupported.rs`：
+    六个能力全 `false` + `detail` 写明「这个宿主没有设备能力实现」），断言当场红。
+    判据：**测试的断言对象要和测试的名字一致**。这条测试钉的是「`DeviceBackend` 能对象化、能跨线程 `Arc` 共享」，
+    能力内容必须按 `cfg!(windows)` 分支（Windows 钉能力位；其它宿主钉「全 false 且 `detail` 有值」——
+    那才是「可诊断的拒绝」这条契约）。同理别断言 Windows 的 `detail` 为空：它在那里是**能力说明**
+    （显示器清单、OCR 语言包、PrintWindow 限制），不是错误原因。
+
+121. **`wait_until` 只等「执行完」不等于等「落库完」**（2026-11-20，CI 的 windows 红）。
+    handler 链路是**先执行、后记账**：`crates/hbot-bot/src/supervisor.rs` 的 `RecordingHandler::on_message`
+    先 `executor.on_message(ctx).await`（测试的 `TestExecutor` 在这里 push 进 `seen`），**再**
+    `inbox.mark_processed(&message_id)` 写 `processed_at`。于是
+    `crates/hbot-bot/tests/runtime.rs` 的 `unprocessed_inbound_is_replayed_on_start` 只等
+    `seen().len() == 1`，下一行断言 `list_unprocessed_inbound(10).is_empty()` 就偶发为假（本机 15 次全绿、
+    CI 上红）。判据：**等待条件要覆盖后面所有断言的因果前置**，把「库里已空」并进 `wait_until`，
+    而不是在等待之后断言一个还没发生的副作用；不放松语义（最终仍必须为空）。

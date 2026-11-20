@@ -277,7 +277,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 
 | 需要什么 | 影响 | 现在怎么办 |
 |---|---|---|
-| ~~git remote~~ | 已有（`haijiawe/hbot`，private），CI 已在真跑并逐步转绿 | 首跑抓到的红点全部修完：① CI clippy 1.100 的 `result_large_err`（装箱）；② 工具链钉死（`rust-toolchain.toml` + `ci.yml` 都写 `1.100.0`，见坑 115）；③ ubuntu-only `unused import`；④ 按窗口 OCR 夹具写死像素尺寸（坑 116）；⑤ ubuntu runner 磁盘耗尽（坑 118）；⑥ 设置 watcher 的 mtime 盲点（坑 117）。**push 必须带 `-c http.proxy=http://127.0.0.1:7897`**，直连 github.com:443 会被重置 |
+| ~~git remote~~ | 已有（`haijiawe/hbot`，private），CI 已在真跑并逐步转绿 | 首跑抓到的红点全部修完：① CI clippy 1.100 的 `result_large_err`（装箱）；② 工具链钉死（`rust-toolchain.toml` + `ci.yml` 都写 `1.100.0`，见坑 115）；③ ubuntu-only `unused import`；④ 按窗口 OCR 夹具写死像素尺寸（坑 116）；⑤ ubuntu runner 磁盘耗尽（坑 118）；⑥ 设置 watcher 的 mtime 盲点（坑 117）；⑦ Linux 的 `RLIMIT_CPU` 软硬上限相等导致 `SIGXCPU` 永不出现、超限被杀当成正常退出（坑 119）；⑧ CI 上两条**测试自身的平台/时序假设**：把 Windows 的设备能力当跨平台契约（坑 120）、`wait_until` 只等「执行完」不等「落库完」（坑 121）。**push 必须带 `-c http.proxy=http://127.0.0.1:7897`**，直连 github.com:443 会被重置 |
 | **真 NapCat 扫码登录** | OneBot 11 只对假网关验过（真事件 JSON 形状、断线重连、`message_id` 语义、at 规则、去重键都没真机证据） | 实物在 `D:\机器人\QQ JQR\QQ JQR\napcat\NapCat.Shell.Windows.OneKey\`，坑与现状见 `docs/spikes/S11-napcat-local-fixture.md`；**二维码会过期、需先确认用户自己的 QQ 是否退出** |
 | **Linux / macOS 机器** | Landlock 只交叉编译；macOS 命令隔离全无 | 交叉 `cargo check --target x86_64-unknown-linux-gnu`；别写"已验证" |
 | **一份独立测试账号** | M6 迁移/影子（0%） | 跳过；M6 需要真实平台影子跑一周 |

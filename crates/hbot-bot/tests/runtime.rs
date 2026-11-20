@@ -262,8 +262,16 @@ async fn unprocessed_inbound_is_replayed_on_start() {
     );
 
     supervisor.start().await.expect("restart");
-    wait_until("replayed message executed", || {
+    // 等两个条件，不是只等执行：handler 链路是「先 executor.on_message，再
+    // mark_processed」（`RecordingHandler`），所以 seen 有记录那一刻
+    // `processed_at` 可能还没落库。只等 seen 会让下面的断言偶发为假（CI 的 windows 上就红过）。
+    wait_until("replayed message executed and marked processed", || {
         fixture.executor.seen().len() == 1
+            && fixture
+                .store
+                .list_unprocessed_inbound(10)
+                .expect("list")
+                .is_empty()
     })
     .await;
 

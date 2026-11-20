@@ -15,8 +15,26 @@ fn the_backend_is_usable_as_a_trait_object() {
     // 跨线程共享。这里钉住"可以对象化"这条性质（加一个泛型方法就会破坏它）。
     let backend: Box<dyn DeviceBackend> = Box::new(platform_backend());
     let report: DeviceCapabilityReport = backend.capabilities();
-    assert!(report.window, "窗口枚举是最基本的能力，任何平台都该报告");
-    assert!(report.clipboard, "剪贴板读写在任何桌面平台都该可用");
+    // 能力内容是**平台相关**的，这条测试钉的是「能对象化、能跨线程共享」。
+    // Windows 上 `window`/`clipboard` 恒真；其它宿主的 `platform_backend()` 是
+    // `UnsupportedBackend`（六个能力全 `false` + `detail` 写明原因，见 `src/unsupported.rs`）。
+    // 曾把 Windows 的能力当成跨平台契约写死断言，CI 的 ubuntu 立刻红 —— 别再把
+    // 某一平台的实现细节当成公开 API 的不变量。
+    if cfg!(windows) {
+        // `detail` 在 Windows 上是**能力说明**（显示器清单、OCR 语言包、
+        // PrintWindow 的限制…），不是错误原因，所以这里只钉能力位。
+        assert!(report.window, "Windows 后端必须报告窗口枚举");
+        assert!(report.clipboard, "Windows 后端必须报告剪贴板");
+    } else {
+        assert!(
+            !report.window && !report.clipboard,
+            "非 Windows 宿主没有设备实现，能力必须全 false：{report:?}"
+        );
+        assert!(
+            report.detail.is_some(),
+            "能力全 false 时必须给出原因，否则用户分不清「没实现」和「配置关了」"
+        );
+    }
     // 通过 trait 对象调用，钉住方法签名没被改成泛型/关联类型。
     let _windows: Result<Vec<WindowInfo>, DeviceError> = backend.windows();
     let _clipboard: Result<ClipboardValue, DeviceError> = backend.clipboard(&ClipboardOp::Read);
