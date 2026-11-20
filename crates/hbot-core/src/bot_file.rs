@@ -12,6 +12,11 @@ pub const MAX_FILE_PATH_BYTES: usize = 256;
 pub const MAX_FILE_SEGMENT_BYTES: usize = 64;
 /// 单次读取的字节上限。
 pub const MAX_FILE_READ_BYTES: usize = 256 * 1024;
+/// 单次按行读取最多跨多少行。
+///
+/// 字节上限挡不住「读第 900 万行」这种请求：它不占内存，但要让后端把整个文件
+/// 逐行扫一遍。所以按行读取除了字节闸，还要有行数闸。
+pub const MAX_FILE_READ_LINES: u64 = 10_000;
 /// 单次写入的字节上限。
 pub const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
 /// 目录列表一次最多返回多少条。
@@ -116,6 +121,33 @@ impl FileEntry {
             kind: FileKind::Dir,
             size: 0,
         }
+    }
+}
+
+/// 按行读取的范围（1 起、两端都含）。
+///
+/// 存在这个类型里而不是拆成两个 `Option<u64>` 参数：行号必须成对解释，
+/// 「只给了 start」和「只给了 end」在中途被谁默认成什么，是这类接口最容易分叉的地方，
+/// 所以两个默认值只在 JS 桥那一层决定一次。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineRange {
+    /// 第一行（1 起）。
+    pub start: u64,
+    /// 最后一行（含）。
+    pub end: u64,
+}
+
+impl LineRange {
+    /// 从 start 到 end（两端都含）。
+    #[must_use]
+    pub const fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    /// 跨了多少行（含两端）。
+    #[must_use]
+    pub const fn span(&self) -> u64 {
+        self.end.saturating_sub(self.start).saturating_add(1)
     }
 }
 
@@ -282,7 +314,11 @@ pub fn normalize_path(raw: &str) -> Result<String, FileError> {
 }
 
 /// 读之前的参数闸。
-pub fn validate_read(path: &str, max_bytes: usize) -> Result<(), FileError> {
+pub fn validate_read(
+    path: &str,
+    max_bytes: usize,
+    range: Option<LineRange>,
+) -> Result<(), FileError> {
     if max_bytes == 0 || max_bytes > MAX_FILE_READ_BYTES {
         return Err(FileError::Invalid {
             message: format!("maxBytes 必须在 1..={MAX_FILE_READ_BYTES} 之间"),
@@ -292,6 +328,29 @@ pub fn validate_read(path: &str, max_bytes: usize) -> Result<(), FileError> {
         return Err(FileError::Invalid {
             message: "read 需要具体文件路径，不能是项目根".to_owned(),
         });
+    }
+    if let Some(range) = range {
+        if range.start == 0 {
+            return Err(FileError::Invalid {
+                message: "startLine 从 1 开始（第 1 行就是文件的第一行）".to_owned(),
+            });
+        }
+        if range.end < range.start {
+            return Err(FileError::Invalid {
+                message: format!(
+                    "endLine（{}）不能小于 startLine（{}）",
+                    range.end, range.start
+                ),
+            });
+        }
+        if range.span() > MAX_FILE_READ_LINES {
+            return Err(FileError::Invalid {
+                message: format!(
+                    "一次最多读 {MAX_FILE_READ_LINES} 行（这次要 {} 行），请分段读",
+                    range.span()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -342,7 +401,15 @@ pub fn validate_remove(path: &str) -> Result<(), FileError> {
 /// 实现方收到的路径已经被 normalize_path 过：相对、/ 分隔、没有 .. 。
 pub trait FileStore: Send + Sync {
     /// 读一个文本文件。
-    fn read(&self, path: &str, max_bytes: usize) -> Result<ReadFile, FileError>;
+    ///
+    /// `range` 为 `None` 时从文件头读到 `max_bytes`；给了范围就只读那几行
+    /// （实现方应当逐行流式读，不要为了取第 5 万行把整个文件读进内存）。
+    fn read(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        range: Option<LineRange>,
+    ) -> Result<ReadFile, FileError>;
     /// 覆盖写一个文本文件。
     fn write(&self, path: &str, text: &str) -> Result<FileEntry, FileError>;
     /// 删除一个文件或空目录。
@@ -431,20 +498,20 @@ mod tests {
     #[test]
     fn reading_the_project_root_is_invalid() {
         assert!(matches!(
-            validate_read("", 1024),
+            validate_read("", 1024, None),
             Err(FileError::Invalid { .. })
         ));
-        assert!(validate_read("a.txt", 1024).is_ok());
+        assert!(validate_read("a.txt", 1024, None).is_ok());
     }
 
     #[test]
     fn read_limits_are_enforced_before_any_io() {
         assert!(matches!(
-            validate_read("a.txt", 0),
+            validate_read("a.txt", 0, None),
             Err(FileError::Invalid { .. })
         ));
         assert!(matches!(
-            validate_read("a.txt", MAX_FILE_READ_BYTES + 1),
+            validate_read("a.txt", MAX_FILE_READ_BYTES + 1, None),
             Err(FileError::Invalid { .. })
         ));
     }
@@ -528,5 +595,37 @@ mod tests {
             validate_list(MAX_FILE_LIST_ENTRIES + 1),
             Err(FileError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn a_line_range_is_one_based_and_inclusive() {
+        assert!(validate_read("a.txt", 1024, Some(LineRange::new(1, 1))).is_ok());
+        assert_eq!(LineRange::new(1, 1).span(), 1);
+        assert_eq!(LineRange::new(10, 20).span(), 11);
+    }
+
+    #[test]
+    fn zero_and_reversed_line_ranges_are_refused() {
+        assert!(matches!(
+            validate_read("a.txt", 1024, Some(LineRange::new(0, 5))),
+            Err(FileError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_read("a.txt", 1024, Some(LineRange::new(9, 3))),
+            Err(FileError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn a_line_range_wider_than_the_limit_is_refused() {
+        assert!(matches!(
+            validate_read(
+                "a.txt",
+                1024,
+                Some(LineRange::new(1, MAX_FILE_READ_LINES + 1))
+            ),
+            Err(FileError::Invalid { .. })
+        ));
+        assert!(validate_read("a.txt", 1024, Some(LineRange::new(1, MAX_FILE_READ_LINES))).is_ok());
     }
 }

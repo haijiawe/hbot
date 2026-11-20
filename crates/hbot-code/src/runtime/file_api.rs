@@ -16,7 +16,10 @@ use rquickjs::{Array, Ctx, Exception, Function, Object, Value};
 
 use crate::error::CodeError;
 use crate::file::FileSlot;
-use hbot_core::{FileEntry, FileKind, MAX_FILE_LIST_ENTRIES, MAX_FILE_READ_BYTES, ReadFile};
+use hbot_core::{
+    FileEntry, FileKind, LineRange, MAX_FILE_LIST_ENTRIES, MAX_FILE_READ_BYTES,
+    MAX_FILE_READ_LINES, ReadFile,
+};
 
 /// ctx.files 上的方法名，一处声明。
 ///
@@ -37,12 +40,13 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, slot: &Arc<FileSlot>) -> Result<Objec
                     let prepared = parse_read(&path, options.0.as_ref());
                     let slot = Arc::clone(&slot);
                     async move {
-                        let (path, max_bytes) = match prepared {
+                        let (path, max_bytes, range) = match prepared {
                             Ok(prepared) => prepared,
                             Err(message) => return ReadReply(Err(message)).into_js(&handle),
                         };
                         let outcome =
-                            tokio::task::spawn_blocking(move || slot.read(&path, max_bytes)).await;
+                            tokio::task::spawn_blocking(move || slot.read(&path, max_bytes, range))
+                                .await;
                         let result = match outcome {
                             Ok(result) => result.map_err(|error| error.to_string()),
                             Err(error) => Err(format!("文件读取的任务没能跑完：{error}")),
@@ -161,7 +165,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, slot: &Arc<FileSlot>) -> Result<Objec
 fn parse_read<'js>(
     path: &Value<'js>,
     options: Option<&Value<'js>>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize, Option<LineRange>), String> {
     let path = text_of(path, "files.read(path, options)")?;
     let max_bytes = match options {
         None => MAX_FILE_READ_BYTES,
@@ -186,7 +190,64 @@ fn parse_read<'js>(
             }
         }
     };
-    Ok((path, max_bytes))
+    let range = match options {
+        None => None,
+        Some(value) if value.is_undefined() || value.is_null() => None,
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid("files.read 的 options 必须是对象"))?;
+            parse_line_range(object)?
+        }
+    };
+    Ok((path, max_bytes, range))
+}
+
+/// 从 options 里取 `startLine` / `endLine`（1 起、两端都含）。
+///
+/// 只给 startLine 时读到 startLine + MAX_FILE_READ_LINES - 1 行为止 —— 默认值只在
+/// 这一层决定一次，core 的 `LineRange` 永远是一个两端都实的区间。
+///
+/// 越界（0、负数、小数、逆序、跨度超限）一律拒绝，不做夹取：夹取会让
+/// 「我要第 10001 行」静默变成「给你第 10000 行」，用户以为读到了那一行。
+fn parse_line_range<'js>(options: &Object<'js>) -> Result<Option<LineRange>, String> {
+    let start = match options.get::<_, Option<Value<'js>>>("startLine") {
+        Ok(Some(raw)) if !raw.is_undefined() && !raw.is_null() => {
+            Some(line_number(&raw, "startLine")?)
+        }
+        Ok(_) => None,
+        Err(error) => return Err(js_message(error)),
+    };
+    let end = match options.get::<_, Option<Value<'js>>>("endLine") {
+        Ok(Some(raw)) if !raw.is_undefined() && !raw.is_null() => {
+            Some(line_number(&raw, "endLine")?)
+        }
+        Ok(_) => None,
+        Err(error) => return Err(js_message(error)),
+    };
+    if start.is_none() && end.is_none() {
+        return Ok(None);
+    }
+    let start = start.unwrap_or(1);
+    let end = match end {
+        Some(end) => end,
+        None => start.saturating_add(MAX_FILE_READ_LINES - 1),
+    };
+    Ok(Some(LineRange::new(start, end)))
+}
+
+fn line_number(raw: &Value<'_>, field: &str) -> Result<u64, String> {
+    let number = raw
+        .as_number()
+        .ok_or_else(|| invalid(format!("files.read 的 {field} 必须是整数")))?;
+    if !number.is_finite() || number < 1.0 || number.fract() != 0.0 {
+        return Err(invalid(format!("files.read 的 {field} 必须是 1 起的整数")));
+    }
+    // JS 的数字只有 2^53 的整数精度，超过这个数就不要再假装它是精确行号了。
+    if number > 9_007_199_254_740_992.0 {
+        return Err(invalid(format!("files.read 的 {field} 太大")));
+    }
+    Ok(number as u64)
 }
 
 fn parse_write<'js>(path: &Value<'js>, text: &Value<'js>) -> Result<(String, String), String> {

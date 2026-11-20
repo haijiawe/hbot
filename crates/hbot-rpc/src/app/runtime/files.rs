@@ -8,11 +8,11 @@
 //! 3. 只读写文本。二进制内容既没有类型真源，也没有体积判据，不属于这一版能力。
 
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 
 use hbot_core::{
-    FileEntry, FileError, FileStore, ReadFile, validate_file_list, validate_file_read,
+    FileEntry, FileError, FileStore, LineRange, ReadFile, validate_file_list, validate_file_read,
     validate_file_write,
 };
 
@@ -106,9 +106,79 @@ impl ProjectFiles {
     }
 }
 
+/// 逐行读一段范围，不把整个文件放进内存。
+///
+/// 三条判据：
+/// 1. **按字节上限收尾，且不切断字符** —— 截断点退到上一行的行尾（整行为单位），
+///    只有「单独一行就超上限」时才在字符边界上切，绝不产出半个 UTF-8 字符；
+/// 2. **`truncated` 的语义是「你要的还没给完」**：撞到字节上限，或者范围到 endLine
+///    而文件后面还有内容，都算；到 EOF 正好读完不算；
+/// 3. 行分隔只用 `\n`，行尾的 `\r` 原样保留（CRLF 文件的读取结果与原始字节一致）。
+fn read_line_range(
+    resolved: &Path,
+    path: &str,
+    range: LineRange,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), FileError> {
+    let file = fs::File::open(resolved).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => FileError::NotFound {
+            path: path.to_owned(),
+        },
+        _ => FileError::Failed {
+            message: format!("{path}: {error}"),
+        },
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut out = Vec::new();
+    let mut line_no: u64 = 0;
+    let mut truncated = false;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| FileError::Failed {
+                message: format!("{path}: {error}"),
+            })?;
+        if read == 0 {
+            break;
+        }
+        line_no += 1;
+        if line_no < range.start {
+            continue;
+        }
+        if line_no > range.end {
+            truncated = true;
+            break;
+        }
+        if out.len() + line.len() > max_bytes {
+            let room = max_bytes.saturating_sub(out.len());
+            out.extend_from_slice(&line[..char_boundary(&line, room)]);
+            truncated = true;
+            break;
+        }
+        out.extend_from_slice(&line);
+    }
+    Ok((out, truncated))
+}
+
+/// 从 `limit` 往回退到最近的 UTF-8 字符边界（切在字符中间会让整段读变成「不是 UTF-8」）。
+fn char_boundary(bytes: &[u8], limit: usize) -> usize {
+    let mut end = limit.min(bytes.len());
+    while end > 0 && end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    end
+}
+
 impl FileStore for ProjectFiles {
-    fn read(&self, path: &str, max_bytes: usize) -> Result<ReadFile, FileError> {
-        validate_file_read(path, max_bytes)?;
+    fn read(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        range: Option<LineRange>,
+    ) -> Result<ReadFile, FileError> {
+        validate_file_read(path, max_bytes, range)?;
         let resolved = self.resolve(path)?;
         let metadata = fs::metadata(&resolved).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound => FileError::NotFound {
@@ -121,9 +191,17 @@ impl FileStore for ProjectFiles {
                 message: format!("{path} 是目录，不是文件：要列目录请用 list()"),
             });
         }
-        let bytes = fs::read(&resolved).map_err(|error| self.failed(&resolved, error))?;
-        let truncated = bytes.len() > max_bytes;
-        let slice = &bytes[..bytes.len().min(max_bytes)];
+        let (bytes, truncated) = match range {
+            None => {
+                let bytes = fs::read(&resolved).map_err(|error| self.failed(&resolved, error))?;
+                let truncated = bytes.len() > max_bytes;
+                (bytes, truncated)
+            }
+            Some(range) => read_line_range(&resolved, path, range, max_bytes)?,
+        };
+        // 截断点退到字符边界：切在字符中间会让整段读变成「不是 UTF-8 文本」，
+        // 而文件本身明明是 UTF-8。
+        let slice = &bytes[..char_boundary(&bytes, max_bytes)];
         let text = String::from_utf8(slice.to_vec()).map_err(|_| FileError::Invalid {
             message: format!(
                 "{path} 不是 UTF-8 文本，这个能力只读文本（二进制请自己转 base64 存）"
@@ -245,7 +323,7 @@ mod tests {
         let entry = files.write("notes/a.txt", "hello").expect("write");
         assert_eq!(entry.size, 5);
         let read = files
-            .read("notes/a.txt", MAX_FILE_READ_BYTES)
+            .read("notes/a.txt", MAX_FILE_READ_BYTES, None)
             .expect("read");
         assert_eq!(read.text, "hello");
         assert!(!read.truncated);
@@ -257,7 +335,7 @@ mod tests {
         let root = TempRoot::new();
         let files = ProjectFiles::new(&root.0).expect("backend");
         assert!(matches!(
-            files.read("../secret", 16),
+            files.read("../secret", 16, None),
             Err(FileError::Denied { .. })
         ));
         assert!(matches!(
@@ -274,7 +352,7 @@ mod tests {
         let root = TempRoot::new();
         let files = ProjectFiles::new(&root.0).expect("backend");
         assert!(matches!(
-            files.read("nope.txt", 16),
+            files.read("nope.txt", 16, None),
             Err(FileError::NotFound { .. })
         ));
     }
@@ -305,9 +383,72 @@ mod tests {
         let root = TempRoot::new();
         let files = ProjectFiles::new(&root.0).expect("backend");
         files.write("long.txt", "0123456789").expect("write");
-        let read = files.read("long.txt", 4).expect("read");
+        let read = files.read("long.txt", 4, None).expect("read");
         assert_eq!(read.text, "0123");
         assert!(read.truncated);
         assert_eq!(read.bytes, 4);
+    }
+
+    #[test]
+    fn a_line_range_reads_exactly_those_lines() {
+        let root = TempRoot::new();
+        let files = ProjectFiles::new(&root.0).expect("backend");
+        files
+            .write("log.txt", "l1\nl2\nl3\nl4\nl5\n")
+            .expect("write");
+        let read = files
+            .read("log.txt", MAX_FILE_READ_BYTES, Some(LineRange::new(2, 4)))
+            .expect("read");
+        assert_eq!(read.text, "l2\nl3\nl4\n");
+        // 第 5 行还在 → truncated 说明「后面还有你没要的内容」，用户据此翻页。
+        assert!(read.truncated);
+    }
+
+    #[test]
+    fn a_range_past_the_end_stops_at_eof_without_error() {
+        let root = TempRoot::new();
+        let files = ProjectFiles::new(&root.0).expect("backend");
+        files.write("log.txt", "a\nb\n").expect("write");
+        let read = files
+            .read("log.txt", MAX_FILE_READ_BYTES, Some(LineRange::new(5, 9)))
+            .expect("read");
+        assert_eq!(read.text, "");
+        assert!(!read.truncated);
+    }
+
+    #[test]
+    fn a_range_that_stops_before_the_end_says_truncated() {
+        let root = TempRoot::new();
+        let files = ProjectFiles::new(&root.0).expect("backend");
+        files.write("log.txt", "a\nb\nc\n").expect("write");
+        let read = files
+            .read("log.txt", MAX_FILE_READ_BYTES, Some(LineRange::new(1, 2)))
+            .expect("read");
+        assert_eq!(read.text, "a\nb\n");
+        assert!(read.truncated, "第 3 行还在，用户没拿到，必须说明");
+    }
+
+    #[test]
+    fn a_range_is_cut_on_byte_limit_without_splitting_a_character() {
+        let root = TempRoot::new();
+        let files = ProjectFiles::new(&root.0).expect("backend");
+        // 每行三个汉字（9 字节 + 换行）；上限 10 字节只够第一行。
+        files.write("log.txt", "一二三\n四五六\n").expect("write");
+        let read = files
+            .read("log.txt", 10, Some(LineRange::new(1, 2)))
+            .expect("read");
+        assert_eq!(read.text, "一二三\n");
+        assert!(read.truncated);
+    }
+
+    #[test]
+    fn crlf_files_keep_their_carriage_returns() {
+        let root = TempRoot::new();
+        let files = ProjectFiles::new(&root.0).expect("backend");
+        files.write("win.txt", "a\r\nb\r\n").expect("write");
+        let read = files
+            .read("win.txt", MAX_FILE_READ_BYTES, Some(LineRange::new(2, 2)))
+            .expect("read");
+        assert_eq!(read.text, "b\r\n");
     }
 }

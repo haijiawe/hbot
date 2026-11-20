@@ -693,7 +693,10 @@ declare module 'hbot' {
     readonly text: string;
     /** 实际读到的字节数。 */
     readonly bytes: number;
-    /** 是否在 `maxBytes` 处被截断（**不是错误**）。 */
+    /**
+     * 后面还有没给你的内容（**不是错误**）：撞到 `maxBytes`，或者按行读时 `endLine`
+     * 之后还有行。读到文件末尾正好读完时为 `false`。
+     */
     readonly truncated: boolean;
   }
 
@@ -701,6 +704,13 @@ declare module 'hbot' {
   export interface FileReadOptions {
     /** 最多读多少字节，1..=262144，缺省 262144。 */
     maxBytes?: number;
+    /**
+     * 从第几行开始读（1 起，第 1 行就是文件第一行）。不写 startLine 与 endLine 就是从头读。
+     * 只给 startLine 时最多读到 startLine + 9999 行。
+     */
+    startLine?: number;
+    /** 读到第几行为止（含，必须 >= startLine）；一次最多 10000 行，想读更多就分段。 */
+    endLine?: number;
   }
 
   /** `ctx.files.list` 的选项。 */

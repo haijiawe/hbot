@@ -50,12 +50,17 @@ impl FileSlot {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 读一个文本文件。
-    pub(crate) fn read(&self, raw_path: &str, max_bytes: usize) -> Result<ReadFile, FileError> {
+    /// 读一个文本文件（`range` 为 None 时从文件头读）。
+    pub(crate) fn read(
+        &self,
+        raw_path: &str,
+        max_bytes: usize,
+        range: Option<hbot_core::LineRange>,
+    ) -> Result<ReadFile, FileError> {
         let path = normalize_file_path(raw_path)?;
-        validate_file_read(&path, max_bytes)?;
+        validate_file_read(&path, max_bytes, range)?;
         let backend = self.gate(false)?;
-        backend.read(&path, max_bytes)
+        backend.read(&path, max_bytes, range)
     }
 
     /// 覆盖写一个文本文件。
@@ -123,6 +128,7 @@ mod tests {
     #[derive(Default)]
     struct Recording {
         reads: Mutex<Vec<(String, usize)>>,
+        read_ranges: Mutex<Vec<Option<hbot_core::LineRange>>>,
         writes: Mutex<Vec<(String, String)>>,
         removes: Mutex<Vec<String>>,
         lists: Mutex<Vec<(String, usize)>>,
@@ -143,11 +149,20 @@ mod tests {
     }
 
     impl FileStore for Recording {
-        fn read(&self, path: &str, max_bytes: usize) -> Result<ReadFile, FileError> {
+        fn read(
+            &self,
+            path: &str,
+            max_bytes: usize,
+            range: Option<hbot_core::LineRange>,
+        ) -> Result<ReadFile, FileError> {
             self.reads
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((path.to_owned(), max_bytes));
+            self.read_ranges
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(range);
             if let Some(error) = self.take_failure() {
                 return Err(error);
             }
@@ -205,7 +220,7 @@ mod tests {
     fn an_empty_slot_reports_not_declared() {
         let slot = FileSlot::new();
         assert!(matches!(
-            slot.read("a.txt", 16),
+            slot.read("a.txt", 16, None),
             Err(FileError::NotDeclared { .. })
         ));
     }
@@ -218,7 +233,7 @@ mod tests {
             write: true,
         });
         assert!(matches!(
-            slot.read("a.txt", 16),
+            slot.read("a.txt", 16, None),
             Err(FileError::Unavailable { .. })
         ));
     }
@@ -227,7 +242,7 @@ mod tests {
     fn a_bad_path_is_reported_before_the_declaration_gate() {
         let slot = FileSlot::new();
         assert!(matches!(
-            slot.read("../x", 16),
+            slot.read("../x", 16, None),
             Err(FileError::Denied { .. })
         ));
     }
@@ -256,7 +271,7 @@ mod tests {
             write: true,
         });
         assert!(matches!(
-            slot.read("a.txt", 16),
+            slot.read("a.txt", 16, None),
             Err(FileError::NotDeclared { .. })
         ));
         assert!(matches!(
@@ -271,7 +286,7 @@ mod tests {
             read: true,
             write: false,
         });
-        let file = slot.read("  data/a.txt  ", 128).unwrap();
+        let file = slot.read("  data/a.txt  ", 128, None).unwrap();
         assert_eq!(file.path, "data/a.txt");
         let reads = recording.reads.lock().unwrap();
         assert_eq!(reads.len(), 1);
@@ -311,12 +326,46 @@ mod tests {
         recording.fail(FileError::NotFound {
             path: "a.txt".to_owned(),
         });
-        let error = slot.read("a.txt", 16).unwrap_err();
+        let error = slot.read("a.txt", 16, None).unwrap_err();
         assert_eq!(error.code(), "HBOT_FILE_NOT_FOUND");
     }
 
     #[test]
     fn the_unassembled_hint_names_the_host_side() {
         assert!(UNASSEMBLED.contains("宿主"));
+    }
+
+    #[test]
+    fn a_line_range_reaches_the_backend_untouched() {
+        let slot = FileSlot::new();
+        slot.set_declared(FilesCapability {
+            read: true,
+            write: false,
+        });
+        let recording = Arc::new(Recording::default());
+        let backend: Arc<dyn FileStore> = recording.clone();
+        slot.set_backend(backend);
+        slot.read("a.txt", 4096, Some(hbot_core::LineRange::new(3, 9)))
+            .expect("读应当成功");
+        let ranges = recording.read_ranges.lock().unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], Some(hbot_core::LineRange::new(3, 9)));
+    }
+
+    #[test]
+    fn a_reversed_range_is_refused_before_the_backend_is_touched() {
+        let slot = FileSlot::new();
+        slot.set_declared(FilesCapability {
+            read: true,
+            write: false,
+        });
+        let recording = Arc::new(Recording::default());
+        let backend: Arc<dyn FileStore> = recording.clone();
+        slot.set_backend(backend);
+        let error = slot
+            .read("a.txt", 4096, Some(hbot_core::LineRange::new(9, 3)))
+            .unwrap_err();
+        assert!(error.to_string().contains("HBOT_FILE_INVALID"), "{error}");
+        assert!(recording.read_ranges.lock().unwrap().is_empty());
     }
 }

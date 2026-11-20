@@ -98,6 +98,17 @@ export default defineBot({
         reply('list:' + entries.map((entry) => entry.path + '|' + entry.kind).join(','));
         return;
       }
+      if (what === 'lines') {
+        await ctx.files.write('notes/log.txt', 'l1\nl2\nl3\n');
+        const file = await ctx.files.read('notes/log.txt', { startLine: 2, endLine: 2 });
+        reply('lines:' + file.text.trim() + ':' + file.truncated);
+        return;
+      }
+      if (what === 'badrange') {
+        await ctx.files.read('notes/a.txt', { startLine: 5, endLine: 2 });
+        reply('badrange-allowed');
+        return;
+      }
       if (what === 'binary') {
         await ctx.files.read('notes/binary.bin');
         reply('binary-allowed');
@@ -324,4 +335,23 @@ async fn binary_content_is_refused_instead_of_replaced() {
     assert_ok(&harness.start().await, "bot_start");
     let reply = harness.say("binary").await;
     assert!(reply.contains("HBOT_FILE_INVALID"), "实际：{reply}");
+}
+
+#[tokio::test]
+async fn a_line_range_read_only_returns_those_lines() {
+    let harness = Harness::new("lines", Some((true, true)), false).await;
+    assert_ok(&harness.start().await, "bot_start");
+    // log.txt 三行，只读第 2 行：内容就是 l2，后面还有第 3 行所以 truncated 为 true。
+    assert_eq!(harness.say("lines").await, "lines:l2:true");
+}
+
+#[tokio::test]
+async fn a_reversed_line_range_is_refused_at_the_js_boundary() {
+    let harness = Harness::new("badrange", Some((true, true)), false).await;
+    assert_ok(&harness.start().await, "bot_start");
+    let reply = harness.say("badrange").await;
+    assert!(
+        reply.contains("HBOT_FILE_INVALID") && reply.contains("endLine"),
+        "期望行号闸在 JS 边界报错，实际：{reply}"
+    );
 }
