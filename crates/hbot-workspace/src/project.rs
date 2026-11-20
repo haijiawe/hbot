@@ -507,14 +507,25 @@ pub(crate) fn display_rel(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|| "<path>".to_owned())
 }
 
-/// 把 IO 错误映射成 [`HbotError`]：不存在 → `NotFound`，无权限 → `Denied`，其余 → `Internal`。
+/// 把 IO 错误映射成 [`HbotError`]：不存在 → `NotFound`，无权限 → `Denied`，
+/// **路径中间段不是目录 → `Invalid`**，其余 → `Internal`。
 ///
 /// `root` 只用来把 `path` 相对化（[`display_rel`]）；错误文案里**不出现**它的绝对形态。
+///
+/// `NotADirectory` 必须归到 `Invalid` 而不是 `Internal`：它来自用户给的路径本身
+/// （`a.txt/sub` 而 `a.txt` 是文件），是**输入问题**不是宿主故障，调用方要能据此提示用户改路径。
+/// 这条分支同时抹平一个平台差异 —— POSIX 的 `symlink_metadata("a.txt/sub")` 直接返回 `ENOTDIR`，
+/// 而 Windows 返回 `ERROR_PATH_NOT_FOUND`（`NotFound`），于是同一句 `create_dir("a.txt/sub")`
+/// 在 Windows 上命中 `resolve_new_dir` 的 `is not a directory` 分支、在 Linux 上落到这里的
+/// 兜底分支。不归一化就会变成「Windows 绿、Linux 红」的断言差异（CI 实测，见 docs/pitfalls.md 坑 125）。
 pub(crate) fn io_error(root: &Path, context: &str, path: &Path, err: io::Error) -> HbotError {
     let shown = display_rel(root, path);
     match err.kind() {
         io::ErrorKind::NotFound => HbotError::not_found(context, shown),
         io::ErrorKind::PermissionDenied => HbotError::denied(format!("{context} `{shown}`: {err}")),
+        io::ErrorKind::NotADirectory => {
+            HbotError::invalid(format!("`{shown}` is not a directory: {err}"))
+        }
         _ => HbotError::internal(format!("{context} `{shown}`: {err}")),
     }
 }
@@ -618,6 +629,29 @@ mod tests {
         );
     }
 
+    /// `NotADirectory` 必须归 `Invalid` 而不是 `Internal`：它是**用户给的路径本身**有问题
+    /// （`a.txt/sub` 而 `a.txt` 是文件），不是宿主故障，调用方要能据此提示用户改路径。
+    ///
+    /// 这条分支同时抹平一个平台差异：POSIX 的 `symlink_metadata("a.txt/sub")` 直接返回 `ENOTDIR`，
+    /// Windows 返回 `NotFound`（于是走 `resolve_new_dir` 的 `is not a directory` 分支）。不归一化
+    /// 就是「Windows 绿、Linux 红」的断言差异 —— CI 的 ubuntu 作业实测抓到过（docs/pitfalls.md 坑 125）。
+    #[test]
+    fn io_error_maps_not_a_directory_to_invalid() {
+        let temp = TestDir::new("enotdir");
+        let err = io_error(
+            temp.path(),
+            "directory",
+            &temp.path().join("a.txt/sub"),
+            io::Error::from(io::ErrorKind::NotADirectory),
+        );
+        assert!(matches!(err, HbotError::Invalid { .. }), "got {err:?}");
+        let shown = err.to_string();
+        assert!(shown.contains("a.txt"), "文案要带用户给的路径：{shown}");
+        assert!(
+            !shown.contains(&temp.path().display().to_string()),
+            "文案不许带项目根的绝对路径：{shown}"
+        );
+    }
     #[test]
     fn open_rejects_missing_root() {
         let temp = TestDir::new("missing-root");

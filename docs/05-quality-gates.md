@@ -140,12 +140,12 @@ pnpm -C apps/web build           # 产物能构建
 
 | 检查 | 状态 | 证据 |
 |---|---|---|
-| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `125 suites / 1980 passed / 0 failed`（`rustc 1.100.0`） |
+| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `125 suites / 1981 passed / 0 failed / 14 ignored`（`rustc 1.100.0`） |
 | `apps/web` 的 `check`/`test` | ✅ 本地实跑通过 | `47 文件 / 427 用例` |
 | `xtask deps` / `gen --check` | ✅ 本地实跑通过 | `0 violation(s)`、生成物一致 |
 | CI `gates` / `web` / `bundle (ubuntu)` | ✅ runner 上通过 | run `44697883029`（head `3e61746`）三步 success |
 | CI `rust` 的 `fmt` / `clippy` 两平台 | ✅ runner 上通过 | 同一 run：`rust (ubuntu-latest)` 与 `rust (windows-latest)` 的 `clippy` 都是 success。此前红过的两处（`clippy::result_large_err`、Linux-only `unused import`）已修，见 `docs/pitfalls.md` 坑 115 |
-| CI `rust` 的 `test` 步 | ⚠️ 已抓出 5 处红点，全部修完待复验 | ① ubuntu：runner 磁盘耗尽（`signal 7 [Bus error]` + `Free space left: 19 MB`），已加腾磁盘步 + `CARGO_PROFILE_DEV_DEBUG=0`（坑 118）；② windows：设置 watcher 的 mtime 盲点（坑 117），判据已改成比文件字节；③ ubuntu：Linux 的 `RLIMIT_CPU` 软硬上限相等 → `SIGXCPU` 永不出现（坑 119，已确认 `cpu_limit_terminates_a_busy_loop ... ok`）；④ run `44697883029`（head `3e61746`）抓到两条**测试自身的平台/时序假设**：`hbot-device/tests/api.rs` 把 Windows 的能力当跨平台契约（坑 120）、`hbot-bot/tests/runtime.rs` 只等「执行完」不等「落库完」（坑 121）；⑤ run `44700956651`（head `75d73cc`，此时 windows 已 success）抓到 `hbot-redteam/tests/a_path_escape.rs` 的四条 Windows 语义用例没按平台门控（坑 122），改后本地 20 passed |
+| CI `rust` 的 `test` 步 | ⚠️ 已抓出 5 处红点，全部修完待复验 | ① ubuntu：runner 磁盘耗尽（`signal 7 [Bus error]` + `Free space left: 19 MB`），已加腾磁盘步 + `CARGO_PROFILE_DEV_DEBUG=0`（坑 118）；② windows：设置 watcher 的 mtime 盲点（坑 117），判据已改成比文件字节；③ ubuntu：Linux 的 `RLIMIT_CPU` 软硬上限相等 → `SIGXCPU` 永不出现（坑 119，已确认 `cpu_limit_terminates_a_busy_loop ... ok`）；④ run `44697883029`（head `3e61746`）抓到两条**测试自身的平台/时序假设**：`hbot-device/tests/api.rs` 把 Windows 的能力当跨平台契约（坑 120）、`hbot-bot/tests/runtime.rs` 只等「执行完」不等「落库完」（坑 121）；⑤ run `44700956651`（head `75d73cc`，此时 windows 已 success）抓到 `hbot-redteam/tests/a_path_escape.rs` 的四条 Windows 语义用例没按平台门控（坑 122），改后本地 20 passed；⑥ run `44713015747`（head `5a91c94`）抓到两处：`b_command_injection.rs` 把 `cmd` 写死成被测程序（坑 123）、窗口 OCR 夹具 1121 宽超过 runner 的 1024 虚拟屏导致右边被裁（坑 124）；⑦ run `44717160170`（head `f2edad5`，此时 **windows 已 success**）抓到 `hbot-workspace` 的 `create_dir("a.txt/sub")`：POSIX 返回 `ENOTDIR`、Windows 返回 `NotFound`，同一个语义错误走两个分支，`io_error` 的兜底把「用户输入错」变成 `Internal`（坑 125，已给 `NotADirectory` 加 `Invalid` 分支 + 单测） |
 | CI `bundle (windows, nsis)` | ✅ runner 上通过 | run `44685861792` success（冷启动约 9 分钟） |
 | CI `bundle (macos, dmg)` | ❌ 未验 | run 里该 job 直接 `cancelled`；无 Mac 本机 |
 | Linux target 编译（`hbot-core`/`hbot-command`/`hbot-workspace`/`hbot-parity`） | ✅ 交叉 `cargo check` 通过 | 直接验证了 `confinement_linux.rs`（libc/Landlock）与 `paths.rs`（XDG）确实能编 |

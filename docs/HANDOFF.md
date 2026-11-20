@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 57 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1980 passed / 0 failed / 125 target
+cargo test -j 2 --workspace              # 当前 1981 passed / 0 failed / 125 target
 pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 ```
 
-现状：**六道全绿**（2026-11-20 13:45 实测，`rustc 1.100.0`，1980 passed / 125 target / web 47 文件 427 用例）。
+现状：**六道全绿**（2026-11-20 18:40 实测，`rustc 1.100.0`，1981 passed / 125 target / web 47 文件 427 用例）。
 **Rust 版本已钉死**：`rust-toolchain.toml` 的 `channel = "1.100.0"` 与 `ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`
 必须一起改（原来两处都写 `stable`，导致 CI 的 clippy 比本地新、只报在 CI，见 `docs/pitfalls.md` 坑 115）。
 `apps/web/src/generated/*.ts` **要入库**；
@@ -122,7 +122,7 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 124 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 125 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -277,7 +277,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 
 | 需要什么 | 影响 | 现在怎么办 |
 |---|---|---|
-| ~~git remote~~ | 已有（`haijiawe/hbot`，private），CI 已在真跑并逐步转绿 | 首跑抓到的红点全部修完：① CI clippy 1.100 的 `result_large_err`（装箱）；② 工具链钉死（`rust-toolchain.toml` + `ci.yml` 都写 `1.100.0`，见坑 115）；③ ubuntu-only `unused import`；④ 按窗口 OCR 夹具写死像素尺寸（坑 116）；⑤ ubuntu runner 磁盘耗尽（坑 118）；⑥ 设置 watcher 的 mtime 盲点（坑 117）；⑦ Linux 的 `RLIMIT_CPU` 软硬上限相等导致 `SIGXCPU` 永不出现、超限被杀当成正常退出（坑 119）；⑧ CI 上两条**测试自身的平台/时序假设**：把 Windows 的设备能力当跨平台契约（坑 120）、`wait_until` 只等「执行完」不等「落库完」（坑 121）；⑨ 安全用例把解释器写死成 `cmd`，Linux 上先撞 `ProgramNotFound`（坑 123）；⑩ 夹具窗口「按文本量宽度」仍超出 runner 的 1024 宽屏幕，被 `PrintWindow` 裁掉末尾字符（坑 124）。**push 必须带 `-c http.proxy=http://127.0.0.1:7897`**，直连 github.com:443 会被重置 |
+| ~~git remote~~ | 已有（`haijiawe/hbot`，private），CI 已在真跑并逐步转绿 | 首跑抓到的红点全部修完：① CI clippy 1.100 的 `result_large_err`（装箱）；② 工具链钉死（`rust-toolchain.toml` + `ci.yml` 都写 `1.100.0`，见坑 115）；③ ubuntu-only `unused import`；④ 按窗口 OCR 夹具写死像素尺寸（坑 116）；⑤ ubuntu runner 磁盘耗尽（坑 118）；⑥ 设置 watcher 的 mtime 盲点（坑 117）；⑦ Linux 的 `RLIMIT_CPU` 软硬上限相等导致 `SIGXCPU` 永不出现、超限被杀当成正常退出（坑 119）；⑧ CI 上两条**测试自身的平台/时序假设**：把 Windows 的设备能力当跨平台契约（坑 120）、`wait_until` 只等「执行完」不等「落库完」（坑 121）；⑨ 安全用例把解释器写死成 `cmd`，Linux 上先撞 `ProgramNotFound`（坑 123）；⑩ 夹具窗口「按文本量宽度」仍超出 runner 的 1024 宽屏幕，被 `PrintWindow` 裁掉末尾字符（坑 124）；⑪ `create_dir("a.txt/sub")` 在 POSIX 给 `ENOTDIR`、Windows 给 `NotFound`，`io_error` 的兜底把「用户输入错」变成 `Internal`（坑 125，已给 `NotADirectory` 加 `Invalid` 分支）。**push 必须带 `-c http.proxy=http://127.0.0.1:7897`**，直连 github.com:443 会被重置 |
 | **真 NapCat 扫码登录** | OneBot 11 只对假网关验过（真事件 JSON 形状、断线重连、`message_id` 语义、at 规则、去重键都没真机证据） | 实物在 `D:\机器人\QQ JQR\QQ JQR\napcat\NapCat.Shell.Windows.OneKey\`，坑与现状见 `docs/spikes/S11-napcat-local-fixture.md`；**二维码会过期、需先确认用户自己的 QQ 是否退出** |
 | **Linux / macOS 机器** | Landlock 只交叉编译；macOS 命令隔离全无 | 交叉 `cargo check --target x86_64-unknown-linux-gnu`；别写"已验证" |
 | **一份独立测试账号** | M6 迁移/影子（0%） | 跳过；M6 需要真实平台影子跑一周 |
@@ -294,7 +294,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1980 passed / 125 target
+cargo test -j 2 --workspace                              # 基线：1981 passed / 125 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。

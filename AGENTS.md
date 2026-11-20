@@ -28,7 +28,7 @@
 |---|---|---|
 | 0 | `docs/HANDOFF.md` | **接手时先看这一份**：决策权在 lead、工作方式、六道闸门现状、已完成/剩余、外部依赖。它是快照，冲突以本文件与 `04` 为准 |
 | 1 | 本文件 | 规则与地图 |
-| 1.5 | [`docs/pitfalls.md`](docs/pitfalls.md) | **124 条坑全表**（编号稳定）：改任何热点模块前先按编号搜一遍 |
+| 1.5 | [`docs/pitfalls.md`](docs/pitfalls.md) | **125 条坑全表**（编号稳定）：改任何热点模块前先按编号搜一遍 |
 | 2 | `docs/03-directory.md` | 改动落点、命名、依赖方向 |
 | 3 | `docs/02-architecture.md` | 消息链路、Agent、沙箱、存储、安全 |
 | 4 | `docs/06-ide.md` | IDE 布局、编辑器、Agent Diff、运行/调试 |
@@ -155,7 +155,7 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 
 ## 7. 已踩过的坑
 
-全表（124 条）在 **[`docs/pitfalls.md`](docs/pitfalls.md)** —— 那里编号稳定，代码注释与
+全表（125 条）在 **[`docs/pitfalls.md`](docs/pitfalls.md)** —— 那里编号稳定，代码注释与
 设计文档里的「坑 66」「坑 69」都指向它。**新增一条写进那个文件**，不要在这里追加。
 
 改代码之前至少扫一眼下面 12 条：它们全是「不报错、只是悄悄失效」那一类，出事最难查。

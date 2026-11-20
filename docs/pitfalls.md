@@ -570,3 +570,19 @@
     窗口贴 `(0,0)` 而不是 `(100,100)`。失败信息里带出 `screen_extent()` 与实际布局，下一轮红就能直接看出是尺寸问题。
     判据：**「稳定地少最后几个字」= 几何裁切，「偶发空串」= DWM 还没合成** —— 两者要分开处理（后者靠重试，
     前者重试一万次也没用）。同族：任何「按内容量出尺寸」的夹具都要再夹一层「不超过宿主可视区域」。
+
+125. **同一个错误在 POSIX 与 Windows 上是不同的 `io::ErrorKind`，`io_error` 的兜底分支会把「用户输入错」变成 `Internal`**（2026-11-20，CI 的 ubuntu 红）。
+    `crates/hbot-workspace/src/files.rs` 的 `create_dir("a.txt/sub")`（`a.txt` 是文件）在 Windows 上绿、
+    在 Linux 上红：`got Internal { message: "path `a.txt/sub`: Not a directory (os error 20)" }`，而测试要求 `Invalid`。
+    原因是 `crates/hbot-workspace/src/project.rs:278` 的 `resolve_new_dir` 用 `fs::symlink_metadata` 逐段上溯：
+    POSIX 对 `a.txt/sub` 直接返回 `ENOTDIR`（`ErrorKind::NotADirectory`）→ 走最后一个 `Err(err) => io_error(...)`；
+    Windows 返回 `ERROR_PATH_NOT_FOUND`（`ErrorKind::NotFound`）→ 走 `missing.push(name)` 继续上溯，
+    最后在 `a.txt` 那一段命中 `Ok(_)` 且 `!canonical.is_dir()`，于是得到 `Invalid` 的 `is not a directory`。
+    **同一个语义错误，两个平台走到两个分支**，而 `io_error`（`project.rs:521`）当时只有 `NotFound` / `PermissionDenied` / 兜底
+    三条，`NotADirectory` 落到兜底就成了 `Internal`。
+    做法：给 `io_error` 加 `io::ErrorKind::NotADirectory => HbotError::invalid(...)` —— 它是**输入问题**不是宿主故障，
+    调用方（Agent 工具、UI）要能据此提示用户改路径；同时它把平台差异归一化，改一处覆盖所有调用点。
+    配一条单测钉三件事：归 `Invalid`、文案带用户给的相对路径、**不带项目根的绝对路径**（坑 47）。
+    判据：① `io_error` 这种「IO → 领域错误」的映射函数，每加一个 `ErrorKind` 分支都要问「另一个平台给的是不是同一个 kind」；
+    ② 兜底 `_ => Internal` 只该接真正的宿主故障，**用户能改的输入不许落到这里**；
+    ③ 这类红本地（Windows）永远看不见，只能靠 CI 或交叉编译 + 读码 —— 见坑 119 的判读纪律。
