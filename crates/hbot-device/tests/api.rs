@@ -4,9 +4,9 @@
 //! 能力报告，不能碰截图/注入/剪贴板 —— 那些在 `tests/windows_desktop.rs`。
 
 use hbot_device::{
-    ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapabilityReport, DeviceError, InputAction,
-    MouseButton, Screenshot, ScreenshotRequest, WindowInfo, enforce_limit, parse_combo,
-    platform_backend, png, process_name,
+    ClipboardOp, ClipboardValue, DeviceBackend, DeviceCapabilityReport, DeviceError, DeviceTarget,
+    InputAction, MouseButton, OcrRequest, Screenshot, ScreenshotRequest, WindowInfo, enforce_limit,
+    parse_combo, platform_backend, png, process_name,
 };
 
 #[test]
@@ -156,4 +156,78 @@ fn the_contract_types_are_re_exported_so_callers_need_only_one_crate() {
         monitor: 0,
     };
     let _op = ClipboardOp::Read;
+}
+#[test]
+fn an_unsupported_host_refuses_every_device_call_with_a_host_limit() {
+    // `docs/07` §10 的 V10：「能力受限时返回 `HOST_LIMIT` 而非静默降级」。
+    // 桌面、但没有设备实现的宿主（Linux/macOS）就是这条判据最真实的样本 ——
+    // 它必须在**每一个**入口上说「不」，而不是 panic、不是返回空结果、
+    // 更不是截一张全黑的图让人以为成功了。
+    if cfg!(windows) {
+        // Windows 有真实现，这条判据在那边由 `tests/windows_desktop.rs` 的
+        // 「不存在的显示器序号 / 无交互桌面」两组用例覆盖。
+        return;
+    }
+    let backend = platform_backend();
+    let detail = "这个宿主没有设备能力实现";
+    let expect_refusal = |what: &str, error: DeviceError| match error {
+        DeviceError::HostLimit { detail: got } => assert_eq!(
+            got, detail,
+            "{what} 的拒绝文案要与 capabilities().detail 同源，否则两处会漂移"
+        ),
+        other => panic!("{what} 必须是 HostLimit，实际 {other:?}"),
+    };
+    expect_refusal(
+        "screenshot",
+        backend
+            .screenshot(&ScreenshotRequest {
+                monitor: None,
+                max_bytes: 8 * 1024 * 1024,
+            })
+            .expect_err("无设备实现的宿主必须拒绝截屏"),
+    );
+    expect_refusal(
+        "ocr",
+        backend
+            .ocr(&OcrRequest {
+                target: DeviceTarget::None,
+                max_chars: 200,
+            })
+            .expect_err("无设备实现的宿主必须拒绝 OCR"),
+    );
+    expect_refusal(
+        "input",
+        backend
+            .input(
+                &InputAction::Click {
+                    x: 0,
+                    y: 0,
+                    button: MouseButton::Left,
+                },
+                &[],
+            )
+            .expect_err("无设备实现的宿主必须拒绝注入"),
+    );
+    expect_refusal(
+        "windows",
+        backend
+            .windows()
+            .expect_err("无设备实现的宿主必须拒绝窗口枚举"),
+    );
+    expect_refusal(
+        "clipboard",
+        backend
+            .clipboard(&ClipboardOp::Read)
+            .expect_err("无设备实现的宿主必须拒绝剪贴板"),
+    );
+    // 三个非 `Result` 的诊断入口：给空值而不是编一个「像真的」的数字。
+    assert!(
+        hbot_device::displays().is_empty(),
+        "无设备实现的宿主不该报出显示器"
+    );
+    assert_eq!(
+        hbot_device::system_dpi(),
+        0,
+        "无 DPI 概念的宿主返回 0，不要当 96 用"
+    );
 }
