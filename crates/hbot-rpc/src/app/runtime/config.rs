@@ -160,6 +160,75 @@ impl BotConfig {
     }
 }
 
+/// `bots.json` 里声明了哪些 bot —— 只给「列出有哪些 bot」用，**不含任何密钥**。
+///
+/// 与 [`read_bot_config`] 的分工：那个是「启动这一个 bot」的严格读取（缺字段、坏 JSON
+/// 都报 -32002，要能让用户照着改）；这个只回答「文件里有哪几个 id、叫什么、什么平台」，
+/// 供 `bot_list` 播种。
+///
+/// 容错口径：文件不存在 / 读失败 / JSON 坏 / 某条 id 不是 UUID —— 都只 `warn` 并跳过，
+/// 返回能用的部分。理由：这是展示路径，让一条坏配置把整个试跑面板变成错误页，比少显示
+/// 一条更糟；真正的错误由 `bot_start` → [`read_bot_config`] 带着路径与可照抄的 schema 报出来。
+///
+/// 顺序 = 文件顺序（用户手写时自己排的次序，不重排）。
+pub fn declared_bots(root: &Path) -> Vec<DeclaredBot> {
+    let path = bots_file(root);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "读不到 bots.json，按「没有声明 bot」处理");
+            return Vec::new();
+        }
+    };
+    let parsed: BotsFile = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "bots.json 解析失败，按「没有声明 bot」处理（bot_start 仍会报出具体错误）"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut declared = Vec::new();
+    for entry in parsed.bots {
+        let raw_id = entry.id.trim().to_owned();
+        let id = match raw_id.parse::<uuid::Uuid>() {
+            Ok(uuid) => BotId::from_uuid(uuid),
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    id = %raw_id,
+                    %error,
+                    "bots.json 里这条 id 不是 UUID，跳过"
+                );
+                continue;
+            }
+        };
+        declared.push(DeclaredBot {
+            id,
+            name: entry.name,
+            platform: entry.platform,
+        });
+    }
+    declared
+}
+
+/// `bots.json` 里一条声明的展示面（没有 token / appSecret 这些字段——它们不进这个结构，
+/// 就没有"顺手打个日志"的泄漏机会）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredBot {
+    /// bot id。
+    pub id: BotId,
+    /// 展示名；缺省由调用方补（项目目录名）。
+    pub name: Option<String>,
+    /// 平台标识；缺省由调用方补（`onebot11`）。
+    pub platform: Option<String>,
+}
+
 /// [`BOTS_FILE`] 在项目里的完整路径（不保证存在）。
 pub fn bots_file(root: &Path) -> PathBuf {
     root.join(BOTS_FILE)
@@ -927,5 +996,77 @@ mod tests {
         let error = read_bot_config(dir.path(), &bot_id()).expect_err("must fail");
         assert_eq!(error.code(), -32002);
         assert!(error.to_string().contains("url"), "{error}");
+    }
+
+    // -----------------------------------------------------------------------
+    // `declared_bots`：只回答「文件里声明了哪几个 bot」
+    // -----------------------------------------------------------------------
+
+    /// 文件不存在 = 没有声明（不是错误）。项目刚建好、用户还没写 `bots.json` 就是这一态。
+    #[test]
+    fn declared_bots_of_a_missing_file_is_empty() {
+        let dir = TempDir::new("declared-missing");
+        assert!(declared_bots(dir.path()).is_empty());
+    }
+
+    /// 正常文件按**文件顺序**返回 id / name / platform，且可选项真的留成 `None`。
+    #[test]
+    fn declared_bots_keeps_file_order_and_optional_fields() {
+        let dir = TempDir::new("declared-ok");
+        dir.write(
+            r#"{"bots":[
+                 {"id":"11111111-1111-4111-8111-111111111111","platform":"local","name":"一"},
+                 {"id":"22222222-2222-4222-8222-222222222222"}
+               ]}"#,
+        );
+
+        let declared = declared_bots(dir.path());
+        assert_eq!(declared.len(), 2);
+        assert_eq!(
+            declared[0].id,
+            BotId::from_uuid(
+                uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("uuid")
+            )
+        );
+        assert_eq!(declared[0].name.as_deref(), Some("一"));
+        assert_eq!(declared[0].platform.as_deref(), Some("local"));
+        assert_eq!(
+            declared[1].id,
+            BotId::from_uuid(
+                uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid")
+            )
+        );
+        // 两个可选字段都没写：调用方负责补默认值（名字取项目目录名、平台取 onebot11）。
+        assert!(declared[1].name.is_none());
+        assert!(declared[1].platform.is_none());
+    }
+
+    /// 坏 JSON 只让列表变空，不 panic —— 展示路径不该把整个面板变成错误页。
+    #[test]
+    fn declared_bots_of_broken_json_is_empty() {
+        let dir = TempDir::new("declared-broken");
+        dir.write("{ 这不是 JSON");
+        assert!(declared_bots(dir.path()).is_empty());
+    }
+
+    /// 一条 id 不是 UUID：跳过那一条，其余照常返回（而不是整份丢弃）。
+    #[test]
+    fn declared_bots_skips_one_bad_id_and_keeps_the_rest() {
+        let dir = TempDir::new("declared-bad-id");
+        dir.write(
+            r#"{"bots":[
+                 {"id":"not-a-uuid","platform":"local"},
+                 {"id":"11111111-1111-4111-8111-111111111111","platform":"local"}
+               ]}"#,
+        );
+
+        let declared = declared_bots(dir.path());
+        assert_eq!(declared.len(), 1, "只有合法的那条应当留下");
+        assert_eq!(
+            declared[0].id,
+            BotId::from_uuid(
+                uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("uuid")
+            )
+        );
     }
 }

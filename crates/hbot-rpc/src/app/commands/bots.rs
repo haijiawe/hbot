@@ -714,19 +714,15 @@ pub async fn bot_list(state: &AppState) -> Response {
         ));
     };
     let path = root.to_string_lossy().into_owned();
-    // 项目行都没有 = 一个 bot 都没启动过（`bots.project_id` 有外键），空数组即可。
-    let Some(project) = (match lookup_project(state, &path).await {
-        Ok(project) => project,
+    // 项目行可能还不存在（从没 `bot_start` 过）：那就没有库里的行可列，但 `bots.json`
+    // 里声明的 bot 仍要出现在列表里（见本函数末尾的合并），所以这里只记成 `None`，
+    // 不再提前返回空数组。
+    let project_id = match lookup_project(state, &path).await {
+        Ok(project) => project.map(|project| project.id),
         Err(error) => return failed(error),
-    }) else {
-        return match serde_json::to_value(Vec::<BotSummary>::new()) {
-            Ok(value) => Response::with_data(value),
-            Err(error) => failed(HbotError::internal(format!("bot_list 序列化失败：{error}"))),
-        };
     };
 
     let store = Arc::clone(state.store());
-    let project_id = project.id;
     // 一次 spawn_blocking 里把"该项目的 bot + 各自状态"读完：两次 await 之间
     // 状态可能变，读成一个快照更不容易自相矛盾。
     let rows = match state
@@ -734,7 +730,7 @@ pub async fn bot_list(state: &AppState) -> Response {
             let bots = store.list_bots().map_err(store_failed)?;
             let mut rows = Vec::new();
             for bot in bots {
-                if bot.project_id != project_id {
+                if Some(bot.project_id) != project_id {
                     continue;
                 }
                 let status = store.get_bot_status(&bot.id).map_err(store_failed)?;
@@ -748,7 +744,7 @@ pub async fn bot_list(state: &AppState) -> Response {
         Err(error) => return failed(error),
     };
 
-    let summaries: Vec<BotSummary> = rows
+    let mut summaries: Vec<BotSummary> = rows
         .into_iter()
         .map(|(bot, status)| BotSummary {
             bot_id: bot.id,
@@ -764,6 +760,31 @@ pub async fn bot_list(state: &AppState) -> Response {
             ),
         })
         .collect();
+
+    // 补上 `bots.json` 里声明、但库里还没有行的 bot。
+    //
+    // 为什么必须有这一段：`project_open` 只登记项目，不在 `bots` 表里建行（真正的补建
+    // 发生在 `bot_start` 的 `bootstrap_bot`）。而试跑面板的数据源就是 `bot_list`，
+    // 于是全新项目打开后列表是空的——用户装好软件、建好项目，却没有任何可点启动的
+    // 对象。把声明补进来，列表与 `bots.json` 就一致了；启动时 `bootstrap_bot` 再把
+    // 行落库，两边不会打架（同一个 id）。
+    let declared = crate::app::runtime::config::declared_bots(&root);
+    let known: std::collections::HashSet<BotId> = summaries.iter().map(|row| row.bot_id).collect();
+    for entry in declared {
+        if known.contains(&entry.id) {
+            continue;
+        }
+        summaries.push(BotSummary {
+            bot_id: entry.id,
+            name: entry
+                .name
+                .unwrap_or_else(|| crate::app::commands::bots::project_name(&root)),
+            platform: entry.platform.unwrap_or_else(|| PLATFORM.to_owned()),
+            // 库里没有这行 = 从没启动过，落盘状态就是"停着"。
+            status: hbot_core::BotStatus::Stopped,
+            updated_at: Timestamp::from_unix_millis(0),
+        });
+    }
 
     match serde_json::to_value(summaries) {
         Ok(value) => Response::with_data(value),

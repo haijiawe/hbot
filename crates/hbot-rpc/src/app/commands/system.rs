@@ -161,12 +161,18 @@ async fn create_project(
         )));
     }
 
+    // 新建项目自带一条 local 平台条目：少了它「新建 → 点启动」会以 -32002 失败
+    // （`read_bot_config` 要求 `bots.json` 里有该 id 的条目）。id 由注入的
+    // `IdGenerator` 给，与 `bot_start` 补建库行时用的是同一套口径。
+    let local_bot_id = state.ids().bot_id().to_string();
+
     // Phase 1：脚手架 + 类型声明（文件 IO 全在阻塞线程上）。
     let scaffolded = {
         let dir = dir.clone();
         let name = name.clone();
+        let local_bot_id = local_bot_id.clone();
         state
-            .blocking(move || scaffold_project(&dir, &name))
+            .blocking(move || scaffold_project(&dir, &name, &local_bot_id))
             .await?
     };
 
@@ -232,12 +238,26 @@ struct Scaffolded {
 }
 
 /// 写脚手架与 `hbot.d.ts`，返回规范化根与入口。
-fn scaffold_project(dir: &Path, name: &str) -> Result<Scaffolded, HbotError> {
+fn scaffold_project(dir: &Path, name: &str, local_bot_id: &str) -> Result<Scaffolded, HbotError> {
     let report = manifest::scaffold(dir, name).map_err(code_failed)?;
     // `scaffold` 内部虽然也写了 `hbot.d.ts`，但"声明文件必须与当前生成器一致"
     // 这条不变量只由 `dts` 模块决定；再调一次 `write_host_dts`（原子写、幂等）
     // 让这条不变量只有一个来源。
     dts::write_host_dts(dir).map_err(code_failed)?;
+
+    // `bots.json` 里放一条 local 平台条目，让新建的项目**立刻能启动**。local 不联网、
+    // 没有任何凭据，所以这份文件是安全的、可以入库；真接平台时把 `platform`
+    // 改成 `onebot11` / `qq_official` 并把连接参数补上即可。
+    //
+    // 只在文件不存在时写：`project_create` 已经保证目标目录是空的或不存在，
+    // 这一层是给"以后加 `--force` 覆盖模式"留的护栏，绝不覆盖用户配置。
+    let mut files = report.files;
+    if !dir.join(BOTS_FILE).exists() {
+        std::fs::write(dir.join(BOTS_FILE), bots_skeleton(name, local_bot_id)).map_err(
+            |error| HbotError::internal(format!("project_create: 写 {BOTS_FILE} 失败：{error}")),
+        )?;
+        files.push(BOTS_FILE.to_owned());
+    }
 
     let root = std::fs::canonicalize(dir).map_err(|error| {
         HbotError::internal(format!(
@@ -247,11 +267,25 @@ fn scaffold_project(dir: &Path, name: &str) -> Result<Scaffolded, HbotError> {
     })?;
     let entry = manifest::load(&root).map_err(code_failed)?.entry_name();
 
-    Ok(Scaffolded {
-        root,
-        entry,
-        files: report.files,
-    })
+    Ok(Scaffolded { root, entry, files })
+}
+
+/// 平台配置文件名（与 `crate::app::runtime::config` 里那份同名常量一致）。
+const BOTS_FILE: &str = "bots.json";
+
+/// 新项目的 `bots.json`：一条 local 平台条目。
+///
+/// 特意只写 `id` / `platform` / `name` 三个字段：local 平台没有任何连接参数，
+/// 写多了就是死配置。名字带上项目名，用户在试跑面板里能认出这是哪一个。
+fn bots_skeleton(name: &str, bot_id: &str) -> String {
+    let value = serde_json::json!({
+        "bots": [{
+            "id": bot_id,
+            "platform": "local",
+            "name": format!("{name} 本地试跑"),
+        }]
+    });
+    format!("{value:#}\n")
 }
 
 /// 检查目标目录能不能用来建项目；返回"调用前它是否已存在"。
@@ -449,6 +483,39 @@ mod tests {
         assert!(
             matches!(read, Response::Ok { .. }),
             "file_read 必须立刻可用，实际 {read:?}"
+        );
+    }
+
+    /// 新建项目必须自带一条能启动的 local 平台声明。
+    ///
+    /// 少这一条，「新建项目 → 点启动」会以 -32002 失败（`read_bot_config` 要求
+    /// `bots.json` 里有该 id 的条目），而用户完全不知道要去手写一个文件。
+    #[test]
+    fn project_create_declares_a_local_bot_that_can_be_started() {
+        let (dir, state) = temp_state();
+        let target = dir.path().join("自带试跑");
+        let summary = expect_ok(create(&state, &target, "自带试跑"));
+        let root = PathBuf::from(&summary.path);
+
+        let text = std::fs::read_to_string(root.join("bots.json")).expect("读 bots.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("bots.json 必须是合法 JSON");
+        let bots = value["bots"].as_array().expect("bots 必须是数组");
+        assert_eq!(bots.len(), 1, "新项目只该声明一个本地试跑 bot");
+        assert_eq!(bots[0]["platform"], "local");
+        assert_eq!(bots[0]["name"], "自带试跑 本地试跑");
+        let id = bots[0]["id"].as_str().expect("id 必须是字符串");
+        uuid::Uuid::parse_str(id).expect("id 必须是 UUID");
+
+        // 声明层看得见它（这就是试跑面板的数据来源），而库里的 bot 行此刻还是 0 条。
+        let declared = crate::app::runtime::config::declared_bots(&root);
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].platform.as_deref(), Some("local"));
+        assert_eq!(declared[0].name.as_deref(), Some("自带试跑 本地试跑"));
+        let stored = state.store().list_bots().expect("列 bot 行");
+        assert!(
+            stored.is_empty(),
+            "创建项目不该顺手插 bot 行，实际 {stored:?}"
         );
     }
 
