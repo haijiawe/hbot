@@ -14,7 +14,9 @@
 //! 4. **正确的密钥 → handler 的返回值成为应答体**（200 + JSON）；
 //! 5. **handler 返回 `null` → 204**（无应答体）；
 //! 6. **信封 `{ status, body }` 改得了状态码**（418）；
-//! 7. **非 POST → 405**；`bot_stop` 之后 → 404；
+//! 7. **`PUT` 等写方法 → 405**；`bot_stop` 之后 → 404；
+//! 11. **`GET` / `HEAD` 是鉴权后的探活**：密钥对 → 200 且**一次都不调 handler**（不产生副作用），
+//!     没密钥/路由没声明照旧 401，`HEAD` 的头与 `GET` 一致但不带体。
 //! 8. **`Content-Length` 超上限 → 413**（在派发之前就拒）；
 //! 9. **webhook 里可以 `ctx.notify`**，收件人是清单 `capabilities.notify` 定的（外部请求能提醒人，却不能指定发到哪）；
 //! 10. **没声明 `capabilities.notify`** 时那次 notify 失败，文案点名 `HBOT_NOTIFY_NOT_DECLARED`。
@@ -238,6 +240,18 @@ async fn call(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> (u16, String) {
+    let (status, _head, body) = call_raw(addr, method, path, headers, body).await;
+    (status, body)
+}
+
+/// 同上，但把响应头也交出来（`HEAD` 的断言要看 `Content-Length`）。
+async fn call_raw(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, String, String) {
     let mut request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
     for (name, value) in headers {
         request.push_str(&format!("{name}: {value}\r\n"));
@@ -259,7 +273,7 @@ async fn call(
         .and_then(|line| line.split(' ').nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
-    (status, body.to_owned())
+    (status, head.to_owned(), body.to_owned())
 }
 
 /// 带正确密钥调一次。
@@ -410,11 +424,11 @@ async fn an_envelope_changes_the_status_code() {
 }
 
 // ---------------------------------------------------------------------------
-// ⑦ 非 POST → 405；bot_stop 之后 → 404
+// ⑦ 写方法（PUT/DELETE…）→ 405；bot_stop 之后 → 404
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_get_is_405_and_a_stopped_bot_is_404() {
+async fn a_put_is_405_and_a_stopped_bot_is_404() {
     let env = "HBOT_TEST_HOOK_METHOD";
     set_secret(env, "s3cret");
     let harness = Harness::new("method", &manifest(&[("echo", env)])).await;
@@ -422,15 +436,16 @@ async fn a_get_is_405_and_a_stopped_bot_is_404() {
     let server = harness.serve().await;
     let addr = server.addr().expect("拿到端口");
 
+    // `GET` 现在是鉴权后的探活（见 ⑪），这里用真正不被接受的写方法。
     let (status, body) = call(
         addr,
-        "GET",
+        "PUT",
         &format!("/hook/{BOT_UUID}/echo"),
         &[(WEBHOOK_SECRET_HEADER, "s3cret")],
         b"",
     )
     .await;
-    assert_eq!(status, 405, "GET 必须 405，实际体：{body}");
+    assert_eq!(status, 405, "PUT 必须 405，实际体：{body}");
 
     // 停掉 bot：登记表里没有执行器了，同一路径必须 404。
     assert_ok(&harness.stop().await, "bot_stop");
@@ -534,6 +549,94 @@ async fn a_webhook_without_a_declared_notify_target_is_told_so() {
     assert!(
         body.contains("HBOT_NOTIFY_NOT_DECLARED"),
         "错误文案要点名缺的是哪一半，实际体：{body}"
+    );
+
+    server.shutdown().await;
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+// ---------------------------------------------------------------------------
+// ⑪ GET / HEAD 是鉴权后的探活：不调 handler、不产生副作用，失败口径与 POST 一致
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_get_probes_the_route_without_running_the_handler() {
+    let env = "HBOT_TEST_HOOK_PROBE";
+    set_secret(env, "s3cret");
+    let harness = Harness::new("probe", &manifest(&[("echo", env)])).await;
+    assert_ok(&harness.start().await, "bot_start");
+    let server = harness.serve().await;
+    let addr = server.addr().expect("拿到端口");
+
+    let (status, body) = call(
+        addr,
+        "GET",
+        &format!("/hook/{BOT_UUID}/echo"),
+        &[(WEBHOOK_SECRET_HEADER, "s3cret")],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200, "探活必须 200，实际体：{body}");
+    assert!(
+        body.contains("\"ok\":true"),
+        "探活体应当点名 ok=true，实际：{body}"
+    );
+
+    // 关键一条：handler 一次都不许跑。handler 里有一行 `log('hook:...')`，
+    // 只要派发过就会出现在日志里。
+    let logs = harness.logs();
+    assert!(
+        logs.iter().all(|line| !line.contains("hook:echo")),
+        "探活不许派发 handler，实际日志：{logs:?}"
+    );
+
+    // 没密钥：401，与 POST 同一口径（探活不是绕过鉴权的存在性探针）。
+    let (status, body) = call(addr, "GET", &format!("/hook/{BOT_UUID}/echo"), &[], b"").await;
+    assert_eq!(status, 401, "没密钥的探活必须 401，实际体：{body}");
+
+    // 没声明的路由：401 而不是 404，同样与 POST 一致。
+    let (status, body) = call(
+        addr,
+        "GET",
+        &format!("/hook/{BOT_UUID}/nope"),
+        &[(WEBHOOK_SECRET_HEADER, "s3cret")],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 401, "没声明的路由探活必须 401，实际体：{body}");
+
+    server.shutdown().await;
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+#[tokio::test]
+async fn a_head_probe_answers_the_headers_without_a_body() {
+    let env = "HBOT_TEST_HOOK_HEAD";
+    set_secret(env, "s3cret");
+    let harness = Harness::new("head", &manifest(&[("echo", env)])).await;
+    assert_ok(&harness.start().await, "bot_start");
+    let server = harness.serve().await;
+    let addr = server.addr().expect("拿到端口");
+
+    let (status, head, body) = call_raw(
+        addr,
+        "HEAD",
+        &format!("/hook/{BOT_UUID}/echo"),
+        &[(WEBHOOK_SECRET_HEADER, "s3cret")],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200, "HEAD 探活必须 200，实际头：{head}");
+    assert!(body.is_empty(), "HEAD 不许带体，实际体：{body}");
+    // 头必须与 GET 一致：`Content-Length` 报的是 GET 会回的那个体长，不是 0。
+    let declared = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    assert!(
+        declared > 0,
+        "HEAD 的 Content-Length 必须按 GET 的体长报，实际头：{head}"
     );
 
     server.shutdown().await;

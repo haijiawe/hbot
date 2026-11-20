@@ -21,7 +21,10 @@
 //! * `<path>` 必须在该 bot 清单的 `capabilities.webhook[].path` 里，否则 404；
 //! * 密钥与那个路由声明的环境变量**常数时间**比较，不匹配 → 401；环境变量没设 → 401
 //!   （fail-closed，不退化成「没配就放行」）；
-//! * 请求体上限 `MAX_WEBHOOK_BODY_BYTES` → 413；`Transfer-Encoding` / 其它方法 → 405；
+//! * 请求体上限 `MAX_WEBHOOK_BODY_BYTES` → 413；`Transfer-Encoding` → 501，其它写方法（`PUT`/`DELETE`…）→ 405；
+//! * `GET` / `HEAD` 是**鉴权后的探活**：路由在跑且密钥对才回 200，**不调 handler、不产生任何副作用**；
+//!   没有密钥、路由没声明、bot 没在跑，都与 `POST` 回同样的 401/404 —— 探活不改变
+//!   「不泄露路由存在性」这条判据（谁能探活，谁本来就知道密钥）；
 //! * 应答直接来自 handler 的返回值（见 `bot_webhook::response_from_handler`）。
 //!
 //! # 单连接一问一答
@@ -217,19 +220,32 @@ impl WireResponse {
         }
     }
 
-    /// 序列化成 HTTP/1.1 响应字节。
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// 响应头（含 `Content-Length`，它按 `GET` 会回的那个体算）。
+    fn head_bytes(&self) -> String {
         let reason = reason_phrase(self.status);
-        let head = format!(
+        format!(
             "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.status,
             self.content_type,
             self.body.len()
-        );
-        let mut bytes = head.into_bytes();
+        )
+    }
+
+    /// 序列化成 HTTP/1.1 响应字节。
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.head_bytes().into_bytes();
         bytes.extend_from_slice(self.body.as_bytes());
         bytes
+    }
+
+    /// 序列化成 **`HEAD`** 的响应字节：头与 `GET` 完全一致，只是不带体。
+    ///
+    /// 不写成 `Content-Length: 0`：`HEAD` 的语义是「`GET` 会得到什么，只别给我体」，
+    /// 探活脚本（以及任何缓存/代理）会按这个头判断长度；写 0 等于在头里说谎。
+    #[must_use]
+    pub fn to_bytes_head(&self) -> Vec<u8> {
+        self.head_bytes().into_bytes()
     }
 }
 
@@ -383,15 +399,23 @@ async fn handle_connection(
         Ok(Ok(request)) => request,
     };
 
-    if request.method != "POST" {
-        let response = WireResponse::error(405, "HBOT_WEBHOOK_INVALID: 只接受 POST");
-        let _ = stream.write_all(&response.to_bytes()).await;
-        return Ok(());
-    }
-
-    let response = dispatch(&state, &request).await;
+    // 三种方法各走一条：POST 派发 handler、GET/HEAD 只探活、其余写方法一律 405。
+    let head_only = request.method == "HEAD";
+    let response = match request.method.as_str() {
+        "POST" => dispatch(&state, &request).await,
+        "GET" | "HEAD" => probe(&state, &request),
+        other => WireResponse::error(
+            405,
+            &format!("HBOT_WEBHOOK_INVALID: 不接受 {other}（收事件用 POST，探活用 GET/HEAD）"),
+        ),
+    };
+    let bytes = if head_only {
+        response.to_bytes_head()
+    } else {
+        response.to_bytes()
+    };
     stream
-        .write_all(&response.to_bytes())
+        .write_all(&bytes)
         .await
         .with_context(|| format!("回写 webhook 响应失败（peer {peer}）"))?;
     Ok(())
@@ -479,6 +503,30 @@ async fn dispatch(state: &Arc<AppState>, request: &ParsedRequest) -> WireRespons
     {
         Ok(response) => wire_response(response),
         Err(error) => response_for_error(&error),
+    }
+}
+
+/// 鉴权后的探活（`GET` / `HEAD`）：路由在跑且密钥对就回 200，**不调 handler**。
+///
+/// 为什么单开一条而不是把 `GET` 也丢给 handler：探活是监控每分钟都打的东西，而 handler 是用户代码
+/// —— 让它跑就会真改库、真调模型、真发消息。探活的语义只有一条：「这个路由现在能不能被我打到」。
+///
+/// 失败口径与 `POST` **完全一致**（401/404 同一套），否则探活会变成一个绕过鉴权的存在性探针。
+fn probe(state: &Arc<AppState>, request: &ParsedRequest) -> WireResponse {
+    let Some((bot_id, route)) = route_of(&request.path) else {
+        return WireResponse::error(404, "HBOT_WEBHOOK_NO_ROUTE: 路径不是 /hook/<botId>/<path>");
+    };
+    if handler_of(state, &bot_id).is_none() {
+        return WireResponse::error(404, "HBOT_WEBHOOK_NO_ROUTE: 这个 bot 没有在运行");
+    }
+    if let Err(error) = authorize(state, &bot_id, &route, request) {
+        warn!(bot = %bot_id, route = %route, error = %error, "webhook 探活鉴权失败");
+        return response_for_error(&error);
+    }
+    WireResponse {
+        status: 200,
+        content_type: "application/json".to_owned(),
+        body: serde_json::json!({ "ok": true, "route": route }).to_string(),
     }
 }
 
