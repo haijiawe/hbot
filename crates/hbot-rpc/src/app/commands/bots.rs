@@ -78,7 +78,7 @@ pub const MAX_LOG_LIMIT: usize = 1000;
 pub const MAX_VIEW_LIMIT: usize = 200;
 
 /// 按命令分发到各 handler（`dispatch.rs` 是本模块唯一调用方）。
-pub async fn handle(state: &AppState, command: Command) -> Response {
+pub async fn handle(state: &Arc<AppState>, command: Command) -> Response {
     match command {
         Command::BotStart { bot_id } => start(state, bot_id).await,
         Command::BotStop { bot_id } => stop(state, bot_id).await,
@@ -100,7 +100,7 @@ pub async fn handle(state: &AppState, command: Command) -> Response {
 ///
 /// 重复启动返回 -32003（conflict）。启动失败时释放占位、把失败落到库里并推事件，
 /// 然后把真错误返回给调用方（绝不"看起来起来了"）。
-pub async fn start(state: &AppState, bot_id: BotId) -> Response {
+pub async fn start(state: &Arc<AppState>, bot_id: BotId) -> Response {
     // 占位先于一切异步动作：两个并发 bot_start 里只有一个能走到下面，
     // 否则两条路径都会订阅同一个适配器（第二条会撞 "只能订阅一次"）并留下半个 runtime。
     if !state.bots().reserve(bot_id) {
@@ -120,7 +120,7 @@ pub async fn start(state: &AppState, bot_id: BotId) -> Response {
 }
 
 /// [`start`] 的实际接线（失败时由调用方统一收尾）。
-async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
+async fn start_inner(state: &Arc<AppState>, bot_id: BotId) -> Result<(), HbotError> {
     let root = state.project_root().ok_or_else(|| {
         HbotError::invalid(
             "没有打开的项目：先发 project_open，再 bot_start（bots.json 位于项目根）",
@@ -339,7 +339,7 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
     let started_at = state.clock().now();
     state.bots().insert(
         bot_id,
-        running_bot(bot.platform.clone(), started_at, supervisor),
+        running_bot(bot.platform.clone(), started_at, Arc::clone(&supervisor)),
     );
 
     // 定时器 tick：每 `TICK_INTERVAL` 问执行器一次"有没有计划到点"。
@@ -376,6 +376,40 @@ async fn start_inner(state: &AppState, bot_id: BotId) -> Result<(), HbotError> {
     if !state.bots().attach_aux(&bot_id, ticker) {
         tracing::warn!(bot = %bot_id, "bot 已不在登记表里，定时器循环立即停止");
     }
+    // 崩溃收尾：读循环**意外**结束（适配器订阅被关掉 / 入队失败）时，这个 bot 已经收不到
+    // 任何消息，但它在登记表里还是 Running。这里是唯一把它按 `crash` 真正停下来的地方：
+    // 跑 `onStop(crash)`、注销 webhook、取消作业与等待、状态置 Stopped。
+    //
+    // 为什么不在 supervisor 里直接收尾：`onStop` 是用户代码，要执行器与 store，那些在应用层；
+    // supervisor 只负责如实报告「读循环死了」。
+    //
+    // 这个任务**不登记进 `aux`**：`aux` 里的任务会被 `stop()` abort，而"自己 abort 自己"
+    // 会让停机流程停在半路。它自己会在读循环结束（正常停机也算）后退出，不会泄漏。
+    let crash_state = Arc::clone(state);
+    let crash_supervisor = Arc::clone(&supervisor);
+    tokio::spawn(async move {
+        let exit = crash_supervisor.wait_read_loop_exit().await;
+        if !exit.is_unexpected() {
+            return;
+        }
+        let reason = exit.describe();
+        tracing::error!(bot = %bot_id, reason = %reason, "读循环意外结束：按 crash 收尾");
+        local::record_lines(
+            crash_state.store(),
+            crash_state.events(),
+            crash_state.clock(),
+            bot_id,
+            LogLevel::Error,
+            vec![format!(
+                "读循环意外结束（{reason}）：这个 bot 已收不到任何新消息，正在按 crash 停机"
+            )],
+        )
+        .await;
+        let response = stop_with_reason(&crash_state, bot_id, hbot_core::StopReason::Crash).await;
+        if let Response::Error { error } = &response {
+            tracing::error!(bot = %bot_id, error = ?error, "crash 收尾失败");
+        }
+    });
 
     state.events().emit(Event::BotStatus {
         bot_id,
