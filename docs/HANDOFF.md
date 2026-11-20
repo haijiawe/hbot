@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-21 01:20**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`（含附件 `ctx.sendImage` / `ctx.sendFile`）、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`（含每 bot 磁盘配额）、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。同日又接上 **`onStop(crash)` 的触发点**：supervisor 的读循环意外结束（订阅被关 / 入队失败）会经 `ReadLoopExit` + `ReadExitSlot` 传出，rpc 侧按 `StopReason::Crash` 停机并跑 `onStop`（`crates/hbot-rpc/tests/crash_capability.rs`）—— `docs/07` §4.6 里「枚举与渲染就位、但没有可靠检测」的那个缺口已关闭。 同轮又收掉 `docs/07` 里最后两件原本记「还没做」的本地能力：**`ctx.sql` 的读走独立只读连接**（`PRAGMA query_only = ON`，长 SELECT 不再占写锁，`hbot-store/src/bot_sql.rs`）与 **`jobs` 的宿主级预算上限**（`bots.json` 的 `limits.jobBudgetMs`，判据只有 `hbot_core::effective_job_budget_ms` 一份）。
+> 本快照时间：**2026-11-21 04:10**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`（含附件 `ctx.sendImage` / `ctx.sendFile`）、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`（含每 bot 磁盘配额）、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。同日又接上 **`onStop(crash)` 的触发点**：supervisor 的读循环意外结束（订阅被关 / 入队失败）会经 `ReadLoopExit` + `ReadExitSlot` 传出，rpc 侧按 `StopReason::Crash` 停机并跑 `onStop`（`crates/hbot-rpc/tests/crash_capability.rs`）—— `docs/07` §4.6 里「枚举与渲染就位、但没有可靠检测」的那个缺口已关闭。 同轮又收掉 `docs/07` 里最后两件原本记「还没做」的本地能力：**`ctx.sql` 的读走独立只读连接**（`PRAGMA query_only = ON`，长 SELECT 不再占写锁，`hbot-store/src/bot_sql.rs`）与 **`jobs` 的宿主级预算上限**（`bots.json` 的 `limits.jobBudgetMs`，判据只有 `hbot_core::effective_job_budget_ms` 一份）。 同轮开始做**桌面端的端到端验收（A）/ 长时稳定性压测（B）/ 五分钟上手指南（C）**：`scripts/verify-*.ps1` 五支全过、安装包冒烟 11 项 PASS（`docs/spikes/S14-desktop-acceptance.md`）；压测首轮抓到真 bug——`hbot serve` 少一条事件桥（业务 emit 到 `EventBus`，WS 只认 `event_sink()`，桌面壳靠 `spawn_event_pump` 所以只有无头宿主坏），已补 `forward_events` 并加回归测试；零配置上手也补了两处——`project_create` 现在自带一条 `local` 的 `bots.json` 条目、`bot_list` 合并 `bots.json` 的声明（否则「新建项目 → 点启动」必 -32002、「试跑」页签永远是空的），`docs/quickstart-desktop.md` 是配套的九节指南。
 
 ---
 
@@ -31,7 +31,7 @@ Agent-first 的 **bot IDE**：用户在 IDE 里让 Agent 写 TypeScript bot 代�
   React 19/TS 仅作 IDE 前端 + QuickJS（rquickjs）+ SQLite（rusqlite，单写者）+ SWC 去类型。
 - **产品运行时零 Node、零 Go**。Node 只出现在 `apps/web` 的构建/测试链（vite / vitest / pnpm）。
 - 规模：Rust 约 **124k 行**（16 crate + `xtask`）、web **22,667 行**；
-  契约 **35 条命令 / 16 个事件 / 9 个 Agent 工具**；迁移 `0001`–`0007`。
+  契约 **35 条命令 / 16 个事件 / 9 个 Agent 工具**；迁移 `0001`–`0010`。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 57 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 2038 passed / 0 failed / 126 target
+cargo test -j 2 --workspace              # 当前 2048 passed / 0 failed / 128 target
 pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 ```
 
-现状：**六道全绿**（2026-11-21 00:18 实测，`rustc 1.100.0`，2038 passed / 126 target / web 47 文件 427 用例）。
+现状：**六道全绿**（2026-11-21 00:18 实测，`rustc 1.100.0`，2048 passed / 128 target / web 47 文件 427 用例）。
 **Rust 版本已钉死**：`rust-toolchain.toml` 的 `channel = "1.100.0"` 与 `ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`
 必须一起改（原来两处都写 `stable`，导致 CI 的 clippy 比本地新、只报在 CI，见 `docs/pitfalls.md` 坑 115）。
 `apps/web/src/generated/*.ts` **要入库**；
@@ -305,7 +305,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：2038 passed / 126 target
+cargo test -j 2 --workspace                              # 基线：2048 passed / 128 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。
