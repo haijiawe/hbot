@@ -597,6 +597,7 @@ impl HandlerExecutor for RecordingExecutor {
                 conversation: ctx.conversation.clone(),
                 text: format!("reply-{}", ctx.text().unwrap_or("?")),
                 reply_to: Some(ctx.external_id().to_owned()),
+                attachment: None,
             };
             replies
                 .send(reply)

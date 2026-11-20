@@ -132,6 +132,7 @@ fn request(text: &str) -> OutboundRequest {
         conversation: ConversationRef::new("chat-dead", ConversationKind::Group),
         text: text.to_owned(),
         reply_to: None,
+        attachment: None,
     }
 }
 

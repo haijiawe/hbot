@@ -634,6 +634,7 @@ async fn outbound_is_persisted_then_retried_until_sent() {
             conversation: ConversationRef::new("chat-out", ConversationKind::Group),
             text: "reply".to_owned(),
             reply_to: None,
+            attachment: None,
         })
         .await
         .expect("persisted and queued");
@@ -697,6 +698,7 @@ async fn outbound_gives_up_after_max_attempts() {
             conversation: ConversationRef::new("chat-dead", ConversationKind::Group),
             text: "never delivered".to_owned(),
             reply_to: None,
+            attachment: None,
         })
         .await
         .expect("persisted");

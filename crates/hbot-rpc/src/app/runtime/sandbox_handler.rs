@@ -965,6 +965,7 @@ impl SandboxHandler {
                 conversation: ctx.conversation.clone(),
                 text,
                 reply_to: reply_to.clone(),
+                attachment: None,
             };
             self.replies.send(request).await.map_err(|_| {
                 HbotError::internal(format!(
@@ -1145,6 +1146,7 @@ impl SandboxHandler {
                 text,
                 // 主动消息：没有可引用的历史事件，**不得**冒用旧 ID。
                 reply_to: None,
+                attachment: None,
             };
             self.replies.send(request).await.map_err(|_| {
                 HbotError::internal(format!(
@@ -1275,6 +1277,7 @@ impl SandboxHandler {
             text: row.prompt.clone(),
             // 主动消息：没有可引用的历史事件，不得冒用旧 ID。
             reply_to: None,
+            attachment: None,
         };
         match self.replies.send(request).await {
             Ok(()) => {
@@ -1594,6 +1597,7 @@ impl SandboxHandler {
                 text,
                 // 主动消息：作业背后没有可引用的历史事件，**不得**冒用旧 ID。
                 reply_to: None,
+                attachment: None,
             };
             self.replies.send(request).await.map_err(|_| {
                 HbotError::internal(format!(
@@ -1982,6 +1986,7 @@ impl SandboxHandler {
                 conversation: ctx.conversation.clone(),
                 text,
                 reply_to: None,
+                attachment: None,
             };
             self.replies.send(request).await.map_err(|_| {
                 HbotError::internal(format!(

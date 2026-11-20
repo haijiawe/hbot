@@ -112,6 +112,12 @@ pub struct OutboundRequest {
     /// `Some(id)` 时一路带到适配器：QQ/OneBot 用它组 `reply` 消息段，平台据此把回复
     /// 归属到原消息并计入被动回复配额（超配额会被拒发）。
     pub reply_to: Option<String>,
+    /// 附件（路径已由宿主解析并核验：项目根内、文件存在、大小不超限）。
+    ///
+    /// 为什么是 `OutboundRequest` 的字段而不是 `enqueue_with_attachment` 的第二个参数：
+    /// `ctx.sendFile` 要经 `replies` 通道（`mpsc<OutboundRequest>`）到 supervisor，
+    /// 旁路参数在通道里没有位置 —— 于是「发什么」必须能整个装进这一个值里。
+    pub attachment: Option<AttachmentRef>,
 }
 
 /// 已完成落库、等待发送的条目（跨重启恢复时由 [`PendingOutboxSource`] 提供）。
@@ -253,30 +259,6 @@ impl Outbox {
     /// 先写 `outbound` 行再进通道：通道满时会等待（背压传给调用方），而消息已经是
     /// `pending` 行，等待期间崩溃也能在下次启动续发。
     pub async fn enqueue(&self, request: OutboundRequest) -> Result<OutboundId, HbotError> {
-        self.enqueue_inner(request, None).await
-    }
-
-    /// 落库并入队一条**带附件**的出站消息。
-    ///
-    /// 与 [`Self::enqueue`] 的区别只有 `attachment`：为什么不做成给 `OutboundRequest` 加一个
-    /// `Option` 字段 —— 那条路要求全仓十几处结构体字面量同批改（`hbot-rpc` 五处、`hbot-parity`
-    /// 一处、各测试），而其中没有一处会因为多一个 `None` 变得更好读。文本与附件共用同一条
-    /// 出站行、同一个重试与死信路径，差别只在适配器怎么翻译载荷。
-    ///
-    /// 附件的路径必须已经由宿主解析并核验（在项目根内、文件存在、大小不超限）。
-    pub async fn enqueue_with_attachment(
-        &self,
-        request: OutboundRequest,
-        attachment: AttachmentRef,
-    ) -> Result<OutboundId, HbotError> {
-        self.enqueue_inner(request, Some(attachment)).await
-    }
-
-    async fn enqueue_inner(
-        &self,
-        request: OutboundRequest,
-        attachment: Option<AttachmentRef>,
-    ) -> Result<OutboundId, HbotError> {
         let outbound_id = self.ids.outbound_id();
         let conversation_id =
             crate::conversation_id_for(&self.bot_id, &request.conversation.external_id);
@@ -290,8 +272,9 @@ impl Outbox {
         let store = Arc::clone(&self.store);
         // 必须用 `enqueue_outbound_with_target`：`enqueue_outbound` 走的是
         // `OutboundTarget::unknown()`，`reply_to` 会永远落成 NULL（被动回复退化成主动消息）。
+        let attachment = request.attachment.clone();
         let mut target = hbot_store::OutboundTarget::new("{}", request.reply_to.clone());
-        if let Some(attachment) = &attachment {
+        if let Some(attachment) = &request.attachment {
             target = target.with_attachment(attachment.to_json());
         }
         run_store("enqueue_outbound", move || {
