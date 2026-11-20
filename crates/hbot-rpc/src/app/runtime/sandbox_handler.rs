@@ -1155,34 +1155,47 @@ impl SandboxHandler {
         }
         Ok(())
     }
-    /// 跑一轮作业 tick：认领本 bot 的到期作业，逐条派发、落日志、发回复、结算终态。
-    ///
-    /// 与 [`Self::tick] 是**两条独立的循环**，不能合并成一条：定时器那条第一句就是
-    /// "没声明计划就 return"，把它复用给作业会让"只声明了 jobs、没声明 timer"的项目
-    /// 永远派发不到作业（而且看起来像"作业不跑"，不像配置问题）。
-    ///
-    /// ## 顺序：先编译，再认领
-    ///
-    /// 反过来的话，编译失败的那一刻作业行**已经被改成 `running 且 `attempts 已加一**，
-    /// 下一拍又因为 `state != 'pending' 拿不到它 —— 这条作业就卡在 `running 里，
-    /// 只能等下一次进程启动的 `resume_interrupted_jobs 救回来。编译在前，失败时行还
-    /// 是 `pending，下一拍自然重试。
-    ///
-    /// 单条作业失败不影响同批其它作业：每条独立结算（重试 / 落 `failed）。
-    /// 跑一轮等待 tick：结算到期的等待，把超时写进日志。
+    /// 跑一轮等待 tick：先重发到点还有额度的提示，再结算真正超时的等待。
     ///
     /// 与 `tick` / `tick_jobs` 是**第三条**独立循环，理由同坑 69：每个「声明了才有」
     /// 的能力都要自己第一句读清单，不能指望共享的循环替它判。
     ///
-    /// 超时**不派发 handler**：等待过期没有「该跑什么代码」的答案（用户没回话）。
-    /// 所以这里只落一行 error 日志 —— 一行日志是超时唯一的痕迹，等待没有 handler。
+    /// ## 两段互斥，先重发后过期
+    ///
+    /// `promote_wait_reminders` 只认 `reminders_left > 0`，`expire_due_waits` 的 SQL 则带了
+    /// `reminders_left = 0` 守卫 —— 同一行在同一拍里只可能落进其中一段。顺序也要紧：
+    /// 反过来先过期的话，还有额度的行已经被置成终态，重发就再也发不出去了。
+    ///
+    /// ## 过期不派发 handler
+    ///
+    /// 等待过期没有「该跑什么代码」的答案（用户没回话）。所以这里只落一行 error 日志。
+    /// 重发同理：只发同一句 `prompt`、不重新调用 handler，否则每重发一次就跑一遍业务逻辑。
     pub async fn tick_waits(&self, now: hbot_core::Timestamp) -> Result<(), HbotError> {
         if !declared_session(&self.project_root) {
             return Ok(());
         }
+        let at = now.unix_millis();
+
+        // 第一段：到点但还有重发额度的等待 —— 推后一轮，并把提示再发一遍。
         let store = Arc::clone(&self.store);
         let bot_id = self.bot_id;
-        let at = now.unix_millis();
+        let promoted = tokio::task::spawn_blocking(move || {
+            store.promote_wait_reminders(&bot_id, at, WAIT_EXPIRE_LIMIT)
+        })
+        .await
+        .map_err(|error| {
+            HbotError::internal(format!(
+                "重发到期等待的任务失败（bot {}）：{error}",
+                self.bot_id
+            ))
+        })?;
+        for row in promoted.map_err(store_failed)? {
+            self.remind_wait(&row).await;
+        }
+
+        // 第二段：额度用尽且到点的等待 —— 落终态并留一行 error。
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
         let expired = tokio::task::spawn_blocking(move || {
             store.expire_due_waits(&bot_id, at, WAIT_EXPIRE_LIMIT)
         })
@@ -1196,8 +1209,7 @@ impl SandboxHandler {
         let expired = expired.map_err(store_failed)?;
         for row in expired {
             self.record_error_line(format!(
-                "等待 `{}` 超时了：{} 秒内没有{}回答（提示是「{}」，目标会话 `{}`）。\
-                 超时不会重发提示；要继续就再问用户一次 ctx.session.prompt",
+                "等待 `{}` 超时了：{} 秒内没有{}回答（提示是「{}」，目标会话 `{}`）；重发额度已用尽，要继续就再问用户一次 ctx.session.prompt",
                 row.key,
                 row.deadline / 1000,
                 if row.scope == "conversation" {
@@ -1211,6 +1223,75 @@ impl SandboxHandler {
             .await;
         }
         Ok(())
+    }
+
+    /// 把一条等待的提示重发回它所在的会话，并留一行 info 日志。
+    ///
+    /// 发的是**同一句** `prompt`：用户看到的上下文没有变，所以不在这里拼「第 N 次提醒」，
+    /// 次数只进日志。查不到会话时写 error 而不是静默丢弃 —— 否则面板上只会看到
+    /// 「等待还在，但没人收到提示」。
+    async fn remind_wait(&self, row: &hbot_store::WaitRow) {
+        let store = Arc::clone(&self.store);
+        let bot_id = self.bot_id;
+        let lookup = row.conversation.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            store.get_conversation_by_external(&bot_id, &lookup)
+        })
+        .await;
+        let conversation = match found {
+            Err(error) => {
+                self.record_error_line(format!(
+                    "等待 `{}` 要重发提示，但查会话的任务失败：{error}",
+                    row.key
+                ))
+                .await;
+                return;
+            }
+            Ok(Err(error)) => {
+                self.record_error_line(format!(
+                    "等待 `{}` 要重发提示，但读会话失败：{}",
+                    row.key,
+                    store_failed(error)
+                ))
+                .await;
+                return;
+            }
+            Ok(Ok(None)) => {
+                self.record_error_line(format!(
+                    "等待 `{}` 要重发提示，但目标会话 `{}` 不存在（这条会话从没收到过消息），提示没有发出去",
+                    row.key, row.conversation
+                ))
+                .await;
+                return;
+            }
+            Ok(Ok(Some(row))) => row,
+        };
+        let target = hbot_bot::ConversationRef::new(
+            conversation.external_id.clone(),
+            crate::app::runtime::conversation_kind_from_str(&conversation.kind),
+        );
+        let request = OutboundRequest {
+            conversation: target,
+            text: row.prompt.clone(),
+            // 主动消息：没有可引用的历史事件，不得冒用旧 ID。
+            reply_to: None,
+        };
+        match self.replies.send(request).await {
+            Ok(()) => {
+                self.record_logs(vec![format!(
+                    "等待 `{}` 到点，重发了提示（还剩 {} 次额度，目标会话 `{}`）",
+                    row.key, row.reminders_left, row.conversation
+                )])
+                .await;
+            }
+            Err(_) => {
+                self.record_error_line(format!(
+                    "回复通道已关闭（bot {}）：等待 `{}` 的重发提示没有进入 outbox",
+                    self.bot_id, row.key
+                ))
+                .await;
+            }
+        }
     }
 
     /// 跑一轮作业 tick：认领本 bot 的到期作业，逐条派发、落日志、发回复、结算终态。

@@ -111,6 +111,10 @@ impl WaitQueue for StoreWaitQueue {
             scope: spec.scope.as_str().to_owned(),
             deadline,
             created_at: now_ms,
+            // 重发额度与单轮超时都落在行上：tick 里只有一个已落库的行可以看，
+            // `deadline - created_at` 在重发之后就不再等于单轮超时了。
+            reminders_left: spec.effective_reminders(),
+            timeout_ms: timeout,
         };
         match self.store.register_wait(&self.bot_id, &wait) {
             Ok(id) => Ok(id.to_string()),

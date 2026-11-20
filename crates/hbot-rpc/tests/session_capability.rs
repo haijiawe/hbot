@@ -105,6 +105,27 @@ export default defineBot({
 "#
 }
 
+/// 开一条带重发额度的等待：2 秒一轮，到点先重发一次提示再放弃。
+fn reminding_handler() -> &'static str {
+    r#"
+import { defineBot, reply } from 'hbot';
+
+export default defineBot({
+  async onMessage(ctx) {
+    try {
+      await ctx.session.prompt('order-no', '请把订单号发给我', { timeoutMs: 2000, reminders: 1 });
+      reply('asked');
+    } catch (error) {
+      reply('session-error:' + error.message);
+    }
+  },
+  async onResume(ctx) {
+    ctx.log('resume:' + ctx.waitKey);
+  },
+});
+"#
+}
+
 fn manifest(declare: bool) -> String {
     if declare {
         "{\"name\":\"session-bot\",\"platform\":{\"kind\":\"local\"},\"capabilities\":{\"state\":{\"session\":true}}}\n".to_owned()
@@ -356,5 +377,50 @@ async fn a_second_prompt_in_the_same_conversation_is_refused() {
         "要点头名挡路的那条（用户才知道先回哪个），实际：{reply}"
     );
     assert_eq!(harness.waits().len(), 1, "只该留下第一条");
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+// ---------------------------------------------------------------------------
+// ⑤ 到点先重发提示，额度用尽才落终态
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_expiring_wait_resends_the_prompt_before_giving_up() {
+    let harness = Harness::new("reminders", reminding_handler(), &manifest(true)).await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    assert_ok(&harness.inject("hello").await, "bot_inject");
+    wait_for("等待行落库", || !harness.waits().is_empty()).await;
+    assert_eq!(
+        harness.waits()[0].reminders_left,
+        1,
+        "声明的重发额度必须落在行上（tick 里只有这一行可看）"
+    );
+
+    // 第一轮到点：同一句提示再发一遍（走 outbox，所以日志里是 `[reply] ` 行）。
+    wait_for("重发了提示", || {
+        harness
+            .replies()
+            .iter()
+            .any(|text| text == "请把订单号发给我")
+    })
+    .await;
+    wait_for("留下重发日志", || {
+        harness
+            .logs()
+            .iter()
+            .any(|row| row.line.contains("重发了提示") && row.line.contains("还剩 0 次额度"))
+    })
+    .await;
+
+    // 第二轮流没人回 → 终态，并留一行点明「额度已用尽」的 error。
+    wait_for("等待落终态", || harness.waits().is_empty()).await;
+    wait_for("留下超时日志", || {
+        harness
+            .logs()
+            .iter()
+            .any(|row| row.level == "error" && row.line.contains("重发额度已用尽"))
+    })
+    .await;
+
     assert_ok(&harness.stop().await, "bot_stop");
 }
