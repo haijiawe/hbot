@@ -60,6 +60,15 @@ pub const DEFAULT_MAX_PENDING_JOBS: u32 = hbot_core::MAX_JOBS_PER_BOT as u32;
 /// 队列）；再高就要求宿主侧的内存与磁盘预算，那是另一个设计，先不给。
 pub const MAX_PENDING_JOBS: u32 = 1024;
 
+/// Hard cap for `limits.quotaMb`（每 bot 在项目里累计可占用的 MiB）。
+///
+/// 与核心常量同值：清单能调小、不能调大。上界之外不是「再给一点」，而是
+/// 「这已经不是 bot 的缓存，是用户自己的数据」—— 那该放项目外。
+pub const MAX_FILE_QUOTA_MB: u64 = hbot_core::MAX_FILE_QUOTA_MB;
+
+/// `limits.quotaMb` 的缺省值：**0 = 不限**（见 [`hbot_core::DEFAULT_FILE_QUOTA_MB`]）。
+pub const DEFAULT_FILE_QUOTA_MB: u64 = hbot_core::DEFAULT_FILE_QUOTA_MB;
+
 /// Reserved bot name used by [`scaffold`] when the caller has no better idea.
 pub const FALLBACK_NAME: &str = "my-bot";
 
@@ -355,6 +364,16 @@ pub struct ManifestLimits {
     /// 「跑到内存/磁盘满才开始丢」。缺省 [`DEFAULT_MAX_PENDING_JOBS`]。
     #[serde(default = "default_max_pending_jobs", rename = "maxPendingJobs")]
     pub max_pending_jobs: u32,
+    /// Ceiling on the bytes this bot may occupy inside the project, in MiB.
+    ///
+    /// **0 = 不限**（缺省）。这一项与上面三项的缺省口径不同：写文件在没有配额时
+    /// 本来就是项目根里的普通操作，给所有既有项目突然加硬上限会让「昨天还能跑的
+    /// bot 今天报 `HBOT_FILE_QUOTA`」。要配额的项目显式写 `limits.quotaMb`。
+    ///
+    /// 与单次写上限（`hbot_core::MAX_FILE_WRITE_BYTES`）不是一回事：那个管「这一次
+    /// 写了多少」，这个管「所有文件加起来占多少」。
+    #[serde(default = "default_file_quota_mb", rename = "quotaMb")]
+    pub quota_mb: u64,
 }
 
 impl Default for ManifestLimits {
@@ -363,6 +382,7 @@ impl Default for ManifestLimits {
             handler_ms: DEFAULT_HANDLER_MS,
             heap_mb: DEFAULT_HEAP_MB,
             max_pending_jobs: DEFAULT_MAX_PENDING_JOBS,
+            quota_mb: DEFAULT_FILE_QUOTA_MB,
         }
     }
 }
@@ -390,6 +410,10 @@ const fn default_heap_mb() -> u64 {
 
 const fn default_max_pending_jobs() -> u32 {
     DEFAULT_MAX_PENDING_JOBS
+}
+
+const fn default_file_quota_mb() -> u64 {
+    DEFAULT_FILE_QUOTA_MB
 }
 
 /// Render a path the way the manifest spells it: `/` separators, no `\\`.
@@ -535,6 +559,14 @@ impl Manifest {
 }
 
 impl ManifestLimits {
+    /// 这个 bot 在项目里累计可占用的字节数；`0` = 不限。
+    ///
+    /// 换算只在这里做一次：runtime 层拿到的是字节，不自己乘 1024（两处换算迟早分叉）。
+    #[must_use]
+    pub fn file_quota_bytes(&self) -> u64 {
+        hbot_core::quota_bytes_from_mb(self.quota_mb)
+    }
+
     fn validate(&self, manifest_path: &Path) -> Result<(), CodeError> {
         if self.handler_ms == 0 || self.handler_ms > MAX_HANDLER_MS {
             return Err(invalid(
@@ -553,6 +585,18 @@ impl ManifestLimits {
                     "`limits.maxPendingJobs` 必须在 1..={MAX_PENDING_JOBS} 之间，收到 {}；\
                      超过宿主硬上限直接报错，不做静默压缩",
                     self.max_pending_jobs
+                ),
+            ));
+        }
+        // 配额的上界是 1 GiB，下界是 0 —— 0 在这里**是合法值**（= 不限），与上面三项
+        // 「0 视为非法」相反。所以判据只判上界，别顺手抄成 `== 0 ||`。
+        if self.quota_mb > MAX_FILE_QUOTA_MB {
+            return Err(invalid(
+                manifest_path,
+                format!(
+                    "`limits.quotaMb` 必须 <= {MAX_FILE_QUOTA_MB}，收到 {}；\
+                     超过宿主硬上限直接报错，不做静默压缩（0 表示不限）",
+                    self.quota_mb
                 ),
             ));
         }
@@ -982,6 +1026,37 @@ mod tests {
         assert!(error.to_string().contains("hbot.json"), "{error}");
     }
 
+    /// 配额与其它三项的缺省口径**相反**：0 是合法值（= 不限），不是「漏填」。
+    /// 这条测试钉的是这个反直觉的口径，别顺手把它改成 `== 0 ||` 就红。
+    #[test]
+    fn a_zero_quota_means_unlimited_and_is_not_refused() {
+        let scratch = Scratch::new("quota-default");
+        scratch.write(ENTRY_MODULE, "export default {};\n");
+        scratch.write(MANIFEST_FILE, MINIMAL);
+
+        let manifest = load(&scratch.0).expect("应能加载");
+        assert_eq!(manifest.limits.quota_mb, DEFAULT_FILE_QUOTA_MB);
+        assert_eq!(DEFAULT_FILE_QUOTA_MB, 0, "缺省必须是不限");
+        assert_eq!(manifest.limits.file_quota_bytes(), 0);
+
+        // 显式写 0 也要通过（用户明确写「不限」是最常见的写法）。
+        scratch.write(
+            MANIFEST_FILE,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":"ws://h"},
+                "limits":{"quotaMb":0}}"#,
+        );
+        assert_eq!(load(&scratch.0).expect("0 应通过").limits.quota_mb, 0);
+
+        // 写一个具体值：字节换算是清单侧唯一的一份。
+        scratch.write(
+            MANIFEST_FILE,
+            r#"{"name":"d","platform":{"kind":"onebot11","ws":"ws://h"},
+                "limits":{"quotaMb":16}}"#,
+        );
+        let manifest = load(&scratch.0).expect("16 应通过");
+        assert_eq!(manifest.limits.quota_mb, 16);
+        assert_eq!(manifest.limits.file_quota_bytes(), 16 * 1024 * 1024);
+    }
     #[test]
     fn limits_above_the_host_caps_are_refused_not_clamped() {
         let scratch = Scratch::new("caps");
@@ -998,6 +1073,7 @@ mod tests {
                 u64::from(MAX_PENDING_JOBS),
             ),
             ("maxPendingJobs", 0, u64::from(MAX_PENDING_JOBS)),
+            ("quotaMb", MAX_FILE_QUOTA_MB + 1, MAX_FILE_QUOTA_MB),
         ] {
             scratch.write(
                 MANIFEST_FILE,
@@ -1038,6 +1114,7 @@ mod tests {
             handler_ms: u64::MAX,
             heap_mb: u64::MAX,
             max_pending_jobs: MAX_PENDING_JOBS,
+            quota_mb: MAX_FILE_QUOTA_MB,
         });
         assert_eq!(limits.handler_timeout_ms(), MAX_HANDLER_MS);
         assert_eq!(
