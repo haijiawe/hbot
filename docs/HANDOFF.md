@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 09:20**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的。
+> 本快照时间：**2026-11-20 10:30**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 56 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 1951 passed / 0 failed / 124 target
+cargo test -j 2 --workspace              # 当前 1977 passed / 0 failed / 125 target
 pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 ```
 
-现状：**六道全绿**（2026-11-20 06:08 实测）。`apps/web/src/generated/*.ts` **要入库**；
+现状：**六道全绿**（2026-11-20 10:19 实测，1977 passed / 125 target）。`apps/web/src/generated/*.ts` **要入库**；
 改 `dto` 后必须 `gen`（还要 `gen --check`）再提交。
 纯文档提交不需要跑全闸，但要在提交信息里说明"仅文档"。
 
@@ -119,7 +119,7 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 106 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 114 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -171,8 +171,8 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 | M7 第 3 步 | 完成 | `C1.timer`（2026-11-18）+ `C4.jobs`（2026-11-19，`bot_jobs` 表 / `onJob` / 重试退避 / `bot_stop` 取消 / 重启恢复） |
 | M7 第 4 步 | 完成 | `C2.session`（2026-11-19，`bot_waits` 表 / `ctx.session.prompt` / `onResume` / 超时结算 / `bot_stop` 取消） |
 | M7 第 5 步 | 完成 | `C3.send` / `C3.notify`（2026-11-19）+ `C1.webhook`（2026-11-19，`WebhookServer` 手写 HTTP/1.1 / 三种鉴权失败统一 401 / 返回值即应答） |
-| M7 第 5.5 步 | 完成 | `C3.file`（2026-11-20，`docs/07` §3.6，项目内文件读写 / 路径钉根 / 只删空目录）+ `onStart`/`onStop`（2026-11-19，`docs/07` §4.6，含 2026-11-20 接上的 `shutdown` 触发点）+ `C2.sql`（2026-11-20，`docs/07` §5.3，每 bot 一个 `<data_dir>/bot_sql/<bot_id>.db` / 运行时禁 DDL / 迁移不阻断启动） |
-| M7 出口标准（示例项目） | 自动化那一半完成 | `examples/chat` / `examples/game` / `examples/support`（无平台凭据，`platform.kind = local`）；`crates/hbot-cli/tests/examples.rs` 逐个跑 `check_project`（清单 → 编译 → `hbot.d.ts` 未漂移）并钉死名字；`cargo xtask gen` 刷新它们的 `hbot.d.ts`、`gen --check` 拦漂移。**整体 e2e（打开示例 → 发消息 → 看到回复）仍缺**，与 V10/V11/V15 一起归 M9/M10 |
+| M7 第 5.5 步 | 完成 | `C3.file`（2026-11-20，`docs/07` §3.6，项目内文件读写 / 路径钉根 / 只删空目录）+ `onStart`/`onStop`（2026-11-19，`docs/07` §4.6，含 2026-11-20 接上的 `shutdown` 触发点）+ `C2.sql`（2026-11-20，`docs/07` §5.3，每 bot 一个 `<data_dir>/bot_sql/<bot_id>.db` / 运行时禁 DDL / 迁移不阻断启动）；同日补 `C3.file` 的递归删除 / `readBytes` / 按行写、webhook 路由级超时 `timeoutMs`、作业池上限 `limits.maxPendingJobs` |
+| M7 出口标准（示例项目） | 自动化那一半完成 | `examples/chat` / `examples/game` / `examples/support`（无平台凭据，`platform.kind = local`）；`crates/hbot-cli/tests/examples.rs` 逐个跑 `check_project`（清单 → 编译 → `hbot.d.ts` 未漂移）并钉死名字；`cargo xtask gen` 刷新它们的 `hbot.d.ts`、`gen --check` 拦漂移。**整体 e2e 2026-11-20 补齐**：`crates/hbot-rpc/tests/examples_e2e.rs` 把 chat / game / support 三个示例复制进临时项目，走「启动 bot → 发消息 → 断言回复」（chat `/count` 只走 kv、game `/score`+`/top` 真跑 `migrations/0001_init.sql`、support `/ticket` 走 `ctx.session.prompt` → `onResume` → `ctx.sql`）；整条 `M7` 仍不标完成，因为 V10/V11/V15 归 M9/M10 |
 
 ---
 
@@ -190,7 +190,7 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 - `hbot_core::JobId` 与 `hbot_store::JobId` 是两个类型，转换用 `from_uuid(*id.as_uuid())`（坑 71）。
 
 **还没做的两件**（不阻塞主线）：宿主级预算上限（手机 30 秒"平台取小"仍在 `docs/08` 的设计里）；
-作业池"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
+作业池"上限可配"**2026-11-20 已落地**：`hbot.json` 的 `limits.maxPendingJobs`（缺省 256 = `hbot_core::MAX_JOBS_PER_BOT`，硬上限 1024，越界报错不夹取），容量闸与预算查询共用同一次 `manifest::load`；e2e 在 `crates/hbot-rpc/tests/jobs_capability.rs` 的 `max_pending_jobs_in_the_manifest_caps_the_queue`。仍没做的只剩宿主级预算上限（手机 30 秒"平台取小"仍在 `docs/08` 的设计里）。
 
 > **2026-11-20 补：作业状态面板已落地**（底部面板「作业」页签，数据来自只读命令 `bot_jobs`/`bot_waits`）。
 
@@ -221,8 +221,14 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 - `Ctx::json_parse` 吃 `Value` 不吃 `String`（坑 85）；`WebhookServer` 的 listener 一旦 move 进接受循环，
   `addr()` 就得靠绑定时存下的 `SocketAddr`（坑 86）。
 
-**还没做的三件**（都不阻塞主线）：应答体流式（现整段进内存，上限 256 KiB）、
-路由级超时（现在统一用 handler 预算）、反向代理/公网暴露（手机做不到，见 `docs/08` §4.4）。
+**2026-11-20 补：路由级超时已落地**。`capabilities.webhook[].timeoutMs`（10..=2000，缺省用
+`limits.handlerTimeout`，**只能收紧不能放宽**）一路透传到 worker，取 `min(清单值, 宿主预算)`；
+超时走既有 `WebhookError::Timeout` → 504。e2e 在 `crates/hbot-rpc/tests/webhook_capability.rs`
+（`a_route_timeout_cuts_a_slow_handler_short`，用**忙等**测，`ctx.sleep` 测不出 —— 坑 109）。
+
+**还没做的两件**（都不阻塞主线）：应答体流式（**刻意不做**：handler 的返回值本来就是 JS 内存里的
+字符串，流式只省传输层缓冲，却要新开一套分块 API；上限 256 KiB 写进文档）、反向代理/公网暴露
+（手机做不到，见 `docs/08` §4.4）。
 
 **刚落地的那两件（`onStart` / `onStop`，`docs/07` §4.6）**：失败语义**相反** —— `onStart` 抛错就是
 启动失败（回滚到 stopped），`onStop` 抛错只落一行 error 日志；预算也不同（`onStart` 用 `handlerMs`，
@@ -243,7 +249,13 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 **刚落地的 `C3.file`（`docs/07` §3.6）**：`capabilities.state.files.{read,write}` **读写分开**（坑 97），
 路径判据只在槽位层（坑 96）、后端只补符号链接逃逸；四个动词 `read`/`write`/`list`/`remove` 不给裸 fs；
 读超限截断并标 `truncated`、写超 1 MiB 报错、非 UTF-8 报错、`remove` 只删空目录（坑 98）。
-还没做：附件发送、二进制直读（约定存 base64）、递归删除、每 bot 配额、按行**写**。
+2026-11-20 补：**递归删除 / 二进制读 / 按行写**都落地了 —— `remove(path, { recursive })`（返回条目数，
+逐层 `symlink_metadata`、遇符号链接一律拒、先扫后删、≤1000 条，坑 107）、
+`readBytes(path, { maxBytes })`（回来是原样字节的 base64，不做 UTF-8 校验）、
+`write(path, text, { startLine, endLine })`（只替换那几行，未触碰行按字节原样复制、行尾不重写，
+同目录 tmp + `sync_all` + `rename` 有界重试；坑 108 / 111）。
+还没做：附件发送（要动 `OutboundRequest` 与三个适配器的媒体上传）、每 bot 磁盘配额（要一张记账表，
+每次写扫树会撞坑 23）。
 
 2026-11-20 补：**按行范围读**已落地 —— `ctx.files.read(path, { startLine, endLine })` 逐行流式读（不再整文件进内存），一次 ≤ 10000 行、行号 1 起、`endLine` 含；越界/逆序报错不夹取；`truncated` 表示「后面还有没给你的」（撞字节上限或范围后仍有行），据此翻页。顺带修掉整文件读的截断点可能切在 UTF-8 字符中间、导致合法文件被报「不是 UTF-8」的老洞。
 
@@ -251,7 +263,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 
 - `onStart` / `onStop`（含 `shutdown` 原因）—— **已落地（2026-11-19 / 2026-11-20，`docs/07` §4.6）**，别再重做；
   `crash` 这个原因**暂时没人发**是刻意的（理由见上面 §7 C 段末尾）；
-- `C3.file` 的收尾件：附件发送、二进制直读、递归删除、每 bot 配额、按行写（主链路与按行读 2026-11-20 已落地，见 `docs/07` §3.6）；
+- `C3.file` 的收尾件：附件发送、每 bot 磁盘配额（主链路、按行读写、二进制读、递归删除 2026-11-20 都已落地，见 `docs/07` §3.6）；
 - `onSchedule` —— **已落地（2026-11-20，`docs/07` §4.4.1）**：它就是 `onTimer` 的正式名，同一条派发路径、同一个 `capabilities.timer`；两个名字都写会启动失败。别再按「另起一条路径」实现；
 - 设备完整版：混合 DPI 跨屏拼图、中文以外的 OCR 语言包（按窗口截图 2026-11-20 已落地，见 `docs/09` §11.1）；
 - `E1` npm 打包、云端执行宿主（`docs/08` §9 / ADR-0006）。
@@ -279,7 +291,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：1951 passed / 124 target
+cargo test -j 2 --workspace                              # 基线：1977 passed / 125 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。

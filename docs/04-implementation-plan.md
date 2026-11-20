@@ -260,7 +260,7 @@
 
 出口标准的两半现在**都可判定**：
 
-- **三类示例项目**：`examples/chat`、`examples/game`、`examples/support` 入库（无平台凭据，统一 `platform.kind = local`）。`crates/hbot-cli/tests/examples.rs` 逐个跑 `check_project`（清单合规 → 入口编译 → `hbot.d.ts` 未漂移），并断言名字就是这三类；`cargo xtask gen` 负责刷新它们的 `hbot.d.ts`，`gen --check` 拦漂移。**「全部能在桌面跑通」仍只有自动化那一半有证据**：真起 bot 投递消息的 e2e 在各能力自己的测试里（`crates/hbot-rpc/tests/*_capability.rs`），没有一条「打开示例 → 发消息 → 看到回复」的整体回归。
+- **三类示例项目**：`examples/chat`、`examples/game`、`examples/support` 入库（无平台凭据，统一 `platform.kind = local`）。`crates/hbot-cli/tests/examples.rs` 逐个跑 `check_project`（清单合规 → 入口编译 → `hbot.d.ts` 未漂移），并断言名字就是这三类；`cargo xtask gen` 负责刷新它们的 `hbot.d.ts`，`gen --check` 拦漂移。**「能在桌面跑通」有整体 e2e 了**：`crates/hbot-rpc/tests/examples_e2e.rs` 把仓库里的示例目录复制进临时项目、真 `bot_start` + `bot_inject`，三条各跑一条链路 —— chat `/count` 走 `kv` 计数（不碰模型）、game `/score` 写库并 `/top` 读回（顺带证明 `migrations/0001_init.sql` 真执行过）、support `/ticket` 注册等待 → 下一句走 `onResume` → 用 `ctx.sql` 落 `tickets` 表。
 - **V1–V11**：2026-11-20 在 `07` §10 逐条对账，V12–V16 一并补上；`V10`（设备能力跨宿主）、`V11`（第二宿主）、`V15`（真机 GUI）**没有自动化证据**，挂在 `M10` 上，不许打勾。
 
 结论：M7 的能力面可以标「已落地」，**整条里程碑仍不能标完成** —— 缺的是上面那一条整体 e2e 与 V10/V11/V15 的宿主侧证据，它们属于 M9/M10 的验收范围。

@@ -402,3 +402,47 @@
      `hbot-rpc` 的 `ProjectFiles::read` 会回 `HBOT_FILE_INVALID`（「不是 UTF-8 文本」），而文件本身一个坏字节都没有 —— 排障会一路查到编码上。
     做法：截断点退到最近的字符边界（`while end > 0 && (bytes[end] & 0xC0) == 0x80 { end -= 1 }`）；按行读那条新路径按整行收尾，
     只有「单独一行就超上限」时才退字符边界。任何「按字节上限收尾」的地方都要问一句：这一刀会不会切在字符或转义序列中间。
+
+107. **递归删除要逐层 `symlink_metadata` 并拒绝符号链接，而且要「先扫后删」**（2026-11-20）。
+     `ctx.files.remove(path, { recursive: true })` 用 `fs::metadata`（跟随链接）判类型，就可能在项目里删掉一个指向 `~/.ssh` 的目录；
+     `fs::remove_dir_all` 遇到符号链接的行为还因平台而异。做法：`count_tree` 先走一遍（每个条目 `symlink_metadata`，`is_symlink()` 一律
+    `HBOT_FILE_DENIED` 且点名「不跟进链接」，顺便数条目与 `MAX_FILE_REMOVE_ENTRIES` 对账），确认整棵树可删之后才 `delete_tree` 自底向上删。
+    先扫后删的第二个好处：超限与链接在**动手之前**就报错，不会留下删了一半的目录。
+
+108. **按行写必须保留未触碰行的原始行尾**（2026-11-20）。把所有行读出来用 `\n` 拼回去，会让一个 CRLF 项目整文件 diff ——
+    用户看到「我只改了一行，却有一千行变更」。做法：未触碰行按**字节**原样复制（`read_until(b'\n')` 拿到的整行，含 `\r`）；
+    被替换段沿用**首行**的终止符（`line_terminator` 返回 `\r\n` / `\n` / `""`），末行本来没有换行就不补。
+
+109. **`ctx.sleep` 会把请求夹到剩余预算然后正常返回 —— 所以「预算到点掐断」的测试必须忙等**（2026-11-20）。
+    写一条 webhook 超时 e2e 时用了 `await ctx.sleep(1500)`，路由预算 200 ms，结果回的是 `200 {ok:true}`：
+    `crates/hbot-code/src/runtime/host_api.rs` 的 sleep 实现是 `requested.min(deadline.remaining())`，到点就醒来、继续跑完 handler。
+    做法：要证明「预算掐断」，handler 里写 `const started = Date.now(); while (Date.now() - started < 1500) {}`（先例
+    `crates/hbot-code/tests/s2_ai.rs:324`）。同族：任何「用一个会自适应的原语去测自适应本身」的断言都是假绿。
+
+110. **`Store::list_logs` 返回的是「新的在前」—— 别用「旧长度当下标」取新回复**（2026-11-20）。
+     `examples_e2e` 的 `ask()` 最初写 `replies[before_len..]`，第二轮取到的是上一轮的回复（`/count` 两次都读成 1，而 kv 行确实是 1→2）。
+    做法：按**文本出现次数**比较（`first_new_reply(previous, current)`：同一句出现得更多才算新的一条），或直接按 `createdAt` 过滤。
+    判据：日志/事件的排序方向不属于「取最新一条」的判据，把它写进断言就会在方向改变时静默错位。
+
+111. **按行写要有「替换段已经写完」这个显式状态**（2026-11-20）。
+    `copy_lines` 最初在 `line_no == range.end` 分支里写替换文本，但循环继续 —— 后面每一行都满足 `line_no >= range.end`，于是**一直覆写**：
+    把 `l1\nl2\nl3\n` 的第 2 行替换成 `X2`，得到 `l1\nX2\nX2\n`。修法是写完立刻 `wrote = true`，之后每行走「原样复制 + continue」。
+    同族：任何「按条件区间改写」的流式循环，都要把「区间已结束」当成一个状态，而不是靠条件表达式在每轮重新判断。
+
+112. **`Async` 闭包里不能捕获任何 JS 对象（`Function` / `Object` / `Value`），只能捕获 Rust 数据**（2026-11-20，坑 53 的同族）。
+    想「注册等待后顺手调一下 `ctx.reply`」，于是把 `Function<'js>` clone 进 `Async` 闭包 —— 编译过、单测过，整个测试进程在退出时崩
+    `Assertion failed: list_empty(&rt->gc_obj_list), file …quickjs.c, line 2704`（退出码 `0xc0000409`），加 `--test-threads=1` 也一样。
+    做法：把「发一条回复」下沉成 Rust 侧操作 —— `Arc<Mutex<HostOutput>>` 的 `push_reply`，与 handler 自己调 `ctx.reply` 走同一条缓冲。
+    判据：`Async` 闭包的捕获列表里出现任何非 Rust 类型的，先停手。
+
+113. **`ctx.session.prompt` 必须在「注册成功」那一刻就把提示发出去**（2026-11-20）。
+    它第一版只写等待行、发提示这件事留给 tick 的重发路径 —— 于是没有声明 `reminders` 的等待**一句提示都不发**：
+    handler 跑完、行是 `pending`、日志干净，用户看到的是「bot 不回我」，而 bot 其实正在等一个从没人问过他的问题。
+    既有测试没抓到，是因为它们的 handler 在 `prompt` 之后自己 `reply('asked')` 了。判据：**每个「注册」型 API 都要问一句「用户在这一刻看到了什么」**；
+    并且补一条测试断言「提示先于 handler 自己的回复」（`crates/hbot-rpc/tests/session_capability.rs` 的 `the_prompt_reaches_the_user_the_moment_the_wait_is_registered`）。
+
+114. **恢复 ctx 少了 `sql`，「等待」就只剩一句口头回复**（2026-11-20）。
+    `onResume` 的 ctx 刻意比消息窄，但漏掉了 `sql` / `files` —— 而等待被唤醒之后，用户那句话几乎一定要落库（工单、订单号、地址）。
+    `examples/support` 的 `onResume` 调 `ctx.sql.exec` 直接抛 `cannot read property 'exec' of undefined`，只有真跑示例才会发现。
+    判据：**narrow ctx 只该砍掉「靠事件身份才能安全工作」的面**（`kv` / `history` / `device` / `jobs` / `session`）；
+    按 bot 绑定的面（`sql` / `files`）没有这条顾虑，砍掉就是无谓的残缺。

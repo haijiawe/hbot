@@ -253,7 +253,7 @@ export default defineBot({
 | 装配层 | 这个 bot 在 `WebhookRegistry` 里（即 `bot_start` 过） | `hbot-rpc::webhook::handler_of` | 404（停掉的 bot 立刻拒，不等到 supervisor 排空） |
 | 应答层 | 解码 handler 返回值 | `hbot_core::response_from_handler` | 非法 `status`（字符串 / 越界）→ `HBOT_WEBHOOK_INVALID`（400） |
 
-**六条设计决定与理由**：
+**八条设计决定与理由**：
 
 1. **请求即事件，返回值即应答**。不做「注册 + 后续投递」：调用方在等 HTTP 响应，晾着它没有任何东西能保证它等到（`AGENTS.md` 坑 74 的同一条理由）。
 2. **不进 `inbound` 表**。外部系统没有平台身份（无 sender / conversation / message_id），塞进去会让 `UNIQUE (bot_id, external_id)` 去重键与回复目标**同时失去定义**。
@@ -263,9 +263,11 @@ export default defineBot({
 6. **单连接一问一答**。`Connection: close`，一条 TCP 只处理一个请求。webhook 调用方通常是「发一条就走」的脚本/服务，keep-alive 省不下可观的握手，却要引入连接生命周期、空闲超时与流水线顺序三条状态机。
 7. **`GET` / `HEAD` 是鉴权后的探活，不派发 handler**（2026-11-20）。监控每分钟都会打探活，而 handler 是用户代码（会真改库、真调模型、真发消息）—— 探活只回答「这个路由现在能不能被我打到」。失败口径与 `POST` 完全一致（401/404），否则探活等于送出一个绕过鉴权的存在性探针。`HEAD` 的头与 `GET` 一致（`Content-Length` 按 `GET` 会回的体长报）、只是不带体：写 `Content-Length: 0` 等于在头里说谎，任何缓存/代理都会读到假长度。
 
-**实测**（`hbot-rpc` 的 `tests/webhook_capability.rs`，12 条，真 TCP + 真派发 + 真库）：路由没声明 → 401；环境变量没设 → 401；密钥不匹配 → 401；正确密钥 → handler 的返回值成为应答体（`ctx.bodyJson` 拿到解析后的 JSON，`ctx.log` 落库）；`return null` → 204 空体；信封 `{status: 418, body: 'teapot'}` → 418；`PUT` → 405；`GET`/`HEAD` 探活 → 200 且**一次都不调 handler**（没密钥/没声明的路由照旧 401）；`bot_stop` 之后同一路径 → 404；`Content-Length` 超上限 → 413（读体之前就拒）。契约层另有 25 条（路径穿越、环境变量名写错、超限、CRLF 注入、非 UTF-8 拒绝替换、信封 status 不做字符串强转）。
+**实测**（`hbot-rpc` 的 `tests/webhook_capability.rs`，13 条，真 TCP + 真派发 + 真库）：路由没声明 → 401；环境变量没设 → 401；密钥不匹配 → 401；正确密钥 → handler 的返回值成为应答体（`ctx.bodyJson` 拿到解析后的 JSON，`ctx.log` 落库）；`return null` → 204 空体；信封 `{status: 418, body: 'teapot'}` → 418；`PUT` → 405；`GET`/`HEAD` 探活 → 200 且**一次都不调 handler**（没密钥/没声明的路由照旧 401）；`bot_stop` 之后同一路径 → 404；`Content-Length` 超上限 → 413（读体之前就拒）；`timeoutMs: 200` + 忙等 1500 ms 的 handler → **504 且 1 秒内返回**（`ctx.sleep` 测不出这件事：它会被夹到剩余预算后正常返回，见坑 109）。契约层另有 28 条（路径穿越、环境变量名写错、超限、CRLF 注入、非 UTF-8 拒绝替换、信封 status 不做字符串强转）。
 
-**还没做**：响应体流式（现在整段进内存，上限 256 KiB）；路由级超时（现在统一用 handler 预算）；反向代理/公网暴露（`docs/08` §4.4 说明手机做不到，桌面/无头交给用户的代理）。
+**还没做**（2026-11-20 更新）：响应体流式 —— **刻意不做**：handler 返回的本来就是 JS 内存里的一个字符串，流式只省传输层缓冲，代价是一整套分块 API，而上限 256 KiB 已经比任何真实回调体小；路由级超时**已落地**（见决定 8）；反向代理/公网暴露（`docs/08` §4.4 说明手机做不到，桌面/无头交给用户的代理）。
+
+8. **路由级超时可以收紧宿主预算，不能放宽**（2026-11-20）。清单 `capabilities.webhook[].timeoutMs`（10..=2000，越界报错不夹取）只允许比 `limits.handlerTimeout` 更短：慢回调占着的是 isolate 与连接，而宿主预算是这个进程的兜底，单条路由没有资格把它拉长。实现上 `budget_ms` 一路透传（`Command::Webhook` → worker），worker 里取 `min(清单值, limits.handler_timeout)`，所以以后即便放宽宿主的解析也会自动封顶。
 ### 3.6 已落地：项目内文件（`C3.file`，2026-11-20）
 
 ```jsonc
@@ -291,6 +293,15 @@ export default defineBot({
     const page = await ctx.files.read(`logs/app.log`, { startLine: 5000, endLine: 5099 });
     if (page.truncated) { /* 后面还有，翻下一页 */ }
 
+    // 只改第 7 行：其余行连行尾都原样保留（CRLF 项目不会被整文件重写）
+    await ctx.files.write(`saves/a.txt`, `new line 7`, { startLine: 7, endLine: 7 });
+
+    // 二进制读：回来是原样字节的 base64，不做 UTF-8 校验
+    const blob = await ctx.files.readBytes(`saves/icon.png`);  // { path, base64, bytes, truncated }
+
+    // 递归删除会先扫一遍再删，返回条目数；符号链接一律拒（不跟进）
+    const removed = await ctx.files.remove(`saves/old`, { recursive: true });
+
     for (const entry of await ctx.files.list(`saves`)) {  // { path, kind: `file` | `dir`, size }
       ctx.log(entry.path);
     }
@@ -301,25 +312,27 @@ export default defineBot({
 | 层 | 判据 | 失败码 |
 |---|---|---|
 | 声明层 | 清单里 `capabilities.state.files.read` / `.write` 现读（每个新 isolate 装一次） | `HBOT_FILE_NOT_DECLARED`（`capability` 是 `read` 或 `write`） |
-| 参数层 | 文本 ≤ 1 MiB、读 ≤ 256 KiB、单段 ≤ 64 字节、全路径 ≤ 256 字节、列表 ≤ 200 条；按行读时行号 1 起、`endLine ≥ startLine`、一次 ≤ 10000 行 | `HBOT_FILE_INVALID` |
+| 参数层 | 文本 ≤ 1 MiB、读 ≤ 256 KiB、单段 ≤ 64 字节、全路径 ≤ 256 字节、列表 ≤ 200 条；按行读/写时行号 1 起、`endLine ≥ startLine`、读一次 ≤ 10000 行；递归删除 ≤ 1000 条 | `HBOT_FILE_INVALID` / `HBOT_FILE_TOO_MANY` |
 | 路径层 | 只接受相对路径；`..`、`.`、盘符、ADS、前导 `/`、`\`、控制字符一律拒 | `HBOT_FILE_DENIED` |
 | 装配层 | 宿主没有后端（测试、bench、`hbot serve` 之外的入口） | `HBOT_FILE_UNAVAILABLE` |
 | 文件层 | 不存在 / 是目录 / 非 UTF-8 / 目录非空 | `HBOT_FILE_NOT_FOUND` / `_INVALID` / `_INVALID` / `_DENIED` |
 | 规模层 | 单次读超过 `maxBytes` **截断并标 `truncated`**（不是报错）；单次写超过 1 MiB 报错 | 见上 |
 
-**六条设计决定与理由**：
+**八条设计决定与理由**：
 
-1. **不给裸 `fs`，只给四个动词**（`read`/`write`/`list`/`remove`）。生成代码没有 `process`/`require`，但一个"能传任意路径的读函数"等价于把整台机器交出去；四个动词各自带参数闸，判据只有一份。
+1. **不给裸 `fs`，只给五个动词**（`read`/`readBytes`/`write`/`list`/`remove`）。生成代码没有 `process`/`require`，但一个"能传任意路径的读函数"等价于把整台机器交出去；四个动词各自带参数闸，判据只有一份。
 2. **路径钉在项目根，符号链接也再验一次**。`normalize_path` 只挡字面上的 `..`；`a/b` 若是指向项目外的链接，字面归一化看不出问题。所以后端对**已存在的每一段**都 `canonicalize` 后要求 `starts_with(root)`，不存在的段只接受 `Component::Normal`。
 3. **读与写分开声明**。一个只会读报表的 bot 不该能删存档；合成一个 `files: true` 会让"我只给了读权限"变成一句无法兑现的话。
-4. **只读写文本，二进制请自己 base64**。rquickjs 的 `ArrayBuffer` 两向 API 不一致，为一条旁路多写一套转换不值得；而 base64 字符串在 `kv`/`sql` 里本来就是可存可读的。读到的非 UTF-8 **直接报错**，不替换成 U+FFFD（悄悄替换等于给用户一段被改过的数据）。
-5. **`remove` 只删空目录**，不做递归。递归删目录在生成代码手里等于一次静默的批量数据丢失；真要清空就让代码自己列出来逐个删，那样每一步都留下可审计的调用。
+4. **文本读要求 UTF-8，二进制走 `readBytes`**（2026-11-20 修正）。rquickjs 的 `ArrayBuffer` 两向 API 不一致，所以回来的是 base64 字符串 —— 但**编码这一侧落在 runtime**（`crates/hbot-code/src/base64.rs`），core 的 `ReadBytes` 只给字节，`hbot-store`/`hbot-core` 不引编码依赖。文本读仍然**直接报错**，不替换成 U+FFFD（悄悄替换等于给用户一段被改过的数据）；二进制读**不做任何校验**，也不当作文本解释。
+5. **递归删除要显式写 `recursive: true`，且先扫一遍再删**（2026-11-20 修正）。默认仍只删空目录 —— 递归删在生成代码手里等于一次静默的批量数据丢失。给出口子的条件是三条：① 显式开关（不写就是旧行为）；② **先 `count_tree` 再 `delete_tree`**：扫到第 1001 条就直接 `HBOT_FILE_TOO_MANY`，不会删了一半再失败；③ 逐层 `symlink_metadata`，**遇符号链接一律拒**（不跟进），否则一次删除能把项目外的目录带走。删完返回条目数，让调用方能核对"我删了多少"。
 6. **超量读截断、超量写报错**。读是"我想看一部分"，截断 + `truncated` 让调用方自己决定要不要按 `maxBytes` 分段；写是"我要保存这一份"，静默截断就等于存了半份文件而看着成功。
 7. **按行读是为了「文件比一次能读的大」，不是为了省事**（2026-11-20）。只给 `maxBytes` 时，5 MB 日志的第 5 万行永远读不到 —— 只能读到开头 256 KiB。所以 `read(path, { startLine, endLine })` 让后端**逐行流式**读，**不把整个文件放进内存**；同时加行数闸（一次 ≤ 10000 行），因为字节闸挡不住"从第 1 行扫到第 900 万行再返回空"这种请求。三个细节：① 只给 `startLine` 时上限是 `startLine + 9999`，默认值只在 JS 桥决定一次，core 的 `LineRange` 永远是两端都实的区间；② `truncated` 表示"后面还有没给你的" —— 撞字节上限、或范围后面还有行都算，据此翻页；③ 截断点退到 UTF-8 字符边界，绝不产出半个字符（整文件读那条老路径也一起修了）。
 
-**实测（2026-11-20）**：`hbot-core` 17 条（路径穿越、盘符、ADS、超长段、非法控制字符、错误码前缀、行号 0 与逆序、跨度超限）；`hbot-code` 槽位 13 条（声明闸先于装配闸、只读声明拒写、端口故障原样上浮、清身份不继承、行范围原样下传、逆序在到达端口前被拒）；JS 桥 2 条 + `s3` 之外的行为由端到端覆盖；`hbot-rpc` 后端 11 条（往返、越界、缺失、排序、非空目录、截断、按行取、超 EOF、范围后仍有内容、字节截断不切汉字、CRLF 保真）；端到端 9 条（未声明 / 只读声明拒写 / 往返 / `..` 与绝对路径 / 缺失 / 列目录只报相对路径 / 非 UTF-8 拒绝 / 按行读只回那几行 / 逆序行号在 JS 边界被拒）。
+8. **按行写只替换那几行，未触碰的行按字节原样复制**（2026-11-20）。写走「同目录临时文件 → `sync_all` → `rename` 有界重试」，和 `hbot-workspace` 的 `write_atomic` 同一手法（Windows 上目标被占用时 `rename` 会 `EPERM`，无限重试会把 isolate 线程钉死）。行尾规则：被替换段连同它自己的终止符一起移除，插入的 `text` 不以换行结尾、且被替换段原来有终止符时补回**原来那个**终止符（`\r\n` 或 `\n`）—— 统一重写成 `\n` 会让一个 CRLF 项目的**整个文件**出现在 diff 里，而用户只改了一行。范围越过 EOF 直接报错，不追加（追加会让人以为"我改的是第 5 行"，实际多出一段）。
 
-**还没做**：把文件当附件发出去（`ctx.send` 仍只推文本）；二进制直读（现在是 base64 约定）；目录递归删除；每 bot 的磁盘配额（现在只有单次体积上限）；按行**写**（改写第 N 行仍需整文件读改写）。
+**实测（2026-11-20）**：`hbot-core` 20 条（路径穿越、盘符、ADS、超长段、非法控制字符、错误码前缀、行号 0 与逆序、跨度超限、写范围越界、递归删除预算常量）；`hbot-code` 槽位 17 条（声明闸先于装配闸、只读声明拒写、端口故障原样上浮、清身份不继承、行范围原样下传、逆序在到达端口前被拒、`readBytes` 不过 UTF-8 闸）；JS 桥 2 条 + 其余由端到端覆盖；`hbot-rpc` 后端 16 条（往返、越界、缺失、排序、非空目录、截断、按行取、超 EOF、范围后仍有内容、字节截断不切汉字、CRLF 保真、递归删计数、二进制截断、按行写、CRLF 按行写、越 EOF 拒写）；端到端 13 条（未声明 / 只读声明拒写 / 往返 / `..` 与绝对路径 / 缺失 / 列目录只报相对路径 / 非 UTF-8 拒绝 / 按行读只回那几行 / 逆序行号在 JS 边界被拒 / `readBytes` 给原样字节 / 按行写只改那行 / 递归删返回条目数 / 非递归删非空目录仍拒）。
+
+**还没做**（2026-11-20 更新）：把文件当附件发出去（`ctx.send` 仍只推文本；要动 `OutboundRequest`/`outbound` 表 + 三个适配器的媒体上传，属于独立设计）；每 bot 的磁盘配额（每次写扫一遍树会把热路径拖成 O(项目)，见坑 23；正确做法是一张记账表，另开一项）。
 
 ---
 
@@ -480,12 +493,12 @@ export default defineBot({
 | 声明层 | 清单 `capabilities.jobs`（`JobSlot::set_specs` 每次入队现读） | 空表 → `HBOT_JOBS_NOT_DECLARED`；名字不在表里 → `HBOT_JOBS_INVALID` |
 | 参数层 | `hbot-core` 的 `validate_job_name` / `validate_payload` / `validate_idempotency_key` / `validate_request` / `validate_specs`（**唯一一份**） | `HBOT_JOBS_INVALID`，**在后端被调用之前**就拒 |
 | 装配层 | 宿主有没有 `set_jobs` | `HBOT_JOBS_UNAVAILABLE`（补救是"bot 没起来/存储没就绪"，不是改清单） |
-| 容量层 | `StoreJobQueue` 里 `count_active_jobs_for_bot` ≥ `MAX_JOBS_PER_BOT`(256) | `HBOT_JOBS_FULL`，不无限攒行 |
+| 容量层 | `StoreJobQueue` 里 `count_active_jobs_for_bot` ≥ 清单 `limits.maxPendingJobs`（缺省 256，硬上限 1024） | `HBOT_JOBS_FULL`，不无限攒行；文案点名上限来自 `limits.maxPendingJobs` |
 | 预算层 | 行里冻结的 `budget_ms`（入队时按类型抄一份）；超预算被内核打断 | `HBOT_JOBS_TIMEOUT` → 按 `retries` 决定重试还是落 `failed` |
 | 目标层 | `build_job_event` 的 `reply` 闭包 | 没写 `options.conversation` → `HBOT_JOBS_NO_TARGET` |
 | 会话层 | `deliver_job_replies` 按 `(bot_id, external_id)` 查 `conversations` | 查不到 → error 行「这个会话从没收到过消息」，不猜群/私聊 |
 
-**七条设计决定与理由**：
+**八条设计决定与理由**：
 
 1. **至少一次，靠幂等键而不是"不会重复执行"**。`bot_jobs` 上有 `UNIQUE (bot_id, idempotency_key)`，重复入队命中唯一约束后返回 `Ok(None)` —— 那是**成功**，只记一条 debug。缺幂等键的入队直接失败（消息事件里缺省取 `ctx.messageId`；定时器/作业事件没有入站身份，缺省值被显式清空，所以那两种事件里必须自己写）。
 2. **预算按行冻结，重试次数按清单现读**。预算跟着**行**走：改清单不该让已经排队的那条作业换预算（换语义是最难排障的一类问题）。`retries` 反过来按清单现读 —— 它是"这个类型失败几次后放弃"的策略，不是这一次执行的快照。
@@ -494,6 +507,7 @@ export default defineBot({
 5. **作业的 `ctx` 比消息 `ctx` 窄，且不挂 `ctx.jobs`**。只有 `reply` / `log` / `sleep` / `ai` + `name` / `payload` / `idempotencyKey`；`kv` / `history` / `device` 都不挂（作业没有入站身份，挂上去就是让它读上一条消息的会话），`ctx.jobs` 也不挂（作业不能无限套作业）。
 6. **tick 先编译、后认领**。反过来的话，编译失败那一刻行已经被改成 `running` 且 `attempts` 已加一，下一拍又因为 `state != pending` 拿不到它 —— 这条作业就卡在 `running`，只能等下次进程启动的 `resume_interrupted_jobs` 救。
 7. **作业不能用定时器那条 tick**。`SandboxHandler::tick` 第一句就是"没有计划就 return"；复用给作业会让"只声明 jobs、没声明 timer"的项目永远派发不到，而且看起来像"作业不跑"而不像配置问题。所以独立成 `tick_jobs`，ticker 每拍先后调两个。
+8. **作业池上限写在清单里，硬上限在宿主**（2026-11-20）。`limits.maxPendingJobs` 缺省 256（= `hbot_core::MAX_JOBS_PER_BOT`，老项目行为不变），可调小到 1、调到 1024 封顶 —— 越界**报错不夹取**，因为"我写了 5000 却按 1024 跑"会让用户以为积压能攒到 5000。上限读的是**清单当前值**而不是行上的快照（与预算相反，见决定 2）：它是"这个 bot 能攒多少"的策略，改了就该立刻生效。容量闸与预算查询共用**同一次** `manifest::load`，不读两遍（读两遍会让两次读之间的一次保存产生两份不一致的判据）。
 
 **存储形态**：`bot_jobs(id, bot_id, name, payload_json, idempotency_key, state, attempts, budget_ms, conversation, next_at, last_error, created_at, updated_at)`，`UNIQUE (bot_id, idempotency_key)`、索引 `(state, next_at)` 与 `(bot_id, state)`。状态五种拼写 `pending` / `running` / `done` / `failed` / `cancelled` 与 `hbot_core::bot_jobs::JobState::as_str()` 同值（存储层有对拍测试）。
 
@@ -636,6 +650,7 @@ export default defineBot({
 | 唯一层 | `0007` 的部分唯一索引 `bot_waits_conv_pending`（只覆盖 `pending`） | `HBOT_SESSION_PENDING`，message 里点名挡路的那条 |
 | 匹配层 | `claim` 那一条 `UPDATE … RETURNING` 的 `scope = 'conversation' OR owner = ?sender` | 不匹配就不唤醒（群里 B 说一句不会填掉 A 的等待） |
 | 目标层 | `build_resume_event` 的 `reply` 闭包 | 等待行没有会话 → `HBOT_SESSION_NO_TARGET` |
+| 提示层 | `session_api::prompt` 注册成功后立刻把 `text` 写进本次事件的 reply 缓冲 | 少了它用户永远看不到问题（只有重发时才发），症状是「bot 不回消息」而等待行明明 pending |
 
 **六条设计决定与理由**：
 
@@ -650,12 +665,20 @@ export default defineBot({
 4. **`claim` 与 `expire` 各是一条 SQL**（`UPDATE … RETURNING`）。拆开时前者会让重投的
    消息**唤醒两次**（用户发一句、bot 回两遍），后者会让两轮 tick 各结算同一批行。
 5. **恢复钩子的 ctx 比消息窄、比作业宽**：有 `waitKey` / `waitPrompt` / `message` 与那条
-   消息的平铺字段，但**不挂** `kv` / `history` / `device` / `jobs` / `session` —— 恢复上下文
-   里的「当前会话」是等待行声明的那个（`scope: conversation` 时回答者可能换了会话），
-   借这条消息的身份去读状态就会读错人。
+   消息的平铺字段，加上 `sql` / `files`，但**不挂** `kv` / `history` / `device` / `jobs` /
+   `session` —— 恢复上下文里的「当前会话」是等待行声明的那个（`scope: conversation` 时
+   回答者可能换了会话），借这条消息的身份去读状态就会读错人。`sql` / `files` 之所以能给，
+   是因为它们按 **bot** 绑定而不靠事件身份；而少了 `sql`，「把用户那句话存下来」这件
+   等待唯一要做的事就没法做了（示例 `examples/support` 就是撞在这个洞上）。
 6. **超时不派发 handler，只落一行 error**。等待过期没有「该跑什么代码」的答案
    （用户没回话），把它塞进 `onResume` 会把「回话了」与「没回话」压成同一个钩子，
    而这两件事该做的事通常相反。
+
+7. **注册那一刻就把提示发出去**。`prompt` 是注册，但「注册」不等于「什么都不发」：
+   用户能看到的唯一一份问题文案就是这一次。写进 `HostOutput` 的 reply 缓冲（与
+   handler 自己调 `ctx.reply` 同一条路），**不**在 `Async` 闭包里调用 JS 的 `reply` 函数 ——
+   把 JS 函数对象捕获进闭包会让它比运行时活得久，退出时撞
+   `list_empty(&rt->gc_obj_list)`（`docs/pitfalls.md` 坑 53 的同族）。
 
 **存储形态**：`bot_waits(id, bot_id, conversation_id, conversation_external_id, owner,
 key, prompt, scope, state, deadline, fulfilled_message_id, created_at, updated_at,
@@ -668,8 +691,9 @@ reminders_left, timeout_ms)`；
 `tick_waits` 结算成 `expired`。两条都是终态，重启不会把它们捡回来 —— 只有 `pending`
 会被下一条消息唤醒。
 
-**实测**：`hbot-rpc` 的 `tests/session_capability.rs` 5 条（全走 `Dispatcher` 真派发 +
-真 tick + 真库）：没声明 → `NOT_DECLARED` 且**不落库**；声明后 `prompt` 落库且 `key` /
+**实测**：`hbot-rpc` 的 `tests/session_capability.rs` 6 条（全走 `Dispatcher` 真派发 +
+真 tick + 真库）：没声明 → `NOT_DECLARED` 且**不落库**；注册那一下提示就发出去（提示在
+handler 自己的 `reply` 之前）；声明后 `prompt` 落库且 `key` /
 `state` / `scope` / `owner` 都对；下一条消息走 `onResume`（`waitKey` 与文本都对）而不是
 `onMessage`，回复进 outbox，等待转 `fulfilled`；同会话第二个 `prompt` 报 `HBOT_SESSION_PENDING`
 并点名挡路键；带 `reminders: 1` 的等待到点先重发同一句提示、额度用尽才落终态。
