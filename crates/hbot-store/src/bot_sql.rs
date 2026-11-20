@@ -16,9 +16,9 @@
 //! 3. **执行闸**（本模块）：写语句放在事务里，受影响行数超过上限就**回滚并报错** ——
 //!    已经写下去的行没法「撤回一部分」，所以判据只能在提交之前。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use hbot_core::{
     BotId, MAX_SQL_AFFECTED, MAX_SQL_ROWS, SqlChange, SqlError, SqlRows, SqlStatement, SqlValue,
@@ -34,6 +34,16 @@ pub struct BotSqlSchemas {
     /// 懒开：bot 从不跑 SQL 时不该占一个文件句柄。连留在表里直到进程退出 ——
     /// 重开一条连接要重新走 WAL 切换与 PRAGMA，比复用它贵得多。
     connections: Mutex<HashMap<BotId, Connection>>,
+    /// 每 bot 一条**只读路径**的独立连接（`query` 走它）。
+    ///
+    /// 分开的理由不是权限而是并发：一条长 SELECT 若与写共用同一条连接、同一把锁，
+    /// 它会把同一个 bot 的写、以及**所有 bot** 的语句一起排队。
+    /// 值外面再套一把锁，是为了不用在读的全程占着这张 map 的锁。
+    readers: Mutex<HashMap<BotId, Arc<Mutex<Connection>>>>,
+    /// 只读连接打不开的 bot（磁盘、权限、文件被删……）。
+    ///
+    /// 记下来是为了**不要每条查询都重试一次打开**：回退是终局状态，直到进程重启。
+    failed_readers: Mutex<HashSet<BotId>>,
 }
 
 impl BotSqlSchemas {
@@ -48,6 +58,8 @@ impl BotSqlSchemas {
         Ok(Self {
             root,
             connections: Mutex::new(HashMap::new()),
+            readers: Mutex::new(HashMap::new()),
+            failed_readers: Mutex::new(HashSet::new()),
         })
     }
 
@@ -139,25 +151,73 @@ impl BotSqlSchemas {
     }
 }
 
-impl std::fmt::Debug for BotSqlSchemas {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BotSqlSchemas")
-            .field("root", &self.root)
-            .field("open", &self.lock().len())
-            .finish()
+impl BotSqlSchemas {
+    /// 取（必要时打开）这个 bot 的只读路径连接。
+    ///
+    /// 返回 None 表示这条连接打不开：调用方回退到写连接，功能不降级，只是读又会占写锁。
+    ///
+    /// 为什么是「读写的连接 + `PRAGMA query_only = ON`」而不是 `SQLITE_OPEN_READ_ONLY`：
+    /// 库是 WAL 模式，只读打开一条 WAL 库需要能写 `-shm` 共享内存文件，否则会以
+    /// 「attempt to write a readonly database」失败 —— 那是平台细节，不是用户数据的问题。
+    /// query_only 让这条连接**在 SQLite 内部**就拒绝任何写，同时保留了 WAL 的正常读写能力。
+    fn reader(&self, bot_id: &BotId) -> Option<Arc<Mutex<Connection>>> {
+        {
+            let readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(existing) = readers.get(bot_id) {
+                return Some(Arc::clone(existing));
+            }
+            let failed = self
+                .failed_readers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if failed.contains(bot_id) {
+                return None;
+            }
+        }
+        let path = self.path_for(bot_id);
+        if !path.exists() {
+            // 库文件还没被写出来（这个 bot 从没执行过迁移或写语句）：这次让调用方回退，
+            // **不记账**，否则文件建出来之后也永远走写连接了。
+            return None;
+        }
+        // 只开 READ_WRITE（不带 CREATE）：读路径不许把库文件创建出来。
+        let opened =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .and_then(|connection| {
+                    connection.execute_batch(
+                "PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA query_only = ON;",
+            )?;
+                    Ok(connection)
+                });
+        match opened {
+            Ok(connection) => {
+                let shared = Arc::new(Mutex::new(connection));
+                let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+                // 两个线程可能同时发现没有、同时打开：只留先插进来的那条。
+                Some(Arc::clone(readers.entry(*bot_id).or_insert(shared)))
+            }
+            Err(error) => {
+                self.failed_readers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(*bot_id);
+                tracing::warn!(
+                    bot = %bot_id,
+                    path = %path.display(),
+                    error = %error,
+                    "只读连接打不开，这个 bot 的查询回退到写连接（读会占写锁，功能不受影响）"
+                );
+                None
+            }
+        }
     }
-}
 
-impl hbot_core::BotSql for BotSqlSchemas {
-    fn query(
-        &self,
-        bot_id: &BotId,
+    /// 一条 SELECT 的全部执行细节：两条连接（读/写）共用这一份，避免判据漂移。
+    fn run_query(
+        connection: &Connection,
         statement: &SqlStatement,
         params: &[SqlValue],
     ) -> Result<SqlRows, SqlError> {
-        let mut guard = self.lock();
-        let connection = Self::connection(&self.root, &mut guard, bot_id)?;
         let bound = bind(params);
         let mut prepared =
             connection
@@ -191,6 +251,55 @@ impl hbot_core::BotSql for BotSqlSchemas {
             rows,
             truncated,
         })
+    }
+}
+
+impl BotSqlSchemas {
+    /// 测试用：读连接与写连接各开了几条。
+    #[cfg(test)]
+    fn open_connection_counts(&self) -> (usize, usize) {
+        let readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let writers = self.lock().len();
+        (readers, writers)
+    }
+
+    /// 测试用：拿这个 bot 的读连接句柄，好在测试里占住它模拟「一条长读正在跑」。
+    #[cfg(test)]
+    fn reader_handle(&self, bot_id: &BotId) -> Option<Arc<Mutex<Connection>>> {
+        self.reader(bot_id)
+    }
+}
+
+impl std::fmt::Debug for BotSqlSchemas {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BotSqlSchemas")
+            .field("root", &self.root)
+            .field("open", &self.lock().len())
+            .finish()
+    }
+}
+
+impl hbot_core::BotSql for BotSqlSchemas {
+    fn query(
+        &self,
+        bot_id: &BotId,
+        statement: &SqlStatement,
+        params: &[SqlValue],
+    ) -> Result<SqlRows, SqlError> {
+        // 读走独立连接：一条长 SELECT 不该把同一个 bot 的写、以及别的 bot 的语句一起排队。
+        if let Some(shared) = self.reader(bot_id) {
+            let connection = shared.lock().unwrap_or_else(PoisonError::into_inner);
+            return Self::run_query(&connection, statement, params);
+        }
+        // 回退：只读连接打不开（极少见）。用写连接读，功能不降级，只是读又占写锁。
+        let mut guard = self.lock();
+        let connection = Self::connection(&self.root, &mut guard, bot_id)?;
+        Self::run_query(connection, statement, params)
     }
 
     fn exec(
@@ -455,5 +564,65 @@ mod tests {
             path.to_string_lossy()
                 .contains("00000000-0000-0000-0000-00000000c0de")
         );
+    }
+
+    #[test]
+    fn a_query_opens_only_the_read_connection() {
+        let (_dir, schemas) = schema();
+        // 第一条：库文件还不存在，读路径不许把它创建出来，只能回退到写连接（写连接会建文件）。
+        let error = query(&schemas, "SELECT * FROM nope", &[]).expect_err("表不存在");
+        assert_eq!(error.code(), "HBOT_SQL_FAILED");
+        assert_eq!(
+            schemas.open_connection_counts(),
+            (0, 1),
+            "库文件还不存在时读只能走写连接"
+        );
+        // 第二条：文件已经被写出来了，读改走自己的连接，写连接不增。
+        let error = query(&schemas, "SELECT * FROM nope", &[]).expect_err("表不存在");
+        assert_eq!(error.code(), "HBOT_SQL_FAILED");
+        assert_eq!(
+            schemas.open_connection_counts(),
+            (1, 1),
+            "库文件存在之后，读不该再碰写连接"
+        );
+    }
+
+    #[test]
+    fn a_read_in_progress_does_not_block_a_write() {
+        // 占住读连接 = 一条长 SELECT 正在跑。写必须还能走完：读与写共用一把锁会把
+        // 同一个 bot 的写（以及所有 bot 的语句）一起排队，这是本次要钉住的回归。
+        let (_dir, schemas) = schema();
+        schemas
+            .apply_migrations(
+                &bot(),
+                &[(
+                    "0001_init".to_owned(),
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY);".to_owned(),
+                )],
+            )
+            .expect("migrate");
+        query(&schemas, "SELECT COUNT(*) FROM users", &[]).expect("warm the reader");
+        let handle = schemas.reader_handle(&bot()).expect("读连接应当已建立");
+        let guard = handle.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let change = exec(
+                    &schemas,
+                    "INSERT INTO users (id) VALUES (?)",
+                    &[SqlValue::Integer(1)],
+                );
+                let _ = sender.send(change.map(|change| change.affected));
+            });
+            let received = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            assert!(
+                received.is_ok(),
+                "读正在进行时写入被挡住了：读与写共用了一把锁"
+            );
+            assert_eq!(received.expect("recv"), Ok(1), "写应当成功");
+            drop(guard);
+            writer.join().expect("writer thread");
+        });
     }
 }
