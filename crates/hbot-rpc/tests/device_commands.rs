@@ -960,8 +960,7 @@ async fn an_external_edit_is_reloaded_by_the_watcher_and_shows_up_in_get() {
         "内容没变就不该重载"
     );
 
-    // 等一拍再写：mtime 是判据，同一时刻内的两次写可能落在同一个时间戳上。
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // 不必等一拍：判据是文件字节，同一时间戳内的两次写也能分辨（见 docs/pitfalls.md 坑 117）。
     std::fs::write(
         fixture.state.device().data_dir().join("device.json"),
         APPS_ONLY_SETTINGS,
@@ -974,7 +973,7 @@ async fn an_external_edit_is_reloaded_by_the_watcher_and_shows_up_in_get() {
             .device()
             .reload_settings_if_changed()
             .is_some(),
-        "mtime 变了就要重载"
+        "字节变了就要重载"
     );
     let data = data_of(&fixture.dispatcher, Command::DeviceSettingsGet).await;
     assert_eq!(data["enabled"], json!(false), "外部把开关关了");
@@ -985,6 +984,6 @@ async fn an_external_edit_is_reloaded_by_the_watcher_and_shows_up_in_get() {
             .device()
             .reload_settings_if_changed()
             .is_none(),
-        "同一 mtime 只处理一次（坏文件也不许每秒重放事件）"
+        "同一份字节只处理一次（坏文件也不许每秒重放事件）"
     );
 }

@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use hbot_core::device::{
     DeviceActor, DeviceCapability, DeviceError, DeviceGate, DeviceSessionState, DeviceTarget,
@@ -80,11 +80,16 @@ pub struct DeviceRegistry {
     /// 1 秒 tick 盯着 `device.json` 的 mtime，外部改动会被重新载入（见
     /// [`Self::reload_settings_if_changed`]）。
     settings: RwLock<DeviceSettings>,
-    /// `device.json` 上次被观察到的修改时间（`None` = 文件不存在 / 平台不给 mtime）。
+    /// `device.json` 上次被观察到的**字节内容**（`None` = 文件不存在 / 读不到）。
     ///
-    /// 这是 watcher 的**变更判据**：只在 mtime 变化时处理一次。于是坏文件也只会被处理
-    /// 一次（退回默认 + 广播一条 `device.settings`），不会每秒重放一条。
-    settings_mtime: Mutex<Option<SystemTime>>,
+    /// 这是 watcher 的**变更判据**。为什么比字节而不是比 mtime：mtime 的分辨率虽然细，
+    /// 但「同一时间戳刻度内的两次写」真实存在（NTFS 上连写两千次有约 2% 落在同一个
+    /// 时间戳上，CI 负载高时更容易撞），那一刻只比 mtime 就会**静默漏掉一次改动**——
+    /// 文件已经换成了坏 JSON，内存里还是旧设置，用户以为改了没生效。`device.json` 不到
+    /// 1 KB 且每秒最多读一次，读全文的代价可以忽略。
+    ///
+    /// 于是坏文件也只会被处理一次（退回默认 + 广播一条 `device.settings`），不会每秒重放一条。
+    settings_bytes: Mutex<Option<Vec<u8>>>,
     /// 每个 bot 最近一条会话（内存真源）。
     sessions: Mutex<HashMap<BotId, LiveSession>>,
     /// 落库用（`device_sessions` / `device_audit`）。
@@ -122,12 +127,12 @@ impl DeviceRegistry {
         events: Arc<EventBus>,
     ) -> Self {
         let settings = DeviceSettings::load(&data_dir);
-        // 基线 mtime 与"已载入的那份设置"对齐：启动之后才发生的改动才算外部改动。
-        let settings_mtime = Mutex::new(settings_mtime_of(&data_dir));
+        // 基线字节与"已载入的那份设置"对齐：启动之后才发生的改动才算外部改动。
+        let settings_bytes = Mutex::new(settings_bytes_of(&data_dir));
         Self {
             data_dir,
             settings: RwLock::new(settings),
-            settings_mtime,
+            settings_bytes,
             sessions: Mutex::new(HashMap::new()),
             store,
             clock,
@@ -398,28 +403,29 @@ impl DeviceRegistry {
 
     /// 外部改了 `device.json` 就重新载入一份，换掉内存并返回**需要广播的新设置**。
     ///
-    /// 判据是 mtime 而不是内容：内容比较得先把整个文件读一遍，而 `metadata()` 一次就够。
-    /// 1 秒轮询对"改文件 → 界面刷新"这个场景完全够用，也**不引入 `notify`**
-    /// （新增依赖过不了 `xtask deps` 与体积预算）。文件被删掉 / 改成坏 JSON 都按
-    /// [`DeviceSettings::load`] 的既有口径处理：退回默认（全拒）+ `warn`。
+    /// 判据是**文件字节内容**而不是 mtime：mtime 有「同一时间戳刻度内的两次写」这个
+    /// 真实存在的盲区（见 `settings_bytes` 字段的注释），那一刻只比 mtime 会把一次改动
+    /// 静默吞掉；而 `device.json` 不到 1 KB、每秒最多读一次，读全文的代价可以忽略。
+    /// 也**不引入 `notify`**（新增依赖过不了 `xtask deps` 与体积预算）。文件被删掉 /
+    /// 改成坏 JSON 都按 [`DeviceSettings::load`] 的既有口径处理：退回默认（全拒）+ `warn`。
     ///
-    /// **只在 mtime 变化时处理一次**：mtime 在读文件之前就记账，所以坏文件不会每秒
+    /// **只在字节变化时处理一次**：新字节在读文件之前就记账，所以坏文件不会每秒
     /// 重放一条事件（内存里那时已经是默认值，本来也不该再变）。内容与内存里那份相同时
     /// 也不广播 —— 自己刚 `save` 过一份一样的设置时，不值得再推一条 `device.settings`。
     ///
     /// 同步且会阻塞（读文件）：只该从 `spawn_blocking` 或测试里调用。
     pub fn reload_settings_if_changed(&self) -> Option<DeviceSettings> {
-        let mtime = settings_mtime_of(&self.data_dir);
+        let bytes = settings_bytes_of(&self.data_dir);
         {
             let mut last = self
-                .settings_mtime
+                .settings_bytes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if *last == mtime {
+            if *last == bytes {
                 return None;
             }
             // 先记账再读：读失败 / 坏文件也只处理这一次。
-            *last = mtime;
+            *last = bytes;
         }
         let loaded = DeviceSettings::load(&self.data_dir);
         if loaded == self.settings() {
@@ -909,14 +915,12 @@ fn normalize_apps(apps: Vec<String>) -> Vec<String> {
     out
 }
 
-/// `device.json` 的修改时间；读不到（文件不存在 / 平台不给 mtime）就是 `None`。
+/// `device.json` 的字节内容；读不到（文件不存在 / 权限）就是 `None`。
 ///
-/// `metadata()` 失败不再区分原因：watcher 的语义是"看着变过就重读一次"，而真正的
-/// 读失败由 [`DeviceSettings::load`] 自己 `warn`（它会把默认值退回并留痕）。
-fn settings_mtime_of(data_dir: &Path) -> Option<SystemTime> {
-    std::fs::metadata(DeviceSettings::path(data_dir))
-        .and_then(|metadata| metadata.modified())
-        .ok()
+/// 读失败不再区分原因：watcher 的语义是"看着变过就重读一次"，而真正的读失败由
+/// [`DeviceSettings::load`] 自己 `warn`（它会把默认值退回并留痕）。
+fn settings_bytes_of(data_dir: &Path) -> Option<Vec<u8>> {
+    std::fs::read(DeviceSettings::path(data_dir)).ok()
 }
 
 /// `-32002`：参数/前置条件不满足（未启用、清单没声明、交集为空）。
@@ -1894,13 +1898,13 @@ mod tests {
         assert_eq!(last.outcome, "ok");
     }
 
-    // ---- 设置 watcher（mtime 轮询，不用 `notify`）----
+    // ---- 设置 watcher（1 秒轮询比文件字节，不用 `notify`）----
 
-    /// `device.json` 被外部改过：判据是 mtime，**一次改动只处理一次**。
+    /// `device.json` 被外部改过：判据是文件字节，**一次改动只处理一次**。
     #[test]
     fn reload_settings_if_changed_picks_up_an_external_write_once() {
         let fixture = Fixture::new("watch-reload", true, &[DeviceCapability::Screen]);
-        // 夹具自己 `save` 过一次，内容与内存里那份一致：第一次调用只对齐 mtime，不报变化。
+        // 夹具自己 `save` 过一次，内容与内存里那份一致：第一次调用只对齐基线，不报变化。
         assert!(
             fixture.registry.reload_settings_if_changed().is_none(),
             "内容没变就不该报变化"
@@ -1919,16 +1923,16 @@ mod tests {
         let loaded = fixture
             .registry
             .reload_settings_if_changed()
-            .expect("mtime 变了就要处理");
+            .expect("字节变了就要处理");
         assert_eq!(loaded, changed);
         assert_eq!(fixture.registry.settings(), changed, "内存要跟着换");
         assert!(
             fixture.registry.reload_settings_if_changed().is_none(),
-            "同一个 mtime 不许重复处理（否则每秒刷一条事件）"
+            "同一份字节不许重复处理（否则每秒刷一条事件）"
         );
     }
 
-    /// 坏文件：按既有口径退回全拒，但**只处理一次** —— mtime 在处理前就记账了。
+    /// 坏文件：按既有口径退回全拒，但**只处理一次** —— 新字节在处理前就记账了。
     #[test]
     fn a_corrupt_external_edit_falls_back_to_deny_all_and_is_processed_once() {
         let fixture = Fixture::new("watch-corrupt", true, &[DeviceCapability::Screen]);
@@ -1953,6 +1957,53 @@ mod tests {
         );
     }
 
+    /// **同一时间戳刻度内、同长度**的改写也必须被抓到。
+    ///
+    /// 判据如果只看 mtime，这类改写会被静默吞掉：文件已经换成新内容，内存里还是旧设置，
+    /// 用户以为"改了没生效"。NTFS 上连写两次实测约 2% 落在同一个时间戳上（CI 负载高时
+    /// 更容易撞，`a_corrupt_external_edit_…` 就是这么在 CI 上红过一次）。所以这条测试
+    /// **不去赌 mtime 一定相等**（那不可控），只钉"判据不只看 mtime"：两份文本字节数相同、
+    /// 内容不同，第二份必须被处理。
+    #[test]
+    fn a_same_length_rewrite_is_never_swallowed() {
+        let fixture = Fixture::new("watch-same-length", true, &[DeviceCapability::Screen]);
+        assert!(fixture.registry.reload_settings_if_changed().is_none());
+
+        let before = DeviceSettings {
+            allowed_apps: vec!["aaa.exe".to_owned()],
+            ..DeviceSettings::default()
+        };
+        DeviceSettings::save(fixture.registry.data_dir(), &before).expect("写第一份");
+        let path = fixture.registry.data_dir().join(settings::SETTINGS_FILE);
+        let first = std::fs::read_to_string(&path).expect("读回第一份");
+        assert_eq!(
+            fixture.registry.reload_settings_if_changed(),
+            Some(before),
+            "第一份要生效，基线才算对齐到它"
+        );
+
+        // 等长替换：`aaa.exe` → `bbb.exe`，字节数完全一样，只有内容不同。
+        let second = first.replace("aaa.exe", "bbb.exe");
+        assert_eq!(
+            second.len(),
+            first.len(),
+            "两份文本必须等长，否则测不到同长度改写"
+        );
+        assert_ne!(second, first, "内容必须真的不同");
+        std::fs::write(&path, &second).expect("外部覆盖成第二份");
+
+        let loaded = fixture
+            .registry
+            .reload_settings_if_changed()
+            .expect("同长度改写也是一次变化，必须处理");
+        assert_eq!(loaded.allowed_apps, vec!["bbb.exe".to_owned()]);
+        assert_eq!(fixture.registry.settings(), loaded, "内存要跟着换");
+        assert!(
+            fixture.registry.reload_settings_if_changed().is_none(),
+            "同一份字节不许重复处理（否则每秒刷一条事件）"
+        );
+    }
+
     /// 1 秒 tick 真的会把外部改动广播出去，而且只广播一次。
     #[tokio::test]
     async fn the_tick_broadcasts_an_external_settings_change_exactly_once() {
@@ -1960,7 +2011,7 @@ mod tests {
         let mut events = fixture.events.subscribe();
         fixture.registry.spawn_expiry_tick();
 
-        // 第一轮 tick 只是把 mtime 对齐（内容与内存一致），不会广播；等它跑过一轮。
+        // 第一轮 tick 只是把基线对齐（内容与内存一致），不会广播；等它跑过一轮。
         tokio::time::sleep(Duration::from_millis(1_300)).await;
 
         let changed = DeviceSettings {
@@ -1990,7 +2041,7 @@ mod tests {
             other => panic!("期望 device.settings，实际：{other:?}"),
         }
 
-        // 再等一轮：mtime 没再变、内容也没变，不许再推一条同样的设置。
+        // 再等一轮：文件没再变、内容也没变，不许再推一条同样的设置。
         tokio::time::sleep(Duration::from_millis(1_300)).await;
         while let Ok(event) = events.try_recv() {
             assert!(

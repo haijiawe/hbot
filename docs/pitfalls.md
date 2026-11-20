@@ -469,3 +469,29 @@
     `TestWindow::create` 按 `TEXT_LEFT + cx + TEXT_MARGIN` 开窗）。`TEXT_MARGIN` 不能为 0 —— OCR 对贴边字形不可靠。
     同族：这条测试还会偶发拿到空串（窗口刚 `ShowWindow`、DWM 未合成第一帧时 `PrintWindow` 返回成功但位图全零，见 `TestWindow::settle`），
     所以它带 5 次重试；**重试不放松断言**，仍要求认出完整的 `WINDOW_TEXT`。
+
+117. **「同一时间戳内的两次写」不是理论问题 —— 只比 mtime 会静默漏改**（2026-11-20）。
+    `crates/hbot-rpc/src/app/device/mod.rs` 的设置 watcher 原本拿 `device.json` 的 mtime 当变更判据。
+    CI 的 `windows-latest` 上 `a_corrupt_external_edit_falls_back_to_deny_all_and_is_processed_once` 红过：
+    夹具 `save` 与测试里 `fs::write` 落在**同一个 mtime 刻度**，`*last == mtime` 直接 `return None`，坏文件没被处理。
+    实测（NTFS，同一文件连写 2000 次）：**41 次 mtime 完全相等**，最小差 5022 ticks = 502.2 µs；单次量到差 3.7 ms。
+    所以「mtime 分辨率够细」和「两次写不会撞」是两件事 —— 负载高时撞的概率明显上升。
+    判据：**变更判据要么比文件字节，要么比「mtime + 长度 + 内容地板」**。小配置文件（`device.json` 不到 1 KB、
+    每秒最多读一次）直接读全文比字节最省心：`settings_bytes: Mutex<Option<Vec<u8>>>` + `settings_bytes_of()` 用 `fs::read`，
+    仍然「先记账再读」所以坏文件只处理一次。大目录树别这么干 —— 那里用 `crates/hbot-rpc/src/app/runtime/fingerprint_cache.rs`
+    的 `MetaSignature = Vec<(String, u64, u64)>`（路径/mtime 纳秒/长度）+ `DEFAULT_CONTENT_FLOOR = 5s` 兜同一类盲区。
+    回归测试的写法：**不要赌「mtime 一定相等」**（不可控），构造两份**等长不同内容**的合法 JSON（等长替换一个应用名即可），
+    断言第二份必须被处理 —— 它钉的是「判据不只看 mtime」，在任何 mtime 结果下都成立
+    （`a_same_length_rewrite_is_never_swallowed`）。
+
+118. **CI runner 磁盘耗尽会伪装成「链接器崩了」**（2026-11-20）。
+    `.github/workflows/ci.yml` 的 `rust` job 跑 `cargo test --workspace --all-targets` 要链 ~120 个测试二进制，
+    `Cargo.toml` 的 `[profile.dev] debug = 1` 让每个都带调试信息，于是 ubuntu runner 的空间被吃光。症状：
+    `##[warning]You are running out of disk space ... Free space left: 19 MB` →
+    `collect2: fatal error: ld terminated with signal 7 [Bus error], core dumped` →
+    `error: could not compile `hbot-code` (test "s1_debug_instrument")`。看起来像编译/链接错误，**实际是磁盘**。
+    修法两条一起上：① job 级 `env: CARGO_PROFILE_DEV_DEBUG: '0'` + `CARGO_PROFILE_TEST_DEBUG: '0'`
+    （只影响 CI，`Cargo.toml` 不动、本地开发体验不变）；② 编译前删掉 runner 预装但本项目不用的大目录
+    （`/usr/share/dotnet`、`/usr/share/swift`、`/opt/ghc`、`/usr/local/lib/android`、`/opt/hostedtoolcache/CodeQL`、
+    `/usr/local/share/boost`，合计约 20 GB）。判读口诀：**看到 `signal 7 [Bus error]` / `IO failure` / `ENOSPC`，
+    先看磁盘再看代码**（本地同族见坑 45）。

@@ -190,9 +190,13 @@ pub struct DevicePermissions {
   - 这两条命令**不 `ensure_bot`**：宿主设置与 bot 无关，干净安装也要能读默认值。
   - 能力名走 `DeviceCapability` 的 parse/formater 反查，**rpc 里没有第二份字符串表**（手抄表迟早与 core 漂移）。
 - **watcher**：没有引入 `notify`（会破 `xtask deps` 与体积预算），复用既有的 1 秒 `spawn_expiry_tick()`
-  比 `device.json` 的 **mtime**；变了才 reload + 广播。判据是"先记账再读文件"，所以写坏/删掉文件
+  比 `device.json` 的**文件字节内容**；变了才 reload + 广播。判据是"先记账再读文件"，所以写坏/删掉文件
   只会被处理**一次**（退回全关 + warn），不会每秒重放事件。命令路径是立即生效，外部改文件最多 1 秒。
-  mtime 的已知盲点：同一时间戳内连写两次、或文件系统不更新 mtime，那次改动不会被重载。
+  **判据从 mtime 改成字节（2026-11-20）**：mtime 有「同一时间戳刻度内的两次写」这个真实盲区 ——
+  NTFS 上连写两次实测约 2% 落在同一个时间戳（CI 负载高时更容易撞），那一刻只比 mtime 会把一次改动
+  静默吞掉：文件已经是新内容，内存里还是旧设置，用户以为"改了没生效"。`device.json` 不到 1 KB 且
+  每秒最多读一次，读全文的代价可忽略。回归测试 `a_same_length_rewrite_is_never_swallowed`
+  （`crates/hbot-rpc/src/app/device/mod.rs`）钉的是"等长改写也必须被抓到"，它不赌 mtime 一定相等。
 - **设置改变对已开会话的生效范围**：会话**时长与子能力不追溯**（那是用户在两个时刻做的两次决定）；
   但 `allowedApps` 与总开关的**收紧在下一次设备调用就生效**（`authorize`/`host_ceiling_allows` 每次重查），
   **放宽不追溯**，只影响之后开的会话。
@@ -468,7 +472,7 @@ interface DeviceApi {
 | OCR 中文 | **已完成（2026-11-17 实测）** | 本机 `["en-US","zh-Hans-CN"]`，画 `你好，世界` → `你 好 ， 世 界`；测试自门控（无语言包/字体回退时打印理由跳过，不伪造通过） |
 | 按窗口截图 | **已完成（2026-11-20）** | `screen({ window: <id> })`：`u64` 句柄来自 `ctx.device.windows()` 的 `id`（JS 侧是数字）。实现走 `PrintWindow(PW_RENDERFULLCONTENT)`，位图全零则退窗口 DC 的 `BitBlt`，仍空报 `HBOT_DEVICE_FAILED`（**不给全黑图**）；句柄不存在 / 已最小化 → `HBOT_DEVICE_HOST_LIMIT`（最小化窗口的矩形是 -32000 那一带的占位值，抓了也没意义）。与 `monitor` 互斥，两个都给当场拒；`monitor`/`window` 缺的那一个在返回值里保持 `undefined`（不拿 0 冒充"主屏"） |
 | 多显示器截图 | **已完成（2026-11-17）** | `ScreenshotRequest::monitor: Some(i)` 抓第 i 块整屏（`CreateDCW(szDevice)`，不是 `GetDC(NULL)`）；序号排序 `primary` → 左上角 → `szDevice`；越界 `HostLimit` 带可用范围；清单由 `hbot_device::displays()` 暴露（**本机只有一块屏，第二块屏只验了对称路径**） |
-| 设置写入 + watcher | **已完成（2026-11-17）** | `device_settings_get` / `device_settings_set` / `device.settings`；1 秒 mtime 轮询（不引入 `notify`），坏文件只处理一次（见 §4.2） |
+| 设置写入 + watcher | **已完成（2026-11-17，判据 2026-11-20 改）** | `device_settings_get` / `device_settings_set` / `device.settings`；1 秒轮询比文件字节（不引入 `notify`），坏文件只处理一次；等长改写也有回归测试（见 §4.2） |
 | IDE 设备设置卡片 | **已完成**（web 31 文件 / 246 用例） | `apps/web/src/features/device/settings-card.tsx`；`maxMinutes>30` 与 `defaultMinutes>maxMinutes` 前端就拦，后端仍独立校验 |
 | `ToolGateway` 的 Capability 闸 | **已完成**（B2，2026-11-17） | `GatewayStep::Capability` 作第一步；实现者 `app/device/capabilities.rs` 的 `ManifestCapabilityGate`（每次重读清单，不快照） |
 | Agent 侧的会话判据 | **已完成**（B2，2026-11-17） | `app/device/agent_backend.rs` 的 `SessionScopedBackend`：撤销/到期对 Agent 立刻生效（见下） |
