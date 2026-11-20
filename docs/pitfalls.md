@@ -495,3 +495,18 @@
     （`/usr/share/dotnet`、`/usr/share/swift`、`/opt/ghc`、`/usr/local/lib/android`、`/opt/hostedtoolcache/CodeQL`、
     `/usr/local/share/boost`，合计约 20 GB）。判读口诀：**看到 `signal 7 [Bus error]` / `IO failure` / `ENOSPC`，
     先看磁盘再看代码**（本地同族见坑 45）。
+
+119. **`rlim_cur == rlim_max` 时 SIGKILL 抢先，`SIGXCPU` 永远不会出现**（2026-11-20，CI 实测）。
+    `crates/hbot-command/src/containment_linux.rs` 的 `apply_limit` 原来把软硬上限设成同一个值
+    （`RLimit { rlim_cur: value, rlim_max: value }`）。软上限到点该发 `SIGXCPU`、硬上限到点发 `SIGKILL`，
+    两者相等时内核在同一刻两个都到，**实测结果直接是 `signal 9`**：CI 的
+    `crates/hbot-command/tests/limits.rs` 里 `cpu_limit_terminates_a_busy_loop`（`cpu_ms: 200`）拿到
+    `status=Exited { code: None, signal: Some(9) }`，而 `cpu_kill_hint()` 只认 `SIGXCPU`，于是
+    `violation()` 恒 `None` → 「被限额杀掉」被当成**正常退出**返回（不是崩溃，是最坏的一种：静默）。
+    判据：**软硬上限必须分开传**，硬上限留出宽限（`crates/hbot-command/src/limits.rs` 的
+    `CPU_HARD_GRACE_SECONDS = 1`；`apply_limit(resource, soft, hard)`），并加一条
+    「hard 恒 > soft」的纯逻辑单测（`cpu_soft_and_hard_limits_are_never_the_same_value`）。
+    `RLIMIT_AS` 不需要宽限 —— 地址空间到顶是**分配失败**，没有信号层。
+    同族的判读纪律：**本地 Windows 全绿 ≠ Linux 绿**。编译期问题能靠
+    `cargo check -p hbot-command --target x86_64-unknown-linux-gnu --all-targets` 抓到（本机 9.62 s 能过，
+    不需要 Linux C 工具链 —— 只有 `ring`/`psm` 这类需要 cc 的 crate 才卡住），**运行期语义只能靠 CI**。

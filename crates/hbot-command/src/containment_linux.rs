@@ -160,10 +160,16 @@ fn sample_children() -> RUsage {
 /// 在子进程里装一条 `rlimit`。**只能在 `pre_exec` 里调用**（fork 之后、exec 之前）。
 ///
 /// `setrlimit` 是 async-signal-safe 的纯系统调用，满足 `pre_exec` 的约束。
-fn apply_limit(resource: i32, value: u64) -> io::Result<()> {
+///
+/// `soft` 与 `hard` 必须分开传：`RLIMIT_CPU` 的软上限到点发 `SIGXCPU`，硬上限到点发
+/// `SIGKILL`。两者设成**同一个值**时内核在同一个 tick 里既到软上限又到硬上限，实测结果是
+/// 直接 `SIGKILL`（`Exited { signal: 9 }`）——`SIGXCPU` 永远发不出来，`cpu_kill_hint()`
+/// 也就永远认不出「这是被我们设的 CPU 上限杀掉的」，调用方只会看到一条普通的被信号 9 杀死。
+/// 所以 CPU 那条的硬上限要留出 [`limits::CPU_HARD_GRACE_SECONDS`] 的余量（见 `configure`）。
+fn apply_limit(resource: i32, soft: u64, hard: u64) -> io::Result<()> {
     let limit = RLimit {
-        rlim_cur: value,
-        rlim_max: value,
+        rlim_cur: soft,
+        rlim_max: hard,
     };
     // SAFETY: 纯系统调用；`limit` 在调用期间存活。
     if unsafe { setrlimit(resource, &limit) } == -1 {
@@ -207,11 +213,18 @@ impl Containment {
         unsafe {
             command.pre_exec(move || {
                 // 先设上限再 exec：exec 之后就没有"趁程序还没起来先超限"的窗口。
+                // CPU 的软/硬上限**必须错开**：相等时内核直接 `SIGKILL`，`SIGXCPU` 发不出来，
+                // 于是 `cpu_kill_hint()` 认不出这次死亡是我们设的上限造成的（见 `apply_limit`）。
                 if let Some(seconds) = cpu_seconds {
-                    apply_limit(RLIMIT_CPU, seconds)?;
+                    apply_limit(
+                        RLIMIT_CPU,
+                        seconds,
+                        seconds.saturating_add(limits::CPU_HARD_GRACE_SECONDS),
+                    )?;
                 }
+                // 地址空间没有信号这一层（超了是 `mmap`/`brk` 直接失败），软硬同值即可。
                 if let Some(bytes) = address_space {
-                    apply_limit(RLIMIT_AS, bytes)?;
+                    apply_limit(RLIMIT_AS, bytes, bytes)?;
                 }
                 if setsid() == -1 {
                     // 万一子进程已经是组长（例如 pid 恰好等于继承来的 pgid），

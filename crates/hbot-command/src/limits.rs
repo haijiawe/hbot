@@ -35,6 +35,18 @@ pub(crate) const MAX_PROCESS_LIMIT: u32 = 64;
 /// 而 Windows 的 `PerJobUserTimeLimit` 是 100 ns 单位的 `i64`，换算前必须先确认不溢出。
 pub(crate) const MAX_CPU_MS: u64 = 24 * 60 * 60 * 1_000;
 
+/// `RLIMIT_CPU` 的硬上限比软上限多留的秒数。
+///
+/// 软上限到点内核发 `SIGXCPU`（默认动作：终止），硬上限到点发 `SIGKILL`。**两者相等时
+/// `SIGKILL` 会抢先**——2026-11-20 的 CI 实测：`cpu_ms = 200` 的死循环得到的是
+/// `Exited { code: None, signal: Some(9) }`，`SIGXCPU` 一次都没发出来，于是
+/// [`crate::containment::Containment::cpu_kill_hint`] 认不出这次死亡来自 CPU 上限，
+/// 调用方看到的是「被信号 9 杀掉的普通退出」而不是 `HBOT_COMMAND_CPU_LIMIT`。
+/// 留 1 秒余量后：正常程序在软上限那一刻就被 `SIGXCPU` 收掉；万一它自己处理/忽略了
+/// `SIGXCPU`，硬上限也会在 1 秒后兜底，不会变成"无限跑"。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const CPU_HARD_GRACE_SECONDS: u64 = 1;
+
 /// CPU 毫秒 → `setrlimit(RLIMIT_CPU)` 的秒数：**向上取整，最小 1 秒**。
 ///
 /// `RLIMIT_CPU` 的单位是整秒，且 `0` 的含义是"不限"（不是"立刻杀"）——所以
@@ -364,6 +376,22 @@ mod tests {
             unsupported_reason(&limits(), Platform::MacOs).is_none(),
             "没请求限额就不该因为平台做不到而拒绝"
         );
+    }
+
+    #[test]
+    fn cpu_soft_and_hard_limits_are_never_the_same_value() {
+        // 软硬上限相等时内核直接 SIGKILL，SIGXCPU 发不出来，`cpu_kill_hint()` 就认不出
+        // 「这是被我们设的 CPU 上限杀掉的」（CI 实测 `signal: Some(9)`）。这条钉住换算关系，
+        // 让 Linux 分支那个本机跑不了的地方至少有一处可测的判据。
+        for cpu_ms in [1_u64, 100, 200, 999, 1_000, 1_001, 2_500, MAX_CPU_MS] {
+            let soft = cpu_seconds_ceiling(cpu_ms);
+            let hard = soft.saturating_add(CPU_HARD_GRACE_SECONDS);
+            assert!(
+                hard > soft,
+                "cpu_ms={cpu_ms} 的软上限 {soft} 秒与硬上限 {hard} 秒必须错开",
+            );
+            assert_eq!(hard - soft, CPU_HARD_GRACE_SECONDS);
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（1977 个 Rust 测试 / 125 个 target / web 427 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（1980 个 Rust 测试 / 125 个 target / web 427 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -28,7 +28,7 @@
 |---|---|---|
 | 0 | `docs/HANDOFF.md` | **接手时先看这一份**：决策权在 lead、工作方式、六道闸门现状、已完成/剩余、外部依赖。它是快照，冲突以本文件与 `04` 为准 |
 | 1 | 本文件 | 规则与地图 |
-| 1.5 | [`docs/pitfalls.md`](docs/pitfalls.md) | **118 条坑全表**（编号稳定）：改任何热点模块前先按编号搜一遍 |
+| 1.5 | [`docs/pitfalls.md`](docs/pitfalls.md) | **119 条坑全表**（编号稳定）：改任何热点模块前先按编号搜一遍 |
 | 2 | `docs/03-directory.md` | 改动落点、命名、依赖方向 |
 | 3 | `docs/02-architecture.md` | 消息链路、Agent、沙箱、存储、安全 |
 | 4 | `docs/06-ide.md` | IDE 布局、编辑器、Agent Diff、运行/调试 |
@@ -155,7 +155,7 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 
 ## 7. 已踩过的坑
 
-全表（118 条）在 **[`docs/pitfalls.md`](docs/pitfalls.md)** —— 那里编号稳定，代码注释与
+全表（119 条）在 **[`docs/pitfalls.md`](docs/pitfalls.md)** —— 那里编号稳定，代码注释与
 设计文档里的「坑 66」「坑 69」都指向它。**新增一条写进那个文件**，不要在这里追加。
 
 改代码之前至少扫一眼下面 12 条：它们全是「不报错、只是悄悄失效」那一类，出事最难查。
