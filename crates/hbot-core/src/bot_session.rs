@@ -82,6 +82,14 @@ pub const MAX_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 /// 没有正确答案：猜最近的那个会被乱序消息打穿，猜最老的那个会让后开的等待饿死。
 pub const MAX_WAITS_PER_CONVERSATION: usize = 1;
 
+/// 一条等待在超时后最多**重发几次**提示（0 = 不重发，当前默认）。
+///
+/// 3 是「一个人可能没看见」与「别把群里刷屏」之间的折中：每次到点重发一遍原话并
+/// 把 deadline 推后同样长的一段时间，次数用尽才落 `expired`。默认 0 保持既有语义
+/// （超时只留一行日志），要不要重发由调用点显式决定 —— 「问完就不管了」在很多场景
+/// 下是正确的，不该被一个更主动的默认值悄悄改掉。
+pub const MAX_WAIT_REMINDERS: u8 = 3;
+
 /// 谁来回答这个等待。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -206,6 +214,13 @@ pub struct WaitSpec {
     /// [`MIN_WAIT_TIMEOUT_MS`] ..= [`MAX_WAIT_TIMEOUT_MS`] 之间。
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// 超时后重发提示的次数；缺省 0（只超时一次，不重发）。
+    ///
+    /// 每重发一次就把 `deadline` 推后一轮 `timeout_ms`，所以「最多等多久」是
+    /// `timeout_ms * (reminders + 1)`。上限 [`MAX_WAIT_REMINDERS`]，越界**报错**
+    /// 而不是夹取（与超时同一条理由：写错配置不该悄悄变成另一份配置）。
+    #[serde(default)]
+    pub reminders: u8,
 }
 
 impl WaitSpec {
@@ -217,6 +232,7 @@ impl WaitSpec {
             prompt: prompt.into(),
             scope: WaitScope::Sender,
             timeout_ms: None,
+            reminders: 0,
         }
     }
 
@@ -234,6 +250,20 @@ impl WaitSpec {
     #[must_use]
     pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// 超时后重发提示的次数（会被上限夹住，供存储层与日志使用）。
+    #[must_use]
+    pub fn effective_reminders(&self) -> u8 {
+        self.reminders.min(MAX_WAIT_REMINDERS)
+    }
+
+    /// 指定超时后重发提示的次数（**不做校验**，越界会在这里被
+    /// [`validate_spec`] 拒掉）。
+    #[must_use]
+    pub fn with_reminders(mut self, reminders: u8) -> Self {
+        self.reminders = reminders;
         self
     }
 
@@ -497,6 +527,19 @@ pub fn validate_spec(spec: &WaitSpec) -> Result<(), SessionError> {
     validate_key(&spec.key)?;
     validate_prompt(&spec.prompt)?;
     validate_timeout(spec.timeout_ms)?;
+    validate_reminders(spec.reminders)?;
+    Ok(())
+}
+
+/// 参数闸：重发次数。越界报错，不夹取（理由同 [`validate_timeout`]）。
+pub fn validate_reminders(reminders: u8) -> Result<(), SessionError> {
+    if reminders > MAX_WAIT_REMINDERS {
+        return Err(SessionError::Invalid {
+            message: format!(
+                "等待的重发次数 {reminders} 越界：只接受 0..={MAX_WAIT_REMINDERS}（不写就是 0，即不重发）"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -524,6 +567,33 @@ mod tests {
     fn a_spec_defaults_to_sender_scope_and_five_minutes() {
         assert_eq!(spec().scope, WaitScope::Sender);
         assert_eq!(spec().effective_timeout_ms(), DEFAULT_WAIT_TIMEOUT_MS);
+    }
+
+    /// 缺省不重发：把「问完就不管了」保持为默认语义，重发必须是显式选择。
+    #[test]
+    fn a_spec_does_not_remind_unless_asked() {
+        assert_eq!(spec().reminders, 0);
+        assert_eq!(spec().effective_reminders(), 0);
+        assert_eq!(WaitSpec::new("a", "b").with_reminders(2).reminders, 2);
+    }
+
+    /// 重发次数越界**报错**，不夹取 —— 与超时同一条口径（写错的值不能悄悄变成另一份配置）。
+    #[test]
+    fn reminders_beyond_the_limit_are_refused_rather_than_clamped() {
+        assert!(validate_spec(&spec().with_reminders(MAX_WAIT_REMINDERS)).is_ok());
+        let error =
+            validate_spec(&spec().with_reminders(MAX_WAIT_REMINDERS + 1)).expect_err("越界必须拒");
+        assert!(
+            error.to_string().contains("重发次数"),
+            "错误要点名是重发次数越界：{error}"
+        );
+    }
+
+    /// 老清单/老库里没有 `reminders` 字段时反序列化必须成功（缺省 0）。
+    #[test]
+    fn a_spec_without_reminders_deserializes_to_zero() {
+        let parsed: WaitSpec = serde_json::from_str(r#"{"key":"a","prompt":"b"}"#).expect("parse");
+        assert_eq!(parsed.reminders, 0);
     }
 
     #[test]
