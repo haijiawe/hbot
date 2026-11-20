@@ -71,8 +71,8 @@ pub use bot_jobs::{
     DEFAULT_JOB_BUDGET_MS, DEFAULT_JOB_RETRIES, JobError, JobRequest, JobSpec, JobState,
     MAX_JOB_BUDGET_MS, MAX_JOB_IDEMPOTENCY_KEY_BYTES, MAX_JOB_NAME_BYTES, MAX_JOB_PAYLOAD_BYTES,
     MAX_JOB_RETRIES, MAX_JOB_TYPES, MAX_JOBS_PER_BOT, MAX_RETRY_DELAY_MS, MIN_JOB_BUDGET_MS,
-    MIN_RETRY_DELAY_MS, retry_delay_ms, validate_idempotency_key, validate_job_name,
-    validate_payload, validate_request, validate_specs,
+    MIN_RETRY_DELAY_MS, effective_job_budget_ms, retry_delay_ms, validate_idempotency_key,
+    validate_job_name, validate_payload, validate_request, validate_specs,
 };
 pub use bot_lifecycle::{LifecyclePhase, STOP_BUDGET, StopReason};
 pub use bot_session::{

@@ -74,6 +74,33 @@ pub const MIN_JOB_BUDGET_MS: u64 = 1_000;
 /// 核心只冻结「声明不能超过多少」，取小的一步（平台上限 vs 声明值）由装配方做。
 pub const MAX_JOB_BUDGET_MS: u64 = 600_000;
 
+/// 一次执行真正该给的预算：声明值再被**宿主上限**收紧一次（只收紧，不放宽）。
+///
+/// `host_ceiling_ms == 0` 表示这台宿主不限（等价于 [`MAX_JOB_BUDGET_MS`]）。
+/// 返回值恒落在 [`MIN_JOB_BUDGET_MS`]..=[`MAX_JOB_BUDGET_MS`]。
+///
+/// 为什么要这一步：清单里的 `budgetMs` 是**项目**要多少，而宿主可能给不了那么多
+/// （手机端后台执行窗口只有几十秒，见 `docs/08`）。取小的一步必须只有一份实现 ——
+/// 装配方各自写一个 `min` 迟早漂移，而漂移的表现是「同一个项目在桌面能跑完、在手机上
+/// 莫名其妙超时」，用户看不出这是两个判据。
+///
+/// 方向是**只收紧不放宽**：宿主上限写成 1 秒时，声明 60 秒的作业只拿 1 秒；反过来
+/// 宿主上限写成 10 分钟也不会把声明 1 秒的作业抬成 10 分钟 —— 声明是用户对代价的承诺。
+#[must_use]
+pub fn effective_job_budget_ms(row_budget_ms: u64, host_ceiling_ms: u64) -> u64 {
+    let declared = if row_budget_ms == 0 {
+        DEFAULT_JOB_BUDGET_MS
+    } else {
+        row_budget_ms.clamp(MIN_JOB_BUDGET_MS, MAX_JOB_BUDGET_MS)
+    };
+    let ceiling = if host_ceiling_ms == 0 {
+        MAX_JOB_BUDGET_MS
+    } else {
+        host_ceiling_ms.clamp(MIN_JOB_BUDGET_MS, MAX_JOB_BUDGET_MS)
+    };
+    declared.min(ceiling)
+}
+
 /// 重试次数的缺省值：0（不重试）。
 ///
 /// 缺省不重试是刻意的：重试要幂等键真的幂等，而「缺省就重试 3 次」会让一个
@@ -696,5 +723,32 @@ mod tests {
         assert_eq!(retry_delay_ms(10), MAX_RETRY_DELAY_MS);
         // 再多也只是封顶，不会溢出。
         assert_eq!(retry_delay_ms(u32::MAX), MAX_RETRY_DELAY_MS);
+    }
+
+    #[test]
+    fn the_host_ceiling_only_ever_tightens_the_declared_budget() {
+        // 默认上限 = 核心上限：行为与没有这一步完全一致（这是「默认不改行为」的钉子）。
+        assert_eq!(
+            effective_job_budget_ms(DEFAULT_JOB_BUDGET_MS, MAX_JOB_BUDGET_MS),
+            DEFAULT_JOB_BUDGET_MS
+        );
+        // 0 = 宿主不限。
+        assert_eq!(
+            effective_job_budget_ms(120_000, 0),
+            120_000,
+            "0 表示不限，不能把作业压成 0 毫秒"
+        );
+        // 收紧：手机端 30 秒窗口 vs 声明 60 秒。
+        assert_eq!(effective_job_budget_ms(60_000, 30_000), 30_000);
+        // 不放宽：上限比声明大时保留声明值。
+        assert_eq!(effective_job_budget_ms(5_000, 600_000), 5_000);
+        // 越界的入参两头都夹回契约区间，结果不越界。
+        for (row, ceiling) in [(0_u64, 0_u64), (1, 1), (u64::MAX, u64::MAX)] {
+            let budget = effective_job_budget_ms(row, ceiling);
+            assert!(
+                (MIN_JOB_BUDGET_MS..=MAX_JOB_BUDGET_MS).contains(&budget),
+                "row={row} ceiling={ceiling} -> {budget} 越界"
+            );
+        }
     }
 }
