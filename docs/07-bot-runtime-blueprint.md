@@ -249,7 +249,7 @@ export default defineBot({
 |---|---|---|---|
 | 声明层 | 清单 `capabilities.webhook[].path` | `SandboxHandler::dispatch_webhook` 先读 `declared_webhook` | `HBOT_WEBHOOK_NO_ROUTE`（404） |
 | 鉴权层 | `x-hbot-secret` 与环境变量**常数时间**比较 | `hbot-rpc::webhook::authorize` + `hbot_core::secrets_match` | `HBOT_WEBHOOK_UNAUTHORIZED`（401；路由没声明 / 变量没设 / 值不对**都是 401**） |
-| 参数层 | 只收 POST、`Content-Length` ≤ 64 KiB、头 ≤ 8 KiB、体必须是 UTF-8 | `hbot-rpc::webhook::read_request` + `hbot_core::validate_request` | 405 / 413 / 400；`Transfer-Encoding` → 501 |
+| 参数层 | 事件只收 `POST`（`GET`/`HEAD` 只探活，见决定 7）、`Content-Length` ≤ 64 KiB、头 ≤ 8 KiB、体必须是 UTF-8 | `hbot-rpc::webhook::read_request` + `hbot_core::validate_request` | 405 / 413 / 400；`Transfer-Encoding` → 501 |
 | 装配层 | 这个 bot 在 `WebhookRegistry` 里（即 `bot_start` 过） | `hbot-rpc::webhook::handler_of` | 404（停掉的 bot 立刻拒，不等到 supervisor 排空） |
 | 应答层 | 解码 handler 返回值 | `hbot_core::response_from_handler` | 非法 `status`（字符串 / 越界）→ `HBOT_WEBHOOK_INVALID`（400） |
 
@@ -261,10 +261,11 @@ export default defineBot({
 4. **传输层手写 HTTP/1.1**。只做「收一条 POST、读 `Content-Length` 字节、回一条响应」；为此引入 `axum` + `hyper` 会把整条异步生态拖进依赖图，而判据一条都不会因此变少。与 `ws.rs` 的取舍一致：传输层自己刻，判据全在 `hbot-core`。
 5. **`onWebhook` 的 ctx 比所有其它事件都窄**：只有 `route` / `method` / `contentType` / `body` / `bodyJson` 与 `log` / `sleep` / `ai`。**没有 `reply`**（外部请求没有会话，应答走返回值），也没有 `kv` / `history` / `device` / `jobs` / `session` —— 它们都要一个 bot 或会话身份。
 6. **单连接一问一答**。`Connection: close`，一条 TCP 只处理一个请求。webhook 调用方通常是「发一条就走」的脚本/服务，keep-alive 省不下可观的握手，却要引入连接生命周期、空闲超时与流水线顺序三条状态机。
+7. **`GET` / `HEAD` 是鉴权后的探活，不派发 handler**（2026-11-20）。监控每分钟都会打探活，而 handler 是用户代码（会真改库、真调模型、真发消息）—— 探活只回答「这个路由现在能不能被我打到」。失败口径与 `POST` 完全一致（401/404），否则探活等于送出一个绕过鉴权的存在性探针。`HEAD` 的头与 `GET` 一致（`Content-Length` 按 `GET` 会回的体长报）、只是不带体：写 `Content-Length: 0` 等于在头里说谎，任何缓存/代理都会读到假长度。
 
-**实测**（`hbot-rpc` 的 `tests/webhook_capability.rs`，8 条，真 TCP + 真派发 + 真库）：路由没声明 → 401；环境变量没设 → 401；密钥不匹配 → 401；正确密钥 → handler 的返回值成为应答体（`ctx.bodyJson` 拿到解析后的 JSON，`ctx.log` 落库）；`return null` → 204 空体；信封 `{status: 418, body: 'teapot'}` → 418；`GET` → 405；`bot_stop` 之后同一路径 → 404；`Content-Length` 超上限 → 413（读体之前就拒）。契约层另有 25 条（路径穿越、环境变量名写错、超限、CRLF 注入、非 UTF-8 拒绝替换、信封 status 不做字符串强转）。
+**实测**（`hbot-rpc` 的 `tests/webhook_capability.rs`，12 条，真 TCP + 真派发 + 真库）：路由没声明 → 401；环境变量没设 → 401；密钥不匹配 → 401；正确密钥 → handler 的返回值成为应答体（`ctx.bodyJson` 拿到解析后的 JSON，`ctx.log` 落库）；`return null` → 204 空体；信封 `{status: 418, body: 'teapot'}` → 418；`PUT` → 405；`GET`/`HEAD` 探活 → 200 且**一次都不调 handler**（没密钥/没声明的路由照旧 401）；`bot_stop` 之后同一路径 → 404；`Content-Length` 超上限 → 413（读体之前就拒）。契约层另有 25 条（路径穿越、环境变量名写错、超限、CRLF 注入、非 UTF-8 拒绝替换、信封 status 不做字符串强转）。
 
-**还没做**：`GET` 探活与 `HEAD`；响应体流式（现在整段进内存，上限 256 KiB）；路由级超时（现在统一用 handler 预算）；反向代理/公网暴露（`docs/08` §4.4 说明手机做不到，桌面/无头交给用户的代理）。
+**还没做**：响应体流式（现在整段进内存，上限 256 KiB）；路由级超时（现在统一用 handler 预算）；反向代理/公网暴露（`docs/08` §4.4 说明手机做不到，桌面/无头交给用户的代理）。
 ### 3.6 已落地：项目内文件（`C3.file`，2026-11-20）
 
 ```jsonc
