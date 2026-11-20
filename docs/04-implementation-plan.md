@@ -256,7 +256,7 @@
 | **M8 Android 宿主** | 拆 `hbot-mobile` crate、vendor rquickjs bindings、APK 能装能跑、前台服务 + 常驻通知、能力矩阵裁剪 | 真机装上；`local` bot 能跑、`onebot11` 能连局域网协议端、`bot_inject` 有回复；体积 ≤ 25 MB；`08` 的 H1–H7 全绿 |
 | **M11 iOS 宿主**（可选） | macOS + Xcode 构建、IPA、WKWebView 控制台、**仅前台运行** | TestFlight 可装、前台跑通同一链路；按 4.7 备齐审核材料 |
 
-**M7 的实际进度（2026-11-20 更新）**：`07` §11 的 1–5 步**全部落地** —— `C2.kv` / `C2.history` / `C5.ai.complete`（§5.0、§3.3）、`C1.timer`（§4.4）、`C4.jobs`（§4.3）、`C2.session` 含超时重发（§5.2）、`C1.webhook` + `C3.send` / `C3.notify`（§6）、`C3.file` 与 `onStart` / `onStop` 都在跑。
+**M7 的实际进度（2026-11-20 更新）**：`07` §11 的 1–5 步**全部落地** —— `C2.kv` / `C2.history` / `C5.ai.complete`（§5.0、§3.3）、`C1.timer`（§4.4）、`C4.jobs`（§4.3）、`C2.session` 含超时重发（§5.2）、`C1.webhook` + `C3.send` / `C3.notify`（§6）、`C3.file`（含每 bot 磁盘配额 `limits.quotaMb`，2026-11-20 晚）与 `onStart` / `onStop` 都在跑。
 
 出口标准的两半现在**都可判定**：
 
