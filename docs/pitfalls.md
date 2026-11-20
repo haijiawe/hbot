@@ -615,3 +615,16 @@
     留着只会诱使下一个人继续写"先归零再比 0"。
     判据：任何 `static Atomic*` / `static Mutex<Vec<_>>` 型测试探针，先问「谁会在我之外碰它」，
     再决定比绝对值还是比增量；同一进程里**没有任何**测试探针能靠 `reset()` 拿到独占。
+128. **「副作用发生了」与「副作用被记账了」是两件事，等待条件必须等到记账**（2026-11-20，CI 的 ubuntu 红）。
+    `crates/hbot-bot/tests/runtime.rs` 的 `outbound_is_persisted_then_retried_until_sent` 只等
+    `fixture.adapter.sent().len() == 1`（假适配器 `send` 一返回就有记录），紧接着断言
+    `supervisor.snapshot().outbox.sent == 1` —— 而 `crates/hbot-bot/src/outbox.rs` 的 `Ok(())` 分支是
+    **先** `mark_outbound_sent` 落库、**再** `counters.sent.fetch_add(1, Ordering::AcqRel)`。于是存在一个
+    窗口：消息真的发出去了，计数器还是 0，断言读到 `left: 0, right: 1`。本机 0.29s 的用例偶发，CI 才稳定红。
+    做法：等待条件写成「已投递 **且** 已记账」两个条件的合取（`sent().len() == 1 && snapshot().outbox
+    .is_some_and(|stats| stats.sent == 1)`），断言口径一字不改 —— 这是把等待补全，不是放宽。
+    判据：① 凡是「先看 A 侧面（适配器 / 日志 / 文件）再断言 B 侧面（计数器 / 数据库 / 快照）」的测试，
+    等待条件必须同时覆盖 B 侧面；② 排查时先看计数器的 `fetch_add` 在代码里排在哪一步之后 ——
+    排在「落库成功」之后的计数器天然比副作用本身晚；③ 与坑 121 同族（那里是 `mark_processed` 晚于
+    `executor.on_message`），一处竞态就要全仓扫同类读法（`grep "snapshot().outbox"` / `"list_unprocessed_inbound"`），
+    别等 CI 一条一条报。

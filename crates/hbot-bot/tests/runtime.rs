@@ -638,8 +638,17 @@ async fn outbound_is_persisted_then_retried_until_sent() {
         .await
         .expect("persisted and queued");
 
+    // 两个条件都要等：`adapter.sent()` 是假适配器自己的记录（`send` 一返回就有），
+    // 而 `snapshot().outbox.sent` 是 outbox 在 `mark_outbound_sent` 落库**之后**才加的
+    // 计数（`crates/hbot-bot/src/outbox.rs` 的 `Ok(())` 分支）。只等前者，下一段
+    // `assert_eq!(stats.sent, 1)` 会在「已经发出去、但还没记账」那一瞬间读到 0 ——
+    // 2026-11-20 的 CI 上就是这样红的（坑 121 的同族）。
     wait_until("outbound delivered after two failures", || {
         fixture.adapter.sent().len() == 1
+            && supervisor
+                .snapshot()
+                .outbox
+                .is_some_and(|stats| stats.sent == 1)
     })
     .await;
 
