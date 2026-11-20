@@ -199,7 +199,7 @@ jobs:
   # 这台仓库没有 Mac 本机，dmg 只能在 runner 上验；所以这里是"第一次真正的 dmg 实测"。
   bundle-macos:
     name: bundle (macos, dmg)
-    runs-on: macos-14
+    runs-on: macos-13
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
