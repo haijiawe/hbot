@@ -25,6 +25,7 @@
 
 #![warn(missing_docs)]
 
+pub mod base64;
 pub mod bot_ai;
 pub mod bot_egress;
 pub mod bot_file;
@@ -45,6 +46,7 @@ pub mod paths;
 pub mod ports;
 pub mod redact;
 
+pub use base64::encode as base64_encode;
 pub use bot_ai::{
     AiClient, AiError, AiRequest, AiText, AiUsage, DEFAULT_OUTPUT_TOKENS, MAX_CALLS_PER_EVENT,
     MAX_OUTPUT_TOKENS, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES, MAX_TEMPERATURE, MAX_TIME_PER_EVENT,
