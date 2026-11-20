@@ -537,6 +537,10 @@ declare module 'hbot' {
     /** 超时毫秒，1000–86400000；省略按 300000（5 分钟）。越界**拒绝**不夹。
      *  超时由宿主结算，不依赖「下一条消息到达」—— 没人回也会到点结束。 */
     timeoutMs?: number;
+    /** 到点后再重发几次提示，0–3；省略按 0（到点直接结束，不再打扰）。
+     *  每次重发都用同一句 `text` 并把 deadline 从**当时**起推后 `timeoutMs`，
+     *  所以从发问到彻底放弃最长是 `timeoutMs × (reminders + 1)`。越界**拒绝**不夹。 */
+    reminders?: number;
   }
 
   /** 一条还没被回答的等待（`ctx.session.current()` 的返回）。 */

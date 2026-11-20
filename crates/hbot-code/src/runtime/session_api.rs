@@ -189,6 +189,24 @@ fn parse_prompt<'js>(
                     spec.timeout_ms = Some(millis);
                 }
             }
+            if let Some(value) = object
+                .get::<_, Option<Value<'js>>>("reminders")
+                .map_err(js_message)?
+            {
+                if !value.is_undefined() && !value.is_null() {
+                    let Some(number) = value.as_number() else {
+                        return Err(invalid("session.prompt 的 reminders 必须是数字"));
+                    };
+                    // 与 timeoutMs 同口径：越界报错而不是夹取，否则用户以为设了 3 次、实际只重发 1 次。
+                    let Some(reminders) = clamp_reminders(number) else {
+                        return Err(invalid(format!(
+                            "session.prompt 的 reminders 必须是 0..={} 的整数，收到 {number}",
+                            hbot_core::bot_session::MAX_WAIT_REMINDERS
+                        )));
+                    };
+                    spec.reminders = reminders;
+                }
+            }
         }
     }
     hbot_core::bot_session::validate_spec(&spec).map_err(|error| error.to_string())?;
@@ -197,6 +215,18 @@ fn parse_prompt<'js>(
 }
 
 /// JS 数字 → 毫秒。超出 `u64` 范围或非正/非整数返回 `None`（调用方报错，不截断）。
+/// JS 数字 → 重发次数。必须是 0..=`MAX_WAIT_REMINDERS` 的整数（同 `clamp_timeout`：不合法就 `None`）。
+fn clamp_reminders(number: f64) -> Option<u8> {
+    if !number.is_finite() || number.fract() != 0.0 || number < 0.0 {
+        return None;
+    }
+    if number > u8::MAX as f64 {
+        return None;
+    }
+    u8::try_from(number as u16)
+        .ok()
+        .filter(|value| *value <= hbot_core::bot_session::MAX_WAIT_REMINDERS)
+}
 fn clamp_timeout(number: f64) -> Option<u64> {
     if !number.is_finite() || number <= 0.0 || number.fract() != 0.0 {
         return None;
@@ -298,6 +328,17 @@ mod tests {
         assert_eq!(clamp_timeout(1.5), None, "毫秒不接受小数");
         assert_eq!(clamp_timeout(f64::NAN), None);
         assert_eq!(clamp_timeout(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn the_reminder_parser_refuses_what_cast_would_silently_rewrite() {
+        assert_eq!(clamp_reminders(0.0), Some(0), "0 是合法值：到点直接结束");
+        assert_eq!(clamp_reminders(3.0), Some(3));
+        assert_eq!(clamp_reminders(4.0), None, "上限是 3，越界报错不夹取");
+        assert_eq!(clamp_reminders(-1.0), None);
+        assert_eq!(clamp_reminders(1.5), None, "次数不接受小数");
+        assert_eq!(clamp_reminders(f64::NAN), None);
+        assert_eq!(clamp_reminders(f64::INFINITY), None);
     }
 
     #[test]
