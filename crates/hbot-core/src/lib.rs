@@ -51,9 +51,10 @@ pub use bot_ai::{
     validate_max_tokens, validate_prompt, validate_system, validate_temperature,
 };
 pub use bot_egress::{
+    AttachmentKind, AttachmentRef, AttachmentRequest, MAX_ATTACHMENT_PATH_BYTES,
     MAX_CONVERSATION_ID_BYTES, MAX_NOTIFY_TEXT_BYTES, MAX_SEND_TEXT_BYTES, NotifyError,
-    NotifyRequest, NotifyTarget, SendError, SendRequest, validate_conversation, validate_notify,
-    validate_notify_target, validate_send,
+    NotifyRequest, NotifyTarget, SendError, SendRequest, validate_attachment,
+    validate_conversation, validate_notify, validate_notify_target, validate_send,
 };
 pub use bot_file::{
     DEFAULT_FILE_QUOTA_MB, FileEntry, FileError, FileKind, FileStore, FilesCapability, LineRange,

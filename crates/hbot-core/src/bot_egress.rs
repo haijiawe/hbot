@@ -507,3 +507,334 @@ mod tests {
         assert!(text.contains("g1"), "{text}");
     }
 }
+
+/// 附件路径的字节上限（UTF-8）。
+///
+/// 路径是**项目内相对路径**（`asserts/logo.png` 这种），不是绝对路径：绝对路径等于把
+/// 宿主机器的目录结构写进项目，换一台机器就发不出去；更要紧的是它绕过了「项目根内」
+/// 这条边界（与 `C3.file` 的路径闸同一个理由）。
+pub const MAX_ATTACHMENT_PATH_BYTES: usize = 512;
+
+/// 一个附件在发送时的**平台无关**分类。
+///
+/// 只有两种，因为平台侧真正不同的处理也只有两种：图片按图片段发（可内联预览），
+/// 其它一律按文件发。刻意**不做**音频/视频/表情分类：「按扩展名猜 MIME」是本项目
+/// 反复拒绝的那类猜测，猜错的表现是对方收到一个打不开的文件，而不是一个报错。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentKind {
+    /// 图片（`ctx.sendImage`）。
+    Image,
+    /// 任意文件（`ctx.sendFile`）。
+    File,
+}
+
+impl AttachmentKind {
+    /// 落库与日志用的稳定字符串。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::File => "file",
+        }
+    }
+
+    /// 从落库值解析；不认识的值返回 `None`（**不**猜成 `File`）。
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "image" => Some(Self::Image),
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+}
+
+/// 一条带附件的主动发送请求。
+///
+/// 与 [[`SendRequest`]] 同源（同一个出站行、同一条重试与回执路径），区别只有两点：
+/// 正文可以为空，且多了一个 `attachment` 与 `path`。
+///
+/// 为什么不把附件塞进 `SendRequest`：那会让「发文本」这条最常用的路径也背上
+/// 路径校验与磁盘 IO 的参数，而它的两个字段（正文/会话）本来就已经冻结。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentRequest {
+    /// 目标会话的平台外部 ID。
+    pub conversation: String,
+    /// 会话类型；语义与 [[`SendRequest::kind`]] 完全一样（显式优先、不猜）。
+    pub kind: Option<ConversationKind>,
+    /// 附件分类。
+    pub attachment: AttachmentKind,
+    /// 项目根内的相对路径（POSIX 风格或平台原生都接受，但必须是相对的）。
+    pub path: String,
+}
+
+impl AttachmentRequest {
+    /// 构造一条请求（不带会话类型）。
+    #[must_use]
+    pub fn new(
+        conversation: impl Into<String>,
+        attachment: AttachmentKind,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            conversation: conversation.into(),
+            kind: None,
+            attachment,
+            path: path.into(),
+        }
+    }
+
+    /// 显式指定会话类型。
+    #[must_use]
+    pub fn with_kind(mut self, kind: ConversationKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    /// 真正生效的会话类型（`Unknown` 与 `None` 都算没给，与 `SendRequest` 同口径）。
+    #[must_use]
+    pub fn effective_kind(&self) -> Option<ConversationKind> {
+        match self.kind {
+            None | Some(ConversationKind::Unknown) => None,
+            Some(kind) => Some(kind),
+        }
+    }
+}
+
+/// 落库形态的附件引用：**已经解析好**的绝对路径 + 分类。
+///
+/// 与 [`AttachmentRequest`] 的区别：那是「用户代码给了什么」（相对路径、可能越界），
+/// 这是「宿主核验并冻结之后是什么」（绝对路径、一定在项目根内且文件存在）。
+/// 出站行里存的就是它，重启续发时不需要重新解析路径。
+///
+/// 为什么不存相对路径：续发时项目可能已经换了根目录（`projects.path` 可变），
+/// 重新解析会指向另一个文件；而附件的语义是「发这个文件」。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentRef {
+    /// 附件分类。
+    pub kind: AttachmentKind,
+    /// 解析后的绝对路径（宿主核验过的）。
+    pub path: String,
+}
+
+impl AttachmentRef {
+    /// 构造一条引用。
+    #[must_use]
+    pub fn new(kind: AttachmentKind, path: impl Into<String>) -> Self {
+        Self {
+            kind,
+            path: path.into(),
+        }
+    }
+
+    /// 序列化成出站行的 `attachment_json`。
+    ///
+    /// 不用 `unwrap()`：这两个字段只有字符串与枚举，序列化不可能失败；真失败了说明
+    /// 类型定义被改坏，那是编译期就该红的事。用 `expect` 也违反库代码约定，所以给
+    /// 一个不可能走到的兜底值（空对象），由调用方的 `from_json` 报错。
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    /// 从出站行的 `attachment_json` 解析。
+    ///
+    /// # Errors
+    ///
+    /// 字段缺失、类型不对或分类值不认识时返回 [`SendError::Invalid`]。
+    pub fn from_json(raw: &str) -> Result<Self, SendError> {
+        serde_json::from_str(raw).map_err(|error| SendError::Invalid {
+            message: format!("附件描述无法解析（{error}）：{raw}"),
+        })
+    }
+}
+
+/// 校验一条附件请求的**纯参数**部分（不碰磁盘）。
+///
+/// 这里只做「形状」判断：路径必须是相对的、不许有 `..` 段、不许有 NUL、长度不超限。
+/// 真正「解析到项目根内 + 文件存在 + 大小不超限」由宿主侧在**入队前**做一次
+/// （那里才知道项目根与真实文件大小），而且必须做 —— 只靠这里会漏掉符号链接。
+///
+/// # Errors
+///
+/// 参数不合法时返回 [[`SendError::Invalid`]]。
+pub fn validate_attachment(request: &AttachmentRequest) -> Result<(), SendError> {
+    if request.conversation.trim().is_empty() {
+        return Err(SendError::Invalid {
+            message: "附件的目标会话 ID 不能为空".to_owned(),
+        });
+    }
+    if request.conversation.len() > MAX_CONVERSATION_ID_BYTES {
+        return Err(SendError::Invalid {
+            message: format!(
+                "目标会话 ID 超过 {} 字节上限（实际 {}）",
+                MAX_CONVERSATION_ID_BYTES,
+                request.conversation.len()
+            ),
+        });
+    }
+
+    let path = request.path.as_str();
+    if path.trim().is_empty() {
+        return Err(SendError::Invalid {
+            message: format!("{} 的路径不能为空", function_name(request.attachment)),
+        });
+    }
+    if path.len() > MAX_ATTACHMENT_PATH_BYTES {
+        return Err(SendError::Invalid {
+            message: format!(
+                "附件路径超过 {} 字节上限（实际 {}）",
+                MAX_ATTACHMENT_PATH_BYTES,
+                path.len()
+            ),
+        });
+    }
+    if path.contains('\0') {
+        return Err(SendError::Invalid {
+            message: "附件路径里不能有 NUL 字节".to_owned(),
+        });
+    }
+    if is_absolute_like(path) {
+        return Err(SendError::Invalid {
+            message: format!("附件路径必须是项目根内的相对路径，不能是绝对路径：{path:?}"),
+        });
+    }
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
+        return Err(SendError::Invalid {
+            message: format!("附件路径里不能有 .. 段（会逃出项目根）：{path:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// 这个附件是哪个 API 发出来的（错误文案要用），不参与判定。
+fn function_name(kind: AttachmentKind) -> &'static str {
+    match kind {
+        AttachmentKind::Image => "sendImage",
+        AttachmentKind::File => "sendFile",
+    }
+}
+
+/// 三种「看起来是相对路径、其实是绝对路径」的形状。
+///
+/// 与 `hbot-workspace` 的 `has_drive_prefix` 同口径，但**不依赖那个 crate**：
+/// core 不许依赖 workspace（依赖方向）。
+fn is_absolute_like(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('\\') {
+        return true;
+    }
+    // `C:foo` 也是「盘符相对」，Windows 上它照样能跳出项目根。
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    fn request(conversation: &str, kind: AttachmentKind, path: &str) -> AttachmentRequest {
+        AttachmentRequest::new(conversation, kind, path)
+    }
+
+    #[test]
+    fn attachment_kind_round_trips_and_refuses_unknown_values() {
+        for kind in [AttachmentKind::Image, AttachmentKind::File] {
+            assert_eq!(AttachmentKind::parse(kind.as_str()), Some(kind));
+        }
+        // 不认识的值必须是 None：猜成 File 会让一张图静默发成文件。
+        for raw in ["", "Image", "video", "image ", "file\n"] {
+            assert_eq!(AttachmentKind::parse(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_nested_relative_path_is_accepted() {
+        let req = request("123456", AttachmentKind::Image, "assets/img/logo.png");
+        assert_eq!(validate_attachment(&req), Ok(()));
+        // Windows 风格的分隔符也接受：项目在不同平台上写的路径习惯不同。
+        let req = request("123456", AttachmentKind::File, "assets\\img\\logo.png");
+        assert_eq!(validate_attachment(&req), Ok(()));
+    }
+
+    #[test]
+    fn absolute_paths_are_rejected_in_every_shape() {
+        for path in [
+            "/etc/passwd",
+            "\\\\server\\share\\a.png",
+            "C:\\Windows\\win.ini",
+            "c:relative-but-still-outside.png",
+        ] {
+            let req = request("1", AttachmentKind::File, path);
+            let error = validate_attachment(&req).expect_err("绝对路径必须被拒");
+            assert_eq!(error.code(), "HBOT_SEND_INVALID");
+            assert!(error.to_string().contains("绝对路径"), "{error}");
+        }
+    }
+
+    #[test]
+    fn parent_segments_are_rejected() {
+        for path in [
+            "../secret.png",
+            "assets/../../secret.png",
+            "..\\secret.png",
+            "..",
+        ] {
+            let req = request("1", AttachmentKind::File, path);
+            let error = validate_attachment(&req).expect_err(".. 段必须被拒");
+            assert_eq!(error.code(), "HBOT_SEND_INVALID");
+            assert!(error.to_string().contains(".."), "{error}");
+        }
+        // 名字里含两个点但不是 .. 段的不该被误伤。
+        let req = request("1", AttachmentKind::File, "assets/a..b.png");
+        assert_eq!(validate_attachment(&req), Ok(()));
+    }
+
+    #[test]
+    fn empty_and_oversized_parameters_are_rejected() {
+        let empty_conversation = request("", AttachmentKind::File, "a.png");
+        assert_eq!(
+            validate_attachment(&empty_conversation).unwrap_err().code(),
+            "HBOT_SEND_INVALID"
+        );
+
+        let empty_path = request("1", AttachmentKind::Image, "   ");
+        let error = validate_attachment(&empty_path).unwrap_err();
+        assert!(error.to_string().contains("sendImage"), "{error}");
+
+        let long_path = "a".repeat(MAX_ATTACHMENT_PATH_BYTES + 1);
+        let error =
+            validate_attachment(&request("1", AttachmentKind::File, &long_path)).unwrap_err();
+        assert!(error.to_string().contains("上限"), "{error}");
+
+        let long_conversation = "1".repeat(MAX_CONVERSATION_ID_BYTES + 1);
+        let error =
+            validate_attachment(&request(&long_conversation, AttachmentKind::File, "a.png"))
+                .unwrap_err();
+        assert!(error.to_string().contains("上限"), "{error}");
+    }
+
+    #[test]
+    fn a_nul_byte_in_the_path_is_rejected() {
+        let error =
+            validate_attachment(&request("1", AttachmentKind::File, "a\0b.png")).unwrap_err();
+        assert!(error.to_string().contains("NUL"), "{error}");
+    }
+
+    #[test]
+    fn effective_kind_treats_unknown_as_not_given() {
+        let req = request("1", AttachmentKind::File, "a.png");
+        assert_eq!(req.effective_kind(), None);
+        assert_eq!(
+            req.clone()
+                .with_kind(ConversationKind::Unknown)
+                .effective_kind(),
+            None
+        );
+        assert_eq!(
+            req.with_kind(ConversationKind::Group).effective_kind(),
+            Some(ConversationKind::Group)
+        );
+    }
+}
