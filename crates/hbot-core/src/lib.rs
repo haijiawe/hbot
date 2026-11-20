@@ -57,10 +57,11 @@ pub use bot_egress::{
 };
 pub use bot_file::{
     FileEntry, FileError, FileKind, FileStore, FilesCapability, LineRange, MAX_FILE_LIST_ENTRIES,
-    MAX_FILE_PATH_BYTES, MAX_FILE_READ_BYTES, MAX_FILE_READ_LINES, MAX_FILE_SEGMENT_BYTES,
-    MAX_FILE_WRITE_BYTES, ReadFile, normalize_path as normalize_file_path,
-    validate_list as validate_file_list, validate_read as validate_file_read,
-    validate_remove as validate_file_remove, validate_write as validate_file_write,
+    MAX_FILE_PATH_BYTES, MAX_FILE_READ_BYTES, MAX_FILE_READ_LINES, MAX_FILE_REMOVE_ENTRIES,
+    MAX_FILE_SEGMENT_BYTES, MAX_FILE_WRITE_BYTES, ReadBytes, ReadFile,
+    normalize_path as normalize_file_path, validate_list as validate_file_list,
+    validate_read as validate_file_read, validate_remove as validate_file_remove,
+    validate_write as validate_file_write, validate_write_range as validate_file_write_range,
 };
 pub use bot_jobs::{
     DEFAULT_JOB_BUDGET_MS, DEFAULT_JOB_RETRIES, JobError, JobRequest, JobSpec, JobState,

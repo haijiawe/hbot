@@ -43,6 +43,7 @@
 //! implements — nothing more (`docs/02-architecture.md` §6.1 status table).
 
 pub mod ai;
+mod base64;
 pub mod compile;
 pub mod device;
 mod dispatch;

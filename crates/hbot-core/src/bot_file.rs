@@ -21,6 +21,12 @@ pub const MAX_FILE_READ_LINES: u64 = 10_000;
 pub const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
 /// 目录列表一次最多返回多少条。
 pub const MAX_FILE_LIST_ENTRIES: usize = 200;
+/// 递归删除一次最多删掉多少条（含目录自身）。
+///
+/// 这个上限不为安全服务（路径已经钉在项目根里），而是为**可预测的耗时**服务：
+/// 一次 `remove(recursive)` 在宿主线程上同步走完整棵树，几万条时 handler 早已超时，
+/// 而用户只看到「删到一半」。超了就拒绝并让调用方分批删。
+pub const MAX_FILE_REMOVE_ENTRIES: usize = 1_000;
 
 /// 清单里 files 能力的声明。
 ///
@@ -164,6 +170,20 @@ pub struct ReadFile {
     pub truncated: bool,
 }
 
+/// 一次二进制读取的结果。
+///
+/// **core 不做编码**：`bytes` 就是原样字节，base64 在 runtime 层（`hbot-code`）编码，
+/// 这样契约层不依赖编码格式，也不引依赖。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadBytes {
+    /// 相对项目根的路径。
+    pub path: String,
+    /// 原样字节（最多 `max_bytes` 个，`truncated` 为 true 时后面还有）。
+    pub bytes: Vec<u8>,
+    /// 是否因为在 max_bytes 处截断。
+    pub truncated: bool,
+}
+
 /// 文件能力的错误。
 ///
 /// NotDeclared / Unavailable 的分工与别的能力一致：前者补清单，后者配宿主。
@@ -201,6 +221,13 @@ pub enum FileError {
         /// 上限。
         limit: usize,
     },
+    /// 一次操作涉及的条目太多（目前只有递归删除会用它）。
+    TooMany {
+        /// 路径。
+        path: String,
+        /// 上限（条）。
+        limit: usize,
+    },
     /// 底层失败。
     Failed {
         /// 说明。
@@ -219,6 +246,7 @@ impl FileError {
             Self::Denied { .. } => "HBOT_FILE_DENIED",
             Self::NotFound { .. } => "HBOT_FILE_NOT_FOUND",
             Self::TooLarge { .. } => "HBOT_FILE_TOO_LARGE",
+            Self::TooMany { .. } => "HBOT_FILE_TOO_MANY",
             Self::Failed { .. } => "HBOT_FILE_FAILED",
         }
     }
@@ -248,6 +276,11 @@ impl fmt::Display for FileError {
             Self::TooLarge { path, limit } => write!(
                 f,
                 "{}: {path} 超过上限 {limit} 字节，请分块读写",
+                self.code()
+            ),
+            Self::TooMany { path, limit } => write!(
+                f,
+                "{}: {path} 一次会涉及超过 {limit} 条记录，请分批操作",
                 self.code()
             ),
             Self::Failed { message } => write!(f, "{}: {message}", self.code()),
@@ -376,6 +409,28 @@ pub fn validate_write(path: &str, text: &str) -> Result<(), FileError> {
     Ok(())
 }
 
+/// 按行写之前的参数闸。
+///
+/// `range` 是要被**替换掉**的那几行（1 起、两端都含）；`text` 是替换进去的内容。
+/// 行号越界（0 / 逆序）报错不夹取 —— 夹取会让「替换第 0 行」静默变成「替换第 1 行」。
+pub fn validate_write_range(path: &str, text: &str, range: LineRange) -> Result<(), FileError> {
+    validate_write(path, text)?;
+    if range.start == 0 {
+        return Err(FileError::Invalid {
+            message: "startLine 从 1 开始（第 1 行就是文件的第一行）".to_owned(),
+        });
+    }
+    if range.end < range.start {
+        return Err(FileError::Invalid {
+            message: format!(
+                "endLine（{}）不能小于 startLine（{}）",
+                range.end, range.start
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// 列目录之前的参数闸。
 pub fn validate_list(limit: usize) -> Result<(), FileError> {
     if limit == 0 || limit > MAX_FILE_LIST_ENTRIES {
@@ -410,10 +465,24 @@ pub trait FileStore: Send + Sync {
         max_bytes: usize,
         range: Option<LineRange>,
     ) -> Result<ReadFile, FileError>;
+    /// 读一个二进制文件（原样字节，最多 `max_bytes` 个）。
+    ///
+    /// 与 [`FileStore::read`] 的区别只有一处：**不做 UTF-8 校验**。图片、zip、
+    /// protobuf 这类内容进来是什么就是什么，编码交给调用方。
+    fn read_bytes(&self, path: &str, max_bytes: usize) -> Result<ReadBytes, FileError>;
     /// 覆盖写一个文本文件。
     fn write(&self, path: &str, text: &str) -> Result<FileEntry, FileError>;
-    /// 删除一个文件或空目录。
-    fn remove(&self, path: &str) -> Result<(), FileError>;
+    /// 把 `range` 那几行替换成 `text`，其余行原样保留。
+    ///
+    /// 行尾（`\n` 还是 `\r\n`）按**未触碰的那一行**来，不统一重写：把 CRLF 项目
+    /// 整文件改成 LF 会让一次「改第 3 行」变成全文件 diff。
+    fn write_range(&self, path: &str, text: &str, range: LineRange)
+    -> Result<FileEntry, FileError>;
+    /// 删除一个文件或目录；`recursive` 为 false 时只允许删空目录。
+    ///
+    /// 返回删掉的条目数（1 = 只删了一个文件或空目录）。实现方**不许跟随符号链接**：
+    /// 递归时遇到链接一律拒绝，否则 `remove(recursive)` 会变成「删掉链接指向的项目外目录」。
+    fn remove(&self, path: &str, recursive: bool) -> Result<u32, FileError>;
     /// 列一个目录（不递归）。
     fn list(&self, path: &str, limit: usize) -> Result<Vec<FileEntry>, FileError>;
 }
@@ -569,6 +638,10 @@ mod tests {
                 path: "x".to_owned(),
                 limit: 1,
             },
+            FileError::TooMany {
+                path: "x".to_owned(),
+                limit: 1,
+            },
             FileError::Failed {
                 message: "x".to_owned(),
             },
@@ -627,5 +700,37 @@ mod tests {
             Err(FileError::Invalid { .. })
         ));
         assert!(validate_read("a.txt", 1024, Some(LineRange::new(1, MAX_FILE_READ_LINES))).is_ok());
+    }
+
+    #[test]
+    fn zero_and_reversed_write_ranges_are_refused() {
+        assert!(matches!(
+            validate_write_range("a.txt", "x", LineRange::new(0, 1)),
+            Err(FileError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_write_range("a.txt", "x", LineRange::new(5, 2)),
+            Err(FileError::Invalid { .. })
+        ));
+        assert!(validate_write_range("a.txt", "x", LineRange::new(3, 3)).is_ok());
+    }
+
+    #[test]
+    fn a_write_range_still_obeys_the_text_limits() {
+        let big = "x".repeat(MAX_FILE_WRITE_BYTES + 1);
+        assert!(matches!(
+            validate_write_range("a.txt", &big, LineRange::new(1, 1)),
+            Err(FileError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            validate_write_range("a.txt", "a\0b", LineRange::new(1, 1)),
+            Err(FileError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn the_remove_budget_is_a_named_constant() {
+        // 递归删除的条目上限是给「可预测的耗时」用的，不是安全边界；变了要有测试提醒。
+        assert_eq!(MAX_FILE_REMOVE_ENTRIES, 1_000);
     }
 }

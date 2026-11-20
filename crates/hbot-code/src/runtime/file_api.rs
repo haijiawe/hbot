@@ -6,8 +6,8 @@
 //! 顺序与 kv / sql / jobs 一致：先同步解析参数，后进槽位（规范化 → 参数闸 → 声明闸 →
 //! 装配闸 → 端口）。第 1 步不过就 rejection，一次 IO 都不会发生。
 //!
-//! 返回值的形状：read → { path, text, bytes, truncated }；write → 一条 FileEntry；
-//! list → FileEntry 数组；remove → undefined（成功与否由 rejection 表达）。
+//! 返回值的形状：read → { path, text, bytes, truncated }；readBytes → { path, base64, bytes, truncated }；
+//! write → 一条 FileEntry；list → FileEntry 数组；remove → 删掉的条目数（int）。
 
 use std::sync::Arc;
 
@@ -18,14 +18,16 @@ use crate::error::CodeError;
 use crate::file::FileSlot;
 use hbot_core::{
     FileEntry, FileKind, LineRange, MAX_FILE_LIST_ENTRIES, MAX_FILE_READ_BYTES,
-    MAX_FILE_READ_LINES, ReadFile,
+    MAX_FILE_READ_LINES, ReadBytes, ReadFile,
 };
+
+use crate::base64::base64_encode;
 
 /// ctx.files 上的方法名，一处声明。
 ///
 /// 这是数据不是散文：crate::dts 的漂移测试把它与 install 的 entries 表、
 /// HOST_MODULE_SOURCE 的 files 命名空间、hbot.d.ts 的 FilesApi 四方对齐。
-pub(crate) const FILES_BINDING_KEYS: &[&str] = &["read", "write", "list", "remove"];
+pub(crate) const FILES_BINDING_KEYS: &[&str] = &["read", "readBytes", "write", "list", "remove"];
 
 /// 装 ctx.files 对象，返回它。
 pub(crate) fn install<'js>(ctx: &Ctx<'js>, slot: &Arc<FileSlot>) -> Result<Object<'js>, CodeError> {
@@ -60,21 +62,57 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, slot: &Arc<FileSlot>) -> Result<Objec
         .map_err(super::js_error)?
     };
 
+    let read_bytes = {
+        let slot = Arc::clone(slot);
+        Function::new(
+            ctx.clone(),
+            Async(
+                move |handle: Ctx<'js>, path: Value<'js>, options: Opt<Value<'js>>| {
+                    let prepared = parse_read_bytes(&path, options.0.as_ref());
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let (path, max_bytes) = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(message) => return BytesReply(Err(message)).into_js(&handle),
+                        };
+                        let outcome =
+                            tokio::task::spawn_blocking(move || slot.read_bytes(&path, max_bytes))
+                                .await;
+                        let result = match outcome {
+                            Ok(Ok(bytes)) => Ok(bytes),
+                            Ok(Err(error)) => Err(error.to_string()),
+                            Err(error) => Err(format!("二进制读取的任务没能跑完：{error}")),
+                        };
+                        BytesReply(result).into_js(&handle)
+                    }
+                },
+            ),
+        )
+        .and_then(|function| function.with_name("readBytes"))
+        .map_err(super::js_error)?
+    };
+
     let write = {
         let slot = Arc::clone(slot);
         Function::new(
             ctx.clone(),
             Async(
-                move |handle: Ctx<'js>, path: Value<'js>, text: Value<'js>| {
-                    let prepared = parse_write(&path, &text);
+                move |handle: Ctx<'js>,
+                      path: Value<'js>,
+                      text: Value<'js>,
+                      options: Opt<Value<'js>>| {
+                    let prepared = parse_write(&path, &text, options.0.as_ref());
                     let slot = Arc::clone(&slot);
                     async move {
-                        let (path, text) = match prepared {
+                        let (path, text, range) = match prepared {
                             Ok(prepared) => prepared,
                             Err(message) => return EntryReply(Err(message)).into_js(&handle),
                         };
-                        let outcome =
-                            tokio::task::spawn_blocking(move || slot.write(&path, &text)).await;
+                        let outcome = tokio::task::spawn_blocking(move || match range {
+                            Some(range) => slot.write_range(&path, &text, range),
+                            None => slot.write(&path, &text),
+                        })
+                        .await;
                         let result = match outcome {
                             Ok(result) => result.map_err(|error| error.to_string()),
                             Err(error) => Err(format!("文件写入的任务没能跑完：{error}")),
@@ -120,22 +158,26 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, slot: &Arc<FileSlot>) -> Result<Objec
         let slot = Arc::clone(slot);
         Function::new(
             ctx.clone(),
-            Async(move |handle: Ctx<'js>, path: Value<'js>| {
-                let prepared = text_of(&path, "files.remove(path)");
-                let slot = Arc::clone(&slot);
-                async move {
-                    let path = match prepared {
-                        Ok(path) => path,
-                        Err(message) => return RemovedReply(Err(message)).into_js(&handle),
-                    };
-                    let outcome = tokio::task::spawn_blocking(move || slot.remove(&path)).await;
-                    let result = match outcome {
-                        Ok(result) => result.map_err(|error| error.to_string()),
-                        Err(error) => Err(format!("删除的任务没能跑完：{error}")),
-                    };
-                    RemovedReply(result).into_js(&handle)
-                }
-            }),
+            Async(
+                move |handle: Ctx<'js>, path: Value<'js>, options: Opt<Value<'js>>| {
+                    let prepared = parse_remove(&path, options.0.as_ref());
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let (path, recursive) = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(message) => return RemovedReply(Err(message)).into_js(&handle),
+                        };
+                        let outcome =
+                            tokio::task::spawn_blocking(move || slot.remove(&path, recursive))
+                                .await;
+                        let result = match outcome {
+                            Ok(result) => result.map_err(|error| error.to_string()),
+                            Err(error) => Err(format!("删除的任务没能跑完：{error}")),
+                        };
+                        RemovedReply(result).into_js(&handle)
+                    }
+                },
+            ),
         )
         .and_then(|function| function.with_name("remove"))
         .map_err(super::js_error)?
@@ -143,6 +185,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, slot: &Arc<FileSlot>) -> Result<Objec
 
     let entries: [(&str, Function<'js>); FILES_BINDING_KEYS.len()] = [
         ("read", read),
+        ("readBytes", read_bytes),
         ("write", write),
         ("list", list),
         ("remove", remove),
@@ -197,20 +240,55 @@ fn parse_read<'js>(
             let object = value
                 .as_object()
                 .ok_or_else(|| invalid("files.read 的 options 必须是对象"))?;
-            parse_line_range(object)?
+            parse_line_range(object, false)?
         }
     };
     Ok((path, max_bytes, range))
 }
 
+fn parse_read_bytes<'js>(
+    path: &Value<'js>,
+    options: Option<&Value<'js>>,
+) -> Result<(String, usize), String> {
+    let path = text_of(path, "files.readBytes(path, options)")?;
+    let max_bytes = match options {
+        None => MAX_FILE_READ_BYTES,
+        Some(value) if value.is_undefined() || value.is_null() => MAX_FILE_READ_BYTES,
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid("files.readBytes 的 options 必须是对象"))?;
+            match object.get::<_, Option<Value<'js>>>("maxBytes") {
+                Ok(Some(raw)) if !raw.is_undefined() && !raw.is_null() => {
+                    let number = raw
+                        .as_number()
+                        .ok_or_else(|| invalid("files.readBytes 的 maxBytes 必须是数字"))?;
+                    if !number.is_finite() || number <= 0.0 {
+                        return Err(invalid("files.readBytes 的 maxBytes 必须是正数"));
+                    }
+                    usize::try_from(number as u64)
+                        .map_err(|_| invalid("files.readBytes 的 maxBytes 太大"))?
+                }
+                Ok(_) => MAX_FILE_READ_BYTES,
+                Err(error) => return Err(js_message(error)),
+            }
+        }
+    };
+    Ok((path, max_bytes))
+}
+
 /// 从 options 里取 `startLine` / `endLine`（1 起、两端都含）。
 ///
-/// 只给 startLine 时读到 startLine + MAX_FILE_READ_LINES - 1 行为止 —— 默认值只在
+/// 读的时候只给 startLine 就返回 startLine 起最多 `MAX_FILE_READ_LINES` 行；
+/// 写的时候只给 startLine 就**只替换那一行**（`single_line`）。默认值只在
 /// 这一层决定一次，core 的 `LineRange` 永远是一个两端都实的区间。
 ///
 /// 越界（0、负数、小数、逆序、跨度超限）一律拒绝，不做夹取：夹取会让
 /// 「我要第 10001 行」静默变成「给你第 10000 行」，用户以为读到了那一行。
-fn parse_line_range<'js>(options: &Object<'js>) -> Result<Option<LineRange>, String> {
+fn parse_line_range<'js>(
+    options: &Object<'js>,
+    single_line: bool,
+) -> Result<Option<LineRange>, String> {
     let start = match options.get::<_, Option<Value<'js>>>("startLine") {
         Ok(Some(raw)) if !raw.is_undefined() && !raw.is_null() => {
             Some(line_number(&raw, "startLine")?)
@@ -231,6 +309,7 @@ fn parse_line_range<'js>(options: &Object<'js>) -> Result<Option<LineRange>, Str
     let start = start.unwrap_or(1);
     let end = match end {
         Some(end) => end,
+        None if single_line => start,
         None => start.saturating_add(MAX_FILE_READ_LINES - 1),
     };
     Ok(Some(LineRange::new(start, end)))
@@ -239,21 +318,59 @@ fn parse_line_range<'js>(options: &Object<'js>) -> Result<Option<LineRange>, Str
 fn line_number(raw: &Value<'_>, field: &str) -> Result<u64, String> {
     let number = raw
         .as_number()
-        .ok_or_else(|| invalid(format!("files.read 的 {field} 必须是整数")))?;
+        .ok_or_else(|| invalid(format!("files 的 {field} 必须是整数")))?;
     if !number.is_finite() || number < 1.0 || number.fract() != 0.0 {
-        return Err(invalid(format!("files.read 的 {field} 必须是 1 起的整数")));
+        return Err(invalid(format!("files 的 {field} 必须是 1 起的整数")));
     }
     // JS 的数字只有 2^53 的整数精度，超过这个数就不要再假装它是精确行号了。
     if number > 9_007_199_254_740_992.0 {
-        return Err(invalid(format!("files.read 的 {field} 太大")));
+        return Err(invalid(format!("files 的 {field} 太大")));
     }
     Ok(number as u64)
 }
 
-fn parse_write<'js>(path: &Value<'js>, text: &Value<'js>) -> Result<(String, String), String> {
+fn parse_write<'js>(
+    path: &Value<'js>,
+    text: &Value<'js>,
+    options: Option<&Value<'js>>,
+) -> Result<(String, String, Option<LineRange>), String> {
     let path = text_of(path, "files.write(path, text)")?;
     let text = text_of(text, "files.write(path, text)")?;
-    Ok((path, text))
+    let range = match options {
+        None => None,
+        Some(value) if value.is_undefined() || value.is_null() => None,
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid("files.write 的 options 必须是对象"))?;
+            parse_line_range(object, true)?
+        }
+    };
+    Ok((path, text, range))
+}
+
+fn parse_remove<'js>(
+    path: &Value<'js>,
+    options: Option<&Value<'js>>,
+) -> Result<(String, bool), String> {
+    let path = text_of(path, "files.remove(path, options)")?;
+    let recursive = match options {
+        None => false,
+        Some(value) if value.is_undefined() || value.is_null() => false,
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid("files.remove 的 options 必须是对象"))?;
+            match object.get::<_, Option<Value<'js>>>("recursive") {
+                Ok(Some(raw)) if !raw.is_undefined() && !raw.is_null() => raw
+                    .as_bool()
+                    .ok_or_else(|| invalid("files.remove 的 recursive 必须是布尔值"))?,
+                Ok(_) => false,
+                Err(error) => return Err(js_message(error)),
+            }
+        }
+    };
+    Ok((path, recursive))
 }
 
 fn parse_list<'js>(
@@ -355,12 +472,30 @@ impl<'js> ListReply {
     }
 }
 
-struct RemovedReply(Result<(), String>);
+struct RemovedReply(Result<u32, String>);
 
 impl<'js> RemovedReply {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
         match self.0 {
-            Ok(()) => Ok(Value::new_undefined(ctx.clone())),
+            Ok(count) => Ok(Value::new_number(ctx.clone(), f64::from(count))),
+            Err(message) => Err(Exception::throw_message(ctx, &message)),
+        }
+    }
+}
+
+struct BytesReply(Result<ReadBytes, String>);
+
+impl<'js> BytesReply {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.0 {
+            Ok(bytes) => {
+                let object = Object::new(ctx.clone())?;
+                object.set("path", bytes.path)?;
+                object.set("base64", base64_encode(&bytes.bytes))?;
+                object.set("bytes", bytes.bytes.len() as u64)?;
+                object.set("truncated", bytes.truncated)?;
+                Ok(object.into_value())
+            }
             Err(message) => Err(Exception::throw_message(ctx, &message)),
         }
     }
@@ -384,8 +519,9 @@ mod tests {
 
     #[test]
     fn the_method_list_is_exactly_what_the_bridge_installs() {
-        assert_eq!(FILES_BINDING_KEYS.len(), 4);
+        assert_eq!(FILES_BINDING_KEYS.len(), 5);
         assert!(FILES_BINDING_KEYS.contains(&"read"));
+        assert!(FILES_BINDING_KEYS.contains(&"readBytes"));
         assert!(FILES_BINDING_KEYS.contains(&"write"));
         assert!(FILES_BINDING_KEYS.contains(&"list"));
         assert!(FILES_BINDING_KEYS.contains(&"remove"));

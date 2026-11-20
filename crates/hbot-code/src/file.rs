@@ -4,8 +4,9 @@
 //! 所以「改了清单但 isolate 没换」不会变成静默失效。
 
 use hbot_core::{
-    FileEntry, FileError, FileStore, FilesCapability, ReadFile, normalize_file_path,
-    validate_file_list, validate_file_read, validate_file_remove, validate_file_write,
+    FileEntry, FileError, FileStore, FilesCapability, LineRange, ReadBytes, ReadFile,
+    normalize_file_path, validate_file_list, validate_file_read, validate_file_remove,
+    validate_file_write, validate_file_write_range,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -63,6 +64,20 @@ impl FileSlot {
         backend.read(&path, max_bytes, range)
     }
 
+    /// 读一个二进制文件（原样字节）。
+    ///
+    /// 参数闸和 [`FileSlot::read`] 是同一套（路径、体积），只是不要求 UTF-8。
+    pub(crate) fn read_bytes(
+        &self,
+        raw_path: &str,
+        max_bytes: usize,
+    ) -> Result<ReadBytes, FileError> {
+        let path = normalize_file_path(raw_path)?;
+        validate_file_read(&path, max_bytes, None)?;
+        let backend = self.gate(false)?;
+        backend.read_bytes(&path, max_bytes)
+    }
+
     /// 覆盖写一个文本文件。
     pub(crate) fn write(&self, raw_path: &str, text: &str) -> Result<FileEntry, FileError> {
         let path = normalize_file_path(raw_path)?;
@@ -71,12 +86,25 @@ impl FileSlot {
         backend.write(&path, text)
     }
 
-    /// 删除一个文件或空目录。
-    pub(crate) fn remove(&self, raw_path: &str) -> Result<(), FileError> {
+    /// 把 `range` 那几行替换成 `text`。
+    pub(crate) fn write_range(
+        &self,
+        raw_path: &str,
+        text: &str,
+        range: LineRange,
+    ) -> Result<FileEntry, FileError> {
+        let path = normalize_file_path(raw_path)?;
+        validate_file_write_range(&path, text, range)?;
+        let backend = self.gate(true)?;
+        backend.write_range(&path, text, range)
+    }
+
+    /// 删除一个文件或目录（`recursive` 为 false 时只允许空目录）。
+    pub(crate) fn remove(&self, raw_path: &str, recursive: bool) -> Result<u32, FileError> {
         let path = normalize_file_path(raw_path)?;
         validate_file_remove(&path)?;
         let backend = self.gate(true)?;
-        backend.remove(&path)
+        backend.remove(&path, recursive)
     }
 
     /// 列一个目录。
@@ -130,7 +158,9 @@ mod tests {
         reads: Mutex<Vec<(String, usize)>>,
         read_ranges: Mutex<Vec<Option<hbot_core::LineRange>>>,
         writes: Mutex<Vec<(String, String)>>,
-        removes: Mutex<Vec<String>>,
+        write_ranges: Mutex<Vec<LineRange>>,
+        byte_reads: Mutex<Vec<(String, usize)>>,
+        removes: Mutex<Vec<(String, bool)>>,
         lists: Mutex<Vec<(String, usize)>>,
         failure: Mutex<Option<FileError>>,
     }
@@ -174,6 +204,21 @@ mod tests {
             })
         }
 
+        fn read_bytes(&self, path: &str, max_bytes: usize) -> Result<ReadBytes, FileError> {
+            self.byte_reads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((path.to_owned(), max_bytes));
+            if let Some(error) = self.take_failure() {
+                return Err(error);
+            }
+            Ok(ReadBytes {
+                path: path.to_owned(),
+                bytes: vec![0x89, 0x50, 0x4e, 0x47],
+                truncated: false,
+            })
+        }
+
         fn write(&self, path: &str, text: &str) -> Result<FileEntry, FileError> {
             self.writes
                 .lock()
@@ -185,14 +230,34 @@ mod tests {
             Ok(FileEntry::file(path.to_owned(), text.len() as u64))
         }
 
-        fn remove(&self, path: &str) -> Result<(), FileError> {
+        fn write_range(
+            &self,
+            path: &str,
+            text: &str,
+            range: LineRange,
+        ) -> Result<FileEntry, FileError> {
+            self.writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((path.to_owned(), text.to_owned()));
+            self.write_ranges
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(range);
+            if let Some(error) = self.take_failure() {
+                return Err(error);
+            }
+            Ok(FileEntry::file(path.to_owned(), text.len() as u64))
+        }
+
+        fn remove(&self, path: &str, recursive: bool) -> Result<u32, FileError> {
             self.removes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(path.to_owned());
+                .push((path.to_owned(), recursive));
             match self.take_failure() {
                 Some(error) => Err(error),
-                None => Ok(()),
+                None => Ok(if recursive { 3 } else { 1 }),
             }
         }
 
@@ -258,7 +323,7 @@ mod tests {
             Err(FileError::NotDeclared { .. })
         ));
         assert!(matches!(
-            slot.remove("a.txt"),
+            slot.remove("a.txt", false),
             Err(FileError::NotDeclared { .. })
         ));
         assert!(recording.writes.lock().unwrap().is_empty());
@@ -367,5 +432,62 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("HBOT_FILE_INVALID"), "{error}");
         assert!(recording.read_ranges.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_bytes_skips_the_utf8_gate_and_hits_the_backend() {
+        let (slot, recording) = slot(FilesCapability {
+            read: true,
+            write: false,
+        });
+        let bytes = slot.read_bytes("img/logo.png", 1024).expect("读应当成功");
+        assert_eq!(bytes.bytes, vec![0x89, 0x50, 0x4e, 0x47]);
+        assert_eq!(recording.byte_reads.lock().unwrap()[0].0, "img/logo.png");
+    }
+
+    #[test]
+    fn read_bytes_still_obeys_the_gate() {
+        let (slot, _) = slot(FilesCapability {
+            read: false,
+            write: true,
+        });
+        assert!(matches!(
+            slot.read_bytes("img/logo.png", 1024),
+            Err(FileError::NotDeclared { .. })
+        ));
+    }
+
+    #[test]
+    fn a_write_range_reaches_the_backend_and_a_reversed_one_does_not() {
+        let (slot, recording) = slot(FilesCapability {
+            read: false,
+            write: true,
+        });
+        slot.write_range("a.txt", "x", LineRange::new(2, 4))
+            .expect("写应当成功");
+        assert_eq!(
+            recording.write_ranges.lock().unwrap()[0],
+            LineRange::new(2, 4)
+        );
+        let error = slot
+            .write_range("a.txt", "x", LineRange::new(4, 2))
+            .unwrap_err();
+        assert!(error.to_string().contains("HBOT_FILE_INVALID"), "{error}");
+        assert_eq!(recording.write_ranges.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recursive_remove_is_forwarded_and_reports_the_count() {
+        let (slot, recording) = slot(FilesCapability {
+            read: false,
+            write: true,
+        });
+        assert_eq!(slot.remove("tmp", true).unwrap(), 3);
+        assert_eq!(
+            recording.removes.lock().unwrap()[0],
+            ("tmp".to_owned(), true)
+        );
+        // 不递归时后端自己的规则说了算，槽位只透传 false。
+        assert_eq!(slot.remove("tmp", false).unwrap(), 1);
     }
 }

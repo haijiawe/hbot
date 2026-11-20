@@ -14,7 +14,12 @@
 //! 4. **`..` 与绝对路径被拒**：`HBOT_FILE_DENIED`，且项目外什么都没被碰；
 //! 5. **不存在是 `NOT_FOUND`**，不是空内容；
 //! 6. **`list` 只报相对项目根的路径**；
-//! 7. **非 UTF-8 明确失败**，不是悄悄替换成 U+FFFD。
+//! 7. **非 UTF-8 明确失败**，不是悄悄替换成 U+FFFD；
+//! 8. **按行范围读只回那几行**；
+//! 9. **`readBytes` 回原样字节的 base64**，不做 UTF-8 校验；
+//! 10. **按行写只替换那几行**，未触碰的行原样保留；
+//! 11. **递归删除返回条目数**，非递归遇到非空目录仍拒；
+//! 12. **行号越界在 JS 边界报错**。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,6 +117,31 @@ export default defineBot({
       if (what === 'binary') {
         await ctx.files.read('notes/binary.bin');
         reply('binary-allowed');
+        return;
+      }
+      if (what === 'bytes') {
+        const blob = await ctx.files.readBytes('notes/binary.bin');
+        reply('bytes:' + blob.base64 + ':' + blob.bytes + ':' + blob.truncated);
+        return;
+      }
+      if (what === 'linewrite') {
+        await ctx.files.write('notes/log.txt', 'l1\nl2\nl3\n');
+        await ctx.files.write('notes/log.txt', 'X2', { startLine: 2, endLine: 2 });
+        const file = await ctx.files.read('notes/log.txt');
+        reply('linewrite:' + file.text.replace(/\n/g, '|'));
+        return;
+      }
+      if (what === 'recursive') {
+        await ctx.files.write('tmp/a.txt', 'a');
+        await ctx.files.write('tmp/sub/b.txt', 'b');
+        const count = await ctx.files.remove('tmp', { recursive: true });
+        reply('removed:' + count);
+        return;
+      }
+      if (what === 'nonrecursive') {
+        await ctx.files.write('tmp/a.txt', 'a');
+        const count = await ctx.files.remove('tmp');
+        reply('nonrecursive-allowed:' + count);
         return;
       }
       reply('unknown');
@@ -353,5 +383,44 @@ async fn a_reversed_line_range_is_refused_at_the_js_boundary() {
     assert!(
         reply.contains("HBOT_FILE_INVALID") && reply.contains("endLine"),
         "期望行号闸在 JS 边界报错，实际：{reply}"
+    );
+}
+#[tokio::test]
+async fn read_bytes_returns_the_raw_bytes_as_base64() {
+    let harness = Harness::new("bytes", Some((true, true)), true).await;
+    assert_ok(&harness.start().await, "bot_start");
+    // [0xff, 0xfe, 0x00, 0x01] 的 base64 是 "//4AAQ=="；文本读会因不是 UTF-8 报错，
+    // 二进制读必须原样给出。
+    assert_eq!(harness.say("bytes").await, "bytes://4AAQ==:4:false");
+}
+
+#[tokio::test]
+async fn a_line_range_write_replaces_only_that_line() {
+    let harness = Harness::new("linewrite", Some((true, true)), false).await;
+    assert_ok(&harness.start().await, "bot_start");
+    assert_eq!(harness.say("linewrite").await, "linewrite:l1|X2|l3|");
+    let raw = std::fs::read_to_string(harness.project.join("notes").join("log.txt"))
+        .expect("读回 log.txt");
+    assert_eq!(raw, "l1\nX2\nl3\n");
+}
+
+#[tokio::test]
+async fn a_recursive_remove_counts_the_entries_it_took() {
+    let harness = Harness::new("recursive", Some((true, true)), false).await;
+    assert_ok(&harness.start().await, "bot_start");
+    // tmp + tmp/a.txt + tmp/sub + tmp/sub/b.txt
+    assert_eq!(harness.say("recursive").await, "removed:4");
+    assert!(!harness.project.join("tmp").exists());
+}
+
+#[tokio::test]
+async fn a_non_recursive_remove_still_refuses_a_non_empty_directory() {
+    let harness = Harness::new("nonrecursive", Some((true, true)), false).await;
+    assert_ok(&harness.start().await, "bot_start");
+    let reply = harness.say("nonrecursive").await;
+    assert!(reply.contains("HBOT_FILE_DENIED"), "实际：{reply}");
+    assert!(
+        harness.project.join("tmp").join("a.txt").exists(),
+        "被拒绝的删除不应该动到里面的文件"
     );
 }
