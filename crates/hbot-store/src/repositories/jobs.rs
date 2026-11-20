@@ -238,6 +238,24 @@ pub(crate) fn list_for_bot(conn: &Connection, bot_id: &BotId, limit: u32) -> Res
     Ok(jobs)
 }
 
+/// 列一个 bot 最近的作业行（**新的在前**，最多 limit 条）—— 面板用。
+///
+/// 与 [`list_for_bot`] 的区别只有排序方向：面板显示「最近发生了什么」，
+/// 所以截断发生时丢掉的必须是最旧的，而不是最新的。
+pub(crate) fn list_recent_for_bot(
+    conn: &Connection,
+    bot_id: &BotId,
+    limit: u32,
+) -> Result<Vec<JobRow>> {
+    let mut statement = conn.prepare(&select_all(LIST_RECENT_TAIL))?;
+    let mapped = statement.query_map(params![bot_id.to_string(), i64::from(limit)], row_to_job)?;
+    let mut jobs = Vec::new();
+    for row in mapped {
+        jobs.push(row?);
+    }
+    Ok(jobs)
+}
+
 /// SELECT 的列清单（与 row_to_job 一一对应；列的出处在 SQL 里只这一份）。
 const COLUMNS: &str = "id, name, payload_json, idempotency_key, state, attempts, budget_ms, conversation, next_at, last_error, created_at";
 
@@ -275,6 +293,9 @@ const COUNT_SQL: &str = "SELECT COUNT(*) FROM bot_jobs WHERE bot_id = ?1 AND sta
 
 /// list_for_bot 的尾部。
 const LIST_TAIL: &str = "WHERE bot_id = ?1 ORDER BY created_at LIMIT ?2";
+
+/// list_recent_for_bot 的尾部（新的在前；同一毫秒用 rowid 作次级键，保证顺序稳定）。
+const LIST_RECENT_TAIL: &str = "WHERE bot_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2";
 
 /// 拼一条从 COLUMNS 出发的 SELECT（尾部的 WHERE / ORDER / LIMIT 由调用方给）。
 fn select_all(tail: &str) -> String {
@@ -727,5 +748,36 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM bot_jobs", [], |row| row.get(0))
             .expect("bot_jobs table exists");
         assert_eq!(count, 0, "新表是空的");
+    }
+
+    /// 面板查询「新的在前」：截断时丢最旧的，而不是最新的。
+    #[test]
+    fn list_recent_puts_the_newest_first_and_drops_the_oldest() {
+        let dir = TempDir::new("jobs-recent");
+        let store = open_store(&dir);
+        for (id, key, at) in [(7, "a", 1_000), (8, "b", 2_000), (9, "c", 3_000)] {
+            store
+                .enqueue_job(&bot_id(), &new_job(id, key, at))
+                .expect("enqueue");
+        }
+
+        let all = store.list_recent_jobs_for_bot(&bot_id(), 10).expect("list");
+        let ids: Vec<JobId> = all.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![job_id(9), job_id(8), job_id(7)], "新的在前");
+
+        let capped = store
+            .list_recent_jobs_for_bot(&bot_id(), 2)
+            .expect("capped");
+        assert_eq!(capped.len(), 2, "limit 就是上限");
+        assert_eq!(capped[0].id, job_id(9));
+        assert_eq!(capped[1].id, job_id(8), "被截断丢掉的是最旧那条");
+
+        assert!(
+            store
+                .list_recent_jobs_for_bot(&bot_id_at(99), 10)
+                .expect("other bot")
+                .is_empty(),
+            "别的 bot 的行不许串到这里"
+        );
     }
 }

@@ -260,6 +260,27 @@ pub(crate) fn count_pending_for_bot(conn: &Connection, bot_id: &BotId) -> Result
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
+/// 列一个 bot 最近的等待行（**新的在前**，最多 limit 条）—— 面板与排障用。
+///
+/// 面板要看「这个 bot 现在在等谁回答什么」，所以带状态一起回：终态行也留着
+/// （用户要能看到「刚才那条已经超时了」），过滤交给调用方。
+pub(crate) fn list_recent_for_bot(
+    conn: &Connection,
+    bot_id: &BotId,
+    limit: u32,
+) -> Result<Vec<WaitRow>> {
+    let mut statement = conn.prepare(&select_all(LIST_RECENT_TAIL))?;
+    let mapped = statement.query_map(params![bot_id.to_string(), i64::from(limit)], row_to_wait)?;
+    let mut waits = Vec::new();
+    for row in mapped {
+        waits.push(row?);
+    }
+    Ok(waits)
+}
+
+/// list_recent_for_bot 的尾部（新的在前；同一毫秒用 rowid 作次级键）。
+const LIST_RECENT_TAIL: &str = "WHERE bot_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2";
+
 /// 数未结等待。
 const COUNT_SQL: &str = "SELECT COUNT(*) FROM bot_waits WHERE bot_id = ?1 AND state = ?2";
 
@@ -361,8 +382,8 @@ mod tests {
     use super::*;
     use crate::StoreError;
     use crate::test_support::{
-        TempDir, bot_id, conversation_id, new_wait, new_wait_with_reminders, open_store, raw,
-        wait_id,
+        TempDir, bot_id, bot_id_at, conversation_id, new_wait, new_wait_with_reminders, open_store,
+        raw, wait_id,
     };
 
     /// 状态与 scope 常量必须与 core 的枚举拼写逐字一致 —— 跨 crate 的隐性契约。
@@ -743,6 +764,54 @@ mod tests {
                 .expect("expire")
                 .len(),
             1
+        );
+    }
+
+    /// 面板查询「新的在前」：终态行也回（要看得到刚才那条已经超时了）。
+    ///
+    /// 这里每条等待都先各自到期落终态再登记下一条：同一会话只允许一条 pending
+    /// （部分唯一索引），而终态行不占这个位置 —— 面板要显示的正是这些历史。
+    #[test]
+    fn list_recent_returns_terminal_rows_newest_first() {
+        let dir = TempDir::new("waits-recent");
+        let store = open_store(&dir);
+        for (id, key, owner, at) in [
+            (7, "a", "u1", 1_000),
+            (8, "b", "u2", 2_000),
+            (9, "c", "u3", 3_000),
+        ] {
+            store
+                .register_wait(&bot_id(), &new_wait(id, key, owner, at))
+                .expect("register");
+            // 每条登记完立刻让它到期，好腾出「同一会话一条 pending」的名额。
+            store
+                .expire_due_waits(&bot_id(), at + 60_000, 8)
+                .expect("expire");
+        }
+
+        let all = store
+            .list_recent_waits_for_bot(&bot_id(), 10)
+            .expect("list");
+        let ids: Vec<WaitId> = all.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![wait_id(9), wait_id(8), wait_id(7)], "新的在前");
+        assert!(
+            all.iter().all(|row| row.state == STATE_EXPIRED),
+            "终态行照样返回，过滤交给 UI"
+        );
+
+        let capped = store
+            .list_recent_waits_for_bot(&bot_id(), 2)
+            .expect("capped");
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].id, wait_id(9));
+        assert_eq!(capped[1].id, wait_id(8), "被截断丢掉的是最旧那条");
+
+        assert!(
+            store
+                .list_recent_waits_for_bot(&bot_id_at(99), 10)
+                .expect("other bot")
+                .is_empty(),
+            "别的 bot 的等待不许串到这里"
         );
     }
 }

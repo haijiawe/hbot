@@ -404,6 +404,18 @@ enum StoreOp {
         limit: u32,
         reply: Reply<Vec<JobRow>>,
     },
+    /// 列一个 bot 最近的作业行（新的在前。面板用）。
+    ListRecentJobsForBot {
+        bot_id: BotId,
+        limit: u32,
+        reply: Reply<Vec<JobRow>>,
+    },
+    /// 列一个 bot 最近的等待行（新的在前。面板用）。
+    ListRecentWaitsForBot {
+        bot_id: BotId,
+        limit: u32,
+        reply: Reply<Vec<WaitRow>>,
+    },
 }
 
 /// SQLite 存储句柄：一个 db 线程 + 一个小只读连接池。
@@ -1298,6 +1310,30 @@ impl Store {
         })
     }
 
+    /// 列一个 bot 最近的作业行，**新的在前**，最多 `limit` 条（作业面板用）。
+    ///
+    /// 与 [`Self::list_jobs_for_bot`] 只差排序方向：面板截断时丢掉的是最旧的。
+    pub fn list_recent_jobs_for_bot(&self, bot_id: &BotId, limit: u32) -> Result<Vec<JobRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ListRecentJobsForBot {
+            bot_id,
+            limit,
+            reply,
+        })
+    }
+
+    /// 列一个 bot 最近的等待行，**新的在前**，最多 `limit` 条（等待面板用）。
+    ///
+    /// 带状态一起回：终态行也是证据（「刚才那条已超时」），要不要过滤由调用方定。
+    pub fn list_recent_waits_for_bot(&self, bot_id: &BotId, limit: u32) -> Result<Vec<WaitRow>> {
+        let bot_id = *bot_id;
+        self.submit(|reply| StoreOp::ListRecentWaitsForBot {
+            bot_id,
+            limit,
+            reply,
+        })
+    }
+
     /// 会话历史：把 `inbound` 与 `outbound` 合成一张表，返回最近的 `limit` 条，
     /// **时间升序、最老的在前**（聊天记录的自然阅读顺序）。`limit == 0` 返回空表。
     ///
@@ -1874,6 +1910,26 @@ fn store_loop(connection: Connection, receiver: Receiver<StoreOp>) {
                 reply_send(
                     reply,
                     repositories::jobs::list_for_bot(&connection, &bot_id, limit),
+                );
+            }
+            StoreOp::ListRecentJobsForBot {
+                bot_id,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::jobs::list_recent_for_bot(&connection, &bot_id, limit),
+                );
+            }
+            StoreOp::ListRecentWaitsForBot {
+                bot_id,
+                limit,
+                reply,
+            } => {
+                reply_send(
+                    reply,
+                    repositories::waits::list_recent_for_bot(&connection, &bot_id, limit),
                 );
             }
             StoreOp::ListHistory {
