@@ -676,3 +676,20 @@
     （坑 24）、bot 还活着，把它算成 crash 会让用户的清理逻辑跑在一个活着的 bot 上。
     另一个必须记住的顺序：`Runtime::stop()` 会 `await` 读循环，所以测「正常停机不算意外」时
     **先 spawn 等待、再调 stop**，反过来会死锁。
+
+133. **`cargo test --workspace` 返回 101 不一定是测试失败，可能是 rustc 自己被 OOM 打死**（2026-11-20 本机实测）。
+    现象：日志末尾是 `alloc::alloc::handle_alloc_error` 的 backtrace，进程 `exit code: 0xc0000409`
+    （`STATUS_STACK_BUFFER_OVERRUN`），紧接着一串 `error[E0463]: cannot find crate for hbot_adapters`。
+    容易被误读成「有人把 Cargo.toml 改坏了」或「代码不编译」。真因是并行链接 ~120 个测试二进制时
+    机器内存见底（本机 32 GB，实测那一刻只剩 7 GB），rustc 在写 rmeta 时分配失败。
+    判据：① 先看日志尾部**有没有 `test result: FAILED` 或 `panicked at`** —— 没有就不是测试红；
+    ② `cargo test --workspace` 单独复跑（不与其他 cargo 命令并发）通常立刻转绿；
+    ③ 真红会指名某个用例，OOM 不会。别为这种假红去改断言或调低并发阈值。
+134. **别用 `read` 的输出反向重写整个文件 —— 它有输出上限，会静默截断**（2026-11-20，代价是丢掉 316 行）。
+    当时的动作是「`read` 全文 → 在末尾追加一条坑 → `write` 回去」，目标文件 `docs/pitfalls.md`
+    约 90 KB / 678 行。`read` 为了控制上下文**按字节截断**返回内容，而返回值里仍然报着
+    `totalLines: 678`，于是一写就把后 316 行抹掉了 —— `git commit` 的 stat 显示
+    `316 +-------------` 才发现不对（幸好 commit 之后立刻看 stat 就能救回来：`git checkout <parent> -- <file>`）。
+    规矩：① 给大文件追加内容用 `fs.appendFile`（或工具的 `edit`，用末几行当 anchor），
+    **不要**走 read→write；② 改完任何文档/大文件，立刻看 `git diff --stat`，出现成百上千
+    行删除就是截断而不是「整理」；③ 这类事故的恢复点是父提交，别急着重写。

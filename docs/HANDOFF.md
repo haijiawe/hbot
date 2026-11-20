@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 23:00**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`（含每 bot 磁盘配额）、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。同日又接上 **`onStop(crash)` 的触发点**：supervisor 的读循环意外结束（订阅被关 / 入队失败）会经 `ReadLoopExit` + `ReadExitSlot` 传出，rpc 侧按 `StopReason::Crash` 停机并跑 `onStop`（`crates/hbot-rpc/tests/crash_capability.rs`）—— `docs/07` §4.6 里「枚举与渲染就位、但没有可靠检测」的那个缺口已关闭。
+> 本快照时间：**2026-11-20 23:10**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`（含每 bot 磁盘配额）、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。同日又接上 **`onStop(crash)` 的触发点**：supervisor 的读循环意外结束（订阅被关 / 入队失败）会经 `ReadLoopExit` + `ReadExitSlot` 传出，rpc 侧按 `StopReason::Crash` 停机并跑 `onStop`（`crates/hbot-rpc/tests/crash_capability.rs`）—— `docs/07` §4.6 里「枚举与渲染就位、但没有可靠检测」的那个缺口已关闭。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 57 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 2010 passed / 0 failed / 126 target
+cargo test -j 2 --workspace              # 当前 2011 passed / 0 failed / 126 target
 pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 ```
 
-现状：**六道全绿**（2026-11-20 22:50 实测，`rustc 1.100.0`，2010 passed / 126 target / web 47 文件 427 用例）。
+现状：**六道全绿**（2026-11-20 23:08 实测，`rustc 1.100.0`，2011 passed / 126 target / web 47 文件 427 用例）。
 **Rust 版本已钉死**：`rust-toolchain.toml` 的 `channel = "1.100.0"` 与 `ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`
 必须一起改（原来两处都写 `stable`，导致 CI 的 clippy 比本地新、只报在 CI，见 `docs/pitfalls.md` 坑 115）。
 `apps/web/src/generated/*.ts` **要入库**；
@@ -122,7 +122,7 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 132 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 134 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -301,7 +301,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：2010 passed / 126 target
+cargo test -j 2 --workspace                              # 基线：2011 passed / 126 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。

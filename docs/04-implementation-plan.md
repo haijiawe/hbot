@@ -261,7 +261,7 @@
 出口标准的两半现在**都可判定**：
 
 - **三类示例项目**：`examples/chat`、`examples/game`、`examples/support` 入库（无平台凭据，统一 `platform.kind = local`）。`crates/hbot-cli/tests/examples.rs` 逐个跑 `check_project`（清单合规 → 入口编译 → `hbot.d.ts` 未漂移），并断言名字就是这三类；`cargo xtask gen` 负责刷新它们的 `hbot.d.ts`，`gen --check` 拦漂移。**「能在桌面跑通」有整体 e2e 了**：`crates/hbot-rpc/tests/examples_e2e.rs` 把仓库里的示例目录复制进临时项目、真 `bot_start` + `bot_inject`，三条各跑一条链路 —— chat `/count` 走 `kv` 计数（不碰模型）、game `/score` 写库并 `/top` 读回（顺带证明 `migrations/0001_init.sql` 真执行过）、support `/ticket` 注册等待 → 下一句走 `onResume` → 用 `ctx.sql` 落 `tickets` 表。
-- **V1–V11**：2026-11-20 在 `07` §10 逐条对账，V12–V16 一并补上；`V10`（设备能力跨宿主）、`V11`（第二宿主）、`V15`（真机 GUI）**没有自动化证据**，挂在 `M10` 上，不许打勾。
+- **V1–V11**：2026-11-20 在 `07` §10 逐条对账，V12–V16 一并补上；`V11`（第二宿主）与 `V15`（真机 GUI）**没有自动化证据**，挂在 `M10` 上，不许打勾。`V10`（能力受限时返回 `HOST_LIMIT`）2026-11-20 晚补上了**桌面侧可自动验证的一半**：没有设备实现的宿主（Linux/macOS 的 `UnsupportedBackend`）在五个入口上全部返回 `HostLimit` 且文案与 `capabilities().detail` 同源（`crates/hbot-device/tests/api.rs`，在 CI 的 ubuntu runner 上真跑）；手机侧那半条仍等 `M10`，所以 `V10` 仍然**不打勾**。
 
 结论：M7 的能力面可以标「已落地」，**整条里程碑仍不能标完成** —— 出口标准的两半里，「三类示例项目」那一半已经有整体 e2e（上面第 1 点），真正缺的只剩 **V10 / V11 / V15 的宿主侧证据**，它们属于 `M10`（设备能力完整版 + 手机宿主）的验收范围，不是 M7 自己能在桌面补出来的。
 
