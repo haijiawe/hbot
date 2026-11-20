@@ -396,3 +396,9 @@
      `gen --check` 只比 `apps/web/src/generated/` 时，漂移的后果是「用户打开示例，Monaco 报得莫名其妙」而不是 CI 红。
      做法：`xtask` 依赖 `hbot-code`（读同一份 `dts.rs`），`gen` 写、`gen --check` 比对，一次覆盖全部含 `hbot.json` 的示例目录。
      同族：新增任何「每个项目一份」的生成物，都要问一句「闸门扫得到它吗」。
+
+106. **按字节截断文件会切断 UTF-8 字符，症状是「合法文件报不是 UTF-8」**（2026-11-20）。
+     `ctx.files.read` 的整文件路径原本是 `&bytes[..max_bytes]` 再 `String::from_utf8`：上限正好落在某个三字节汉字中间时，
+     `hbot-rpc` 的 `ProjectFiles::read` 会回 `HBOT_FILE_INVALID`（「不是 UTF-8 文本」），而文件本身一个坏字节都没有 —— 排障会一路查到编码上。
+    做法：截断点退到最近的字符边界（`while end > 0 && (bytes[end] & 0xC0) == 0x80 { end -= 1 }`）；按行读那条新路径按整行收尾，
+    只有「单独一行就超上限」时才退字符边界。任何「按字节上限收尾」的地方都要问一句：这一刀会不会切在字符或转义序列中间。

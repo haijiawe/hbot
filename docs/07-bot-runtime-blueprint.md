@@ -287,7 +287,11 @@ export default defineBot({
     const file = await ctx.files.read(`saves/u42.json`);   // { path, text, bytes, truncated }
     reply(`hp=` + JSON.parse(file.text).hp);
 
-    for (const entry of await ctx.files.list(`saves`)) {  // { path, kind: #S#file#S# | #S#dir#S#, size }
+    // 大文件按行读：第 5000..5099 行，不必先把整个文件读进内存
+    const page = await ctx.files.read(`logs/app.log`, { startLine: 5000, endLine: 5099 });
+    if (page.truncated) { /* 后面还有，翻下一页 */ }
+
+    for (const entry of await ctx.files.list(`saves`)) {  // { path, kind: `file` | `dir`, size }
       ctx.log(entry.path);
     }
   },
@@ -297,7 +301,7 @@ export default defineBot({
 | 层 | 判据 | 失败码 |
 |---|---|---|
 | 声明层 | 清单里 `capabilities.state.files.read` / `.write` 现读（每个新 isolate 装一次） | `HBOT_FILE_NOT_DECLARED`（`capability` 是 `read` 或 `write`） |
-| 参数层 | 文本 ≤ 1 MiB、读 ≤ 256 KiB、单段 ≤ 64 字节、全路径 ≤ 256 字节、列表 ≤ 200 条 | `HBOT_FILE_INVALID` |
+| 参数层 | 文本 ≤ 1 MiB、读 ≤ 256 KiB、单段 ≤ 64 字节、全路径 ≤ 256 字节、列表 ≤ 200 条；按行读时行号 1 起、`endLine ≥ startLine`、一次 ≤ 10000 行 | `HBOT_FILE_INVALID` |
 | 路径层 | 只接受相对路径；`..`、`.`、盘符、ADS、前导 `/`、`\`、控制字符一律拒 | `HBOT_FILE_DENIED` |
 | 装配层 | 宿主没有后端（测试、bench、`hbot serve` 之外的入口） | `HBOT_FILE_UNAVAILABLE` |
 | 文件层 | 不存在 / 是目录 / 非 UTF-8 / 目录非空 | `HBOT_FILE_NOT_FOUND` / `_INVALID` / `_INVALID` / `_DENIED` |
@@ -311,10 +315,11 @@ export default defineBot({
 4. **只读写文本，二进制请自己 base64**。rquickjs 的 `ArrayBuffer` 两向 API 不一致，为一条旁路多写一套转换不值得；而 base64 字符串在 `kv`/`sql` 里本来就是可存可读的。读到的非 UTF-8 **直接报错**，不替换成 U+FFFD（悄悄替换等于给用户一段被改过的数据）。
 5. **`remove` 只删空目录**，不做递归。递归删目录在生成代码手里等于一次静默的批量数据丢失；真要清空就让代码自己列出来逐个删，那样每一步都留下可审计的调用。
 6. **超量读截断、超量写报错**。读是"我想看一部分"，截断 + `truncated` 让调用方自己决定要不要按 `maxBytes` 分段；写是"我要保存这一份"，静默截断就等于存了半份文件而看着成功。
+7. **按行读是为了「文件比一次能读的大」，不是为了省事**（2026-11-20）。只给 `maxBytes` 时，5 MB 日志的第 5 万行永远读不到 —— 只能读到开头 256 KiB。所以 `read(path, { startLine, endLine })` 让后端**逐行流式**读，**不把整个文件放进内存**；同时加行数闸（一次 ≤ 10000 行），因为字节闸挡不住"从第 1 行扫到第 900 万行再返回空"这种请求。三个细节：① 只给 `startLine` 时上限是 `startLine + 9999`，默认值只在 JS 桥决定一次，core 的 `LineRange` 永远是两端都实的区间；② `truncated` 表示"后面还有没给你的" —— 撞字节上限、或范围后面还有行都算，据此翻页；③ 截断点退到 UTF-8 字符边界，绝不产出半个字符（整文件读那条老路径也一起修了）。
 
-**实测（2026-11-20）**：`hbot-core` 14 条（路径穿越、盘符、ADS、超长段、非法控制字符、错误码前缀）；`hbot-code` 槽位 11 条（声明闸先于装配闸、只读声明拒写、端口故障原样上浮、清身份不继承）；JS 桥 2 条 + `s3` 之外的行为由端到端覆盖；`hbot-rpc` 后端 6 条（往返、越界、缺失、排序、非空目录、截断）；端到端 7 条（未声明 / 只读声明拒写 / 往返 / `..` 与绝对路径 / 缺失 / 列目录只报相对路径 / 非 UTF-8 拒绝）。
+**实测（2026-11-20）**：`hbot-core` 17 条（路径穿越、盘符、ADS、超长段、非法控制字符、错误码前缀、行号 0 与逆序、跨度超限）；`hbot-code` 槽位 13 条（声明闸先于装配闸、只读声明拒写、端口故障原样上浮、清身份不继承、行范围原样下传、逆序在到达端口前被拒）；JS 桥 2 条 + `s3` 之外的行为由端到端覆盖；`hbot-rpc` 后端 11 条（往返、越界、缺失、排序、非空目录、截断、按行取、超 EOF、范围后仍有内容、字节截断不切汉字、CRLF 保真）；端到端 9 条（未声明 / 只读声明拒写 / 往返 / `..` 与绝对路径 / 缺失 / 列目录只报相对路径 / 非 UTF-8 拒绝 / 按行读只回那几行 / 逆序行号在 JS 边界被拒）。
 
-**还没做**：把文件当附件发出去（`ctx.send` 仍只推文本）；二进制直读（现在是 base64 约定）；目录递归删除；每 bot 的磁盘配额（现在只有单次体积上限）；读时按行范围（现在只能按字节截断）。
+**还没做**：把文件当附件发出去（`ctx.send` 仍只推文本）；二进制直读（现在是 base64 约定）；目录递归删除；每 bot 的磁盘配额（现在只有单次体积上限）；按行**写**（改写第 N 行仍需整文件读改写）。
 
 ---
 

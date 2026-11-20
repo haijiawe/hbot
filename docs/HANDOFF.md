@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-20 08:45**（工作树干净）。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、以及 `ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的。
+> 本快照时间：**2026-11-20 08:55**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的。
 
 ---
 
@@ -240,13 +240,15 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 **刚落地的 `C3.file`（`docs/07` §3.6）**：`capabilities.state.files.{read,write}` **读写分开**（坑 97），
 路径判据只在槽位层（坑 96）、后端只补符号链接逃逸；四个动词 `read`/`write`/`list`/`remove` 不给裸 fs；
 读超限截断并标 `truncated`、写超 1 MiB 报错、非 UTF-8 报错、`remove` 只删空目录（坑 98）。
-还没做：附件发送、二进制直读（约定存 base64）、递归删除、每 bot 配额、按行范围读。
+还没做：附件发送、二进制直读（约定存 base64）、递归删除、每 bot 配额、按行**写**。
+
+2026-11-20 补：**按行范围读**已落地 —— `ctx.files.read(path, { startLine, endLine })` 逐行流式读（不再整文件进内存），一次 ≤ 10000 行、行号 1 起、`endLine` 含；越界/逆序报错不夹取；`truncated` 表示「后面还有没给你的」（撞字节上限或范围后仍有行），据此翻页。顺带修掉整文件读的截断点可能切在 UTF-8 字符中间、导致合法文件被报「不是 UTF-8」的老洞。
 
 ### D. 其它未做（不阻塞主线）
 
 - `onStart` / `onStop`（含 `shutdown` 原因）—— **已落地（2026-11-19 / 2026-11-20，`docs/07` §4.6）**，别再重做；
   `crash` 这个原因**暂时没人发**是刻意的（理由见上面 §7 C 段末尾）；
-- `C3.file` 的收尾件：附件发送、二进制直读、递归删除、每 bot 配额、按行范围读（主链路 2026-11-20 已落地，见 `docs/07` §3.6）；
+- `C3.file` 的收尾件：附件发送、二进制直读、递归删除、每 bot 配额、按行写（主链路与按行读 2026-11-20 已落地，见 `docs/07` §3.6）；
 - `onSchedule` —— **已落地（2026-11-20，`docs/07` §4.4.1）**：它就是 `onTimer` 的正式名，同一条派发路径、同一个 `capabilities.timer`；两个名字都写会启动失败。别再按「另起一条路径」实现；
 - 设备完整版：混合 DPI 跨屏拼图、中文以外的 OCR 语言包（按窗口截图 2026-11-20 已落地，见 `docs/09` §11.1）；
 - `E1` npm 打包、云端执行宿主（`docs/08` §9 / ADR-0006）。
