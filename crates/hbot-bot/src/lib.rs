@@ -73,5 +73,5 @@ pub use outbox::{
 };
 pub use queue::{FailureTracker, QueueConfig, QueueError, SessionKey, SessionQueues};
 pub use supervisor::{
-    BotSnapshot, BotSpec, InjectOutcome, StartupStep, Supervisor, SupervisorDeps,
+    BotSnapshot, BotSpec, InjectOutcome, ReadLoopExit, StartupStep, Supervisor, SupervisorDeps,
 };

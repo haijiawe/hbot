@@ -181,6 +181,14 @@ impl TestAdapter {
         self.subscribe_calls.load(Ordering::SeqCst)
     }
 
+    /// 关掉订阅通道：模拟平台侧连接断开（读循环应当报「意外结束」）。
+    ///
+    /// 松手的是发送端，于是 `AdapterSubscription::events.recv()` 返回 `None` —— 与真实
+    /// 适配器在 WebSocket 断开后 drop 发送端是同一条路径。
+    pub fn close_subscription(&self) {
+        *self.sender.lock().expect("sender lock") = None;
+    }
+
     /// 模拟平台推送一条事件；未订阅时返回 `false`。
     pub fn push(&self, event: PlatformEvent) -> bool {
         match self.sender.lock().expect("sender lock").as_ref() {

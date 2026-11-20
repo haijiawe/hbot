@@ -718,6 +718,65 @@ async fn outbound_gives_up_after_max_attempts() {
     supervisor.stop().await.expect("stop");
 }
 
+/// 适配器订阅被关掉：读循环必须报「意外结束」，而不是安静地不再收消息。
+///
+/// 这条钉的是 `docs/07` §4.6 的前置：`onStop(crash)` 之前必须有人能看出
+/// 「这个 bot 已经瞎了」。订阅关闭不影响任何计数器，从外面看与「平台很安静」完全一样，
+/// 所以判据只能由读循环自己给出。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_subscription_is_reported_as_an_unexpected_exit() {
+    let fixture = Fixture::new(vec![ConversationRef::new(
+        "chat-closed",
+        ConversationKind::Group,
+    )]);
+    let supervisor = fixture.supervisor(bot_id(), fixture.deps());
+    supervisor.start().await.expect("start");
+    assert_eq!(supervisor.status(), BotStatus::Running);
+
+    // 平台侧断线 = 发送端被 drop。
+    fixture.adapter.close_subscription();
+
+    let exit = tokio::time::timeout(Duration::from_secs(5), supervisor.wait_read_loop_exit())
+        .await
+        .expect("读循环必须在订阅关闭后退出，而不是挂着");
+    assert_eq!(
+        exit,
+        hbot_bot::ReadLoopExit::SubscriptionClosed,
+        "订阅关闭必须报成 SubscriptionClosed，实际 {exit:?}"
+    );
+    assert!(exit.is_unexpected(), "订阅关闭是意外结束，不是正常停机");
+    assert_eq!(
+        supervisor.status(),
+        BotStatus::Degraded,
+        "读循环意外结束后不能再对外报 Running：它已经收不到任何消息了"
+    );
+
+    // 收尾仍可正常进行（`crash` 路径就是先拿到上面这个原因，再调 stop）。
+    supervisor.stop().await.expect("stop");
+    assert_eq!(supervisor.status(), BotStatus::Stopped);
+}
+
+/// 正常停机报 `StopRequested`，调用方不得据此触发 `crash` 收尾。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_normal_stop_is_not_reported_as_an_unexpected_exit() {
+    let fixture = Fixture::new(Vec::new());
+    let supervisor = fixture.supervisor(bot_id(), fixture.deps());
+    supervisor.start().await.expect("start");
+
+    // 先取走读循环的退出原因：`stop()` 会等读循环结束，所以顺序不能反过来。
+    let waiter = {
+        let supervisor = Arc::clone(&supervisor);
+        tokio::spawn(async move { supervisor.wait_read_loop_exit().await })
+    };
+    supervisor.stop().await.expect("stop");
+    let exit = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("waiter 必须在停机后返回")
+        .expect("join");
+    assert_eq!(exit, hbot_bot::ReadLoopExit::StopRequested);
+    assert!(!exit.is_unexpected());
+}
+
 /// 测试脚手架自身的契约：`TestExecutor` 的并发计数不会因失败路径泄漏。
 #[test]
 fn executor_fake_does_not_leak_running_counter() {

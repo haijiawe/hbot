@@ -65,7 +65,7 @@ use hbot_core::{
 use hbot_store::{Bot as StoreBot, NewLog, Store};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::adapter::{AdapterSubscription, BotAdapter};
@@ -230,13 +230,66 @@ pub enum InjectOutcome {
     },
 }
 
+/// 读循环退出的原因。
+///
+/// `StopRequested` 是正常停机（`bot_stop` / 切项目 / 进程退出）；其余三种都是**意外**结束，
+/// 共同后果是「bot 还登记在运行表里，但已经不会再收到任何新消息」。上层必须据此收尾
+/// （`onStop` 的 `crash` 原因就是从这里来的），否则面板会一直显示 Running 而实际已瞎。
+///
+/// 为什么这个判断必须由 supervisor 给、而不是让上层去看队列深度：订阅被关掉、入队失败
+/// 都不影响任何计数器，从外面看与"安静"完全一样（`AGENTS.md` §7.1 坑 24 同族）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadLoopExit {
+    /// 收到停止信号（正常停机）。
+    StopRequested,
+    /// 适配器的订阅通道被关闭：平台侧连接没了，不会再有事件进来。
+    SubscriptionClosed,
+    /// 入站落库失败到无法继续（`admit_with_retry` 只在停止时返回，这里是兜底）。
+    AdmitFailed {
+        /// 原始错误文案。
+        error: String,
+    },
+    /// 入队失败（`QueueError::Closed` 之外的错误）。
+    EnqueueFailed {
+        /// 原始错误文案。
+        error: String,
+    },
+}
+
+impl ReadLoopExit {
+    /// 是不是意外结束（正常停机返回 `false`）。
+    pub fn is_unexpected(&self) -> bool {
+        !matches!(self, Self::StopRequested)
+    }
+
+    /// 一行可读的原因：日志、`onStop` 的记录与测试断言都用它。
+    pub fn describe(&self) -> String {
+        match self {
+            Self::StopRequested => "read loop stopped by request".to_owned(),
+            Self::SubscriptionClosed => "adapter subscription closed".to_owned(),
+            Self::AdmitFailed { error } => format!("persisting inbound failed: {error}"),
+            Self::EnqueueFailed { error } => format!("enqueue failed: {error}"),
+        }
+    }
+}
+
+/// 读循环结束后留下的退出原因（只写一次，`notify_one` 唤醒等待者）。
+///
+/// 用 `Notify` 而不是再开一条通道：等待者只有一个（应用层的崩溃收尾任务），
+/// 而 `notify_one` 会留下一个 permit，所以"先结束、后等待"也不会漏。
+#[derive(Default)]
+struct ReadExitSlot {
+    exit: Mutex<Option<ReadLoopExit>>,
+    notify: Notify,
+}
+
 /// 一次运行期的资源集合（stop 时整体拆掉）。
 struct Runtime {
     inbox: Arc<Inbox>,
     queues: Arc<SessionQueues>,
     outbox: Arc<Outbox>,
     stop_tx: watch::Sender<bool>,
-    read_task: JoinHandle<()>,
+    read_task: JoinHandle<ReadLoopExit>,
     watcher_task: JoinHandle<()>,
 }
 
@@ -268,6 +321,8 @@ pub struct Supervisor {
     lifecycle: AsyncMutex<()>,
     inner: Arc<Mutex<Inner>>,
     failures: Arc<FailureTracker>,
+    /// 读循环的退出原因（写一次，见 [`ReadExitSlot`]）。
+    read_exit: Arc<ReadExitSlot>,
 }
 
 impl Supervisor {
@@ -280,6 +335,7 @@ impl Supervisor {
             lifecycle: AsyncMutex::new(()),
             inner: Arc::new(Mutex::new(Inner::new())),
             failures,
+            read_exit: Arc::new(ReadExitSlot::default()),
         }
     }
 
@@ -316,6 +372,31 @@ impl Supervisor {
             .runtime
             .as_ref()
             .map_or(0, |runtime| runtime.queues.total_depth())
+    }
+
+    /// 等读循环结束，并取回退出原因（只返回一次）。
+    ///
+    /// 应用层用它区分「这个 bot 是正常停的」还是「它自己瞎了」：`StopRequested` 是正常
+    /// 停机，其余值说明读循环意外死亡。**意外结束时 supervisor 已经把状态改成
+    /// `Degraded`**，但收尾（`onStop(crash)`、注销 webhook、取消作业）只能在应用层做，
+    /// 所以这里只如实报告，不自己拆资源。
+    ///
+    /// 只返回一次：第二次调用会一直等到下一次读循环结束（同一个 supervisor 重启后才会
+    /// 有第二个读循环），所以调用方应当只起一个等待者。
+    pub async fn wait_read_loop_exit(&self) -> ReadLoopExit {
+        loop {
+            if let Some(exit) = self
+                .read_exit
+                .exit
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                return exit;
+            }
+            // `notify_one` 会留 permit：读循环先结束、这个等待者后到也不会漏。
+            self.read_exit.notify.notified().await;
+        }
     }
 
     /// 启动 bot：按 [`StartupStep`] 顺序建资源，成功后才进入 `Running`。
@@ -561,6 +642,8 @@ impl Supervisor {
             Arc::clone(&inbox),
             Arc::clone(&queues),
             stop_rx.clone(),
+            Arc::clone(&self.inner),
+            Arc::clone(&self.read_exit),
         ));
         let watcher_task = tokio::spawn(degraded_watch(
             bot_id,
@@ -791,34 +874,42 @@ impl HandlerExecutor for RecordingHandler {
 }
 
 /// 读循环：订阅事件 → 去重落库 → 入队；队列满时暂停（背压），不丢消息。
+///
+/// 返回**退出原因**，并把它记进 `read_exit`：退出本身不是错误（正常停机也会退出），
+/// 但「为什么退出」决定了上层要不要按 `crash` 收尾。意外结束时顺手把状态改成
+/// `Degraded` —— 那一刻这个 bot 已经收不到任何新消息了，继续显示 `Running` 是撒谎。
 async fn read_loop(
     bot_id: BotId,
     mut subscription: AdapterSubscription,
     inbox: Arc<Inbox>,
     queues: Arc<SessionQueues>,
     mut stop: watch::Receiver<bool>,
-) {
-    loop {
+    inner: Arc<Mutex<Inner>>,
+    read_exit: Arc<ReadExitSlot>,
+) -> ReadLoopExit {
+    let exit = loop {
         let event = tokio::select! {
-            _ = stop.changed() => break,
+            _ = stop.changed() => break ReadLoopExit::StopRequested,
             received = subscription.events.recv() => match received {
                 Some(event) => event,
                 None => {
                     tracing::warn!(bot = %bot_id, "adapter subscription closed; stopping read loop");
-                    break;
+                    break ReadLoopExit::SubscriptionClosed;
                 }
             },
         };
         let admission = match admit_with_retry(&bot_id, &inbox, &event, &mut stop).await {
             Ok(Some(admission)) => admission,
-            Ok(None) => break,
+            Ok(None) => break ReadLoopExit::StopRequested,
             Err(error) => {
                 tracing::error!(
                     bot = %bot_id,
                     %error,
                     "failed to persist inbound event; stopping read loop"
                 );
-                break;
+                break ReadLoopExit::AdmitFailed {
+                    error: error.to_string(),
+                };
             }
         };
         match admission {
@@ -833,17 +924,38 @@ async fn read_loop(
                     Err(QueueError::Closed { .. }) => {
                         // 停止中：消息已落库，下次启动会重放。
                         tracing::debug!(bot = %bot_id, %message_id, "queue closed while stopping");
-                        break;
+                        break ReadLoopExit::StopRequested;
                     }
                     Err(error) => {
                         tracing::error!(bot = %bot_id, %message_id, %error, "enqueue failed");
-                        break;
+                        break ReadLoopExit::EnqueueFailed {
+                            error: error.to_string(),
+                        };
                     }
                 }
             }
         }
+    };
+
+    tracing::debug!(bot = %bot_id, reason = %exit.describe(), "read loop stopped");
+    if exit.is_unexpected() {
+        // 只有「仍在跑」才降级：停机途中读循环退出是正常时序，别把 Stopping 盖成 Degraded。
+        let mut guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(guard.status, BotStatus::Running) {
+            guard.status = BotStatus::Degraded;
+            tracing::error!(
+                bot = %bot_id,
+                reason = %exit.describe(),
+                "read loop exited unexpectedly: this bot will not receive new events"
+            );
+        }
     }
-    tracing::debug!(bot = %bot_id, "read loop stopped");
+    *read_exit
+        .exit
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(exit.clone());
+    read_exit.notify.notify_one();
+    exit
 }
 
 /// 落库失败通常是暂时性的（SQLite busy/磁盘抖动）：退避重试直到成功或停止。
