@@ -175,6 +175,20 @@ impl Harness {
             .filter(|text| text.starts_with("send-error:"))
             .collect()
     }
+
+    /// 适配器收到的附件（local 平台写成 `[attachment] <kind> <file>` 行）。
+    fn attachments(&self) -> Vec<String> {
+        self.store()
+            .list_logs(Some(&self.bot), 1024)
+            .expect("读日志")
+            .into_iter()
+            .filter_map(|row| row.line.strip_prefix("[attachment] ").map(str::to_owned))
+            .collect()
+    }
+
+    fn project(&self) -> PathBuf {
+        self._dir.path().join("project")
+    }
 }
 
 fn assert_ok(response: &Response, what: &str) {
@@ -371,5 +385,115 @@ async fn notify_uses_the_declared_target() {
     })
     .await;
     assert!(harness.errors().is_empty(), "声明了目标时不该报错");
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+// ---------------------------------------------------------------------------
+// ⑧ 附件真的走到了适配器（base64 段的构造在适配器那侧，这里只验链路）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_attachment_reaches_the_adapter() {
+    let handler = send_handler("await ctx.sendImage('local:default', 'assets/logo.png');");
+    let harness = Harness::new("attach", &handler, &manifest("{\"send\":true}")).await;
+    std::fs::create_dir_all(harness.project().join("assets")).expect("创建 assets");
+    // 一段最小的 PNG 头：内容是无关的，这里钉的是「字节从项目里读出来了」。
+    std::fs::write(
+        harness.project().join("assets").join("logo.png"),
+        [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+    )
+    .expect("写附件");
+    assert_ok(&harness.start().await, "bot_start");
+
+    assert_ok(&harness.inject("hello").await, "bot_inject");
+    wait_for("附件到了适配器", || {
+        harness
+            .attachments()
+            .iter()
+            .any(|line| line == "image logo.png")
+    })
+    .await;
+    assert!(harness.errors().is_empty(), "声明了附件路径合法时不该报错");
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+// ---------------------------------------------------------------------------
+// ⑨ 参数闸：绝对路径 / 越界路径在入队前就被拒（HBOT_SEND_INVALID）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_absolute_attachment_path_is_refused() {
+    let handler = send_handler("await ctx.sendImage('local:default', 'C:/Windows/win.ini');");
+    let harness = Harness::new("attach-abs", &handler, &manifest("{\"send\":true}")).await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    assert_ok(&harness.inject("hello").await, "bot_inject");
+    wait_for("收到错误回复", || !harness.errors().is_empty()).await;
+    let error = harness.errors().into_iter().next().expect("error reply");
+    assert!(
+        error.contains("HBOT_SEND_INVALID"),
+        "绝对路径必须报 HBOT_SEND_INVALID，实际：{error}"
+    );
+    assert!(harness.attachments().is_empty(), "被拒的附件不该走到适配器");
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+#[tokio::test]
+async fn an_attachment_path_that_escapes_the_project_is_refused() {
+    let handler = send_handler("await ctx.sendFile('local:default', 'assets/../../outside.txt');");
+    let harness = Harness::new("attach-esc", &handler, &manifest("{\"send\":true}")).await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    assert_ok(&harness.inject("hello").await, "bot_inject");
+    wait_for("收到错误回复", || !harness.errors().is_empty()).await;
+    let error = harness.errors().into_iter().next().expect("error reply");
+    assert!(
+        error.contains("HBOT_SEND_INVALID"),
+        "带 .. 的路径必须报 HBOT_SEND_INVALID，实际：{error}"
+    );
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+// ---------------------------------------------------------------------------
+// ⑩ 宿主闸：文件不存在 / 超大小上限（这两条参数闸看不出来）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_missing_attachment_is_refused_by_the_host() {
+    let handler = send_handler("await ctx.sendImage('local:default', 'assets/missing.png');");
+    let harness = Harness::new("attach-missing", &handler, &manifest("{\"send\":true}")).await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    assert_ok(&harness.inject("hello").await, "bot_inject");
+    wait_for("收到错误回复", || !harness.errors().is_empty()).await;
+    let error = harness.errors().into_iter().next().expect("error reply");
+    assert!(
+        error.contains("都不存在") || error.contains("不存在"),
+        "不存在的附件必须报出来，实际：{error}"
+    );
+    assert!(
+        harness.attachments().is_empty(),
+        "不存在的附件不该走到适配器"
+    );
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+#[tokio::test]
+async fn an_oversized_attachment_is_refused_by_the_host() {
+    let handler = send_handler("await ctx.sendFile('local:default', 'assets/huge.bin');");
+    let harness = Harness::new("attach-huge", &handler, &manifest("{\"send\":true}")).await;
+    std::fs::create_dir_all(harness.project().join("assets")).expect("创建 assets");
+    let too_big = vec![0u8; (hbot_adapters::onebot::MAX_OUTBOUND_ATTACHMENT_BYTES + 1) as usize];
+    std::fs::write(harness.project().join("assets").join("huge.bin"), too_big).expect("写大文件");
+    assert_ok(&harness.start().await, "bot_start");
+
+    assert_ok(&harness.inject("hello").await, "bot_inject");
+    wait_for("收到错误回复", || !harness.errors().is_empty()).await;
+    let error = harness.errors().into_iter().next().expect("error reply");
+    assert!(
+        error.contains("上限"),
+        "超限的附件必须报出上限，实际：{error}"
+    );
+    assert!(harness.attachments().is_empty(), "超限的附件不该走到适配器");
     assert_ok(&harness.stop().await, "bot_stop");
 }

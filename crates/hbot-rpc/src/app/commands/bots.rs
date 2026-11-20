@@ -231,6 +231,7 @@ async fn start_inner(state: &Arc<AppState>, bot_id: BotId) -> Result<(), HbotErr
         // 生产装配只有这一处 —— 不装配时 `ctx.send` 明确报 `HBOT_SEND_UNAVAILABLE`，不是静默丢消息。
         .with_send(Arc::new(StoreSendQueue::new(
             bot_id,
+            root.clone(),
             Arc::clone(state.store()),
             replies_tx,
             Arc::clone(state.clock()),

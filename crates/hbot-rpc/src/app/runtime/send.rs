@@ -23,13 +23,15 @@
 //! 值不是三种已知类型之一，就报 `NO_TARGET` 并要求调用点补 `kind` —— **不猜**。
 //! 猜成 `private` 而目标其实是群，就是把消息发给错误的收件人。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hbot_bot::event::ConversationRef;
 use hbot_bot::outbox::OutboundRequest;
 use hbot_code::send::{SendFailure, SendQueue};
-use hbot_core::{BotId, Clock, ConversationKind, NotifyTarget, SendRequest};
+use hbot_core::{
+    AttachmentRef, AttachmentRequest, BotId, Clock, ConversationKind, NotifyTarget, SendRequest,
+};
 use hbot_store::Store;
 use tokio::sync::mpsc;
 
@@ -38,6 +40,8 @@ use crate::app::store_failed;
 /// 出站端口的 store 实现（一个 bot 一个）。
 pub struct StoreSendQueue {
     bot_id: BotId,
+    /// 项目根：附件路径是相对它的，解析与根内校验都在这里做。
+    project_root: PathBuf,
     store: Arc<Store>,
     /// supervisor 的回复通道：handler 返回值与主动消息共用同一条队列，顺序不会互相插队。
     replies: mpsc::Sender<OutboundRequest>,
@@ -50,12 +54,14 @@ impl StoreSendQueue {
     #[must_use]
     pub fn new(
         bot_id: BotId,
+        project_root: PathBuf,
         store: Arc<Store>,
         replies: mpsc::Sender<OutboundRequest>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             bot_id,
+            project_root,
             store,
             replies,
             clock,
@@ -72,10 +78,14 @@ impl StoreSendQueue {
     /// `FOREIGN KEY constraint failed`，而那时 `ctx.send` 早就返回成功 —— 用户只会看到
     /// 「发了但对方没收到」。会话 ID 走 `hbot_bot::conversation_id_for` 的确定性派生，
     /// 与 supervisor 写 inbound 时用的是同一个函数，所以补建出来的行就是那一行。
-    fn ensure_target(&self, request: &SendRequest) -> Result<ConversationKind, SendFailure> {
+    fn ensure_target(
+        &self,
+        conversation: &str,
+        requested: Option<ConversationKind>,
+    ) -> Result<ConversationKind, SendFailure> {
         let existing = self
             .store
-            .get_conversation_by_external(&self.bot_id, &request.conversation)
+            .get_conversation_by_external(&self.bot_id, conversation)
             .map_err(|error| SendFailure::Failed {
                 reason: store_failed(error).to_string(),
             })?;
@@ -84,17 +94,17 @@ impl StoreSendQueue {
             .as_ref()
             .map(|row| crate::app::runtime::conversation_kind_from_str(&row.kind))
             .filter(|kind| *kind != ConversationKind::Unknown);
-        let Some(kind) = stored.or_else(|| request.effective_kind()) else {
+        let Some(kind) = stored.or(requested) else {
             return Err(SendFailure::NoTarget {
-                conversation: request.conversation.clone(),
+                conversation: conversation.to_owned(),
             });
         };
 
         if existing.is_none() {
             let row = hbot_store::Conversation {
-                id: hbot_bot::conversation_id_for(&self.bot_id, &request.conversation),
+                id: hbot_bot::conversation_id_for(&self.bot_id, conversation),
                 bot_id: self.bot_id,
-                external_id: request.conversation.clone(),
+                external_id: conversation.to_owned(),
                 kind: crate::app::runtime::conversation_kind_str(kind).to_owned(),
                 created_at: self.clock.now().unix_millis(),
             };
@@ -106,14 +116,73 @@ impl StoreSendQueue {
         }
         Ok(kind)
     }
+    /// 把用户给的相对路径解析成宿主要发的绝对路径。
+    ///
+    /// 三道判据缺一不可：
+    /// 1. `canonicalize` 之后再比前缀 —— 只比拼接结果会漏符号链接（`link -> ..`）；
+    /// 2. 必须在项目根内 —— 用户代码只能发自己项目里的文件；
+    /// 3. 必须存在、是普通文件、不超大小上限 —— 否则发到平台那一刻才失败，
+    ///    而那时 handler 早就返回成功，用户只会看到「发了但对方没收到」。
+    ///
+    /// 错误文案只给相对路径：这条 message 会进 run log 与模型上下文（AGENTS.md 坑 47）。
+    fn resolve_attachment(
+        &self,
+        request: &AttachmentRequest,
+    ) -> Result<AttachmentRef, SendFailure> {
+        let root = self
+            .project_root
+            .canonicalize()
+            .map_err(|error| SendFailure::Failed {
+                reason: format!("项目根不可读，附件 {} 无法核验：{error}", request.path),
+            })?;
+        let resolved =
+            root.join(&request.path)
+                .canonicalize()
+                .map_err(|error| SendFailure::Failed {
+                    reason: format!("附件 {} 不存在或不可读：{error}", request.path),
+                })?;
+        if !resolved.starts_with(&root) {
+            return Err(SendFailure::Failed {
+                reason: format!("附件 {} 解析到了项目根之外", request.path),
+            });
+        }
+        let metadata = std::fs::metadata(&resolved).map_err(|error| SendFailure::Failed {
+            reason: format!("附件 {} 不可读：{error}", request.path),
+        })?;
+        if !metadata.is_file() {
+            return Err(SendFailure::Failed {
+                reason: format!("附件 {} 不是普通文件", request.path),
+            });
+        }
+        // 与适配器同一个上限：这里先挡住，用户拿到的是「文件太大」，而不是
+        // 一条进了 outbox 又永远发不出去的死信。
+        if metadata.len() > hbot_adapters::onebot::MAX_OUTBOUND_ATTACHMENT_BYTES {
+            return Err(SendFailure::Failed {
+                reason: format!(
+                    "附件 {} 有 {} 字节，超过 {} 字节上限",
+                    request.path,
+                    metadata.len(),
+                    hbot_adapters::onebot::MAX_OUTBOUND_ATTACHMENT_BYTES
+                ),
+            });
+        }
+        // 落库存绝对路径：续发时项目根可能已经变了（项目被移动/重开），
+        // 存相对路径会在那一刻指向另一个文件。
+        Ok(AttachmentRef::new(
+            request.attachment,
+            resolved.to_string_lossy().into_owned(),
+        ))
+    }
 }
+
 impl SendQueue for StoreSendQueue {
     fn send(&self, request: &SendRequest) -> Result<(), SendFailure> {
-        let kind = self.ensure_target(request)?;
+        let kind = self.ensure_target(&request.conversation, request.effective_kind())?;
         let outbound = OutboundRequest {
             conversation: ConversationRef::new(request.conversation.clone(), kind),
             text: request.text.clone(),
             reply_to: None,
+            attachment: None,
         };
         // 这里是同步上下文（`hbot-code` 已把端口调用放进 `spawn_blocking`），所以用
         // `blocking_send`：它在该线程上阻塞等待容量，不会把 reactor 卡住。
@@ -121,6 +190,22 @@ impl SendQueue for StoreSendQueue {
             .blocking_send(outbound)
             .map_err(|error| SendFailure::Failed {
                 reason: format!("出站通道已关闭，消息没能交给 supervisor：{error}"),
+            })
+    }
+    fn send_attachment(&self, request: &AttachmentRequest) -> Result<(), SendFailure> {
+        let kind = self.ensure_target(&request.conversation, request.effective_kind())?;
+        let attachment = self.resolve_attachment(request)?;
+        let outbound = OutboundRequest {
+            conversation: ConversationRef::new(request.conversation.clone(), kind),
+            // 附件消息可以没有正文（「把这个发给张三」）。
+            text: String::new(),
+            reply_to: None,
+            attachment: Some(attachment),
+        };
+        self.replies
+            .blocking_send(outbound)
+            .map_err(|error| SendFailure::Failed {
+                reason: format!("出站通道已关闭，附件没能交给 supervisor：{error}"),
             })
     }
 }

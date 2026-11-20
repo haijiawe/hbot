@@ -128,7 +128,17 @@ impl BotAdapter for LocalAdapter {
     }
 
     async fn send(&self, envelope: OutboundEnvelope) -> Result<(), HbotError> {
-        let lines = primitives::reply_lines(&envelope.text);
+        let mut lines = primitives::reply_lines(&envelope.text);
+        // 附件：本地平台没有真的发送通道，但也要留痕 —— 试跑时用户要能确认
+        // 「文件确实走到了适配器」。只记文件名与类型，**不记绝对路径**：
+        // 这条日志会进 run log 面板与模型上下文（AGENTS.md 坑 47）。
+        if let Some(attachment) = &envelope.attachment {
+            let name = std::path::Path::new(&attachment.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment");
+            lines.push(format!("[attachment] {} {name}", attachment.kind.as_str()));
+        }
         if lines.is_empty() {
             // 空回复：没有可显示的行。不伪造一条 "[reply] "（那会让人以为 bot 回了空串），
             // 但也留一下痕，便于查"为什么点了回复日志里没有"。
