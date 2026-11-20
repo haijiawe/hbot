@@ -316,6 +316,11 @@ pub fn read_bot_config(root: &Path, bot_id: &BotId) -> Result<BotConfig, HbotErr
                 let millis = millis.max(1);
                 base = base.with_handler_timeout(Duration::from_millis(millis));
             }
+            if let Some(millis) = limits.job_budget_ms {
+                // 0 在这里是「不限」，由 Limits::job_budget_ms() 解释；不在这里夹取，
+                // 否则「写 0 表示不限」会在解析层就被悄悄改成 1 秒。
+                base = base.with_job_budget_ms(millis);
+            }
             base
         }
     };
@@ -628,6 +633,10 @@ struct LimitsEntry {
     memory_mb: Option<u32>,
     #[serde(default)]
     handler_timeout_ms: Option<u64>,
+    /// 后台作业单次预算的宿主上限（毫秒）。缺省 = 核心契约上限（10 分钟），
+    /// 也就是「这台宿主不额外收紧」；写 0 同样表示不限。
+    #[serde(default)]
+    job_budget_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for BotEntry {

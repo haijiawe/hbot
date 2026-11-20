@@ -1441,8 +1441,11 @@ impl SandboxHandler {
         };
         let sandbox = Arc::clone(&worker.sandbox);
         // budget_ms 取**行里冻结的那一份**，不重读清单：改清单不该让已经排队的作业
-        // 换预算（换语义是排障时最费时间的一类问题）。
-        let budget_ms = row.budget_ms;
+        // 换预算（换语义是排障时最费时间的一类问题）；再被这台宿主的平台上限
+        // 收紧一次（手机端后台窗口只有几十秒，`docs/08-multi-host.md`）。
+        // 取小的那一步只有 `hbot_core::effective_job_budget_ms` 一份实现。
+        let budget_ms =
+            hbot_core::effective_job_budget_ms(row.budget_ms, self.limits.job_budget_ms());
         let name = row.name.clone();
         let key = row.idempotency_key.clone();
         let conversation = row.conversation.clone();

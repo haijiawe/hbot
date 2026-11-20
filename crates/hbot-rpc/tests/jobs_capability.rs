@@ -144,6 +144,12 @@ fn bots_json() -> String {
     format!("{{\"bots\":[{{\"id\":\"{BOT_UUID}\",\"platform\":\"local\",\"name\":\"作业能力\"}}]}}")
 }
 
+/// 带 `limits.jobBudgetMs` 的 `bots.json`：这台宿主对**每个**后台作业的墙钟上限。
+fn bots_json_with_job_budget(millis: u64) -> String {
+    format!(
+        "{{\"bots\":[{{\"id\":\"{BOT_UUID}\",\"platform\":\"local\",\"name\":\"作业能力\",\"limits\":{{\"jobBudgetMs\":{millis}}}}}]}}"
+    )
+}
 fn bot_id() -> BotId {
     BotId::from_uuid(uuid::Uuid::parse_str(BOT_UUID).expect("bot uuid"))
 }
@@ -158,12 +164,20 @@ struct Harness {
 
 impl Harness {
     async fn new(label: &str, handler_source: &str, manifest_json: &str) -> Self {
+        Self::with_bots(label, handler_source, manifest_json, &bots_json()).await
+    }
+
+    /// 与 [`Harness::new`] 相同，只是 `bots.json` 由调用方给。
+    ///
+    /// 存在的理由：宿主级作业预算上限（`limits.jobBudgetMs`）写在 `bots.json` 里，
+    /// 固定那一份就永远验不到「这台宿主把清单的预算收紧」这条路径。
+    async fn with_bots(label: &str, handler_source: &str, manifest_json: &str, bots: &str) -> Self {
         let dir = TempDir::new(label);
         let project = dir.path().join("project");
         std::fs::create_dir_all(project.join("src")).expect("创建 src");
         std::fs::write(project.join("src").join("main.ts"), handler_source).expect("写 handler");
         std::fs::write(project.join("hbot.json"), manifest_json).expect("写 hbot.json");
-        std::fs::write(project.join("bots.json"), bots_json()).expect("写 bots.json");
+        std::fs::write(project.join("bots.json"), bots).expect("写 bots.json");
 
         let data_dir = dir.path().join("data");
         let state = AppState::open(data_dir.clone(), Arc::new(SystemClock), Arc::new(UuidIds))
@@ -631,6 +645,146 @@ async fn max_pending_jobs_in_the_manifest_caps_the_queue() {
         1,
         "被拒的那条不许落库，实际：{:?}",
         harness.jobs()
+    );
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+// ---------------------------------------------------------------------------
+// ⑧ 宿主级预算上限：只收紧、不放宽，且真的能掐断一条作业
+// ---------------------------------------------------------------------------
+
+/// 作业体写一行开始、忙等 `busy_ms`、再写一行结束。
+///
+/// 用**忙等**而不是 `ctx.sleep`：`sleep` 会被剩余预算夹短后正常返回（那是它的既有语义，
+/// 见 `crates/hbot-code/src/runtime/host_api.rs` 里 `budget = deadline.remaining()` 那段），
+/// 于是「预算到底有没有生效」在 sleep 上看不出来。忙等不夹预算，超预算时由 deadline 直接
+/// 打断 handler，作业才会真的失败。这与 `crates/hbot-code/tests/s2_ai.rs` 里量模型预算
+/// 必须用忙等是同一条理由。
+fn busy_job_handler(busy_ms: u64) -> String {
+    format!(
+        r#"
+import {{ defineBot, reply, log }} from 'hbot';
+
+export default defineBot({{
+  async onMessage(ctx) {{
+    try {{
+      await ctx.jobs.enqueue('slow-war', {{}}, {{ conversation: 'local:default' }});
+      reply('queued');
+    }} catch (error) {{
+      reply('jobs-error:' + error.message);
+    }}
+  }},
+  async onJob(ctx, name) {{
+    log('job:' + name + ':start');
+    const started = Date.now();
+    while (Date.now() - started < {busy_ms}) {{ /* 忙等，不夹预算 */ }}
+    log('job:' + name + ':end');
+  }},
+}});
+"#
+    )
+}
+
+#[tokio::test]
+async fn the_host_job_budget_ceiling_cuts_a_longer_declared_job() {
+    // 清单给的预算是 60 秒、宿主上限只有 1 秒，作业体要忙等 3 秒。
+    // 上限接上了才会在第 1 秒被打断：行落 failed、结束行永远不出现。
+    // 上限没接上（或取了清单的 60 秒）时，这条作业会跑满 3 秒并落 done —— 两种都是红的。
+    let harness = Harness::with_bots(
+        "ceiling",
+        &busy_job_handler(3_000),
+        &manifest(Some(&spec("slow-war", 60_000, 0))),
+        &bots_json_with_job_budget(1_000),
+    )
+    .await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    let before = harness.replies().len();
+    assert_ok(&harness.inject("slow").await, "bot_inject");
+    wait_for("入队回复", || harness.replies().len() > before).await;
+
+    wait_for("作业落 failed 终态", || {
+        harness
+            .jobs()
+            .first()
+            .is_some_and(|row| row.state == "failed")
+    })
+    .await;
+
+    let row = &harness.jobs()[0];
+    assert_eq!(row.attempts, 1, "第一次执行就被掐断，attempts 必须是 1");
+    assert!(
+        row.last_error
+            .as_deref()
+            .is_some_and(|text| !text.is_empty()),
+        "被掐断的作业必须带错误正文，实际：{:?}",
+        row.last_error
+    );
+    assert!(
+        harness
+            .job_lines()
+            .iter()
+            .any(|line| line.ends_with(":start")),
+        "作业体应当已经开始执行，实际日志：{:?}",
+        harness.job_lines()
+    );
+    assert!(
+        !harness
+            .job_lines()
+            .iter()
+            .any(|line| line.ends_with(":end")),
+        "宿主上限 1000 毫秒，忙等 3000 毫秒后才写的结束行不该出现，实际日志：{:?}",
+        harness.job_lines()
+    );
+    // 结算顺序是「先把行改成 failed、再写 error 行」，所以这里必须等那一行真的落库，
+    // 不能紧接上一个 wait_for 就断言（并行跑测试时这条会偶发空列表）。
+    wait_for("点名作业的 error 行落库", || {
+        harness
+            .errors()
+            .iter()
+            .any(|line| line.contains("slow-war"))
+    })
+    .await;
+    assert_ok(&harness.stop().await, "bot_stop");
+}
+
+#[tokio::test]
+async fn a_job_within_the_default_host_budget_runs_to_completion() {
+    // 对照组：不写 `limits.jobBudgetMs` 时宿主上限是核心上限（600000 毫秒），
+    // 清单 60 秒、作业忙等 1.5 秒 —— 必须跑完并落 done。
+    // 少了这一条，把默认值误写成几百毫秒会让所有长作业被静默掐断，而上面那条反而是绿的。
+    let harness = Harness::with_bots(
+        "default-budget",
+        &busy_job_handler(1_500),
+        &manifest(Some(&spec("slow-war", 60_000, 0))),
+        &bots_json(),
+    )
+    .await;
+    assert_ok(&harness.start().await, "bot_start");
+
+    let before = harness.replies().len();
+    assert_ok(&harness.inject("slow").await, "bot_inject");
+    wait_for("入队回复", || harness.replies().len() > before).await;
+
+    wait_for("作业落 done 终态", || {
+        harness
+            .jobs()
+            .first()
+            .is_some_and(|row| row.state == "done")
+    })
+    .await;
+    assert!(
+        harness
+            .job_lines()
+            .iter()
+            .any(|line| line.ends_with(":end")),
+        "1.5 秒的作业在默认上限下必须跑完，实际日志：{:?}",
+        harness.job_lines()
+    );
+    assert!(
+        harness.errors().is_empty(),
+        "正常跑完的作业不该留 error 日志，实际：{:?}",
+        harness.errors()
     );
     assert_ok(&harness.stop().await, "bot_stop");
 }
