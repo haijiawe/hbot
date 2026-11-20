@@ -103,13 +103,36 @@ struct TempDir {
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "hbot-hotreload-{label}-{}-{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).expect("创建临时目录");
-        Self { path }
+        // 目录名必须**每次调用都不同**，只靠 `pid + seq` 不够：
+        //
+        // Windows 上 `Drop` 里的 `remove_dir_all` 常被还没释放的文件句柄挡住（SQLite
+        // 连接、isolate 的 worker 线程），`let _ =` 把失败吞掉之后目录就留在 %TEMP%。
+        // 等进程号被复用（Windows 上很常见），新的 `latency-{pid}-2` 会正好撞上那个残留
+        // 目录，`scaffold` 见到已存在的 `hbot.json` 直接拒绝覆盖 —— 表现为一条与业务
+        // 毫无关系的随机失败（2026-11-20 的 `cargo test --workspace` 里就是这样红的）。
+        // 所以名字里再加一次纳秒时间戳，并在建好之后确认目录真的是空的。
+        for _ in 0..8 {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let path = std::env::temp_dir().join(format!(
+                "hbot-hotreload-{label}-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            // 极低概率撞上同一纳秒：撞了就删掉重来，不要带着别人的文件往下跑。
+            if path.exists() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            std::fs::create_dir_all(&path).expect("创建临时目录");
+            let empty = std::fs::read_dir(&path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if empty {
+                return Self { path };
+            }
+        }
+        panic!("连续 8 次都没拿到空的临时目录：{label}");
     }
 
     fn path(&self) -> &Path {

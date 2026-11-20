@@ -460,3 +460,12 @@
     `size_of::<GatewayError>() < 128` —— clippy 的判据是「至少 128 字节」就红，所以守卫必须用严格小于），
     这样本地就能提前红，不用等 push；
     ③ 判读 CI 红点时先看它停在**哪一步**：`fmt`/`clippy`/`test` 分步跑，停在 `clippy` 且本地绿 = 版本差，不是代码坏了。
+
+116. **夹具里写死的像素尺寸会在别人的字体度量下失效 —— 尺寸要量出来，不要猜**（2026-11-20）。
+    `crates/hbot-device/tests/windows_desktop.rs` 的按窗口 OCR 夹具把客户区写死 `1100 × 320`、字号 96px 粗体 Segoe UI。
+    CI 的 `windows-latest` 字体度量比本机略宽，于是 `TextOutW(hdc, 40, 100, …)` 画 `"HBOT WIN OCR 7788"` 时末尾 `88` 落到客户区外被裁掉：
+    OCR 只认出 `"HBOT WIN OCR 77"`，本机跑同一条测试全绿。判据：**凡是「画进去再读出来」的夹具，窗口/画布尺寸必须由实测值决定**
+    （`GetTextExtentPoint32W` 之类；夹具里 `window_font()` 让画字与量字共用同一份 `HFONT`，`text_extent()` 给出宽高，
+    `TestWindow::create` 按 `TEXT_LEFT + cx + TEXT_MARGIN` 开窗）。`TEXT_MARGIN` 不能为 0 —— OCR 对贴边字形不可靠。
+    同族：这条测试还会偶发拿到空串（窗口刚 `ShowWindow`、DWM 未合成第一帧时 `PrintWindow` 返回成功但位图全零，见 `TestWindow::settle`），
+    所以它带 5 次重试；**重试不放松断言**，仍要求认出完整的 `WINDOW_TEXT`。

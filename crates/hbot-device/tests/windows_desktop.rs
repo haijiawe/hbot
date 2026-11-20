@@ -395,36 +395,36 @@ unsafe extern "system" fn ocr_window_proc(
     }
 }
 
-/// 往 `hdc` 上画：[`WINDOW_TEXT`]（黑字、白底、96px 粗体）。
+/// 夹具字体的像素高度（负值 = 字符高度，见 `CreateFontW` 的 `cHeight`）。
+const FONT_HEIGHT: i32 = -96;
+
+/// 文本左上角在客户区里的位置。
+const TEXT_LEFT: i32 = 40;
+const TEXT_TOP: i32 = 100;
+
+/// 文本之外至少留这么多像素。
 ///
-/// SAFETY: 调用方保证 `hwnd`/`hdc` 有效。
-unsafe fn paint_window_text(
-    hwnd: windows_sys::Win32::Foundation::HWND,
-    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
-) {
-    use windows_sys::Win32::Foundation::RECT;
+/// 不为零是因为 OCR 对贴边的字符不可靠（引擎要看到完整的字形边界）；
+/// 留一段白边比"刚好放下"稳得多。
+const TEXT_MARGIN: i32 = 120;
+
+/// 建夹具字体：96px 粗体 Segoe UI。
+///
+/// **画字与量字必须用同一份字体**：窗口开多大是由 [`text_extent`] 量出来的宽度决定的，
+/// 两处字体不一致就会退回"宽度靠猜"。
+///
+/// SAFETY: 返回的 `HFONT` 由调用方 `DeleteObject` 释放。
+unsafe fn window_font() -> windows_sys::Win32::Graphics::Gdi::HFONT {
     use windows_sys::Win32::Graphics::Gdi::{
-        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
-        DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_BOLD, FillRect, OUT_TT_PRECIS, SelectObject,
-        SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
+        FF_DONTCARE, FW_BOLD, OUT_TT_PRECIS,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-    // SAFETY: `RECT` 是 POD；`GetClientRect` 只在成功时写入。
-    let mut rect: RECT = unsafe { std::mem::zeroed() };
-    // SAFETY: `hwnd` 有效；`&mut rect` 指向栈上有效内存。
-    unsafe { GetClientRect(hwnd, &mut rect) };
-    let units: Vec<u16> = WINDOW_TEXT.encode_utf16().collect();
     let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
-    // SAFETY: `hdc` 有效；画笔画完即删；字体名以 NUL 结尾；`units` 调用期间存活。
-    unsafe {
-        let brush = CreateSolidBrush(0x00FF_FFFF); // COLORREF：白
-        assert!(!brush.is_null(), "CreateSolidBrush 失败");
-        let _ = FillRect(hdc, &rect, brush);
-        DeleteObject(brush);
-
-        let font = CreateFontW(
-            -96,
+    // SAFETY: 字体名以 NUL 结尾、调用期间存活；其余参数都是按 Win32 契约填的常量。
+    let font = unsafe {
+        CreateFontW(
+            FONT_HEIGHT,
             0,
             0,
             0,
@@ -438,12 +438,81 @@ unsafe fn paint_window_text(
             ANTIALIASED_QUALITY as u32,
             (DEFAULT_PITCH | FF_DONTCARE) as u32,
             face.as_ptr(),
-        );
-        assert!(!font.is_null(), "CreateFontW 失败");
+        )
+    };
+    assert!(!font.is_null(), "CreateFontW 失败");
+    font
+}
+
+/// 量出 [`WINDOW_TEXT`] 在夹具字体下的像素尺寸。
+///
+/// **为什么要量而不是写死窗口宽度**：96px 粗体的文本宽度随字体与 DPI 变化。
+/// 2026-11-20 的 CI（`windows-latest`）就是这样红的 —— 画进去的是
+/// `"HBOT WIN OCR 7788"`，OCR 只认到 `"HBOT WIN OCR 77"`，最后两个字符落在
+/// 写死的 1100×320 客户区之外被裁掉了；而同一份代码在本机（字体度量略窄）全绿。
+/// 这类"本机绿、CI 红"的夹具问题比业务 bug 更难查，所以窗口尺寸改成按实测宽度开。
+fn text_extent() -> (i32, i32) {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject,
+    };
+
+    let units: Vec<u16> = WINDOW_TEXT.encode_utf16().collect();
+    // SAFETY: `GetDC(NULL)` 取屏幕 DC，返回空表示没有可用显示（无交互桌面）。
+    let dc = unsafe { GetDC(std::ptr::null_mut()) };
+    if dc.is_null() {
+        // 没有桌面时这些用例本来就会在 `interactive_desktop()` 里跳过；这里给一个保守值，
+        // 让窗口还能建出来，不要因为"量不了"就 panic。
+        return (900, 120);
+    }
+    // SAFETY: `dc` 非空；字体在 SelectObject 之后才用，用完换回并删除。
+    let (width, height) = unsafe {
+        let font = window_font();
+        let previous = SelectObject(dc, font);
+        // SAFETY: `SIZE` 是 POD；`GetTextExtentPoint32W` 只在成功时写入。
+        let mut size: SIZE = std::mem::zeroed();
+        let ok = GetTextExtentPoint32W(dc, units.as_ptr(), units.len() as i32, &mut size);
+        SelectObject(dc, previous);
+        DeleteObject(font);
+        assert_ne!(ok, 0, "GetTextExtentPoint32W 失败（量不出夹具文本的宽度）");
+        (size.cx, size.cy)
+    };
+    // SAFETY: 与上面的 GetDC 成对；`GetDC(NULL)` 只能用 `ReleaseDC(NULL, …)` 释放。
+    unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
+    (width, height)
+}
+
+/// 往 `hdc` 上画：[`WINDOW_TEXT`]（黑字、白底、96px 粗体）。
+///
+/// SAFETY: 调用方保证 `hwnd`/`hdc` 有效。
+unsafe fn paint_window_text(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateSolidBrush, DeleteObject, FillRect, SelectObject, SetBkMode, SetTextColor,
+        TRANSPARENT, TextOutW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+    // SAFETY: `RECT` 是 POD；`GetClientRect` 只在成功时写入。
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    // SAFETY: `hwnd` 有效；`&mut rect` 指向栈上有效内存。
+    unsafe { GetClientRect(hwnd, &mut rect) };
+    let units: Vec<u16> = WINDOW_TEXT.encode_utf16().collect();
+    // SAFETY: `hdc` 有效；画笔画完即删；字体由 `window_font` 建、用完即删；`units` 调用期间存活。
+    unsafe {
+        let brush = CreateSolidBrush(0x00FF_FFFF); // COLORREF：白
+        assert!(!brush.is_null(), "CreateSolidBrush 失败");
+        let _ = FillRect(hdc, &rect, brush);
+        DeleteObject(brush);
+
+        let font = window_font();
         let previous = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT as i32);
         SetTextColor(hdc, 0x0000_0000); // COLORREF：黑
-        TextOutW(hdc, 40, 100, units.as_ptr(), units.len() as i32);
+        TextOutW(hdc, TEXT_LEFT, TEXT_TOP, units.as_ptr(), units.len() as i32);
         SelectObject(hdc, previous);
         DeleteObject(font);
     }
@@ -475,6 +544,14 @@ impl TestWindow {
             .collect();
         let title_units: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
+        // **客户区按实测文本宽度开，不写死**：96px 粗体的文本宽度随字体与 DPI 变化。
+        // 2026-11-20 的 CI（`windows-latest`）就是这样红的 —— 画进去的是
+        // `"HBOT WIN OCR 7788"`，OCR 只认到 `"HBOT WIN OCR 77"`：最后两个字符落在
+        // 写死的 1100×320 之外被裁掉了，而本机（字体度量略窄）全绿。
+        let (text_width, text_height) = text_extent();
+        let window_width = TEXT_LEFT + text_width + TEXT_MARGIN;
+        let window_height = TEXT_TOP + text_height + TEXT_MARGIN;
+
         // SAFETY: 所有指针都指向调用期间存活的、以 NUL 结尾的 UTF-16 缓冲区。
         unsafe {
             let instance =
@@ -502,8 +579,8 @@ impl TestWindow {
                 WS_POPUP, // 无标题栏：PrintWindow 抓到的就是纯客户区
                 100,
                 100,
-                1100,
-                320,
+                window_width,
+                window_height,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 instance,
@@ -586,33 +663,46 @@ fn window_ocr_reads_text_from_a_real_window() {
     }
     let window = TestWindow::create("HBOT 按窗口 OCR 夹具");
     let own = own_process_name();
-    let result = WindowsBackend::new().ocr(&OcrRequest {
-        target: DeviceTarget::Window {
-            process: own.clone(),
-        },
-        max_chars: 200,
-    });
-    match result {
-        Ok(recognized) => {
-            eprintln!(
-                "[window-ocr] 进程 {own} 的窗口：画进去的是 {WINDOW_TEXT:?}，识别结果是 {:?}（truncated={}）",
-                recognized.text, recognized.truncated
-            );
-            let normalized = squashed(&recognized.text);
-            assert!(
-                normalized.contains(&squashed(WINDOW_TEXT)),
-                "窗口里画的字没认全：画的是 {WINDOW_TEXT:?}，认出来是 {:?}",
-                recognized.text
-            );
+    let expected = squashed(WINDOW_TEXT);
+
+    // **最多试几次**：这条测的是"按窗口 OCR 能读到自建窗口里的字"，不是"DWM 第一帧就合成好了"。
+    // 实测（2026-11-20）这条会偶发拿到空串 —— 窗口刚 `ShowWindow`、DWM 还没合成第一帧时
+    // `PrintWindow` 返回成功但位图全零（见 `TestWindow::settle` 的注释），重试一次就好。
+    // 断言本身没有放松：仍然必须认出**完整**的 `WINDOW_TEXT`，只是不再要求"第一次就必须成功"。
+    let mut last: Option<String> = None;
+    for attempt in 0..5 {
+        let result = WindowsBackend::new().ocr(&OcrRequest {
+            target: DeviceTarget::Window {
+                process: own.clone(),
+            },
+            max_chars: 200,
+        });
+        match result {
+            Ok(recognized) => {
+                eprintln!(
+                    "[window-ocr] 第 {} 次：进程 {own} 的窗口，画进去的是 {WINDOW_TEXT:?}，识别结果是 {:?}（truncated={}）",
+                    attempt + 1,
+                    recognized.text,
+                    recognized.truncated
+                );
+                if squashed(&recognized.text).contains(&expected) {
+                    drop(window);
+                    return;
+                }
+                last = Some(recognized.text);
+            }
+            Err(DeviceError::HostLimit { detail }) => {
+                // 没装 OCR 语言包 / 受限会话：引擎建不出来。这是宿主限制，不是按窗口抓图失败 ——
+                // 打印原因后跳过（"引擎不可用"与"抓不到窗口"必须能区分开，见 `recognize_text` 注释）。
+                eprintln!("[window-ocr] 本机 OCR 引擎不可用，跳过真识别：{detail}");
+                drop(window);
+                return;
+            }
+            Err(error) => panic!("自建可见窗口必须能被按窗口 OCR 读到，实际：{error:?}"),
         }
-        Err(DeviceError::HostLimit { detail }) => {
-            // 没装 OCR 语言包 / 受限会话：引擎建不出来。这是宿主限制，不是按窗口抓图失败 ——
-            // 打印原因后跳过（"引擎不可用"与"抓不到窗口"必须能区分开，见 `recognize_text` 注释）。
-            eprintln!("[window-ocr] 本机 OCR 引擎不可用，跳过真识别：{detail}");
-        }
-        Err(error) => panic!("自建可见窗口必须能被按窗口 OCR 读到，实际：{error:?}"),
+        window.settle(); // 再抽一会儿消息，让 DWM 把这一帧合成出来
     }
-    drop(window);
+    panic!("窗口里画的字没认全：画的是 {WINDOW_TEXT:?}，认出来是 {last:?}");
 }
 
 /// **最小化窗口不是可读窗口**：必须是明确错误，绝不返回空串冒充"窗口里没字"。

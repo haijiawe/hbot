@@ -404,6 +404,9 @@ fn render_output(output: CommandOutput, sandbox: SandboxMode, timeout: Duration)
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    // 只在 Windows 那条 `timeout_kills_the_whole_process_tree` 里用：`Instant` 放在模块级
+    // 会让 Linux 的 `-D unused-imports` 红（clippy 在 CI 的 ubuntu 上就是这么抓到的）。
+    #[cfg(windows)]
     use std::time::Instant;
 
     use hbot_command::{CapabilityReport, IsolationLevel, IsolationProbe, PlatformRunner};
