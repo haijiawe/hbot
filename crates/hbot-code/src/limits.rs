@@ -35,6 +35,15 @@ pub struct Limits {
     pub stack_bytes: usize,
     /// Wall-clock budget for one handler invocation.
     pub handler_timeout: Duration,
+    /// 后台作业（`onJob`）单次预算的**宿主上限**，毫秒；`0` = 不限。
+    ///
+    /// 与 `handler_timeout` 分开：handler 是「一条消息最多跑多久」（秒级、由宿主硬掐），
+    /// 作业是「一个后台任务最多跑多久」（分钟级、由声明给出），把两者塞进同一个字段会让
+    /// 「作业跑得久」和「handler 卡住」变成同一件事，排障时分不清。
+    ///
+    /// 缺省是核心契约的上限（10 分钟），即「宿主不额外收紧」——**默认行为与没有这个字段
+    /// 时完全一致**。手机端这台宿主会把它设成几十秒（`docs/08-multi-host.md`）。
+    pub job_budget_ms: u64,
 }
 
 impl Default for Limits {
@@ -43,6 +52,7 @@ impl Default for Limits {
             memory_bytes: DEFAULT_MEMORY_BYTES,
             stack_bytes: DEFAULT_STACK_BYTES,
             handler_timeout: DEFAULT_HANDLER_TIMEOUT,
+            job_budget_ms: hbot_core::MAX_JOB_BUDGET_MS,
         }
     }
 }
@@ -74,6 +84,24 @@ impl Limits {
     /// The handler budget in whole milliseconds (`u64` for error reporting).
     pub fn handler_timeout_ms(&self) -> u64 {
         u64::try_from(self.handler_timeout.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Override the host ceiling for one background job (milliseconds; `0` = no ceiling).
+    pub fn with_job_budget_ms(mut self, millis: u64) -> Self {
+        self.job_budget_ms = millis;
+        self
+    }
+
+    /// The host ceiling for one background job, in whole milliseconds.
+    ///
+    /// 夹回核心契约的区间：写 0 是「不限」，写 1 是「1 毫秒」这种没有意义的配置，
+    /// 一律按 `MIN_JOB_BUDGET_MS` 处理，避免装配方各自解释。
+    pub fn job_budget_ms(&self) -> u64 {
+        if self.job_budget_ms == 0 {
+            return hbot_core::MAX_JOB_BUDGET_MS;
+        }
+        self.job_budget_ms
+            .clamp(hbot_core::MIN_JOB_BUDGET_MS, hbot_core::MAX_JOB_BUDGET_MS)
     }
 }
 
