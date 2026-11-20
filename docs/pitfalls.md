@@ -529,3 +529,19 @@
     `seen().len() == 1`，下一行断言 `list_unprocessed_inbound(10).is_empty()` 就偶发为假（本机 15 次全绿、
     CI 上红）。判据：**等待条件要覆盖后面所有断言的因果前置**，把「库里已空」并进 `wait_until`，
     而不是在等待之后断言一个还没发生的副作用；不放松语义（最终仍必须为空）。
+
+122. **Windows 文件系统语义的用例，在 POSIX 上必须按平台门控**（2026-11-20，CI 的 ubuntu 红）。
+    `crates/hbot-redteam/tests/a_path_escape.rs` 有四条用例无条件要求「必须拒绝」：`a04` 的
+    `....\\secret.txt` / `..\..\secret.txt`、`a06` 的 `C:\Windows\win.ini` 文案含 `absolute`、
+    `a10` 的 `a.` / `a `（尾随点/空格）、`a11` 的 `CON` / `NUL` / `COM1`（保留设备名）。
+    实现是对的 —— `crates/hbot-workspace/src/project.rs` 的 `reject_windows_unsafe_name` **第一句就是**
+    `if !cfg!(windows) { return Ok(()); }`（尾随点/空格、`<>:"|?*` 与控制字符、`WINDOWS_RESERVED_NAMES`
+    全在这道门后面），因为那些名字**只在 Windows 上是逃逸面**：POSIX 上 `a.` 与 `a` 是两个文件、
+    `CON` 只是三个字母、反斜杠不是分隔符。在 Linux 上拒绝它们反而是错的（合法的普通文件名）。
+    另有一条更细的：`a06` 的 `C:\Windows\win.ini` 在 Linux 上命中的是 `has_drive_prefix`
+    （`project.rs:523-526`，`bytes[1]==b':'`），文案是 `Windows drive paths are not allowed`，
+    不是 `absolute paths are not allowed` —— 断言里必须两个词都接受。
+    判据：① 表驱动用例里逐条问「这条输入在另一个平台上是不是同一个东西」，不是就分流；
+    ② 分流后的弱断言**不是放水**：改成「拒绝 **或** 落点仍在根内」（`reject_or_contained_for_windows_names`），
+    逃逸仍然必红，只是不再要求「合法名字也必须拒」；③ Windows 分支保持原样（必须拒绝 + 文案关键字），
+    别为了两边都能过就把断言删成 `let _ =`。

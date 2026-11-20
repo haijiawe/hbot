@@ -56,6 +56,36 @@ fn assert_contained_or_rejected(tree: &TempTree, ws: &Workspace, raw: &str) {
         ),
     }
 }
+
+/// Windows 文件系统语义专用的名字（反斜杠分隔、尾随点/空格、`CON` 这类设备名）。
+///
+/// **Windows 上必须拒绝**（那是真实的逃逸面：`a.` 与 `a` 会落到同一个文件、`CON` 指向设备）。
+/// 其它平台上这些字符/名字都是**合法的普通文件名**（`\` 不是分隔符、`CON` 只是三个字母），
+/// 拒绝它们反而是错的，所以那里只要求「拒绝或落点仍在根内」——逃逸才是缺陷。
+/// 返回 `Some(拒绝理由)` 表示当前平台要求拒绝（Windows），`None` 表示已按上面第二条判定过。
+fn reject_or_contained_for_windows_names(
+    tree: &TempTree,
+    ws: &Workspace,
+    raw: &str,
+    existing: bool,
+) -> Option<String> {
+    let result = if existing {
+        ws.resolve_existing(Path::new(raw))
+    } else {
+        ws.resolve_new(Path::new(raw))
+    };
+    if cfg!(windows) {
+        return Some(reject(raw, result));
+    }
+    if let Ok(resolved) = result {
+        assert!(
+            is_within_tree(&resolved, tree),
+            "【{raw}】解析到了根外：{}",
+            resolved.display()
+        );
+    }
+    None
+}
 // ── 1. `..` 各种拼法 ───────────────────────────────────────────────────────────
 
 /// 防的是：`..` 被当成普通文件名（或只查了首段）从而把子目录层级退回根外。
@@ -125,6 +155,9 @@ fn a03_百分号编码的点号不得逃出根() {
 }
 
 /// 防的是：`....//`、`....\` 这类「四个点 + 分隔符」被某些解码器折叠成 `../`。
+///
+/// 只有 `//` 与 `%2e` 两条是**跨平台**的；带反斜杠的两条是 Windows 语义（那里 `\` 是分隔符），
+/// 在 POSIX 上它们是合法的单段文件名，所以按平台判定（见 `reject_or_contained_for_windows_names`）。
 #[test]
 fn a04_四点与混合分隔符的变体必须被拒() {
     let tree = TempTree::new("a04");
@@ -132,12 +165,13 @@ fn a04_四点与混合分隔符的变体必须被拒() {
 
     for raw in [
         "....//....//secret.txt",
-        "....\\\\secret.txt",
         "....//secret.txt",
-        "..\\..\\secret.txt",
         "..%2e/secret.txt",
     ] {
         reject(raw, ws.resolve_new(Path::new(raw)));
+    }
+    for raw in ["....\\\\secret.txt", "..\\..\\secret.txt"] {
+        reject_or_contained_for_windows_names(&tree, &ws, raw, false);
     }
     assert_nothing_landed_outside(&tree, "secret.txt");
 }
@@ -163,18 +197,30 @@ fn a06_绝对路径必须被拒() {
     let tree = TempTree::new("a06");
     let ws = open_ws(&tree);
 
-    for raw in [
-        "/etc/passwd",
-        "/",
-        "C:\\Windows\\win.ini",
-        "c:/windows/win.ini",
-        "\\Windows\\win.ini",
-    ] {
+    // POSIX 绝对路径：任何平台都必须因「绝对」被拒。
+    for raw in ["/etc/passwd", "/"] {
         let message = reject(raw, ws.resolve_existing(Path::new(raw)));
         assert!(
             message.contains("absolute") || message.contains("绝对"),
             "【{raw}】应当因「绝对路径」被拒，实际：{message}"
         );
+    }
+    // Windows 形态：`C:…` 在任何平台都因盘符前缀被拒；`\Windows\…` 在 POSIX 上只是
+    // 一个合法的单段文件名（反斜杠不是分隔符），所以那里只要求落点仍在根内。
+    for raw in [
+        "C:\\Windows\\win.ini",
+        "c:/windows/win.ini",
+        "\\Windows\\win.ini",
+    ] {
+        if let Some(message) = reject_or_contained_for_windows_names(&tree, &ws, raw, true) {
+            assert!(
+                message.contains("absolute")
+                    || message.contains("绝对")
+                    || message.contains("drive")
+                    || message.contains("盘"),
+                "【{raw}】应当因「绝对路径 / 盘符路径」被拒，实际：{message}"
+            );
+        }
     }
 }
 
@@ -233,7 +279,11 @@ fn a09_ntfs备用数据流必须被拒() {
 }
 
 /// 防的是：Windows 会把尾随点/空格**静默剥掉**，于是 `a.` 与 `a` 落到同一个文件，
+/// 防的是：Windows 会把尾随点/空格**静默剥掉**，于是 `a.` 与 `a` 落到同一个文件，
 /// 白名单按字面判就漏了（`CON.` 之类同样生效）。
+///
+/// 这是 **Windows 文件系统语义**：POSIX 上 `a.` 是合法的普通文件名，拒绝它反而是错的，
+/// 所以那里只要求「拒绝或落点仍在根内」。
 #[test]
 fn a10_尾随点或空格必须被拒() {
     let tree = TempTree::new("a10");
@@ -241,19 +291,23 @@ fn a10_尾随点或空格必须被拒() {
     let ws = open_ws(&tree);
 
     for raw in ["a.", "a ", "a.txt.", "a.txt ", "sub./x", "sub /x", "sub/a."] {
-        let message = reject(raw, ws.resolve_new(Path::new(raw)));
-        assert!(
-            message.contains("dot")
-                || message.contains("space")
-                || message.contains("点")
-                || message.contains("空格"),
-            "【{raw}】应当因「尾随点/空格」被拒，实际：{message}"
-        );
+        if let Some(message) = reject_or_contained_for_windows_names(&tree, &ws, raw, false) {
+            assert!(
+                message.contains("dot")
+                    || message.contains("space")
+                    || message.contains("点")
+                    || message.contains("空格"),
+                "【{raw}】应当因「尾随点/空格」被拒，实际：{message}"
+            );
+        }
     }
 }
 
 /// 防的是：Windows 保留设备名（`CON`/`NUL`/`COM1`…）在**任意目录**都指向设备本身，
+/// 防的是：Windows 保留设备名（`CON`/`NUL`/`COM1`…）在**任意目录**都指向设备本身，
 /// 写进去等于直接向控制台/空设备/串口写入；带扩展名的 `CON.txt` 同样被当作设备。
+///
+/// 同上：这是 **Windows 文件系统语义**，POSIX 上 `CON` 只是三个字母，按平台判定。
 #[test]
 fn a11_windows保留设备名必须被拒() {
     let tree = TempTree::new("a11");
@@ -275,11 +329,14 @@ fn a11_windows保留设备名必须被拒() {
         "PRN",
         "AUX.txt",
     ] {
-        let message = reject(raw, ws.resolve_new(Path::new(raw)));
-        assert!(
-            message.contains("reserved") || message.contains("device") || message.contains("设备"),
-            "【{raw}】应当因「保留设备名」被拒，实际：{message}"
-        );
+        if let Some(message) = reject_or_contained_for_windows_names(&tree, &ws, raw, false) {
+            assert!(
+                message.contains("reserved")
+                    || message.contains("device")
+                    || message.contains("设备"),
+                "【{raw}】应当因「保留设备名」被拒，实际：{message}"
+            );
+        }
     }
 }
 
