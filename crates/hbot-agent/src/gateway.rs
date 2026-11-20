@@ -171,10 +171,15 @@ impl AuditSink for NullAudit {
 }
 
 /// 网关错误：保留"走到哪一步"的证据。
+///
+/// `error` **装箱**：`Result<GatewayOutcome, GatewayError>` 的 `Err` 侧要压在
+/// 128 字节以内，否则新版本 clippy 的 `result_large_err` 会红（同
+/// `hbot_code::EventFailure` 的取舍，见 `crates/hbot-code/src/dispatch.rs`）。
+/// 字段语义与访问方式都不变：`error.error.code()` 靠 `Box` 的 `Deref` 照旧可用。
 #[derive(Debug)]
 pub struct GatewayError {
     /// 具体错误。
-    pub error: HbotError,
+    pub error: Box<HbotError>,
     /// 已到达的步骤（最后一个是失败点；`Audit` 总会追加）。
     pub steps: Vec<GatewayStep>,
     /// 工具名。
@@ -184,7 +189,7 @@ pub struct GatewayError {
     /// 风险类别（工具存在时）。
     pub risk: Option<Risk>,
     /// 审批键（若走到审批）。
-    pub key: Option<ApprovalKey>,
+    pub key: Option<Box<ApprovalKey>>,
 }
 
 impl GatewayError {
@@ -221,7 +226,7 @@ impl std::error::Error for GatewayError {}
 
 impl From<GatewayError> for HbotError {
     fn from(error: GatewayError) -> Self {
-        error.error
+        *error.error
     }
 }
 
@@ -402,12 +407,12 @@ impl ToolGateway {
             }
             Err(error) => {
                 let failed = GatewayError {
-                    error,
+                    error: Box::new(error),
                     steps: trace.steps,
                     tool_name: call.name,
                     approval: trace.approval,
                     risk: trace.risk,
-                    key: trace.key,
+                    key: trace.key.map(Box::new),
                 };
                 tracing::warn!(error = %failed.describe(), "工具调用被拒绝或失败");
                 Err(failed)
@@ -601,6 +606,19 @@ mod tests {
     };
     use crate::tools::{CreateDirTool, ListDirTool, ReadFileTool, Risk, WriteFileTool};
 
+    /// 防的是：`GatewayError` 悄悄又长大，让**新版本** clippy 的 `result_large_err`
+    /// 在 CI 红、而本地（clippy 版本更旧）全绿 —— 这类红只会在 push 之后出现。
+    /// 阈值与 clippy 的默认 `large_error_threshold` 一致（128 字节）。
+    #[test]
+    fn gateway_error_stays_within_the_large_err_budget() {
+        let size = std::mem::size_of::<GatewayError>();
+        assert!(
+            size < 128,
+            "GatewayError 已长到 {size} 字节，超过 clippy result_large_err 的 128 字节预算；\
+             请把大字段装箱（照 `error: Box<HbotError>` 的先例）"
+        );
+    }
+
     fn call(name: &str, arguments: Value) -> ToolCallRequest {
         ToolCallRequest {
             id: format!("call_{name}"),
@@ -693,7 +711,7 @@ mod tests {
             .await
             .expect_err("只读档必须拒绝写入");
 
-        assert!(matches!(error.error, HbotError::Denied { .. }));
+        assert!(matches!(*error.error, HbotError::Denied { .. }));
         // 走到沙箱档就停：没有 realpath、没有审批、没有执行。
         assert_eq!(
             error.steps,
@@ -800,7 +818,7 @@ mod tests {
             )
             .await
             .expect_err("策略拒绝");
-        assert!(matches!(error.error, HbotError::Denied { .. }));
+        assert!(matches!(*error.error, HbotError::Denied { .. }));
         assert_eq!(error.failed_at(), Some(GatewayStep::Approval));
         assert_eq!(approver.count(), 0, "规则已拒绝，不该再问用户");
         assert_eq!(fixture.dir.read("a.txt"), "old");
@@ -896,7 +914,7 @@ mod tests {
             )
             .await
             .expect_err("未知工具");
-        assert!(matches!(error.error, HbotError::NotFound { .. }));
+        assert!(matches!(*error.error, HbotError::NotFound { .. }));
         assert_eq!(
             error.steps,
             vec![
@@ -923,7 +941,7 @@ mod tests {
             )
             .await
             .expect_err("参数类型错误");
-        assert!(matches!(error.error, HbotError::Invalid { .. }));
+        assert!(matches!(*error.error, HbotError::Invalid { .. }));
         assert_eq!(
             error.steps,
             vec![GatewayStep::ValidateArgs, GatewayStep::Audit]
@@ -972,7 +990,7 @@ mod tests {
             )
             .await
             .expect_err("工具内部错误");
-        assert!(matches!(error.error, HbotError::Internal { .. }));
+        assert!(matches!(*error.error, HbotError::Internal { .. }));
         assert_eq!(error.failed_at(), Some(GatewayStep::Execute));
         let events = fixture.audit.events();
         assert!(matches!(events[0].outcome, AuditOutcome::Failed { .. }));
@@ -1179,7 +1197,7 @@ mod tests {
             .await
             .expect_err("只读档必须拒");
 
-        assert!(matches!(error.error, HbotError::Denied { .. }));
+        assert!(matches!(*error.error, HbotError::Denied { .. }));
         assert_eq!(error.error.code(), -32005);
         assert_eq!(error.failed_at(), Some(GatewayStep::SandboxMode));
         assert_eq!(approver.count(), 0, "沙箱档拒绝不得弹审批");
@@ -1292,7 +1310,7 @@ mod tests {
             "create_dir 的放行不得命中 write_file（审批键含工具名）"
         );
         assert!(
-            matches!(error.error, HbotError::Invalid { .. }),
+            matches!(*error.error, HbotError::Invalid { .. }),
             "got {:?}",
             error.error
         );
@@ -1382,7 +1400,7 @@ mod tests {
             "必须在能力步就停，实际：{:?}",
             error.steps
         );
-        assert!(matches!(error.error, HbotError::Denied { .. }));
+        assert!(matches!(*error.error, HbotError::Denied { .. }));
         assert!(error.error.to_string().contains("ocr"));
         assert_eq!(gate.calls(), vec![hbot_core::DeviceCapability::Ocr]);
         assert!(tool.calls().is_empty(), "拒绝后工具不得执行");

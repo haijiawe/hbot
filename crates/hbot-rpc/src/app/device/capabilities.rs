@@ -366,7 +366,10 @@ mod tests {
             error.steps
         );
         let message = error.error.to_string();
-        assert!(matches!(error.error, HbotError::Denied { .. }), "{message}");
+        assert!(
+            matches!(*error.error, HbotError::Denied { .. }),
+            "{message}"
+        );
         assert!(message.contains("项目没有声明能力 `ocr`"), "{message}");
 
         // 补上声明：同一个网关（闸与后端都没重建）下一次调用立刻改判。
