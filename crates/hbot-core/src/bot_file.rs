@@ -28,6 +28,27 @@ pub const MAX_FILE_LIST_ENTRIES: usize = 200;
 /// 而用户只看到「删到一半」。超了就拒绝并让调用方分批删。
 pub const MAX_FILE_REMOVE_ENTRIES: usize = 1_000;
 
+/// 一个 bot 在项目里累计可占用的字节上限（清单 `limits.quotaMb` 的上界，单位 MiB）。
+///
+/// 配额不是安全边界（路径已经钉在项目根里），而是**可预测的磁盘占用**：没有它，
+/// 一个 while(true) 写文件的 handler 会把用户整个盘写满，而宿主侧看到的现象是
+/// 「HBot 把磁盘吃了」，排障方向完全错。上界取 1 GiB：再大就不是「bot 的缓存」，
+/// 而是「用户自己的数据」，那应该放在项目外、由用户自己管。
+pub const MAX_FILE_QUOTA_MB: u64 = 1024;
+/// 清单没写 `limits.quotaMb` 时的取值：**0 = 不限**。
+///
+/// 这一项与 `handlerMs` / `heapMb` / `maxPendingJobs` 的缺省口径不同（那三项缺省是
+/// 一个具体的小数值），因为「写文件」在没有配额时本来就是项目根里的普通操作：
+/// 给所有既有项目突然加一条硬上限，会让「昨天还能跑的 bot 今天报 HBOT_FILE_QUOTA」。
+/// 要配额的项目显式写 `limits.quotaMb`。
+pub const DEFAULT_FILE_QUOTA_MB: u64 = 0;
+
+/// 把清单里的 MiB 配额换算成字节；`0`（不限）原样返回 `0`。
+#[must_use]
+pub const fn quota_bytes_from_mb(mb: u64) -> u64 {
+    mb.saturating_mul(1024 * 1024)
+}
+
 /// 清单里 files 能力的声明。
 ///
 /// 读与写分开声明：只读的项目（比如只做数据导出）不该顺手拿到删除权限。
@@ -228,6 +249,21 @@ pub enum FileError {
         /// 上限（条）。
         limit: usize,
     },
+    /// 会超过这个 bot 的累计磁盘配额（`limits.quotaMb`）。
+    ///
+    /// 与 [`FileError::TooLarge`] **不是一回事**：那个是「这一次读写的字节数」，
+    /// 这个是「所有文件加起来占多少」。混成一个码，用户会拿单次上限去查累计问题，
+    /// 怎么调都对不上。
+    Quota {
+        /// 路径。
+        path: String,
+        /// 这个 bot 当前已占用的字节数。
+        used: u64,
+        /// 这次操作会新增的字节数（覆盖写是差值，删除是 0）。
+        incoming: u64,
+        /// 配额上限（字节）。
+        limit: u64,
+    },
     /// 底层失败。
     Failed {
         /// 说明。
@@ -247,6 +283,7 @@ impl FileError {
             Self::NotFound { .. } => "HBOT_FILE_NOT_FOUND",
             Self::TooLarge { .. } => "HBOT_FILE_TOO_LARGE",
             Self::TooMany { .. } => "HBOT_FILE_TOO_MANY",
+            Self::Quota { .. } => "HBOT_FILE_QUOTA",
             Self::Failed { .. } => "HBOT_FILE_FAILED",
         }
     }
@@ -282,6 +319,18 @@ impl fmt::Display for FileError {
                 f,
                 "{}: {path} 一次会涉及超过 {limit} 条记录，请分批操作",
                 self.code()
+            ),
+            Self::Quota {
+                path,
+                used,
+                incoming,
+                limit,
+            } => write!(
+                f,
+                "{}: {path} 会把该 bot 的项目占用推到 {} 字节，超过 limits.quotaMb 的上限 {limit} 字节\
+                 （已用 {used}，这次要新增 {incoming}）；先删掉一些文件，或调大清单里的 limits.quotaMb",
+                self.code(),
+                used.saturating_add(*incoming)
             ),
             Self::Failed { message } => write!(f, "{}: {message}", self.code()),
         }
@@ -451,6 +500,39 @@ pub fn validate_remove(path: &str) -> Result<(), FileError> {
     Ok(())
 }
 
+/// 一次写会让这个 bot 的累计占用新增多少字节。
+///
+/// 覆盖写是**差值**（先写 10 KB 再改成 12 KB，只新增 2 KB），删除是 0（负数被夹成 0）。
+/// 这个换算放在 core 而不是后端：后端只管「写成功了」，记账口径必须只有一份，
+/// 否则覆盖写会被当成新增，配额很快就假满。
+#[must_use]
+pub const fn quota_delta(previous: u64, next: u64) -> u64 {
+    next.saturating_sub(previous)
+}
+
+/// 写之前的配额闸。
+///
+/// `limit == 0` 表示清单没设配额（[`DEFAULT_FILE_QUOTA_MB`]），一律放行。
+/// 判据是「写完之后的总占用」而不是「这次写了多少」：否则一个 1 MiB 的写入能在
+/// 已用 999 MiB / 上限 1000 MiB 时把总量顶到 1000 MiB 以上。
+///
+/// # Errors
+///
+/// * [`FileError::Quota`] — 写完之后会超过 `limit`。
+pub fn check_quota(path: &str, used: u64, incoming: u64, limit: u64) -> Result<(), FileError> {
+    if limit == 0 {
+        return Ok(());
+    }
+    if used.saturating_add(incoming) > limit {
+        return Err(FileError::Quota {
+            path: path.to_owned(),
+            used,
+            incoming,
+            limit,
+        });
+    }
+    Ok(())
+}
 /// 文件能力的端口。
 ///
 /// 实现方收到的路径已经被 normalize_path 过：相对、/ 分隔、没有 .. 。
@@ -642,6 +724,12 @@ mod tests {
                 path: "x".to_owned(),
                 limit: 1,
             },
+            FileError::Quota {
+                path: "x".to_owned(),
+                used: 1,
+                incoming: 1,
+                limit: 1,
+            },
             FileError::Failed {
                 message: "x".to_owned(),
             },
@@ -732,5 +820,69 @@ mod tests {
     fn the_remove_budget_is_a_named_constant() {
         // 递归删除的条目上限是给「可预测的耗时」用的，不是安全边界；变了要有测试提醒。
         assert_eq!(MAX_FILE_REMOVE_ENTRIES, 1_000);
+    }
+
+    #[test]
+    fn a_quota_of_zero_means_unlimited() {
+        assert_eq!(DEFAULT_FILE_QUOTA_MB, 0);
+        assert!(check_quota("a.txt", u64::MAX / 2, u64::MAX / 2, 0).is_ok());
+    }
+
+    #[test]
+    fn the_quota_gate_looks_at_the_total_after_the_write() {
+        // 上限 1000，已用 900：新增 100 刚好到线（放行），101 就超（拒绝）。
+        assert!(check_quota("a.txt", 900, 100, 1000).is_ok());
+        assert!(matches!(
+            check_quota("a.txt", 900, 101, 1000),
+            Err(FileError::Quota {
+                used: 900,
+                incoming: 101,
+                limit: 1000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_overwrite_only_counts_the_difference() {
+        // 覆盖写不该被当成新增：10 KB 改成 12 KB 只新增 2 KB。
+        assert_eq!(quota_delta(10 * 1024, 12 * 1024), 2 * 1024);
+        assert_eq!(quota_delta(12 * 1024, 10 * 1024), 0);
+        assert_eq!(quota_delta(0, 5), 5);
+        assert!(check_quota("a.txt", 995, quota_delta(10, 12), 1000).is_ok());
+    }
+
+    #[test]
+    fn the_quota_is_its_own_code_not_a_single_write_limit() {
+        // 两个上限说的不是一件事：单次读写是 HBOT_FILE_TOO_LARGE，累计占用是 HBOT_FILE_QUOTA。
+        let quota = FileError::Quota {
+            path: "a.txt".to_owned(),
+            used: 900,
+            incoming: 200,
+            limit: 1000,
+        };
+        assert_eq!(quota.code(), "HBOT_FILE_QUOTA");
+        assert!(quota.to_string().starts_with("HBOT_FILE_QUOTA"));
+        assert!(quota.to_string().contains("quotaMb"));
+        assert_ne!(
+            quota.code(),
+            FileError::TooLarge {
+                path: "a.txt".to_owned(),
+                limit: 1,
+            }
+            .code()
+        );
+    }
+
+    #[test]
+    fn megabytes_convert_to_bytes_without_overflow() {
+        assert_eq!(quota_bytes_from_mb(0), 0);
+        assert_eq!(quota_bytes_from_mb(1), 1024 * 1024);
+        assert_eq!(
+            quota_bytes_from_mb(MAX_FILE_QUOTA_MB),
+            MAX_FILE_QUOTA_MB * 1024 * 1024
+        );
+        // 越界不 panic：饱和而不是回绕，否则超大值会变成一个小配额。
+        assert_eq!(quota_bytes_from_mb(u64::MAX), u64::MAX);
     }
 }
