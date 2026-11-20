@@ -727,3 +727,38 @@
     同族的两个细节：① 落库与穿越队列的路径是**绝对路径**（`attachment_json`），因为续发时项目根
     可能已经变了，相对路径会指向另一个文件；② 错误文案只带**文件名**不带目录（坑 47：这条 message
     会进 run log 面板与模型上下文）。
+
+## 137. `ctx.sleep` 会被剩余预算夹短，所以它证明不了「预算生效」（2026-11-21）
+
+    给作业/消息预算写端到端测试时，很自然会写「睡 3 秒，断言超时」。这条是**假的**：
+    `crates/hbot-code/src/runtime/host_api.rs` 的 sleep 先取 `deadline.remaining()` 再夹短，
+    3 秒的 sleep 在 1 秒预算下会**正常返回**，handler 接着往下跑、作业落 `done` —— 看起来「预算没生效」，
+    实际是这层本来就有的语义（睡眠不该把预算变成异常）。
+
+    要证明预算真的在拦，必须用**不夹预算**的忙等：`const started = Date.now(); while (Date.now() - started < 3000) {}`，
+    超预算那一刻由 deadline 打断 handler，作业才会落 `failed`、结束行永远不出现。
+    同一条理由在 `crates/hbot-code/tests/s2_ai.rs` 里已经用过（量模型抵账必须忙等）。
+    对照组同样必要：不写 `limits.jobBudgetMs` 时 1.5 秒的作业必须跑满并落 `done`，
+    否则「默认上限被误写小」会让所有长作业静默被掐断而掐断测试仍是绿的。
+
+## 138. WAL 库的只读连接要用 `PRAGMA query_only`，不是 `SQLITE_OPEN_READ_ONLY`（2026-11-21）
+
+    `crates/hbot-store/src/bot_sql.rs` 给 `ctx.sql.query` 单开一条连接（让长 SELECT 不占写锁）时，
+    最直觉的写法是 `OpenFlags::SQLITE_OPEN_READ_ONLY`。库是 WAL 模式，这条会以
+    `attempt to write a readonly database` 失败：只读打开一条 WAL 库需要能写 `-shm` 共享内存文件。
+
+    正确写法是普通读写打开（不带 `CREATE`）+ `PRAGMA query_only = ON`：连接可以写 shm，
+    而 SQL 层拒绝一切写。另外两条同族判据：① 库文件还不存在时**不要**把它记进「打不开」集合
+    （否则文件建好后也永远走写连接），先 `path.exists()` 再决定；② 只读连接失败要**回退写连接**并记一行 warn ——
+    这是性能优化，不是权限收紧，功能与错误码一律不变。
+
+## 139. 日志行的时间戳是「落库时刻」，别拿它量耗时（2026-11-21）
+
+    想用两条 `ctx.log` 的 `at` 之差证明「作业实际拿到了多少预算」是行不通的：
+    `hbot-code` 先把日志收进 `EventOutcome.logs`，handler 结束后由宿主一次性落库，
+    同一次执行的所有行共享**同一个**时间戳，差值恒为 0。
+
+    要量耗时只有三条路：① 测试侧自己在派发前后取墙钟（会被 tick 间隔污染，需要宽余量）；
+    ② 让 handler 把耗时写进 `ctx.kv` 或回复正文（那要额外能力，测预算时反而绕远）；
+    ③ 改成断言**可分辨的结果**而不是时长 —— 例如「超预算 → 落 failed 且结束行不存在」，这正是
+    坑 137 那条测试的形状。测量之前先确认那个数字真的是被测量的那一侧写下来的。

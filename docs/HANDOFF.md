@@ -4,7 +4,7 @@
 > `AGENTS.md`（坑与"改 X 去哪"）、`docs/04-implementation-plan.md`（里程碑与出口标准）、
 > `docs/02-architecture.md`（架构与契约）。每次交接时更新本文件，冲突时以真源为准。
 >
-> 本快照时间：**2026-11-21 00:20**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`（含附件 `ctx.sendImage` / `ctx.sendFile`）、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`（含每 bot 磁盘配额）、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。同日又接上 **`onStop(crash)` 的触发点**：supervisor 的读循环意外结束（订阅被关 / 入队失败）会经 `ReadLoopExit` + `ReadExitSlot` 传出，rpc 侧按 `StopReason::Crash` 停机并跑 `onStop`（`crates/hbot-rpc/tests/crash_capability.rs`）—— `docs/07` §4.6 里「枚举与渲染就位、但没有可靠检测」的那个缺口已关闭。
+> 本快照时间：**2026-11-21 01:20**。`C4.jobs`、`C2.session`、`C3.send`/`C3.notify`（含附件 `ctx.sendImage` / `ctx.sendFile`）、`C1.webhook`、`onStart`/`onStop`（含 `shutdown` 触发点）、`C2.sql`、`C3.file`（含每 bot 磁盘配额）、`onSchedule`（= `onTimer` 的正式名）全部落地，另加 **`C6.device` 的按窗口截图**（`ctx.device.screen({ window })`）、`ctx.session.prompt` 的**超时重发提示**（`reminders`，2026-11-20）、`ctx.files.read` 的**按行范围读**（`startLine`/`endLine`，2026-11-20）、**作业与等待的只读面板**（底部面板「作业」页签 + `bot_jobs`/`bot_waits`，2026-11-20）—— **M7 第 1–5.5 步完成，能力面已无缺口**；`examples/` 三个无凭据示例 2026-11-20 入库，M7 出口标准里「三类示例项目」那一半变成可自动验证的；同日又补齐 **`C3.file` 的递归删除 / 二进制读 / 按行写**、**webhook 路由级超时 `timeoutMs`**、**作业池上限 `limits.maxPendingJobs`** 与 **三个示例的整体 e2e**（`crates/hbot-rpc/tests/examples_e2e.rs`）。同日又接上 **`onStop(crash)` 的触发点**：supervisor 的读循环意外结束（订阅被关 / 入队失败）会经 `ReadLoopExit` + `ReadExitSlot` 传出，rpc 侧按 `StopReason::Crash` 停机并跑 `onStop`（`crates/hbot-rpc/tests/crash_capability.rs`）—— `docs/07` §4.6 里「枚举与渲染就位、但没有可靠检测」的那个缺口已关闭。 同轮又收掉 `docs/07` 里最后两件原本记「还没做」的本地能力：**`ctx.sql` 的读走独立只读连接**（`PRAGMA query_only = ON`，长 SELECT 不再占写锁，`hbot-store/src/bot_sql.rs`）与 **`jobs` 的宿主级预算上限**（`bots.json` 的 `limits.jobBudgetMs`，判据只有 `hbot_core::effective_job_budget_ms` 一份）。
 
 ---
 
@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 57 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 2033 passed / 0 failed / 126 target
+cargo test -j 2 --workspace              # 当前 2038 passed / 0 failed / 126 target
 pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 ```
 
-现状：**六道全绿**（2026-11-21 00:18 实测，`rustc 1.100.0`，2033 passed / 126 target / web 47 文件 427 用例）。
+现状：**六道全绿**（2026-11-21 00:18 实测，`rustc 1.100.0`，2038 passed / 126 target / web 47 文件 427 用例）。
 **Rust 版本已钉死**：`rust-toolchain.toml` 的 `channel = "1.100.0"` 与 `ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`
 必须一起改（原来两处都写 `stable`，导致 CI 的 clippy 比本地新、只报在 CI，见 `docs/pitfalls.md` 坑 115）。
 `apps/web/src/generated/*.ts` **要入库**；
@@ -122,7 +122,7 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 136 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 139 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -192,8 +192,10 @@ pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 - `cancel_jobs_for_bot` 只动 `pending`/`running`，终态不碰（坑 73）；
 - `hbot_core::JobId` 与 `hbot_store::JobId` 是两个类型，转换用 `from_uuid(*id.as_uuid())`（坑 71）。
 
-**还没做的两件**（不阻塞主线）：宿主级预算上限（手机 30 秒"平台取小"仍在 `docs/08` 的设计里）；
-作业池"上限可配"**2026-11-20 已落地**：`hbot.json` 的 `limits.maxPendingJobs`（缺省 256 = `hbot_core::MAX_JOBS_PER_BOT`，硬上限 1024，越界报错不夹取），容量闸与预算查询共用同一次 `manifest::load`；e2e 在 `crates/hbot-rpc/tests/jobs_capability.rs` 的 `max_pending_jobs_in_the_manifest_caps_the_queue`。仍没做的只剩宿主级预算上限（手机 30 秒"平台取小"仍在 `docs/08` 的设计里）。
+**宿主级预算上限 2026-11-21 已落地**：判据只放在 `hbot_core::effective_job_budget_ms(row, ceiling)`（`0` = 不限、结果夹在 `MIN..=MAX`、返回两者较小的那个，**只收紧不放宽**），宿主取值来自 `bots.json` 的 `limits.jobBudgetMs`（`hbot-code::Limits::job_budget_ms()`，缺省 = `MAX_JOB_BUDGET_MS`，所以不写这个字段的部署行为不变）。
+作业池"上限可配"**2026-11-20 已落地**：`hbot.json` 的 `limits.maxPendingJobs`（缺省 256 = `hbot_core::MAX_JOBS_PER_BOT`，硬上限 1024，越界报错不夹取），容量闸与预算查询共用同一次 `manifest::load`；e2e 在 `crates/hbot-rpc/tests/jobs_capability.rs` 的 `max_pending_jobs_in_the_manifest_caps_the_queue`。
+
+> **测这条必须用忙等**：`ctx.sleep` 会被剩余预算夹短后**正常返回**，用它测预算会得到假绿（`docs/pitfalls.md` 坑 137）。两条 e2e：`the_host_job_budget_ceiling_cuts_a_longer_declared_job`（上限 1 秒掐断清单里 60 秒、忙等 3 秒的作业，落 `failed` 且不写结束行）与对照组 `a_job_within_the_default_host_budget_runs_to_completion`。
 
 > **2026-11-20 补：作业状态面板已落地**（底部面板「作业」页签，数据来自只读命令 `bot_jobs`/`bot_waits`）。
 
@@ -302,7 +304,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：2033 passed / 126 target
+cargo test -j 2 --workspace                              # 基线：2038 passed / 126 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。

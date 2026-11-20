@@ -546,7 +546,7 @@ export default defineBot({
 | 参数层 | `hbot-core` 的 `validate_job_name` / `validate_payload` / `validate_idempotency_key` / `validate_request` / `validate_specs`（**唯一一份**） | `HBOT_JOBS_INVALID`，**在后端被调用之前**就拒 |
 | 装配层 | 宿主有没有 `set_jobs` | `HBOT_JOBS_UNAVAILABLE`（补救是"bot 没起来/存储没就绪"，不是改清单） |
 | 容量层 | `StoreJobQueue` 里 `count_active_jobs_for_bot` ≥ 清单 `limits.maxPendingJobs`（缺省 256，硬上限 1024） | `HBOT_JOBS_FULL`，不无限攒行；文案点名上限来自 `limits.maxPendingJobs` |
-| 预算层 | 行里冻结的 `budget_ms`（入队时按类型抄一份）；超预算被内核打断 | `HBOT_JOBS_TIMEOUT` → 按 `retries` 决定重试还是落 `failed` |
+| 预算层 | 行里冻结的 `budget_ms`（入队时按类型抄一份），再被宿主上限收紧一次（`hbot_core::effective_job_budget_ms`）；超预算被内核打断 | `HBOT_JOBS_TIMEOUT` → 按 `retries` 决定重试还是落 `failed` |
 | 目标层 | `build_job_event` 的 `reply` 闭包 | 没写 `options.conversation` → `HBOT_JOBS_NO_TARGET` |
 | 会话层 | `deliver_job_replies` 按 `(bot_id, external_id)` 查 `conversations` | 查不到 → error 行「这个会话从没收到过消息」，不猜群/私聊 |
 
@@ -560,14 +560,15 @@ export default defineBot({
 6. **tick 先编译、后认领**。反过来的话，编译失败那一刻行已经被改成 `running` 且 `attempts` 已加一，下一拍又因为 `state != pending` 拿不到它 —— 这条作业就卡在 `running`，只能等下次进程启动的 `resume_interrupted_jobs` 救。
 7. **作业不能用定时器那条 tick**。`SandboxHandler::tick` 第一句就是"没有计划就 return"；复用给作业会让"只声明 jobs、没声明 timer"的项目永远派发不到，而且看起来像"作业不跑"而不像配置问题。所以独立成 `tick_jobs`，ticker 每拍先后调两个。
 8. **作业池上限写在清单里，硬上限在宿主**（2026-11-20）。`limits.maxPendingJobs` 缺省 256（= `hbot_core::MAX_JOBS_PER_BOT`，老项目行为不变），可调小到 1、调到 1024 封顶 —— 越界**报错不夹取**，因为"我写了 5000 却按 1024 跑"会让用户以为积压能攒到 5000。上限读的是**清单当前值**而不是行上的快照（与预算相反，见决定 2）：它是"这个 bot 能攒多少"的策略，改了就该立刻生效。容量闸与预算查询共用**同一次** `manifest::load`，不读两遍（读两遍会让两次读之间的一次保存产生两份不一致的判据）。
+9. **宿主级预算上限只收紧、不放宽，且只有一份实现**（2026-11-21）。手机上后台窗口只有几十秒（`docs/08`），宿主得能压低清单写的 `budgetMs`；但"取小的那一步"若每个装配方各写一个 `min`，迟早漂移，而漂移的表现是"同一个项目在桌面跑完、在手机上莫名超时"。所以判据只放在 `hbot_core::effective_job_budget_ms(row_budget_ms, host_ceiling_ms)`：`0` 当不限、结果夹在 `MIN_JOB_BUDGET_MS..=MAX_JOB_BUDGET_MS`、返回 `declared.min(ceiling)`。宿主上限来自 `bots.json` 的 `limits.jobBudgetMs`（`hbot-code::Limits::job_budget_ms()`），缺省等于核心上限 `MAX_JOB_BUDGET_MS`，所以**不写这个字段的部署行为与以前完全一致**。
 
 **存储形态**：`bot_jobs(id, bot_id, name, payload_json, idempotency_key, state, attempts, budget_ms, conversation, next_at, last_error, created_at, updated_at)`，`UNIQUE (bot_id, idempotency_key)`、索引 `(state, next_at)` 与 `(bot_id, state)`。状态五种拼写 `pending` / `running` / `done` / `failed` / `cancelled` 与 `hbot_core::bot_jobs::JobState::as_str()` 同值（存储层有对拍测试）。
 
 **恢复与取消**：进程启动时 `AppState::open` 调 `resume_interrupted_jobs(now)` 把残留的 `running` 退回 `pending`（"它可能跑过一半"，由作业体自己的幂等兜住重复执行）；`bot_stop` 调 `cancel_jobs_for_bot` 把 `pending` / `running` 落成 `cancelled`，终态（`done` / `failed` / `cancelled`）不动 —— 把成功记录改写成"取消"会抹掉真实结果。
 
-**实测**：`hbot-rpc` 的 `tests/jobs_capability.rs` 6 条，全走 `Dispatcher` 真派发 + 真 tick + 真库：没声明 → `NOT_DECLARED` 且**不落库**；声明后入队 → 落库 → 下一拍认领 → `onJob` 真跑 → `done` → 回复进 outbox；同幂等键入队两次只留一行、只跑一次；缺 `onJob` 时每次派发记一行点名钩子的 error；`bot_stop` 之后 `pending` 落 `cancelled` 且不再派发；作业体抛异常时 `retries: 0` 直接落 `failed` 并写 `last_error` + error 日志。存储层另有 12 条（含 per-bot claim 不越界、`resume` 退回 `pending`、级联删除）。
+**实测**：`hbot-rpc` 的 `tests/jobs_capability.rs` 9 条，全走 `Dispatcher` 真派发 + 真 tick + 真库：没声明 → `NOT_DECLARED` 且**不落库**；声明后入队 → 落库 → 下一拍认领 → `onJob` 真跑 → `done` → 回复进 outbox；同幂等键入队两次只留一行、只跑一次；缺 `onJob` 时每次派发记一行点名钩子的 error；`bot_stop` 之后 `pending` 落 `cancelled` 且不再派发；作业体抛异常时 `retries: 0` 直接落 `failed` 并写 `last_error` + error 日志；**宿主上限 1000 毫秒能掐断清单里 60000 毫秒、要忙等 3 秒的作业**（落 `failed`、结束行不出现、error 点名作业），**默认上限下 1.5 秒的作业跑满并落 `done`**（对照组：防止把默认值误写小）。存储层另有 12 条（含 per-bot claim 不越界、`resume` 退回 `pending`、级联删除）；`hbot-core` 另有 `effective_job_budget_ms` 的边界单测（默认值=核心上限、0=不限、只收紧、越界入参仍落在合法区间）。
 
-**还没做**：`jobs` 的宿主级预算上限（手机上 30 秒这类"平台取小"还在 `docs/08` 的设计里，当前只有清单写的值）；作业池的"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）。
+**还没做**：作业池的"上限可配"（现在恒为 256 行 + 每拍认领 `MAX_ISOLATES` 条）；手机宿主上真正的平台取值（`docs/08` 里那个"后台窗口几十秒"的数字）还没有第二个宿主演生出来 —— 判据与注入口已经就位，缺的是手机端本体。
 
 > **2026-11-20 补：作业面板已落地。** 底部面板多了一个「作业」页签（`apps/web/src/features/run/jobs-panel.tsx`），数据来自两条只读命令 `bot_jobs` / `bot_waits`（`docs/07` §4.5 与 §5.2 共用一个面板）。三条判据：① 命令是**只读快照** —— 不派发 handler、不改状态、不重发提示、不结算超时；② 终态行也返回（面板要能看见「刚才那条失败了」），过滤交给 UI，`state`/`scope` 是**开放字符串**（遇到未知值显示「未知（原值）」，绝不 throw）；③ `bot_id` 不存在时返回 `-32001` 而不是空数组（空数组会让「id 写错」看起来像「什么都没跑过」），`limit` 超过 200 按 200 算不报错（轮询不该让 UI 变红）。
 
@@ -620,7 +621,7 @@ export default defineBot({
 | 能力 | 语义 | 关键约束 |
 |---|---|---|
 | `kv` | `ctx.kv.get/set/delete/list`，值为 JSON，可选 TTL | 每 bot 一个命名空间；`setMany` 要原子；并发写要串行（走 store 的单 writer 线程） |
-| `sql` | `ctx.sql.query/exec`，只允许参数化语句 | schema 由项目里的 `migrations/*.sql` 定义，**运行时不许 DDL**；**每 bot 一个库文件**（§5.3） |
+| `sql` | `ctx.sql.query/exec`，只允许参数化语句 | schema 由项目里的 `migrations/*.sql` 定义，**运行时不许 DDL**；**每 bot 一个库文件**（§5.3）；读与写各用一条连接（读不占写锁） |
 | `history` | `ctx.history(n)` 返回最近 n 条（含自己发过的） | 只读；由 supervisor 维护，来自 `inbound`/`outbound` 表 |
 | `session` | `ctx.session.prompt(key, text, options)` + `onResume`（**注册而非阻塞**，见 §5.2） | **归属键必须是 `(bot_id, conversation_id, sender_id)`**，且落库；同会话只允许一个未结等待 |
 
@@ -844,7 +845,9 @@ export default defineBot({
 `HBOT_SQL_DENIED`；没有迁移文件 → `HBOT_SQL_FAILED` 且错误里能看出表名。存储层另有 7 条
 （含「迁移只跑一次」「跨 bot 隔离」「超上限回滚」「结果截断标记」）。
 
-**还没做**：`ctx.sql` 的**只读连接**（现在读写同一条 lazy 连接，读也会占写锁）；
+**读与写各用一条连接**（2026-11-21）：`query` 走每 bot 一条独立的只读连接（`PRAGMA query_only = ON`），`exec` 仍走写连接，所以一条长 SELECT 不再占着写锁（此前读写共用一条 lazy 连接）。三条判据：① 选 `query_only` 而不是 `SQLITE_OPEN_READ_ONLY` —— 库是 WAL 模式，真只读打开一条 WAL 库需要能写 `-shm`，否则以"attempt to write a readonly database"失败，那是平台细节不是用户数据问题；② 库文件还不存在时**不记账**、直接回退写连接（否则文件建好后也永远走写连接）；③ 只读连接打不开时回退写连接并记一行 warn —— 这是性能优化，不是权限收紧，语义/错误码/结果形状一律不变。`hbot-store` 有两条测试钉住：`a_query_opens_only_the_read_connection`（第一次查询只开写连接、第二次只开读连接）与 `a_read_in_progress_does_not_block_a_write`（占住读连接时另一个线程的 `exec` 仍能完成）。
+
+**还没做**：
 查询计划与慢 SQL 上报；`migrations/` 的**回滚**（现在只有前进）；把 `sql` 与 `kv` 合成
 「一个能存东西的口子」（见 §13 未决 2）。
 ---
