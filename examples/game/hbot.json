@@ -1,0 +1,17 @@
+{
+  "name": "游戏示例（sql + onSchedule）",
+  "entry": "src/main.ts",
+  "platform": { "kind": "local" },
+  "permissions": { "http": [] },
+  "limits": { "handlerMs": 2000, "heapMb": 32 },
+  "capabilities": {
+    "state": { "sql": true },
+    "timer": [
+      {
+        "name": "daily-reset",
+        "when": { "kind": "daily", "atMsOfDay": 0, "utcOffsetMinutes": 480 },
+        "conversation": "local:default"
+      }
+    ]
+  }
+}

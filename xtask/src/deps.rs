@@ -127,7 +127,9 @@ const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     // 开发期工具。
-    ("xtask", &["hbot-rpc", "hbot-core"]),
+    // 代码生成要读 `hbot_code::dts`（示例项目的 `hbot.d.ts` 与核心契约同源），
+    // 依赖方向与 hbot-cli 一致：开发期工具可以看见所有实现 crate，产品 crate 看不见它。
+    ("xtask", &["hbot-rpc", "hbot-core", "hbot-code"]),
 ];
 
 /// 一条内部依赖边。

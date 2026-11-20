@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 hbot-rpc = { path = "../crates/hbot-rpc" }
+hbot-code = { path = "../crates/hbot-code" }

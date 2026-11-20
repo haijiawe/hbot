@@ -1,0 +1,14 @@
+{
+  "name": "客服示例（webhook + session + notify + sql）",
+  "entry": "src/main.ts",
+  "platform": { "kind": "local" },
+  "permissions": { "http": [] },
+  "limits": { "handlerMs": 2000, "heapMb": 32 },
+  "capabilities": {
+    "state": { "sql": true, "session": true },
+    "notify": { "conversation": "local:default", "kind": "private" },
+    "webhook": [
+      { "path": "tickets", "secretEnv": "HBOT_TICKET_SECRET" }
+    ]
+  }
+}

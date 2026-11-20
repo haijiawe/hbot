@@ -1,0 +1,11 @@
+{
+  "name": "聊天示例（kv + history + ai）",
+  "entry": "src/main.ts",
+  "platform": { "kind": "local" },
+  "permissions": { "http": [] },
+  "limits": { "handlerMs": 2000, "heapMb": 32 },
+  "capabilities": {
+    "ai": true,
+    "state": { "kv": true, "history": true }
+  }
+}
