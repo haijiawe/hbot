@@ -418,6 +418,7 @@ fn envelope(kind: ConversationKind, external_id: &str, reply_to: Option<&str>) -
         conversation: ConversationRef::new(external_id, kind),
         text: "pong".to_owned(),
         reply_to: reply_to.map(str::to_owned),
+        attachment: None,
         attempts: 1,
     }
 }

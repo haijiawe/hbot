@@ -87,6 +87,7 @@ impl PendingOutboxSource for StorePendingOutbox {
                 text: row.text,
                 attempts: row.attempts,
                 reply_to: row.reply_to,
+                attachment: None,
             });
         }
         Ok(pending)

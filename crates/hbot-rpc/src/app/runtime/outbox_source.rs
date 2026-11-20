@@ -71,6 +71,8 @@ impl PendingOutboxSource for StorePendingOutbox {
                         row.id, row.conversation_id
                     ))
                 })?;
+            // 先解析附件（借用 `row`），再 move 其余字段：`reply_to` 在字面量里会把它借住。
+            let attachment = attachment_of(&row)?;
             pending.push(PendingOutbound {
                 id: row.id,
                 bot_id: row.bot_id,
@@ -80,11 +82,28 @@ impl PendingOutboxSource for StorePendingOutbox {
                 ),
                 text: row.text,
                 reply_to: row.reply_to,
+                attachment,
                 attempts: row.attempts,
             });
         }
         Ok(pending)
     }
+}
+
+/// 把 `outbound.attachment_json` 还原成领域引用。
+///
+/// 解析失败**不**降级成纯文本：那会把「发这个文件」静默变成「发一段空正文」，
+/// 用户既收不到文件也看不到错误。这里返回错误，由 supervisor 的启动恢复流程记日志
+/// 并把这一批续发整体失败暴露出来（`AGENTS.md` §7.1 坑 22：不许有「会恢复」的谎话）。
+fn attachment_of(
+    row: &hbot_store::OutboundRow,
+) -> Result<Option<hbot_core::AttachmentRef>, HbotError> {
+    let Some(raw) = row.attachment_json.as_deref() else {
+        return Ok(None);
+    };
+    hbot_core::AttachmentRef::from_json(raw)
+        .map(Some)
+        .map_err(|error| HbotError::internal(error.to_string()))
 }
 
 impl std::fmt::Debug for StorePendingOutbox {

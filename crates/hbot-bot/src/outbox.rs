@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hbot_core::{BotId, Clock, HbotError, IdGenerator, OutboundId, Timestamp};
+use hbot_core::{AttachmentRef, BotId, Clock, HbotError, IdGenerator, OutboundId, Timestamp};
 use hbot_store::{NewOutbound, Store};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -132,6 +132,11 @@ pub struct PendingOutbound {
     /// 重启恢复必须把它读回来：丢了这个字段，续发的消息就变成“主动消息”，
     /// 平台会拒发或在群里脱离上下文（`AGENTS.md` §4.1）。
     pub reply_to: Option<String>,
+    /// 附件（来自 `outbound.attachment_json`）；`None` = 纯文本。
+    ///
+    /// 续发时必须把它读回来：丢了附件字段，重启前的「发这个文件」会退化成发一段空正文，
+    /// 用户看到的是「文件没发出去但也没报错」。
+    pub attachment: Option<AttachmentRef>,
 }
 
 /// 跨重启恢复未发 `outbound` 的注入点。
@@ -248,6 +253,30 @@ impl Outbox {
     /// 先写 `outbound` 行再进通道：通道满时会等待（背压传给调用方），而消息已经是
     /// `pending` 行，等待期间崩溃也能在下次启动续发。
     pub async fn enqueue(&self, request: OutboundRequest) -> Result<OutboundId, HbotError> {
+        self.enqueue_inner(request, None).await
+    }
+
+    /// 落库并入队一条**带附件**的出站消息。
+    ///
+    /// 与 [`Self::enqueue`] 的区别只有 `attachment`：为什么不做成给 `OutboundRequest` 加一个
+    /// `Option` 字段 —— 那条路要求全仓十几处结构体字面量同批改（`hbot-rpc` 五处、`hbot-parity`
+    /// 一处、各测试），而其中没有一处会因为多一个 `None` 变得更好读。文本与附件共用同一条
+    /// 出站行、同一个重试与死信路径，差别只在适配器怎么翻译载荷。
+    ///
+    /// 附件的路径必须已经由宿主解析并核验（在项目根内、文件存在、大小不超限）。
+    pub async fn enqueue_with_attachment(
+        &self,
+        request: OutboundRequest,
+        attachment: AttachmentRef,
+    ) -> Result<OutboundId, HbotError> {
+        self.enqueue_inner(request, Some(attachment)).await
+    }
+
+    async fn enqueue_inner(
+        &self,
+        request: OutboundRequest,
+        attachment: Option<AttachmentRef>,
+    ) -> Result<OutboundId, HbotError> {
         let outbound_id = self.ids.outbound_id();
         let conversation_id =
             crate::conversation_id_for(&self.bot_id, &request.conversation.external_id);
@@ -261,7 +290,10 @@ impl Outbox {
         let store = Arc::clone(&self.store);
         // 必须用 `enqueue_outbound_with_target`：`enqueue_outbound` 走的是
         // `OutboundTarget::unknown()`，`reply_to` 会永远落成 NULL（被动回复退化成主动消息）。
-        let target = hbot_store::OutboundTarget::new("{}", request.reply_to.clone());
+        let mut target = hbot_store::OutboundTarget::new("{}", request.reply_to.clone());
+        if let Some(attachment) = &attachment {
+            target = target.with_attachment(attachment.to_json());
+        }
         run_store("enqueue_outbound", move || {
             store.enqueue_outbound_with_target(row, target)
         })
@@ -273,6 +305,7 @@ impl Outbox {
             conversation: request.conversation,
             text: request.text,
             reply_to: request.reply_to,
+            attachment,
             attempts: 0,
         };
         self.send_envelope(envelope).await?;
@@ -293,6 +326,7 @@ impl Outbox {
                 conversation: item.conversation,
                 text: item.text,
                 reply_to: item.reply_to,
+                attachment: item.attachment,
                 attempts: item.attempts,
             };
             self.send_envelope(envelope).await?;

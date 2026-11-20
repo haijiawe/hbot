@@ -9,7 +9,7 @@
 //! `connect` 之前、由 supervisor 在队列就绪后建立，见 [`crate::supervisor`]。
 
 use async_trait::async_trait;
-use hbot_core::{BotId, ConversationId, HbotError, OutboundId};
+use hbot_core::{AttachmentRef, BotId, ConversationId, HbotError, OutboundId};
 use tokio::sync::mpsc;
 
 use crate::event::{ConversationRef, PlatformEvent};
@@ -36,6 +36,12 @@ pub struct OutboundEnvelope {
     /// （`hbot_adapters::platforms::onebot::message::build_outbound`），其它平台按各自协议。
     /// **不要在这里重新生成 ID，也不要复用无关的旧事件 ID**（`AGENTS.md` §4.1）。
     pub reply_to: Option<String>,
+    /// 附件（`None` = 纯文本）。
+    ///
+    /// 适配器负责把它变成一个平台媒体段：路径已在入队前由宿主解析成绝对路径并核验
+    /// 过（在项目根内、文件存在、大小不超限），**适配器不要重新按用户输入解析路径**。
+    /// 读文件失败要返回 `Err`（交给 outbox 重试 / 死信），不要静默降级成「只发正文」。
+    pub attachment: Option<AttachmentRef>,
     /// 本条消息已尝试次数（含本次）；用于适配器侧日志与死信判定。
     pub attempts: u32,
 }
