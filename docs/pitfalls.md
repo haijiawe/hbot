@@ -845,3 +845,29 @@
   色盲与灰度截图下完全不可分；改成「实心点 = 停止中 / 空心环 = 降级」，形状也参与编码。
 - 验证手法：写个 10 行的 WCAG 相对亮度函数（sRGB 线性化 + `(L1+0.05)/(L2+0.05)`）本地算，别靠眼睛看截图；
   改完在 headless 浏览器里 `getComputedStyle` 取实际生效值再算一遍，防止变量没生效却以为算对了。
+
+---
+
+## 144. 加一个「整页面」要同批改五处，少一处就是「点了没反应」
+
+2026-11-21 补作业看板 / 设计文档 / 开发日志时踩到。`SidebarView` 是联合类型，扩一个值编译器只会在
+**部分**地方报错，剩下几处会静默降级（点了没反应、或侧栏渲染空白）：
+
+1. `apps/web/src/lib/layout.ts` 的 `SidebarView` 联合类型；
+2. `apps/web/src/lib/layout-prefs.ts` 的 `SIDEBAR_VIEWS`（存档迁移按这个白名单过滤，漏了会被 `PREFS_VERSION` 迁移丢掉，刷新回默认面）；
+3. `apps/web/src/app/activity-bar.tsx` 的按钮表（aria-label 与 title 用同一个 label）；
+4. `apps/web/src/app/App.tsx` 的 `renderSidebar()`（侧栏那一列）；
+5. 同文件的 `renderPage()`（整页面正文）——**整页面不要塞进侧栏**：侧栏最大 420px，三列看板会折成三条竖线。
+
+另两条同族：① 整页面的数据源不许另建一份（日志面直接用 `runStore` 的环形缓冲，文档面直接 `fs.read`/`fs.write`），
+否则「底部面板显示 3 行、整页面显示 5 行」这种两套真相会立刻出现；② 浏览器 mock（`lib/ipc-mock.ts`）里
+`bot_jobs` 是演示行、`run.log` 只在「试跑」注入后才有，截图时别把 mock 的空态当成功能没做。
+
+## 145. `pnpm` 可能被 corepack 的空壳 shim 顶掉（与本仓无关，但会伪装成构建失败）
+
+2026-11-21 实测：`pnpm --dir apps/web run check` 直接退出 1，日志唯一一行
+`Error: Cannot find module 'C:\Users\Administrator\AppData\Local\node\corepack\v1\pnpm\12.21.0\bin\pnpm.mjs'`。
+去看那个目录，里面只有一个 `pnpm-native.exe` —— corepack 装了一半。**这不是代码问题**，
+但也别急着 `corepack prepare` 重装（要走网络）：先 `where.exe pnpm` 找另一个，
+本机 `D:\node_global\pnpm.cmd`（12.14.0）可正常跑完整闸门。判据是**换一个 pnpm 后同一条命令转绿**，
+而不是去改 `packageManager` 字段或删 `node_modules`。

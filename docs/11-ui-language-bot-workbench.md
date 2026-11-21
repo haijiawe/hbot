@@ -296,17 +296,29 @@ Q5 的后半句是这次「低对比度」要求的正面表述：低对比 ≠ 
 | 世界 / 项目容器 `worldsys` | **项目 Project** | `ProjectSummary{path,name,entry}`（`project_open` / `project_create`） | 总览页 + 侧栏头（已有 `.panel-header__title` 显示 `rootName`） | 项目是唯一容器，别再叠「工作区 → 项目 → 世界」三层 |
 | 阶段 / 路线图 `roadmap` | **上手引导 checklist**（不是路线图画布） | `hbot.json` 是否存在（`file_list`）；`entry` 文件是否存在；平台是否配；首次 `bot_start` 是否成功（`run.log`） | 总览页 4 行 checklist（28px/行） | Q4：HBot 没有「阶段」实体。造一个 roadmap 画布 = 为了好看编实体 |
 | 角色 `character` + 属性卡 + `presets/avatars` | **Bot** | `BotSummary{botId,name,platform,status,updatedAt}`；`bot_list` | 列表行 28px（状态字形 + 名字 + platform 标签 + 最近活动 + 启停）；详情页身份条 56px | 头像降级为 20px 单色首字母字形（§2.2 第 3 条） |
-| 关卡 `quests` + 难度/星级/入口 | **作业 Job** | `JobView{id,name,state,attempts,budgetMs,conversation,nextAt,lastError,createdAt}`；`bot_jobs` | 表格（沿用 `.jobs-panel__table` 语言：11px、2px 8px、等宽数字） | 「尝试次数 / 预算 / 上次错误」与「难度 / 星级 / 失败原因」同构，映射最自然 |
+| 关卡 `quests` + 难度/星级/入口 | **作业 Job** | `JobView{id,name,state,attempts,budgetMs,conversation,nextAt,lastError,createdAt}`；`bot_jobs` | 三列看板（`board` 面，2026-11-21 落地）+ 底部「作业」页签的表格（11px、2px 8px、等宽数字） | 「尝试次数 / 预算 / 上次错误」与「难度 / 星级 / 失败原因」同构，映射最自然 |
 | 道具 / 合成 / 图鉴 `craft` `collection` | **能力 Capability**（6 组） | `hbot.json` 的 `capabilities`（`file_read` 解析）；分组见 `docs/07` C1–C6 | 能力矩阵（组头 + 24px 行 + 三态列） | 能力的「有/没」是 IDE 里唯一值得做成矩阵的东西（Q4：必须分声明/装配/授权三列） |
 | 对话树 `story` | **会话 Conversation** | `ConversationSummary{conversationId,externalId,kind}`；`bot_conversations` / `bot_inject` | 两列列表（等宽 `externalId` + `kind` 标签 18px），选中后走已有「试跑」页签 | 对话树是「分支叙事」，会话是「一条链路」——**不要**把会话画成树 |
 | 日程 / 日历 `calendar` `time` | **定时器（计划任务）** | **无独立 DTO**；落在 `JobView.nextAt`（`onSchedule` 产生的作业） | 作业表 +「下次触发」相对时间列（等宽 11px）；≥5 个定时器时加 24h 单行时间轴条（高 8px） | 日历网格在 320–560px 面板里放不下，且定时器通常 <20 个 |
 | 地图 `mapmaker` / 关系图 `graph` | **不做拓扑图** | **无**（没有查队列深度/链路追踪的命令） | 用日志 `source` 列 + 会话过滤 + `bot_waits` 快照代替 | Q4：画不出真数据的关系图，只能造假数据 |
-| 设定集 `lore` + 文档 `doceditor` | **代码与文档（同一个编辑器）** | 现有 `editor-area`（Monaco） | 打开 `.md` 即可；`hbot.d.ts` 作为只读参考页 | 硬规则 9「代码是唯一真源」：第二个知识库真源一定会漂 |
+| 设定集 `lore` + 文档 `doceditor` | **代码与文档（同一个编辑器）** | 现有 `editor-area`（Monaco） | `docs` 面（2026-11-21 落地：左清单 + textarea 直改直存）+ 资源管理器里用 Monaco 打开；`hbot.d.ts` 作为只读参考页 | 硬规则 9「代码是唯一真源」：第二个知识库真源一定会漂 |
 | 美术板 `artboard` + `presets/{covers,doc-covers,logos,mapicons}` | **不使用** | — | 图标走 16/20px 单色线性图标；平台用文字标签 | 图片资源 = 体积 + 第二套设计语言（§4 第 9 条） |
 | 测试 `testing` | **试跑 TryRun + 回放 Replay**（两个已有页签） | `tryrun` / `replay_run` / `replay_save_fixture` / `fixture_run` | 沿用现有面板 | 已经存在且够用，**不新增页签**（8 个页签已接近上限） |
 | 首页头部 `pagehead` + 主从 `masterdetail` | **主从布局保留，页头降级** | — | 主从：左列表 240–280 / 右详情自适应；页头 56px（不是 84px + 封面） | masterdetail 是 IDE 的天然形态；pagehead 的装饰部分见 §4 第 2 条 |
 
 **渠道 / 平台（Channel/Platform）** 不进上表：它不是独立页面，而是三处属性 —— `BotSummary.platform`（标签 18px）、设置页的平台段表单（`settings-view` 已有）、能力矩阵里 C3 出口（`send`/`notify`）的「发到哪」。渠道做成一页会是空壳页。
+
+### 2.1.1 已落地的三个整页面（2026-11-21）
+
+上表的「关卡 → 作业」「设定集 → 文档」「试跑」原本只落在侧栏面与页签里。用户拿 Mino 源码逐页核对后指出：Mino 的**任务看板 / 设计文档 / 开发日志**是三个独立整页面，而 HBot 只有对应的**数据**没有对应的**面**。于是补三面，全部用真实数据（不引 localStorage 第二套真相）：
+
+| Mino 视图（`js/app.js`） | HBot 面 | 数据来源 | 为什么不是照搬 |
+|---|---|---|---|
+| `tasks` 三列看板（todo/doing/done + 表单 + ←→ 删除） | `board` 作业看板 | `bot_jobs`（`JobView` 只读快照，`BOARD_LIMIT=60`） | 拖拽改状态 = 改调度真相，面板只读；三列按 `pending` / `running` / `done·failed·cancelled` 分，不认识的状态进「已结束」但不丢行（`lib/job-board.ts`） |
+| `docs` 左列表 + 标题 + textarea + 保存 | `docs` 设计文档 | `workspace.tree` 过滤 `.md/.markdown/.txt/.json` + `fs.read` / `fs.write` | 不建文档库：硬规则 9「代码是唯一真源」，第二个知识库真源一定会漂。源码仍留给资源管理器与 Monaco |
+| `logs` 输入框 + 日期列表 + 删除 | `logs` 开发日志 | `runStore` 的 10000 行环形缓冲（`run.log`） | 日志只有一份：与底部「日志」页签共用同一缓冲，整页只多级别/子串过滤与四档计数 |
+
+三面都渲染在编辑区位置（`App.tsx` 的 `renderPage()`），侧栏只放统计与清单 —— 三列看板在 420px 侧栏里会折成三条竖线。Mino 的 `localStorage` 持久化**没有搬**：IDE 的项目状态在文件与 SQLite 里。
 
 ### 2.2 四个「明确不映射」及理由（避免为了对称而造实体）
 

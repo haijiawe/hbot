@@ -1,6 +1,8 @@
 # features/workbench
 
-> bot 工作台的六个面：概览、Bot、能力、会话、运行态、渠道。
+> bot 工作台的九个面：六个侧栏面（概览、Bot、能力、会话、运行态、渠道）+ 三个整页面（作业看板、设计文档、开发日志）。
+>
+> 整页面的正文渲染在编辑区位置（`App.tsx` 的 `renderPage()`），侧栏只放清单与统计 —— 三列看板在 420px 侧栏里会折成三条竖线。
 
 ## 职责
 
@@ -19,6 +21,9 @@
 | `conversations` | `conversations-view.tsx` | `bot_conversations` 命令 |
 | `runtime` | `runtime-view.tsx` | `bot_jobs` / `bot_waits` 各 20 条，三个计数 + 最近几条 |
 | `channels` | `channels-view.tsx` | `workspace-store.botsFile` 的原文，解析在 `lib/bots-file.ts` |
+| `board` | `jobs-board-view.tsx` | `bot_jobs` 只读快照（`BOARD_LIMIT=60`），分列逻辑在 `lib/job-board.ts` |
+| `docs` | `docs-view.tsx` | `workspace.tree` 挑文档扩展名（`lib/doc-list.ts`）+ `fs.read` / `fs.write` |
+| `logs` | `logs-view.tsx` | `run-store.logs`（与底部「日志」页签同一份缓冲）+ 级别/子串过滤 |
 | 共用 | `bot-status.ts` | 五态标签与状态点类名（颜色不是唯一信号：降级是空心环） |
 
 清单的解析在 `lib/bot-manifest.ts`，bots.json 的解析在 `lib/bots-file.ts` ——

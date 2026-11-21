@@ -15,7 +15,7 @@
 | 你想干什么 | 读这份 |
 |---|---|
 | 接手这个仓库 | [HANDOFF.md](HANDOFF.md) —— 快照：已完成 / 剩余 / 闸门现状 / 外部依赖 |
-| 补一条踩过的坑 | [pitfalls.md](pitfalls.md) —— 143 条，编号稳定，别重排 |
+| 补一条踩过的坑 | [pitfalls.md](pitfalls.md) —— 145 条，编号稳定，别重排 |
 | 五分钟装上并跑起来 | [quickstart-desktop.md](quickstart-desktop.md) |
 | 改代码前确认落点 | [03-directory.md](03-directory.md) + 各目录的 README.md |
 | 改能力面（6 组能力 / 4 类 bot） | [07-bot-runtime-blueprint.md](07-bot-runtime-blueprint.md) |
@@ -39,7 +39,7 @@
 | [09-device-capability.md](09-device-capability.md) | C6 设备能力：闸只有一份、撤销要即时、审计不记内容 |
 | [10-plugin-model.md](10-plugin-model.md) | 插件模型：编译期 seam + 沙箱槽位，与 DSH-Cordis 的对照，为什么不做运行时 dlopen |
 | [HANDOFF.md](HANDOFF.md) | 交接快照：当前 HEAD、闸门数字、剩余清单、卡住的外部条件 |
-| [pitfalls.md](pitfalls.md) | 踩过的坑全表（143 条）。每条都是实测过的，不是推测 |
+| [pitfalls.md](pitfalls.md) | 踩过的坑全表（145 条）。每条都是实测过的，不是推测 |
 | [quickstart-desktop.md](quickstart-desktop.md) | 五分钟上手：装包 → 新建项目 → 试跑 → 看到回复 |
 
 ## 子目录

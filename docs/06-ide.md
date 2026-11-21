@@ -40,8 +40,8 @@
 
 | 区域 | 内容 | 默认 | 可关闭 |
 |---|---|---|---|
-| 活动栏 | Bot 工作台六面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道）+ 资源管理器 / 搜索 / 运行 / 问题 / 调试 / Agent / 设置 | 左，48px | 否 |
-| 侧栏 | 工作台六面、文件树、搜索结果、运行目标、设置页 | 左，240–420px | 是 |
+| 活动栏 | Bot 工作台九面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道 / 作业看板 / 设计文档 / 开发日志）+ 资源管理器 / 搜索 / 运行 / 问题 / 调试 / Agent / 设置 | 左，48px | 否 |
+| 侧栏 | 工作台九面、文件树、搜索结果、运行目标、设置页 | 左，240–420px | 是 |
 | 编辑区 | 标签页、面包屑、Monaco、分栏、Diff 编辑器 | 中，自适应 | 否 |
 | Agent 栏 | 对话、计划、工具卡、审批、Diff 审查 | 右，320–560px | 是 |
 | 底部面板 | 问题 / 输出 / 日志 / 调试控制台 | 下，160–400px | 是 |
@@ -49,9 +49,9 @@
 
 **布局只有一个真源**：`apps/web/src/lib/layout.ts` 的 `resolveLayout()`。侧栏与 Agent 栏的宽度、折叠阈值、分隔条宽度都从它来；组件不得各自写死宽度。旧项目踩过的坑：两套布局档位、CSS Grid 与内联宽度叠加 —— 新项目不重复。
 
-### 2.1 Bot 工作台的六个面（2026-11-21 落地）
+### 2.1 Bot 工作台的九个面（2026-11-21 落地）
 
-活动栏上半段是 **bot 视角**的六个面，下半段才是原来的 IDE 视图（资源管理器 / 搜索 / 运行 / 问题 / 调试 / Agent / 设置）。六个面都挂在同一个侧栏里，改的只是「看什么」，不动编辑区与 Agent 栏 —— 右侧 Agent 始终是同一个循环。
+活动栏上半段是 **bot 视角**的九个面，下半段才是原来的 IDE 视图（资源管理器 / 搜索 / 运行 / 问题 / 调试 / Agent / 设置）。前六个是**侧栏面**（改的只是侧栏「看什么」），后三个是**整页面**：它们要三列看板或整页编辑器的宽度，侧栏最大 420px 装不下，所以正文渲染在编辑区位置（`App.tsx` 的 `renderPage()`），侧栏只放清单与统计。九个面都不动右侧 Agent 栏 —— Agent 始终是同一个循环。
 
 | 面 | 侧栏值 | 回答的问题 | 数据来源 |
 |---|---|---|---|
@@ -61,13 +61,17 @@
 | 会话 | `conversations` | 已登记哪些会话、各自形态 | `bot_conversations` |
 | 运行态 | `runtime` | 作业在途 / 等待中 / 最近几条 | `bot_jobs` / `bot_waits` |
 | 渠道 | `channels` | `bots.json` 里登记了哪些平台与地址 | `fs.read('bots.json')`（**不显示 token / clientSecret**） |
+| 作业看板 | `board` | 排队 / 运行中 / 已结束各有几条，失败的那条错在哪 | `bot_jobs`（只读快照，`BOARD_LIMIT=60`） |
+| 设计文档 | `docs` | 项目里的 Markdown / 文本 / JSON 写的是什么、改完存哪 | `workspace.tree` 挑扩展名（`lib/doc-list.ts`）+ `fs.read` / `fs.write` |
+| 开发日志 | `logs` | 这次运行到底打了什么、哪几行是错误 | `runStore` 的 10000 行环形缓冲（`run.log` 事件，与底部「日志」页签同一份） |
 
 四条硬约定：
 
 1. **只显示声明层**。能力面的 ✓ 只代表 `hbot.json` 写了；装配（宿主有没有接上模型 / 设备）与授权（用户批没批）要到运行时才成立（ADR-0005 三层求交）。面板底部把这句话写出来，不让 ✓ 冒充「可以用」。
 2. **凭据不上界面**。渠道面解析 `bots.json` 时压根不读 `token` / `clientSecret` 字段（`lib/bots-file.ts`），不是读到再打码。
 3. **没有项目不发命令**。所有面在 `projectRoot === null` 时直接渲染提示，不发请求 —— 否则首屏状态栏会挂一条 `-32002` 红字（这正是 2026-11-21 修掉的一个真瑕疵）。
-4. **不新增命令**。六面只用现有 `Command`；清单与渠道走 `fs.read`，因为核心没有「返回清单」的命令，而纯函数解析在 Web 侧能直接喂字符串测试。
+4. **不新增命令**。九面只用现有 `Command`；清单与渠道走 `fs.read`，因为核心没有「返回清单」的命令，而纯函数解析在 Web 侧能直接喂字符串测试。
+5. **整页面不建第二个真相**。作业看板读 `bot_jobs` 快照（只读，不改状态）；设计文档走 `fs.read`/`fs.write`（不建文档库，因为「代码是唯一真源」，AGENTS §0.9）；开发日志直接用 `runStore` 里那份环形缓冲（不再订阅一遍事件、不另存一份）。浏览器 mock 里 `bot_jobs` 是演示行，`run.log` 只在「试跑」注入后才有 —— 面板在 mock 下会显示空态而不是假数据。
 
 视觉语言与设计令牌（配色、对比度、17 条不可借用项）见 [11-ui-language-bot-workbench.md](11-ui-language-bot-workbench.md)；面本身没有组件测试，理由写在 `apps/web/src/features/workbench/README.md`。
 
@@ -88,7 +92,7 @@
 
 **刻意没有搬**：侧栏宽度过渡（420ms 会拖 Monaco 重排）、径向渐变光晕、`rise` 入场动画、webfont、大封面图与插画空态、`backdrop-filter` 模糊、按页面 40–200ms 逐条延迟的入场。理由仍是 [11](11-ui-language-bot-workbench.md) §4.2 的三条预算（装饰 / 动效 / 意义），这三条用户没有要求改。
 
-判据：`pnpm --dir apps/web run check` 绿（50 文件 / 443 用例）；浅深两套都能在 headless Edge 里截到（`_recovery/mino-{1,2,3}-*.png`），实测 `documentElement.dataset.theme` 随按钮切换、卡片 `border-radius:18px`、`body` 14px。
+判据：`pnpm --dir apps/web run check` 绿（52 文件 / 462 用例）；浅深两套都能在 headless Edge 里截到（`_recovery/mino-{1,2,3}-*.png`），实测 `documentElement.dataset.theme` 随按钮切换、卡片 `border-radius:18px`、`body` 14px。三个整页面另有截图 `_recovery/face-{board,docs,logs}.png` 与走真流程（试跑注入 → 日志落地）的 `_recovery/face-logs-live.png`。
 
 
 ---
