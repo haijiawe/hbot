@@ -98,6 +98,12 @@ export interface WorkspaceState {
   /** 浅色 / 深色。写进 `<html data-theme>`，见 lib/theme.ts。 */
   theme: Theme
   sidebarView: SidebarView
+  /**
+   * 文档面选中的文件（相对项目根的路径）。
+   *
+   * 不进 prefs：它是"这一眼在看哪份"，不是布局偏好；换项目时随 `files` 一起回落。
+   */
+  docPath: string
   bottomPanelTab: BottomPanelTab
   error: string | null
   /** 待执行的"跳行"意图；编辑器消费后不清空（`seq` 保证重复点击也生效）。 */
@@ -221,6 +227,8 @@ export interface WorkspaceState {
   saveActive: () => Promise<void>
   saveAll: () => Promise<void>
   setSidebarView: (view: SidebarView) => void
+  /** 选中文档面要编辑的文件（主区域据此 `fs.read`）。 */
+  setDocPath: (path: string) => void
   setTheme: (theme: Theme) => void
   setBottomPanelTab: (tab: BottomPanelTab) => void
   setSidebarWidth: (width: number) => void
@@ -328,6 +336,7 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
   layout: initialPrefs.layout,
   theme: initialPrefs.theme,
   sidebarView: initialPrefs.sidebarView,
+  docPath: '',
   bottomPanelTab: initialPrefs.bottomPanelTab,
   error: null,
   reveal: null,
@@ -665,6 +674,10 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
         layout: { ...state.layout, sidebarCollapsed: false },
       }),
     )
+  },
+
+  setDocPath(path) {
+    set({ docPath: path })
   },
 
   setBottomPanelTab(tab) {

@@ -29,6 +29,9 @@ import { BotsView } from '../features/workbench/bots-view'
 import { CapabilitiesView } from '../features/workbench/capabilities-view'
 import { ChannelsView } from '../features/workbench/channels-view'
 import { ConversationsView } from '../features/workbench/conversations-view'
+import { DocsSide, DocsView } from '../features/workbench/docs-view'
+import { JobsBoardSide, JobsBoardView } from '../features/workbench/jobs-board-view'
+import { LogsSide, LogsView } from '../features/workbench/logs-view'
 import { OverviewView } from '../features/workbench/overview-view'
 import { RuntimeView } from '../features/workbench/runtime-view'
 import { restoreSessionIfSameProject, startSessionPersistence } from '../lib/session-persistence'
@@ -66,6 +69,12 @@ function renderSidebar(view: SidebarView) {
       return <RuntimeView />
     case 'channels':
       return <ChannelsView />
+    case 'board':
+      return <JobsBoardSide />
+    case 'docs':
+      return <DocsSide />
+    case 'logs':
+      return <LogsSide />
     case 'settings':
       return <SettingsView />
     case 'explorer':
@@ -73,6 +82,24 @@ function renderSidebar(view: SidebarView) {
   }
 }
 
+/**
+ * 三个"要整页宽度"的面（看板 / 文档 / 日志）。返回 null 表示主区域还是编辑器。
+ *
+ * 为什么不分两套导航：侧栏放清单、主区域放正文是同一个面的两半（与 VSCode 的
+ * "视图 + 编辑区"一致）。面一旦确定，主区域就不该再猜——所以这里只认 `SidebarView`。
+ */
+function renderPage(view: SidebarView) {
+  switch (view) {
+    case 'board':
+      return <JobsBoardView />
+    case 'docs':
+      return <DocsView />
+    case 'logs':
+      return <LogsView />
+    default:
+      return null
+  }
+}
 export function App() {
   const layout = useWorkspaceStore((state) => state.layout)
   const sidebarView = useWorkspaceStore((state) => state.sidebarView)
@@ -106,6 +133,7 @@ export function App() {
   const noticeTimer = useRef<number | null>(null)
 
   const resolved = resolveLayout(layout)
+  const page = renderPage(sidebarView)
   const styleVars = layoutStyleVars(resolved)
 
   const notify = useCallback((message: string) => {
@@ -203,7 +231,9 @@ export function App() {
         ) : null}
 
         <div className="workspace-column">
-          {projectRoot === null ? (
+          {page !== null ? (
+            <ErrorBoundary name="工作台页面">{page}</ErrorBoundary>
+          ) : projectRoot === null ? (
             // 还没有项目：显示一句能照着做的提示，而不是一块空白画布。
             // 真桌面壳启动时 `projectRoot` 是 null（要等用户打开/新建项目）；
             // mock 模式由 `startSessionPersistence` 先定成 `mock://project`，所以这条

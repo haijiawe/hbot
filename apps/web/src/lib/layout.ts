@@ -59,6 +59,10 @@ export type SidebarView =
   | 'conversations'
   | 'runtime'
   | 'channels'
+  // 看板与文档是"要整页宽度"的面：它们的正文渲染在主区域，侧栏只放清单/统计。
+  | 'board'
+  | 'docs'
+  | 'logs'
   | 'explorer'
   | 'settings'
 

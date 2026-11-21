@@ -72,6 +72,28 @@ export function ActivityBar() {
       active: sidebarView === 'channels' && !sidebarCollapsed,
       onClick: () => setSidebarView('channels'),
     },
+
+    {
+      id: 'board',
+      label: '作业看板',
+      icon: '▦',
+      active: sidebarView === 'board' && !sidebarCollapsed,
+      onClick: () => setSidebarView('board'),
+    },
+    {
+      id: 'docs',
+      label: '设计文档',
+      icon: '▧',
+      active: sidebarView === 'docs' && !sidebarCollapsed,
+      onClick: () => setSidebarView('docs'),
+    },
+    {
+      id: 'logs',
+      label: '开发日志',
+      icon: '☰',
+      active: sidebarView === 'logs' && !sidebarCollapsed,
+      onClick: () => setSidebarView('logs'),
+    },
     {
       id: 'explorer',
       label: '资源管理器',

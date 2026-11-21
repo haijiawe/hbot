@@ -466,3 +466,224 @@
   background: var(--bg-active);
   font-size: 10px;
 }
+
+/* ---------- 整页面（看板 / 文档 / 日志） ----------
+ *
+ * 这三面由主区域承载（侧栏只放清单与统计），所以它们的容器要吃掉整个高度：
+ * `.wb-page--editor` 让正文自己滚动，而不是被 `.wb-page` 的 padding 夹在中间。
+ * 尺寸全部相对：列宽用 `minmax`，字号跟 `--font-ui`，不写死 px 以外的单位。
+ */
+
+.wb-page--editor {
+  gap: 10px;
+}
+
+/* 表单行：Mino 的 .form-row（输入 + 下拉 + 按钮排一行）。 */
+.wb-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.wb-input,
+.wb-textarea {
+  min-width: 0;
+  padding: 8px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--bg-elevated);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+
+.wb-input {
+  flex: 1 1 200px;
+}
+
+.wb-input:focus-visible,
+.wb-textarea:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* 正文编辑器：占满剩余高度，等宽字体（Markdown / JSON 都是对着读的东西）。 */
+.wb-textarea {
+  flex: 1 1 auto;
+  min-height: 240px;
+  resize: none;
+  font-family: var(--font-mono);
+  line-height: 1.6;
+  tab-size: 2;
+}
+
+/* 看板：三列等宽，窄屏自动折成一列（同 Mino 的响应式）。 */
+.wb-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.wb-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 120px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-panel);
+}
+
+.wb-column__title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+
+.wb-column__count {
+  min-width: 20px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--bg-active);
+  color: var(--fg-muted);
+  font-size: 10px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.wb-column__empty {
+  margin: 0;
+  padding: 10px 0;
+  text-align: center;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+/* 卡片：Mino 的 .task。左缘一条状态色是唯一"颜色编码"，其余保持纸面。 */
+.wb-task {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-card);
+}
+
+.wb-task__title {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.wb-task__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.wb-task__error {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* 状态标签：ok / bad / neutral 三档，与 `jobOutcome` 一一对应。 */
+.wb-tag--ok {
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+  color: var(--ok);
+}
+
+.wb-tag--bad {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
+}
+
+.wb-tag--neutral {
+  background: var(--bg-active);
+  color: var(--fg-muted);
+}
+
+/* 日志流：等宽、行内三段（时刻 / 级别 / 正文），级别只染左边一条。 */
+.wb-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-panel);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.wb-log__line {
+  display: grid;
+  grid-template-columns: 62px 46px 1fr;
+  gap: 8px;
+  padding: 2px 10px;
+  border-left: 2px solid transparent;
+}
+
+.wb-log__line:hover {
+  background: var(--bg-hover);
+}
+
+.wb-log__line--error {
+  border-left-color: var(--danger);
+}
+
+.wb-log__line--warn {
+  border-left-color: var(--warn);
+}
+
+.wb-log__line--info {
+  border-left-color: var(--border-strong);
+}
+
+.wb-log__line--debug {
+  border-left-color: transparent;
+}
+
+.wb-log__time {
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.wb-log__level {
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.wb-log__text {
+  min-width: 0;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}

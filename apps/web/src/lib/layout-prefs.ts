@@ -55,6 +55,9 @@ const SIDEBAR_VIEWS: readonly SidebarView[] = [
   'conversations',
   'runtime',
   'channels',
+  'board',
+  'docs',
+  'logs',
   'explorer',
   'settings',
 ]
