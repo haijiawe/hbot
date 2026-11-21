@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`（含附件 `sendImage`/`sendFile`）、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（2038 个 Rust 测试 / 126 个 target / web 427 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`（含附件 `sendImage`/`sendFile`）、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（2048 个 Rust 测试 / 128 个 target / web 427 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -28,7 +28,7 @@
 |---|---|---|
 | 0 | `docs/HANDOFF.md` | **接手时先看这一份**：决策权在 lead、工作方式、六道闸门现状、已完成/剩余、外部依赖。它是快照，冲突以本文件与 `04` 为准 |
 | 1 | 本文件 | 规则与地图 |
-| 1.5 | [`docs/pitfalls.md`](docs/pitfalls.md) | **140 条坑全表**（编号稳定）：改任何热点模块前先按编号搜一遍 |
+| 1.5 | [`docs/pitfalls.md`](docs/pitfalls.md) | **141 条坑全表**（编号稳定）：改任何热点模块前先按编号搜一遍 |
 | 2 | `docs/03-directory.md` | 改动落点、命名、依赖方向 |
 | 3 | `docs/02-architecture.md` | 消息链路、Agent、沙箱、存储、安全 |
 | 4 | `docs/06-ide.md` | IDE 布局、编辑器、Agent Diff、运行/调试 |
@@ -45,29 +45,34 @@
 
 ## 2. 目录地图
 
-| 路径 | 放什么 | 不能放什么 |
-|---|---|---|
-| `crates/hbot-core` | 实体、端口 trait、错误、ID | 任何 IO、任何 workspace 依赖 |
-| `crates/hbot-store` | SQLite、迁移、repository | 业务规则、Agent 逻辑 |
-| `crates/hbot-agent` | 循环、上下文、工具、审批、provider | Bot 生命周期、UI DTO |
-| `crates/hbot-code` | manifest、SWC 编译、QuickJS、宿主 API | 平台协议、Agent 循环 |
-| `crates/hbot-bot` | supervisor、会话队列、outbox、去重 | 具体平台协议 |
-| `crates/hbot-workspace` | 项目文件、监听、搜索、符号/源码映射、编辑事务 | UI、Agent 决策 |
-| `crates/hbot-adapters` | OneBot/Webhook/Telegram…、keyring、HTTP、fs | 业务编排 |
-| `crates/hbot-rpc` | Command/Event、dispatch、WS 服务 | 业务实现 |
-| `crates/hbot-cli` | `hbot` 二进制：serve/check/run | 库逻辑 |
-| `crates/hbot-desktop` | Tauri 命令、窗口、托盘、更新 | 业务规则 |
-| `crates/xtask` | 代码生成、依赖检查、基准 | 运行时逻辑 |
-| `apps/web/src/features/*` | explorer/editor/search/problems/agent/run/debug/logs/settings | 跨 feature 内部 import |
-| `apps/web/src/lib/layout.ts` | 布局唯一真源 | 组件写死宽度 |
-| `apps/web/src/lib/keybindings.ts` | 快捷键唯一真源 | 组件自己绑快捷键 |
-| `apps/web/src/stores` | workspace / agent / run 三个 store | store 之间直接 setter |
-| `apps/web/src/generated` | Rust 生成的 TS | **手改** |
-| `tests/integration` | 真 SQLite + mock 平台 | 真实账号 |
-| `tests/parity` | 旧项目行为场景 | 逐条搬旧测试 |
-| `docs/` | 设计、ADR、体检 | 运行日志、临时文件 |
-
-依赖方向与“改 X 去哪”见 `docs/03-directory.md` §2、§8。
+| 路径 | 放什么 | 不能放什么 | 说明书 |
+|---|---|---|---|
+| `crates/hbot-core` | 实体、端口 trait、错误、ID、能力判据 | 任何 IO、任何 workspace 依赖 | [README](crates/hbot-core/README.md) |
+| `crates/hbot-store` | SQLite、迁移、repository | 业务规则、Agent 逻辑 | [README](crates/hbot-store/README.md) |
+| `crates/hbot-agent` | 循环、上下文、工具、审批、provider | Bot 生命周期、UI DTO | [README](crates/hbot-agent/README.md) |
+| `crates/hbot-code` | manifest、SWC 编译、QuickJS、宿主 API | 平台协议、Agent 循环 | [README](crates/hbot-code/README.md) |
+| `crates/hbot-bot` | supervisor、会话队列、outbox、去重 | 具体平台协议 | [README](crates/hbot-bot/README.md) |
+| `crates/hbot-workspace` | 项目文件、路径守卫、原子写、搜索 | UI、Agent 决策 | [README](crates/hbot-workspace/README.md) |
+| `crates/hbot-adapters` | OneBot / QQ 官方 / local、受限 HTTP、TLS | 业务编排 | [README](crates/hbot-adapters/README.md) |
+| `crates/hbot-command` | 子进程、进程树隔离、资源限额 | 审批、工具语义 | [README](crates/hbot-command/README.md) |
+| `crates/hbot-device` | 截图、注入、窗口、剪贴板、OCR（只有 Windows 实现） | 授权判据 | [README](crates/hbot-device/README.md) |
+| `crates/hbot-replay` | 历史重放与输出比对 | 自己开库、拉起 bot | [README](crates/hbot-replay/README.md) |
+| `crates/hbot-rpc` | Command/Event、dispatch、WS 服务、能力装配 | 业务实现 | [README](crates/hbot-rpc/README.md) |
+| `crates/hbot-cli` | `hbot` 二进制：serve / check / replay / fixture / token | 库逻辑 | [README](crates/hbot-cli/README.md) |
+| `crates/hbot-desktop` | Tauri 窗口、托盘、自启、事件泵 | 业务规则、命令分支 | [README](crates/hbot-desktop/README.md) |
+| `crates/hbot-bench` | 性能预算手测台 | 改实现或预算值 | [README](crates/hbot-bench/README.md) |
+| `crates/hbot-parity` | 跨 crate 行为回归（**只有 tests/**） | 任何实现 | [README](crates/hbot-parity/README.md) |
+| `crates/hbot-redteam` | 红队夹具（**只有 tests/** + 夹具库） | 任何实现 | [README](crates/hbot-redteam/README.md) |
+| `crates/xtask` | 代码生成、依赖检查、基准 | 运行时逻辑 | — |
+| `apps/web/src` | app / components / features / lib / stores / generated | 见各自的边界 | [README](apps/web/src/README.md) |
+| `apps/web/src/features/*` | 12 个功能面板，一目录一份 README | 跨 feature 内部 import | 见各目录 README |
+| `apps/web/src/lib/layout.ts` | 布局唯一真源 | 组件写死宽度 | — |
+| `apps/web/src/lib/keybindings.ts` | 快捷键唯一真源 | 组件自己绑快捷键 | — |
+| `apps/web/src/stores` | workspace / agent / run 三个主 store（另有 debug/device/search/tryrun） | store 之间直接 setter | — |
+| `apps/web/src/generated` | Rust 生成的 TS | **手改** | — |
+| `tests/integration` | 真 SQLite + mock 平台 | 真实账号 | — |
+| `tests/parity` | 旧项目行为场景 | 逐条搬旧测试 | — |
+| `docs/` | 设计、ADR、体检、计划、spike | 运行日志、临时文件 | 从 [HANDOFF](docs/HANDOFF.md) 进入 |
 
 ---
 
@@ -155,7 +160,7 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 
 ## 7. 已踩过的坑
 
-全表（140 条）在 **[`docs/pitfalls.md`](docs/pitfalls.md)** —— 那里编号稳定，代码注释与
+全表（141 条）在 **[`docs/pitfalls.md`](docs/pitfalls.md)** —— 那里编号稳定，代码注释与
 设计文档里的「坑 66」「坑 69」都指向它。**新增一条写进那个文件**，不要在这里追加。
 
 改代码之前至少扫一眼下面 12 条：它们全是「不报错、只是悄悄失效」那一类，出事最难查。
@@ -174,6 +179,7 @@ adapter → normalize → INSERT inbound (UNIQUE bot_id, external_id)
 | 60 | 清单参与热重载指纹：改 `hbot.json` 会重建 isolate |
 | 66 | 给 `SandboxHandler` 加能力要加五处；缺一处就是「看着能用、其实没接上」 |
 | 69 | 每个「声明了才有」的能力都要自己第一句读清单，不要复用别人的 tick |
+
 ---
 
 ## 8. 新增 X 的步骤
