@@ -800,3 +800,23 @@
     「用户改了缩放/主题/DPI 之后它还成立吗」**。判据：断言应该是解方程的恒等式（换算关系）或
     单调性（只升不降），而不是「值相等」；真需要值相等就先断言前提（这里是「缩放比是 100%」）。
     产品侧不用改：`monitor_dpi`（`crates/hbot-device/src/windows.rs:963`）本来就该照系统说法报。
+
+## 142. 追加 CSS 时把规则写进了上一个未闭合的块：样式静默「缩进到」别人的选择器里
+
+2026-11-21 给 `apps/web/src/styles/app.css` 追加 bot 工作台样式时踩到：那一次是先 `read` 全文再 `write` 回去（坑 134 的复现），
+`read` 有输出上限，**尾部 830 行被静默截断**，而我的插入点正好落在 `.device-panel__request {` 这个规则的声明之间 ——
+于是这个规则既没有原始声明、也没有闭合花括号，后面整段工作台样式在构建时被 Lightning CSS 当成 **CSS 嵌套**，
+全部编译成 `.device-panel__request .wb { … }` / `.device-panel__request .cap__row { … }`。
+
+**症状是「样式全丢」，但没有任何报错**：构建 0 退出、`dist` 里能 grep 到类名、dev 服务器照样起。
+只是渲染出来像没写 CSS —— 侧栏里 `状态 · KV未声明` 挤成一行、`.cap__row` 的 `display` 是 `list-item` 而不是 `grid`。
+
+判读方法（比一张张截图猜快得多）：在浏览器/WebView 里 `getComputedStyle(document.querySelector('.cap__row'))`，
+看 `display` 是不是你以为的值；不对就去 `dist/assets/*.css` 里 grep 类名，看它前面是不是被拼了一个父选择器。
+
+规矩：
+
+1. **给大文件追加一律 `fs.appendFile` 或 `edit`（加锚点）**，绝不 `read`→`write`（坑 134）。
+2. 追加后**先做结构自检再看效果**：CSS 数花括号（`depth == 0 && neg == 0`）、Markdown 数标题、Rust 跑 `cargo fmt --check`。
+3. 改完立刻 `git diff --stat`：行数变化与预期差太远（这次是 1046 行删成 214 行）说明被截断了，**先恢复再继续**。
+   恢复手法：`git show HEAD:<path> > /tmp/head`，用「HEAD 里锚点之后的部分」重建尾部，再把新块拼到最后。

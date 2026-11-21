@@ -36,7 +36,7 @@
 | Bot | Rust supervisor，每会话串行队列，持久化 inbound/outbound |
 | 平台 | OneBot 11 + 通用 Webhook 优先，适配器 SDK 扩展到其他平台 |
 | 生成代码 | 多文件 TypeScript（相对 import）→ 逐文件 SWC 去类型 → QuickJS 模块加载器 |
-| IDE | Monaco 编辑器、文件树、搜索、问题、Diff 审查、运行/日志、插桩调试 |
+| IDE | **Bot 工作台六面**（概览 / Bot / 能力 / 会话 / 运行态 / 渠道）+ Monaco 编辑器、文件树、搜索、问题、Diff 审查、运行/日志、插桩调试 |
 | 存储 | SQLite（rusqlite bundled，WAL，单 writer） |
 | 密钥 | OS keychain（`keyring`） |
 | 打包 | Tauri bundler（NSIS / dmg / deb+AppImage） |
@@ -70,7 +70,7 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | 技术栈 ADR | Proposed（`0002`；转 Accepted 还差 QuickJS 长跑、真 OneBot 网关、macOS 隔离） |
 | 架构 / 目录 / 计划 / 闸门 / IDE | Draft，已按实现回填实测口径（`02`–`06`） |
 | 代码 | **已落地 M0–M2 主体 + M3/M4/M5 绝大部分 + C6 设备能力窄版（Windows）+ M7 第 1–5.5 步全部（`ctx.kv` / `ctx.history` / `ctx.ai` / `onSchedule`（旧名 `onTimer`）/ `ctx.jobs` / `ctx.session` / `ctx.sql`）+ `ctx.send` / `ctx.notify` / `ctx.webhook`（`onWebhook`）+ `onStart` / `onStop` + `ctx.files` + `ctx.device.screen({ window })`（按窗口截图）**（`crates/` 下 16 个 crate + `xtask`，`apps/web` 可构建） |
-| 测试 | 最近一次 `cargo test --workspace`：**2053 passed / 0 failed**（128 个 target，`rustc 1.100.0`）；`apps/web`：47 文件 427 用例 |
+| 测试 | 最近一次 `cargo test --workspace`：**2053 passed / 0 failed**（128 个 target，`rustc 1.100.0`）；`apps/web`：49 文件 438 用例 |
 | CI | GitHub Actions **全绿**（`haijiawe/hbot`，2026-11-21 起 public）：`gates` / `web` / `bundle (ubuntu)` / `bundle (windows, nsis)` 与 `rust` 的 `fmt`+`clippy`+`test`（ubuntu 与 windows 两平台）全部通过，最近一次 head `c84d04d`（run `44822773155`）也是 workflow 级 success（首次是 head `d0132d2` 的 run `44788353950`）；后续纯文档提交不再逐个登记 run id；`bundle (macos, dmg)` 因这台账号没有 macOS runner 容量改成手动触发，默认 `skipped`（≠ 通过）|
 | 真机验证 | QQ 官方群/私聊被动回复已端到端跑通（`docs/spikes/S9-e2e-qq-official.md`）；Windows NSIS 安装包 9.14 MiB、安装冒烟 11/11；Windows 设备能力（截屏/原生 OCR/输入/多显示器）真机验证；DPI 声明 `unaware → per-monitor-v2` 实测 |
 | 未完成 | M6 迁移/影子（缺测试账号）、云端执行宿主（`M9` 只剩真机那一半：`wss`/多客户端 token/备份/24h 验收；本地可做的一半已落地，见 `docs/08` §9.3.1）、真 NapCat 登录（需扫码且二维码会过期）、Linux/macOS 运行（Landlock 只交叉编译过、一次没真跑）、设备混合 DPI 跨屏拼图/中文以外的 OCR 语言包与手机宿主 |
@@ -99,7 +99,7 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | [`docs/07-bot-runtime-blueprint.md`](docs/07-bot-runtime-blueprint.md) | **起 bot 的架构蓝图**：三层分离、6 组能力、四类 bot 缺什么、状态/定时/作业、设备能力（C6）三道闸、网关顺序 |
 | [`docs/08-multi-host.md`](docs/08-multi-host.md) | **多宿主与运行位置**：桌面/无头/手机能力矩阵、iOS/Android 后台真相、本机/局域网/云端四档、npm 打包、移动端风险 |
 | [`docs/09-device-capability.md`](docs/09-device-capability.md) | **设备能力实现设计**（Draft）：两个消费者一份闸、库表、三层闸落点、`DeviceBackend`、Windows 抓屏/注入选型、会话状态机、契约增量、窄版 vs 完整版 |
-| [`docs/pitfalls.md`](docs/pitfalls.md) | **踩过的坑全表（141 条，编号稳定）**：旧项目的证据 + 新仓库自己实测的坑，AGENTS.md §7 只留摘要 |
+| [`docs/pitfalls.md`](docs/pitfalls.md) | **踩过的坑全表（142 条，编号稳定）**：旧项目的证据 + 新仓库自己实测的坑，AGENTS.md §7 只留摘要 |
 | [`docs/adr/0004-one-core-three-hosts.md`](docs/adr/0004-one-core-three-hosts.md) | 决策：一个核心三宿主、手机不做完整 IDE、为什么 QuickJS 对 iOS 也成立 |
 | [`docs/adr/0005-capability-ceiling-and-device-grant.md`](docs/adr/0005-capability-ceiling-and-device-grant.md) | 决策：能力上限不砍、默认全关、逐项授权（含键鼠注入的三层闸） |
 | [`docs/adr/0006-execution-backend.md`](docs/adr/0006-execution-backend.md) | 决策：运行位置可选（本机/局域网/云端）、单一写者、换位置靠搬家不靠热迁移 |
