@@ -40,5 +40,5 @@
 
 ## 构建与检查
 
-`pnpm --dir apps/web run check`（= `tsc --noEmit` + biome），`pnpm --dir apps/web test`（vitest，52 文件）。
+`pnpm --dir apps/web run check`（= `tsc --noEmit` + biome），`pnpm --dir apps/web test`（vitest，54 文件）。
 `dist/` 是构建产物，被 `crates/hbot-desktop` 的 `frontendDist` 引用 —— 所以 `cargo check --workspace --all-targets` 之前它必须存在。
