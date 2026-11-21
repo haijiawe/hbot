@@ -12,16 +12,21 @@
   --border: #2c2f36;
   --border-strong: #3a3e47;
 
-  --fg: #d7dae0;
+  --fg: #c9cdd4;
   --fg-muted: #9aa0aa;
-  --fg-dim: #6b7280;
+  --fg-dim: #7f8794;
 
-  --accent: #4f8cff;
+  /* 文字/线条用的强调色（在 --bg 上 5.50，达 AA）。实底按钮另用 --accent-fill：
+     一个色既当文字又当底色，必然有一头不达标（白字压在 #4f8cff 上只有 3.22）。 */
+  --accent: #5b8def;
+  /* 实底（按钮/徽标）的填充色：白字压在上面 4.74，达 AA。 */
+  --accent-fill: #2f6fdc;
+  --accent-fill-hover: #2a67d0;
   --accent-fg: #ffffff;
   --ok: #52b788;
   --warn: #e0b341;
   --danger: #f06a6a;
-  --focus: #6ea8ff;
+  --focus: #7fb0ff;
 
   --font-ui: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, 'Liberation Mono', monospace;

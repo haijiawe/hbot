@@ -28,11 +28,20 @@ export interface WorkspacePrefs {
 
 export const DEFAULT_WORKSPACE_PREFS: WorkspacePrefs = {
   layout: DEFAULT_LAYOUT,
-  sidebarView: 'explorer',
+  sidebarView: 'overview',
   bottomPanelTab: 'logs',
 }
 
-const SIDEBAR_VIEWS: readonly SidebarView[] = ['explorer', 'settings']
+const SIDEBAR_VIEWS: readonly SidebarView[] = [
+  'overview',
+  'bots',
+  'capabilities',
+  'conversations',
+  'runtime',
+  'channels',
+  'explorer',
+  'settings',
+]
 const BOTTOM_PANEL_TABS: readonly BottomPanelTab[] = [
   'logs',
   'problems',

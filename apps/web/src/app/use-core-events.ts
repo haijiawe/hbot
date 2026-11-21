@@ -28,9 +28,14 @@ import { useSearchStore } from '../stores/search-store'
 import { useWorkspaceStore } from '../stores/workspace-store'
 
 export function useCoreEvents(): void {
+  // 项目切换（含从"没打开"到打开）时重新播种：`bot.list` 只对当前项目有效，
+  // 没有项目时核心直接回 `-32002`，那会变成首屏的一条红字。
+  const projectRoot = useWorkspaceStore((state) => state.projectRoot)
+
   useEffect(() => {
+    if (projectRoot === null) return
     void useRunStore.getState().hydrate()
-  }, [])
+  }, [projectRoot])
 
   useEffect(() => {
     // onEvent 在 mock 模式下订阅内存事件总线、旧桥模式下是空订阅，卸载时统一调它即可。

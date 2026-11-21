@@ -44,6 +44,7 @@ function actionLocation(item: Diagnostic): string {
 
 export function ProblemsPanel() {
   const diagnostics = useWorkspaceStore((state) => state.diagnostics)
+  const projectRoot = useWorkspaceStore((state) => state.projectRoot)
   const openAt = useWorkspaceStore((state) => state.openAt)
   const error = useWorkspaceStore((state) => state.error)
   const dismissError = useWorkspaceStore((state) => state.dismissError)
@@ -56,8 +57,12 @@ export function ProblemsPanel() {
   useEffect(() => {
     // 切到问题页签（或面板首次挂载）就拉一次：诊断只在按下按钮后才新鲜，
     // 核心不会主动推（`crates/hbot-rpc/src/app/commands/files.rs`）。
+    //
+    // 没有打开项目时不发：核心会以 `-32002 没有打开的项目` 拒绝，而底部面板是常驻挂载的，
+    // 这一条会变成首屏状态栏上的一行红字（用户什么都没做就报错）。
+    if (projectRoot === null) return
     void useWorkspaceStore.getState().refreshDiagnostics()
-  }, [])
+  }, [projectRoot])
 
   // 订阅 `tabs`（唯一真源）而不是每次渲染都去 `getState()`：文件变脏/变干净时这行提示
   // 要跟着变，否则用户会对着过期的提示判断。

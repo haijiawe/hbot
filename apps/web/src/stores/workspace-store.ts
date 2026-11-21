@@ -19,6 +19,8 @@ import {
   type SidebarView,
 } from '../lib/layout'
 import { readPrefs, writePrefs, type WorkspacePrefs } from '../lib/layout-prefs'
+import type { ManifestView } from '../lib/bot-manifest'
+import { parseManifest } from '../lib/bot-manifest'
 import type { SessionSnapshot } from '../lib/session-journal'
 
 /**
@@ -106,6 +108,24 @@ export interface WorkspaceState {
    */
   diagnostics: Diagnostic[]
   /**
+   * 清单（`hbot.json`）的只读视图（`null` = 还没读或没有项目）。
+   *
+   * 它只回答"声明了什么"：装配（宿主有没有接上模型/设备）与授权（用户有没有批）
+   * 是另外两层，面板必须分开显示（ADR-0005）。
+   */
+  manifest: ManifestView | null
+  /** 读清单失败的人话原因；成功时清空。 */
+  manifestError: string | null
+  /**
+   * 最近一次读到的 `bots.json` 原文（`null` = 没读或没有这个文件）。
+   *
+   * 渠道面板要显示"这个项目声明了哪些平台"，而 `bot_list` 只返回已经落库的 bot；
+   * 没启动过的声明不在库里。原文留着是为了让面板能说清"哪份文件解析失败"。
+   */
+  botsFile: string | null
+  /** 读 `bots.json` 失败的人话原因。 */
+  botsFileError: string | null
+  /**
    * 当前打开着的项目对话框（`null` = 没有对话框）。
    *
    * 为什么放在 store 而不是命令面板的局部 state：命令面板只负责"发起"，执行完命令就
@@ -148,6 +168,10 @@ export interface WorkspaceState {
   openAt: (path: string, line: number) => Promise<void>
   /** 拉一次诊断（问题面板挂载 / 切到该页签时调用）。 */
   refreshDiagnostics: () => Promise<void>
+  /** 读一次项目清单（概览 / 能力面板挂载时调用；失败只记错，不清空上一次成功的值）。 */
+  refreshManifest: () => Promise<void>
+  /** 读一次 `bots.json` 原文（渠道面板挂载时调用）。 */
+  refreshBotsFile: () => Promise<void>
   /** 核心推来 `diagnostics` 事件时并入当前列表。 */
   ingestEvent: (event: CoreEvent) => void
   closeTab: (path: string) => void
@@ -301,6 +325,10 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
   error: null,
   reveal: null,
   diagnostics: [],
+  manifest: null,
+  manifestError: null,
+  botsFile: null,
+  botsFileError: null,
   projectDialog: null,
   lastApply: null,
 
@@ -374,6 +402,34 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
     }
   },
 
+  async refreshManifest() {
+    if (get().projectRoot === null) {
+      set({ manifest: null, manifestError: null })
+      return
+    }
+    try {
+      const result = await dispatch({ type: 'fs.read', path: 'hbot.json' })
+      const parsed = parseManifest(result.content)
+      if (parsed.ok) set({ manifest: parsed.view, manifestError: null })
+      else set({ manifestError: parsed.reason })
+    } catch (error) {
+      // 读不到清单不是灭顶之灾（项目可能还没建完），但必须让用户看见。
+      set({ manifestError: `读取 hbot.json 失败：${errorMessage(error)}` })
+    }
+  },
+
+  async refreshBotsFile() {
+    if (get().projectRoot === null) {
+      set({ botsFile: null, botsFileError: null })
+      return
+    }
+    try {
+      const result = await dispatch({ type: 'fs.read', path: 'bots.json' })
+      set({ botsFile: result.content, botsFileError: null })
+    } catch (error) {
+      set({ botsFile: null, botsFileError: `读取 bots.json 失败：${errorMessage(error)}` })
+    }
+  },
   ingestEvent(event) {
     if (event.type !== 'diagnostics') return
     diagnosticsEventSeq += 1

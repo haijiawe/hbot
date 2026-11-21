@@ -14,7 +14,7 @@
 import { create } from 'zustand'
 import type { LogLevel as LogLevelDto } from '../generated'
 import { errorMessage } from '../lib/format'
-import type { BotStatus, CoreEvent, LogLine, LogLevel } from '../lib/ipc'
+import type { BotStatus, BotSummary, CoreEvent, LogLine, LogLevel } from '../lib/ipc'
 import { dispatch } from '../lib/ipc'
 
 /** 日志环形缓冲上限：10k 行 —— 够复现一次故障，又不至于把内存吃光。 */
@@ -25,6 +25,8 @@ export const LOG_TAIL_LIMIT = 500
 
 export interface RunState {
   botId: string
+  /** 当前项目的全部 bot（`bot_list` 的完整结果，最少含声明未启动的那些）。 */
+  bots: BotSummary[]
   status: BotStatus
   logs: LogLine[]
   /** 启停命令在途（只用于禁用按钮，不代表运行态）。 */
@@ -37,6 +39,13 @@ export interface RunState {
 
   /** 用 `bot.list` 对齐一次状态；事件优先，`live` 时不动 status。 */
   refresh: () => Promise<void>
+  /**
+   * 选中一个 bot（概览/会话/运行态面板都按它取数据）。
+   *
+   * 选中的是本进程的 UI 意图，不落库：刷新后如果这个 bot 还在列表里就保留，
+   * 不在了就回落到列表第一条（避免界面停在一条已经不存在的记录上）。
+   */
+  selectBot: (botId: string) => void
   /** 从 `logs_tail` 补读一次历史日志；`botId` 为空时读全项目（含 Agent 行）。 */
   loadLogs: () => Promise<void>
   hydrate: () => Promise<void>
@@ -62,6 +71,7 @@ function appendLine(existing: LogLine[], line: LogLine): LogLine[] {
 
 export const useRunStore = create<RunState>()((set, get) => ({
   botId: '',
+  bots: [],
   status: 'stopped',
   logs: [],
   busy: false,
@@ -69,17 +79,22 @@ export const useRunStore = create<RunState>()((set, get) => ({
   hydrated: false,
   live: false,
 
+  selectBot(botId) {
+    const found = get().bots.find((bot) => bot.botId === botId)
+    set({ botId, status: found ? found.status : get().status })
+  },
   async refresh() {
     try {
       const bots = await dispatch({ type: 'bot.list' })
-      const first = bots[0]
+      // 保留当前选中项（它可能不是第一台），只有在列表里找不到时才回落第一条。
+      const selected = bots.find((bot) => bot.botId === get().botId) ?? bots[0]
       // 事件已经到过就别用快照覆盖它（快照可能比事件旧）。
-      if (!first || get().live) {
-        set({ hydrated: true })
+      if (!selected || get().live) {
+        set({ bots, hydrated: true })
         await get().loadLogs()
         return
       }
-      set({ botId: first.botId, status: first.status, hydrated: true })
+      set({ bots, botId: selected.botId, status: selected.status, hydrated: true })
       await get().loadLogs()
     } catch (error) {
       // 查不到列表不是致命错误（可能还没打开项目），但必须让用户看见。
@@ -153,9 +168,16 @@ export const useRunStore = create<RunState>()((set, get) => ({
     switch (event.type) {
       case 'bot.status': {
         const state = get()
+        const bots = state.bots.map((bot) =>
+          bot.botId === event.botId ? { ...bot, status: event.status } : bot,
+        )
         // 只认当前 bot：多 bot 时别的 bot 的状态不该改这条状态栏。
-        if (state.botId.length > 0 && state.botId !== event.botId) return
+        if (state.botId.length > 0 && state.botId !== event.botId) {
+          set({ bots })
+          return
+        }
         set({
+          bots,
           botId: event.botId,
           status: event.status,
           live: true,

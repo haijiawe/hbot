@@ -46,10 +46,21 @@ export const DEBUG_STACK_WIDTH = 240
 /**
  * 侧栏当前显示哪个视图。
  *
+ * 前六个是 bot 工作台的面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道），后两个是
+ * 原来的 IDE 视图。面只是"看什么"，不改变编辑区：文件仍然在编辑区的标签里。
+ *
  * 放在 layout.ts 而不是 store 里：它和布局一起被持久化（见 `lib/layout-prefs.ts`），
  * 而且组件只从这里取类型，避免"布局真源"和"页签类型"分成两处分头维护。
  */
-export type SidebarView = 'explorer' | 'settings'
+export type SidebarView =
+  | 'overview'
+  | 'bots'
+  | 'capabilities'
+  | 'conversations'
+  | 'runtime'
+  | 'channels'
+  | 'explorer'
+  | 'settings'
 
 /**
  * 底部面板当前页签（同样随布局一起持久化）。

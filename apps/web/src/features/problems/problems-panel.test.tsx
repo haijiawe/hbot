@@ -70,6 +70,8 @@ async function renderPanel(): Promise<void> {
 
 beforeEach(() => {
   useWorkspaceStore.setState({
+    // 挂载时的第一次 diagnostics 要求项目已打开（没有项目时不该发，见 problems-panel）。
+    projectRoot: '/proj',
     contents: {},
     saved: {},
     tabs: [],
@@ -168,6 +170,14 @@ describe('ProblemsPanel', () => {
     ingest('src/b.ts', [diagnostic({ path: 'src/b.ts', message: '另一个文件' })])
     expect(screen.getByText('新的')).toBeTruthy()
     expect(screen.getByText('另一个文件')).toBeTruthy()
+  })
+
+  it('没有打开项目时不发 diagnostics（否则首屏状态栏会挂一条 -32002 红字）', async () => {
+    useWorkspaceStore.setState({ projectRoot: null })
+    render(<ProblemsPanel />)
+    // 给挂载后的微任务一轮机会：真发了就会出现在 dispatch 的调用里。
+    await act(async () => {})
+    expect(commandsOf('diagnostics')).toEqual([])
   })
 
   it('读取失败走 role=alert 一行错误，不把上一批诊断清空（清空等于撒谎）', async () => {

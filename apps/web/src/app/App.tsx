@@ -15,6 +15,7 @@ import {
   SIDEBAR_MIN_WIDTH,
   layoutStyleVars,
   resolveLayout,
+  type SidebarView,
 } from '../lib/layout'
 import { AgentPanel } from '../features/agent/agent-panel'
 import { EditorArea } from '../features/editor/editor-area'
@@ -23,6 +24,12 @@ import { openSearch } from '../features/search/open-search'
 // 行内编辑的桥：编辑器挂载时注册，快捷键这边只问一句"现在能不能开浮层"。
 import { requestInlineEdit } from '../lib/inline-edit'
 import { SettingsView } from '../features/settings/settings-view'
+import { BotsView } from '../features/workbench/bots-view'
+import { CapabilitiesView } from '../features/workbench/capabilities-view'
+import { ChannelsView } from '../features/workbench/channels-view'
+import { ConversationsView } from '../features/workbench/conversations-view'
+import { OverviewView } from '../features/workbench/overview-view'
+import { RuntimeView } from '../features/workbench/runtime-view'
 import { restoreSessionIfSameProject, startSessionPersistence } from '../lib/session-persistence'
 import { useRunStore } from '../stores/run-store'
 import { useDebugStore } from '../stores/debug-store'
@@ -41,6 +48,29 @@ import { useGlobalKeybindings } from './use-global-keybindings'
 const BottomPanel = lazy(() => import('../features/run/bottom-panel'))
 
 const NOTICE_DURATION_MS = 4000
+
+// 侧栏的面只有一个真源：活动栏改的是 sidebarView，这里决定渲染谁。
+// 新增一个面时，layout.ts 的 SidebarView、活动栏的条目、这里的三处要同批改。
+function renderSidebar(view: SidebarView) {
+  switch (view) {
+    case 'overview':
+      return <OverviewView />
+    case 'bots':
+      return <BotsView />
+    case 'capabilities':
+      return <CapabilitiesView />
+    case 'conversations':
+      return <ConversationsView />
+    case 'runtime':
+      return <RuntimeView />
+    case 'channels':
+      return <ChannelsView />
+    case 'settings':
+      return <SettingsView />
+    case 'explorer':
+      return <ExplorerView />
+  }
+}
 
 export function App() {
   const layout = useWorkspaceStore((state) => state.layout)
@@ -89,8 +119,11 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    // 没有打开项目时不发 `workspace.tree`：核心回 `-32002`，而首屏状态栏会把这条
+    // 显示成红字（用户什么都没做就报错）。项目打开 / 切换时再读。
+    if (projectRoot === null) return
     void loadTree()
-  }, [loadTree])
+  }, [projectRoot, loadTree])
 
   // 未保存缓冲区 journal：挂载时接上录制（编辑 / 切标签 / 脏标记变化 → 节流写 IndexedDB）
   // 与 beforeunload 冲刷，随后尝试恢复上次现场。写盘失败进状态栏（不静默吞）。
@@ -148,7 +181,7 @@ export function App() {
           <>
             <aside className="sidebar" aria-label="侧栏">
               <ErrorBoundary name="侧栏">
-                {sidebarView === 'explorer' ? <ExplorerView /> : <SettingsView />}
+                {renderSidebar(sidebarView)}
               </ErrorBoundary>
             </aside>
             <Splitter

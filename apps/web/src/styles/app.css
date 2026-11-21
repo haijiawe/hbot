@@ -73,6 +73,22 @@ body.is-resizing {
   opacity: 0.4;
 }
 
+/* 活动栏分组：每一项一个槽，分隔线画在槽里（按钮本身尺寸不变）。 */
+.activity-bar__slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+}
+
+.activity-bar__separator {
+  width: 20px;
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+
 /* ---------- 侧栏 / Agent 栏 ---------- */
 
 .sidebar {
@@ -197,13 +213,13 @@ body.is-resizing {
 }
 
 .button--primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-fill);
+  border-color: var(--accent-fill);
   color: var(--accent-fg);
 }
 
 .button--primary:hover:not(:disabled) {
-  background: #6a9dff;
+  background: var(--accent-fill-hover);
 }
 
 .button:disabled {
@@ -1030,9 +1046,12 @@ body.is-resizing {
   background: var(--warn);
 }
 
-/* 降级：还在跑，但平台侧有问题（契约里没有 error 档，错误走 bot.status 的 error 文本）。 */
+/* 降级：还在跑，但平台侧有问题（契约里没有 error 档，错误走 bot.status 的 error 文本）。
+ * 与 stopping 同色，所以形状必须不同：降级是空心环（还在干活，只是有问题），
+ * 停止中是实心点。颜色不是唯一信号（docs/11 §1 的 Q3）。 */
 .status-dot--degraded {
-  background: var(--warn);
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--warn);
 }
 
 /* ---------- 命令面板 ---------- */
@@ -3037,4 +3056,215 @@ body.is-resizing {
   color: var(--fg-dim);
   font-size: 11px;
   line-height: 1.4;
+}
+
+/* ---------- bot 工作台（docs/11-ui-language-bot-workbench.md） ---------- */
+
+/*
+ * 六个面共用一套骨架：标题行 + 若干 section（eyebrow 小字 + 值 + meta）。
+ * 刻意不用卡片 / 大圆角 / 阴影 / 大留白：侧栏只有 280px，密度优先（docs/11 黑名单）。
+ */
+.wb {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px 14px;
+  overflow-y: auto;
+}
+
+.wb__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wb__title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+
+.wb__section {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.wb__eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.wb__name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+  word-break: break-all;
+}
+
+.wb__value {
+  color: var(--fg);
+  /* 作业名 / 会话 id 可能很长且没有空格：宁可折行，也不要被截成 "order-no"。 */
+  overflow-wrap: anywhere;
+}
+
+.wb__meta {
+  font-size: 12px;
+  color: var(--fg-dim);
+  word-break: break-word;
+}
+
+.wb__row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.wb__buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.wb__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.wb__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.wb__item:last-child {
+  border-bottom: none;
+}
+
+.wb__item-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 4px;
+  text-align: left;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+.wb__item-main--static {
+  cursor: default;
+}
+
+.wb__item--active {
+  background: var(--bg-active);
+  border-radius: 4px;
+}
+
+.wb__stats {
+  display: flex;
+  gap: 18px;
+}
+
+.wb__stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.wb__stat-num {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--fg);
+}
+
+.wb__checklist {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.wb__check--done {
+  color: var(--fg-muted);
+}
+
+.wb__note {
+  margin: 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+
+.wb__error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+  word-break: break-word;
+}
+
+/* 能力表：勾/点 + 名称 + 明细，一条一行；只用横线分隔，不用斑马纹。 */
+.cap {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cap__row {
+  display: grid;
+  grid-template-columns: 16px minmax(96px, 140px) 1fr;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.cap__row:last-child {
+  border-bottom: none;
+}
+
+.cap__mark {
+  font-size: 12px;
+  text-align: center;
+  color: var(--fg-dim);
+}
+
+.cap__row--on .cap__mark {
+  color: var(--accent);
+}
+
+.cap__label {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.cap__row--on .cap__label {
+  color: var(--fg);
+}
+
+.cap__detail {
+  font-size: 11px;
+  color: var(--fg-dim);
+  word-break: break-word;
 }

@@ -94,6 +94,8 @@ async function renderPanel(): Promise<void> {
 
 beforeEach(() => {
   useWorkspaceStore.setState({
+    // 挂载时的第一次 diagnostics 要求项目已打开（没有项目时面板不发，见 problems-panel）。
+    projectRoot: '/proj',
     contents: {},
     saved: {},
     tabs: [],
