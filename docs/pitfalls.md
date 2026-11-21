@@ -894,3 +894,15 @@ runStore 的环形缓冲是 10000 行，于是打开日志面就是一万个节�
 5. **只测数学不够，必须有一条组件测试**：apps/web/src/features/workbench/logs-view.test.tsx 塞 10000 行、
    render 后断言 li 数量 >0 且 <=40，并断言首行 textContent 含 'line-9999'。前者钉「真的用了窗口」，
    后者钉「倒序 + 从最新开始」，缺任一条都可能绿着错。
+
+## 147. 在空环境里 spawn pwsh 会在仓库里长出 `%SystemDrive%` 目录
+
+2026-11-21。用 `execFileSync('pwsh', …)` 推代码后，`git status` 多出一个未跟踪目录，
+名字就是字面量 `%SystemDrive%`，里面是 `ProgramData/Microsoft/Windows/Caches/*.db`。
+原因：这个执行环境里 `process.env` 起始为空，子进程拿不到 `SystemDrive`，
+某个 Windows 组件（版本号缓存）就按未经展开的路径串落了盘 —— 落点恰好是**当前工作目录**，也就是仓库根。
+危害不在于那几个 db，而在于它会混进 `git add -A`，也会让 `status` 永远不干净、掩盖真正的未跟踪文件。
+
+做法：需要跑 pwsh 时**别用裸 `execFileSync`**，走仓库里的 `run_code` 的 `tools.pwsh`（它带完整环境），
+或者在传 env 时至少补上 `SystemDrive`/`SystemRoot`/`TEMP`/`PATH`。已经长出来了就直接 
+`fs.rmSync(dir, {recursive:true, force:true})` 删掉（内容是纯缓存，不含任何项目文件）。
