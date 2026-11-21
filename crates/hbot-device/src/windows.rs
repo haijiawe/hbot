@@ -45,25 +45,43 @@
 //! * 进程是 **Per-Monitor V2** 时，`rcMonitor` 是**物理像素**，`GetDeviceCaps(DESKTOPHORZRES)`
 //!   与它相等，`CreateDCW` 抓到的位图也等于它 —— 三者对齐，归一化坐标与像素坐标是同一个东西。
 //!
-//! 本机实测（Windows 11 26300，笔记本单屏 1920×1080，**100% 缩放**，`GetDpiForSystem() = 96`）：
+//! 本机实测（Windows 11 26300，笔记本单屏 1920×1080）**100% 缩放**：
 //!
 //! | 量 | 声明前（DPI-Unaware） | 声明后（Per-Monitor V2） |
 //! |---|---|---|
-//! | `GetDpiForSystem()` | 96 | 96 |
-//! | `GetDpiForMonitor(MDT_EFFECTIVE_DPI)` | 96 | 96 |
-//! | `rcMonitor` | 1920×1080 | 1920×1080 |
-//! | `GetDeviceCaps(DESKTOPHORZRES/VERTRES)` | 1920×1080 | 1920×1080 |
-//! | `GetDeviceCaps(LOGPIXELSX)` | 96 | 96 |
+//! | GetDpiForSystem() | 96 | 96 |
+//! | GetDpiForMonitor(MDT_EFFECTIVE_DPI) | 96 | 96 |
+//! | rcMonitor | 1920×1080 | 1920×1080 |
+//! | GetDeviceCaps(DESKTOPHORZRES/VERTRES) | 1920×1080 | 1920×1080 |
+//! | GetDeviceCaps(LOGPIXELSX) | 96 | 96 |
 //! | 截图位图 | 1920×1080 | 1920×1080 |
 //!
-//! **这张表不能证明虚拟化存在 —— 它证明的是本机 100% 缩放，所以没有虚拟化可做。** 上表四个
-//! 尺寸在两种档位下全等，正是"100% 缩放下两种档位等价"的实证；150% 缩放下声明前的
-//! `rcMonitor`/位图会变成 1280×720（1920/1.5），声明后仍是 1920×1080。这条是**系统文档
-//! 保证的行为**（DPI Virtualization），本机没有 150% 缩放可测，如实标注为未实测。
+//! **这张表不能证明虚拟化存在 —— 它证明的是本机 100% 缩放，所以没有虚拟化可做。** 上表
+//! 四个尺寸在两种档位下全等，正是「100% 缩放下两种档位等价」的实证。
+//!
+//! 同一台机器**同一会话里缩放到 150%** 之后（2026-11-21 实测，远程会话把逻辑分辨率
+//! 降到 1280×720），同一支测试打出来的表是：
+//!
+//! | 量 | 声明前（DPI-Unaware） | 声明后（Per-Monitor V2） |
+//! |---|---|---|
+//! | GetDpiForSystem() | 96 | 144 |
+//! | GetDpiForMonitor(MDT_EFFECTIVE_DPI) | 96 | 144 |
+//! | rcMonitor | 1280×720 | 1920×1080 |
+//! | GetDeviceCaps(DESKTOPHORZRES/VERTRES) | 1920×1080 | 1920×1080 |
+//! | GetDeviceCaps(LOGPIXELSX) | 96 | 144 |
+//! | 截图位图 | 1280×720 | 1920×1080 |
+//!
+//! 这张表是虚拟化的直接证据：rcMonitor、DC 的 LOGPIXELSX、截图位图三者一起被钉成逻辑
+//! 像素，物理尺寸（DESKTOPHORZRES）不受影响；声明成 PMv2 之后三者一起变成物理像素。
+//! 它同时说明**「声明前后每屏 DPI 不变」是假的平台不变量**：不变只在 100% 缩放时成立。
+//! 恒成立的是换算关系 逻辑尺寸 / 逻辑缩放 == 物理尺寸 / 真实缩放（见
+//! tests/windows_dpi.rs 的断言），以及「PMv2 下 rcMonitor == 物理像素」。
 //!
 //! 复现命令（真机、无需 GUI）：`cargo test -p hbot-device --test windows_dpi -- --nocapture`
 //! —— 它会把"声明前/声明后"两组数字打成表，并断言每块屏的 `scale_percent > 0`、
-//! `dpi_x`/`dpi_y` 在 96..=480、`display_metrics()` 与 `displays()` 一一对应。
+//! `dpi_x`/`dpi_y` 在 96..=480、`display_metrics()` 与 `displays()` 一一对应；声明后
+//! 再断言 DPI 只升不降、rcMonitor 满足 DPI 虚拟化的换算关系、且 PMv2 下 rcMonitor
+//! 等于物理像素。
 //!
 //! ## 本 crate 做不到什么（别在这里想办法）
 //!

@@ -780,3 +780,23 @@
     处理方式：把这类 job 改成手动触发（`if: github.event_name == 'workflow_dispatch' || vars.ENABLE_MACOS_BUNDLE == 'true'`），
     默认 push 时它是 `skipped` 而不是 `cancelled` —— 这两者的区别在报告里必须写清楚：
     `skipped` 是「没跑」，不是「通过」。别为了让整轮变绿把 `continue-on-error` 加上去。
+
+## 141. Windows 的 DPI 虚拟化会让「同一块屏的 DPI 前后不变」变成假断言（2026-11-21）
+
+    `crates/hbot-device/tests/windows_dpi.rs` 曾断言「声明 Per-Monitor V2 前后，每块屏的
+    dpi_x/dpi_y/scale_percent 不变」，理由写着「DPI 是屏的属性，不是进程属性」。它在本机 100%
+    缩放下连跑几个月都是绿的，直到某次远程会话把缩放改成 150% 才红：
+
+    - 声明前（Unaware）：GetDpiForSystem 96、GetDpiForMonitor 96/96、rcMonitor 1280×720、位图 1280×720；
+    - 声明后（PMv2）：144、144/144、1920×1080、1920×1080。
+
+    这不是产品缺陷，是系统文档保证的 DPI 虚拟化：DPI-Unaware 进程调 `GetDpiForMonitor(MDT_EFFECTIVE_DPI)`
+    被钉成 96，`GetMonitorInfoW` 的 `rcMonitor` 与 `CreateDCW` 抓的位图也一起被钉成逻辑像素。
+    所以「不变」只在 **100% 缩放**时成立；恒成立的是两条：① 逻辑尺寸 / 逻辑缩放 == 物理尺寸 /
+    真实缩放（交叉相乘 + 1% 容差，因为 `scale_percent` 是四舍五入过的）；② PMv2 下
+    `rcMonitor` 恒等于物理像素（旧断言只在 scale==100 时才敢断，太弱）。
+
+    同族坑：坑 116 与坑 124（夹具写死像素尺寸）那一类 —— **凡是把一个平台的默认配置写进断言，就要问一句
+    「用户改了缩放/主题/DPI 之后它还成立吗」**。判据：断言应该是解方程的恒等式（换算关系）或
+    单调性（只升不降），而不是「值相等」；真需要值相等就先断言前提（这里是「缩放比是 100%」）。
+    产品侧不用改：`monitor_dpi`（`crates/hbot-device/src/windows.rs:963`）本来就该照系统说法报。

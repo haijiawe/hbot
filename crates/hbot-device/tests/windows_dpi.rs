@@ -225,8 +225,13 @@ fn every_display_reports_a_plausible_dpi_and_scale() {
         after.awareness
     );
 
-    // 声明后：清单、序号、DPI 与缩放比都不该变（它们是**屏**的属性，不是进程属性），
-    // 变的只可能是 `rcMonitor`/位图（只有在非 100% 缩放时才变）。
+    // 声明后：数量与身份不变，DPI 只会从「进程口径」升到「这块屏的真实口径」，不会降。
+    //
+    // 为什么不再断言「声明前后 DPI/缩放比不变」：DPI-Unaware 进程拿到的
+    // GetDpiForMonitor(MDT_EFFECTIVE_DPI) 被 Windows 虚拟化成 96（见 windows.rs 顶部 §DPI），
+    // 所以「不变」只在 100% 缩放时成立。150% 缩放的屏上实测：声明前 96/100%、声明后
+    // 144/150%，rcMonitor 也从 1280x720 变成 1920x1080 —— 这是系统文档保证的 DPI 虚拟化
+    // （同一块屏，进程换了看法），不是本 crate 的缺陷。恒成立的是下面那条换算关系。
     assert_eq!(
         after.displays.len(),
         before.displays.len(),
@@ -238,15 +243,27 @@ fn every_display_reports_a_plausible_dpi_and_scale() {
             (new.index, &new.device, new.primary),
             "声明前后同一序号必须仍是同一块屏：{old:?} vs {new:?}"
         );
-        assert_eq!(
-            (old.dpi_x, old.dpi_y, old.scale_percent),
-            (new.dpi_x, new.dpi_y, new.scale_percent),
-            "每屏 DPI/缩放比是屏的属性，声明前后不该变：{old:?} vs {new:?}"
+        assert!(
+            new.dpi_x >= old.dpi_x && new.dpi_y >= old.dpi_y,
+            "声明后每屏 DPI 只能升到真实口径、不能降：{old:?} vs {new:?}"
+        );
+        assert!(
+            new.scale_percent > 0,
+            "声明后每块屏都必须报得出缩放比：{new:?}"
+        );
+        // DPI 虚拟化恒等式：逻辑尺寸 / 逻辑缩放 == 物理尺寸 / 真实缩放。
+        // 用交叉相乘 + 1% 容差：自定义缩放（如 115%）下 scale_percent 是四舍五入过的，
+        // 精确相等会把一条正确的系统行为判成失败。
+        let logical_scaled = u64::from(new.width) * u64::from(old.scale_percent);
+        let physical_scaled = u64::from(old.width) * u64::from(new.scale_percent);
+        assert!(
+            logical_scaled.abs_diff(physical_scaled) * 100 <= physical_scaled,
+            "声明前后的 rcMonitor 必须满足 DPI 虚拟化的换算关系：{old:?} vs {new:?}"
         );
     }
 
-    // 100% 缩放下两种档位的 rcMonitor 必须相同（没有虚拟化可做）；非 100% 缩放下声明后
-    // 变大到物理像素。两种情况都用 size_delta 的口径断言，避免猜机器。
+    // Per-Monitor V2 下 rcMonitor 就是物理像素 —— 这条在**任何**缩放比下都成立，
+    // 所以不再像旧版本那样只在 scale_percent == 100 时才敢断言。
     for metrics in &after.metrics {
         println!(
             "显示器 {} 声明后：rcMonitor {}x{}，物理 {}x{}，delta = {:?}，虚拟化 = {}",
@@ -256,14 +273,12 @@ fn every_display_reports_a_plausible_dpi_and_scale() {
             metrics.physical_width,
             metrics.physical_height,
             metrics.size_delta(),
-            metrics.is_virtualized(),
+            metrics.is_virtualized()
         );
-        if metrics.scale_percent == 100 {
-            assert!(
-                metrics.matches_physical(),
-                "100% 缩放下 rcMonitor 必须等于物理像素（没有虚拟化可做）：{metrics:?}"
-            );
-        }
+        assert!(
+            metrics.matches_physical(),
+            "Per-Monitor V2 下 rcMonitor 必须等于物理像素：{metrics:?}"
+        );
     }
 }
 
