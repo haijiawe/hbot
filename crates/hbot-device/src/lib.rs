@@ -254,6 +254,35 @@ impl DisplayMetrics {
     }
 }
 
+/// DPI 虚拟化的换算恒等式：**逻辑尺寸 × 逻辑缩放 == 物理尺寸 × 真实缩放**。
+///
+/// 参数是同一块屏在两个进程档位下的 `(宽, 缩放百分比)` 两对：
+/// `logical_*` 是 DPI-Unaware 进程看到的（`rcMonitor` 与 `scale_percent`），
+/// `aware_*` 是同一进程声明 Per-Monitor V2 之后看到的。
+///
+/// 为什么用交叉相乘 + 1% 容差：自定义缩放（115% / 125%）下 `scale_percent` 是四舍五入过的，
+/// 精确相等会把一条正确的系统行为判成失败。
+///
+/// 这条恒等式在**任何**缩放比下都成立 —— 所以它既能给真机测试用
+/// （`tests/windows_dpi.rs`），也能在任何平台上用已知数字单测（见本文件 `mod tests`）。
+/// 存在这个函数而不是把算式写在测试里，是为了让 150% 缩放那组**实测数字**跑在每一台 CI 机器上：
+/// GitHub 的 windows runner 是 100% 缩放，光靠真机测试抓不到 150% 的回归。
+///
+/// 反向用法：缩放比给错（例如把 150% 写成 144%）时返回 `false`，所以它能当判据。
+#[must_use]
+pub fn dpi_virtualization_holds(
+    logical_width: u32,
+    logical_scale_percent: u32,
+    aware_width: u32,
+    aware_scale_percent: u32,
+) -> bool {
+    if logical_scale_percent == 0 || aware_scale_percent == 0 || aware_width == 0 {
+        return false;
+    }
+    let logical_scaled = u128::from(aware_width) * u128::from(logical_scale_percent);
+    let physical_scaled = u128::from(logical_width) * u128::from(aware_scale_percent);
+    logical_scaled.abs_diff(physical_scaled) * 100 <= physical_scaled
+}
 /// 本机每块屏的 DPI / 缩放 / 虚拟化诊断指标（[`DisplayMetrics`]），序号规则与 [`displays`] 相同。
 ///
 /// 这是**诊断 API**，不是截图路径的一部分：截图仍然只认 [`ScreenshotRequest::monitor`]。
@@ -727,5 +756,48 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// 100% 缩放（本机与 CI runner 的默认档）：两个档位看到的数字全等。
+    #[test]
+    fn dpi_identity_holds_at_one_hundred_percent() {
+        assert!(dpi_virtualization_holds(1920, 100, 1920, 100));
+        assert!(dpi_virtualization_holds(1280, 100, 1280, 100));
+    }
+
+    /// 150% 缩放：这组数字是 Windows 11 26300、单屏 1920x1080 的**实测**
+    /// （DPI-Unaware 报 1280x720/100%，声明 PMv2 后报 1920x1080/150%）。
+    ///
+    /// 这条测试的价值：GitHub 的 windows runner 是 100% 缩放，真机测试在那里
+    /// 等价于恒等断言，抓不到 150% 场景 —— 而这组数字在任何平台都能跑。
+    #[test]
+    fn dpi_identity_holds_at_one_hundred_fifty_percent() {
+        assert!(dpi_virtualization_holds(1280, 100, 1920, 150));
+        // 竖屏 / 另一块屏同样的比例。
+        assert!(dpi_virtualization_holds(720, 100, 1080, 150));
+    }
+
+    /// 自定义缩放（115%）：逻辑宽度是 1920 / 1.15 = 1669.6 取整后的 1670，
+    /// 交叉相乘差 50（相对误差 0.026%），1% 容差必须放行。精确相等会误判。
+    #[test]
+    fn dpi_identity_tolerates_rounding_at_custom_scales() {
+        assert!(dpi_virtualization_holds(1670, 100, 1920, 115));
+        // 125%：1920 / 1.25 = 1536，整除，仍是真。
+        assert!(dpi_virtualization_holds(1536, 100, 1920, 125));
+    }
+
+    /// 判据必须能说"不"：把 150% 写成 144%（多屏机器上按错屏取值的典型错法）就要拒绝。
+    #[test]
+    fn dpi_identity_rejects_a_wrong_scale() {
+        assert!(!dpi_virtualization_holds(1280, 100, 1920, 144));
+        assert!(!dpi_virtualization_holds(1920, 100, 1280, 150));
+    }
+
+    /// 缩放比拿不到（0）时不猜：先判 0 再算，避免"除以 0 之外的第二类假绿"。
+    #[test]
+    fn dpi_identity_refuses_unknown_scales() {
+        assert!(!dpi_virtualization_holds(1280, 0, 1920, 150));
+        assert!(!dpi_virtualization_holds(1280, 100, 1920, 0));
+        assert!(!dpi_virtualization_holds(1280, 100, 0, 150));
     }
 }

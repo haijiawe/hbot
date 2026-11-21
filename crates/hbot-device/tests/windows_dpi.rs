@@ -12,17 +12,23 @@
 //!
 //! 跑法：`cargo test -p hbot-device --test windows_dpi -- --nocapture`
 //!
-//! # 已知事实（本机 Windows 11 26300、单屏 1920×1080、100% 缩放）
+//! # 已知事实（本机 Windows 11 26300、单屏 1920×1080）
 //!
-//! 两组数字**全等** —— 因为 100% 缩放下没有虚拟化可做。150% 缩放下声明前的 `rcMonitor` 与
-//! 位图会变成 1280×720，声明后仍是 1920×1080；那条是系统文档保证的行为，本机没有 150% 缩放
-//! 可测，所以测试**不断言绝对宽度**（换台机器就是另一个数），只断言两组之间的一致性与区间。
+//! **100% 缩放**：两组数字全等 —— 没有虚拟化可做。
+//!
+//! **150% 缩放**（2026-11-21 换档后实测）：声明前 `rcMonitor` 与截图位图变成 1280×720、
+//! `GetDpiForMonitor` 被虚拟化成 96（100%）；声明 Per-Monitor V2 后三者都变成
+//! 1920×1080 / 144（150%）。这是系统文档保证的行为，**不是**本 crate 的缺陷，
+//! 所以测试不断言"声明前后 DPI 不变"，只断言：DPI 单调不降、两组数字满足换算恒等式
+//! （`hbot_device::dpi_virtualization_holds`）、以及 PMv2 下 `rcMonitor` 等于物理像素。
+//!
+//! 那条换算恒等式的 150% 数字也进了 `src/lib.rs` 的单测，所以 CI 的 100% runner 也能覆盖它。
 #![cfg(windows)]
 
 use hbot_core::device::DeviceBackend;
 use hbot_device::{
     DisplayInfo, DisplayMetrics, ScreenshotRequest, WindowsBackend, display_metrics, displays,
-    system_dpi,
+    dpi_virtualization_holds, system_dpi,
 };
 use windows_sys::Win32::UI::HiDpi::{
     AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
@@ -251,13 +257,11 @@ fn every_display_reports_a_plausible_dpi_and_scale() {
             new.scale_percent > 0,
             "声明后每块屏都必须报得出缩放比：{new:?}"
         );
-        // DPI 虚拟化恒等式：逻辑尺寸 / 逻辑缩放 == 物理尺寸 / 真实缩放。
-        // 用交叉相乘 + 1% 容差：自定义缩放（如 115%）下 scale_percent 是四舍五入过的，
-        // 精确相等会把一条正确的系统行为判成失败。
-        let logical_scaled = u64::from(new.width) * u64::from(old.scale_percent);
-        let physical_scaled = u64::from(old.width) * u64::from(new.scale_percent);
+        // DPI 虚拟化恒等式：逻辑尺寸 × 逻辑缩放 == 物理尺寸 × 真实缩放。
+        // 判据只有一份（hbot_device::dpi_virtualization_holds），这里不重写算式 ——
+        // 那组 150% 的实测数字还进了 lib.rs 的单测，所以 100% 缩放的 CI runner 也能覆盖它。
         assert!(
-            logical_scaled.abs_diff(physical_scaled) * 100 <= physical_scaled,
+            dpi_virtualization_holds(old.width, old.scale_percent, new.width, new.scale_percent),
             "声明前后的 rcMonitor 必须满足 DPI 虚拟化的换算关系：{old:?} vs {new:?}"
         );
     }
