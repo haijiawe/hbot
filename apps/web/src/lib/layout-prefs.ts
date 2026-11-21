@@ -19,14 +19,26 @@ import {
 /** 存储键：布局 + 侧栏视图 + 底部页签。 */
 export const LAYOUT_STORAGE_KEY = 'hbot.ide.workspace-prefs'
 
+/**
+ * 偏好存档的版本。
+ *
+ * 侧栏在 v2 从「两层（资源管理器 / 设置）」变成「八个面（六个 bot 视角 + 两个旧视图）」，
+ * 默认面也从资源管理器改成概览。老存档里的 `explorer` 是**旧界面下唯一的选择**，不是用户挑过的面，
+ * 照搬会让升级后第一眼还是旧界面；因此 v1 存档只保留布局尺寸与底部页签，侧栏回落新默认值。
+ * 之后的存档带 `version: 2`，用户再选什么就一直是那个。
+ */
+export const PREFS_VERSION = 2
+
 /** 可持久化的工作区偏好（标签页与未保存缓冲区不在这里，见 journal）。 */
 export interface WorkspacePrefs {
+  version: number
   layout: LayoutState
   sidebarView: SidebarView
   bottomPanelTab: BottomPanelTab
 }
 
 export const DEFAULT_WORKSPACE_PREFS: WorkspacePrefs = {
+  version: PREFS_VERSION,
   layout: DEFAULT_LAYOUT,
   sidebarView: 'overview',
   bottomPanelTab: 'logs',
@@ -76,9 +88,12 @@ function readWidth(value: unknown, fallback: number, clampFn: (width: number) =>
 export function sanitizePrefs(raw: unknown): WorkspacePrefs {
   if (!isRecord(raw)) return DEFAULT_WORKSPACE_PREFS
   const layout = isRecord(raw.layout) ? raw.layout : {}
-  const sidebarView = SIDEBAR_VIEWS.find((view) => view === raw.sidebarView)
+  // v1 存档的侧栏值不采信（那时只有资源管理器 / 设置两项，见 PREFS_VERSION 的注释）。
+  const current = raw.version === PREFS_VERSION
+  const sidebarView = current ? SIDEBAR_VIEWS.find((view) => view === raw.sidebarView) : undefined
   const bottomPanelTab = BOTTOM_PANEL_TABS.find((tab) => tab === raw.bottomPanelTab)
   return {
+    version: PREFS_VERSION,
     layout: {
       sidebarWidth: readWidth(layout.sidebarWidth, DEFAULT_LAYOUT.sidebarWidth, clampSidebarWidth),
       agentWidth: readWidth(layout.agentWidth, DEFAULT_LAYOUT.agentWidth, clampAgentWidth),

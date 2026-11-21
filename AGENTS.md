@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`（含附件 `sendImage`/`sendFile`）、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（2053 个 Rust 测试 / 128 个 target / web 49 文件 438 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`（含附件 `sendImage`/`sendFile`）、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（2053 个 Rust 测试 / 128 个 target / web 50 文件 443 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 

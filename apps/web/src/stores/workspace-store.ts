@@ -18,7 +18,7 @@ import {
   type LayoutState,
   type SidebarView,
 } from '../lib/layout'
-import { readPrefs, writePrefs, type WorkspacePrefs } from '../lib/layout-prefs'
+import { PREFS_VERSION, readPrefs, writePrefs, type WorkspacePrefs } from '../lib/layout-prefs'
 import type { ManifestView } from '../lib/bot-manifest'
 import { parseManifest } from '../lib/bot-manifest'
 import type { SessionSnapshot } from '../lib/session-journal'
@@ -299,6 +299,7 @@ function withPrefs(
   patch: Partial<Pick<WorkspaceState, 'layout' | 'sidebarView' | 'bottomPanelTab'>>,
 ): Partial<WorkspaceState> {
   const error = savePrefsError({
+    version: PREFS_VERSION,
     layout: patch.layout ?? state.layout,
     sidebarView: patch.sidebarView ?? state.sidebarView,
     bottomPanelTab: patch.bottomPanelTab ?? state.bottomPanelTab,
