@@ -24,8 +24,16 @@
 > - `docs` 设计文档：`workspace.tree` 过滤 `.md/.markdown/.txt/.json`，选中走 `fs.read`、改完 `fs.write`（`lib/doc-list.ts`）。不建文档库 —— 硬规则 9「代码是唯一真源」；源码仍留给资源管理器 + Monaco。
 > - `logs` 开发日志：直接用 `runStore` 那份 10000 行环形缓冲（与底部「日志」页签同一份，不另订阅），整页只多级别/子串过滤与四档计数。
 > - 三面都是**整页面**（`SidebarView` 新增 `board`/`docs`/`logs`，正文由 `App.tsx` 的 `renderPage()` 渲染在编辑区位置，侧栏只放清单与统计）—— 三列看板在 420px 侧栏里会折成三条竖线。
-> - 判据：`pnpm --dir apps/web run check` 绿（**54 文件 / 471 用例**，含窗口化回归 +9 用例）；headless Edge 截图 `_recovery/face-{board,docs,logs}.png`，日志面另有一张走真流程（试跑注入 → `run.log` 落地）的 `_recovery/face-logs-live.png`。落地口径见 [06-ide.md](06-ide.md) §2.1，映射与理由见 [11](11-ui-language-bot-workbench.md) §2.1.1。
+> - 判据：`pnpm --dir apps/web run check` 绿（当时 **54 文件 / 471 用例**；次日 P0 收敛后为 53 / 472，见文首 2026-11-21 23:15 补充）；headless Edge 截图 `_recovery/face-{board,docs,logs}.png`，日志面另有一张走真流程（试跑注入 → `run.log` 落地）的 `_recovery/face-logs-live.png`。落地口径见 [06-ide.md](06-ide.md) §2.1，映射与理由见 [11](11-ui-language-bot-workbench.md) §2.1.1。
 > - **pnpm 环境坑**：corepack 的 `AppData/Local/node/corepack/v1/pnpm/12.21.0/` 里只剩 `pnpm-native.exe`，`pnpm` shim 找不到 `bin/pnpm.mjs` 直接报 `Cannot find module`。改用 `D:\node_global\pnpm.cmd`（12.14.0）可正常跑。与本仓代码无关。
+> **2026-11-21 23:15 补充：P0 收敛（用户问「为什么我的项目这么乱」后的减法）。** 拿 Mino 源码（1186 行 / 26 个可点入口 / 6 视图）与 `apps/web/src`（212 文件 / 31039 行 / 85 个 `<button>` / 16 个活动栏按钮 / 11 个 SidebarView）对账，结论是「乱」不来自代码量，来自**同一份数据有三个入口、同一件事有三个名字**。这一轮只删不加：
+> - 删底部「作业」页签（`features/run/jobs-panel.tsx`）：作业与等待只在整页看板出现一次；看板补上「等待回应（`ctx.session.prompt`）」一栏。
+> - 删整页「开发日志」面（`features/workbench/logs-view.tsx`）：日志只剩底部一个渲染器；原页面的级别/关键词筛选搬进底部工具栏（`lib/log-filter.ts` + `features/run/run-log.tsx`），这是**搬功能而不是删功能**。
+> - 删活动栏的搜索 / 运行与日志 / 问题 / 调试四个镜像按钮：它们只重复底部页签，命令面板与 Ctrl+Shift+F / M / J 已覆盖。
+> - 概览不再重复渲染「能力 / HTTP」两张卡（明细留在能力面，概览只报一个数并指路）；运行态面只留三个数字 + 「打开看板」，不再列最近作业与等待。
+> - 结果：`SidebarView` 11 → 10 项（8 个 bot 面 + 资源管理器 + 设置），`BottomPanelTab` 8 → 7 项，活动栏 12 个按钮（11 面 + 主题）。`docs/06-ide.md` §2.1 新增**UI 预算表**（每个面的唯一职责 / 数据来源 / 允许入口数）—— 以后加面先过这张表。
+> - 判据：`pnpm --dir apps/web run check` 绿（**53 文件 / 472 用例**；净删 2 个测试文件、新增 `lib/log-filter.test.ts` 9 例与 `run-log.test.tsx` 3 例）；headless Edge 实机确认七个页签、看板等待区、日志筛选工具栏（`_recovery/face2-{board,docs,logs-toolbar}.png`）。提交 `7d6463c`（24 files, +536 −1436）。新坑 [pitfalls 148](pitfalls.md)。
+
 
 ---
 
@@ -87,7 +95,7 @@ cargo test -j 2 --workspace              # 当前 2053 passed / 0 failed / 128 t
 pnpm --dir apps/web run check            # 当前 49 文件 / 438 用例
 ```
 
-现状：**六道全绿**（2026-11-21 20:40 实测，`rustc 1.100.0`，2053 passed / 128 target / web 54 文件 471 用例）。
+现状：**六道全绿**（2026-11-21 23:00 实测，`rustc 1.100.0`，2053 passed / 128 target / web 53 文件 472 用例）。
 **Rust 版本已钉死**：`rust-toolchain.toml` 的 `channel = "1.100.0"` 与 `ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`
 必须一起改（原来两处都写 `stable`，导致 CI 的 clippy 比本地新、只报在 CI，见 `docs/pitfalls.md` 坑 115）。
 `apps/web/src/generated/*.ts` **要入库**；
@@ -197,7 +205,7 @@ pnpm --dir apps/web run check            # 当前 49 文件 / 438 用例
 | M7 第 5 步 | 完成 | `C3.send` / `C3.notify`（2026-11-19）+ `C1.webhook`（2026-11-19，`WebhookServer` 手写 HTTP/1.1 / 三种鉴权失败统一 401 / 返回值即应答） |
 | M7 第 5.5 步 | 完成 | `C3.file`（2026-11-20，`docs/07` §3.6，项目内文件读写 / 路径钉根 / 只删空目录）+ `onStart`/`onStop`（2026-11-19，`docs/07` §4.6，含 2026-11-20 接上的 `shutdown` 触发点）+ `C2.sql`（2026-11-20，`docs/07` §5.3，每 bot 一个 `<data_dir>/bot_sql/<bot_id>.db` / 运行时禁 DDL / 迁移不阻断启动）；同日补 `C3.file` 的递归删除 / `readBytes` / 按行写、webhook 路由级超时 `timeoutMs`、作业池上限 `limits.maxPendingJobs` |
 | M7 出口标准（示例项目） | 自动化那一半完成 | `examples/chat` / `examples/game` / `examples/support`（无平台凭据，`platform.kind = local`）；`crates/hbot-cli/tests/examples.rs` 逐个跑 `check_project`（清单 → 编译 → `hbot.d.ts` 未漂移）并钉死名字；`cargo xtask gen` 刷新它们的 `hbot.d.ts`、`gen --check` 拦漂移。**整体 e2e 2026-11-20 补齐**：`crates/hbot-rpc/tests/examples_e2e.rs` 把 chat / game / support 三个示例复制进临时项目，走「启动 bot → 发消息 → 断言回复」（chat `/count` 只走 kv、game `/score`+`/top` 真跑 `migrations/0001_init.sql`、support `/ticket` 走 `ctx.session.prompt` → `onResume` → `ctx.sql`）；整条 `M7` 仍不标完成，因为 V10/V11/V15 归 M9/M10 |
-| UI（bot 工作台） | 九面完成 | 侧栏六面（概览/Bot/能力/会话/运行态/渠道）+ 三个整页面（作业看板/设计文档/开发日志，2026-11-21）；外观按 Mino 整套搬（浅色暖调默认、深色可切）；右侧 Agent 栏与底部面板功能未动 |
+| UI（bot 工作台） | 八面完成 + P0 收敛 | 侧栏六面（概览/Bot/能力/会话/运行态/渠道）+ 两个整页面（作业看板含等待、设计文档）；日志只在底部一个渲染器（筛选工具栏 2026-11-21 搬入）；外观按 Mino 整套搬（浅色暖调默认、深色可切）；右侧 Agent 栏未动；`docs/06-ide.md` §2.1 有 UI 预算表 |
 
 ---
 
@@ -300,7 +308,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 - `C3.file`：主链路、按行读写、二进制读、递归删除、**每 bot 磁盘配额**（2026-11-20）都已落地，见 `docs/07` §3.6；**附件出站 `ctx.sendImage` / `ctx.sendFile` 也已落地（2026-11-21）**，见 `docs/07` §3.4.1；
 - `onSchedule` —— **已落地（2026-11-20，`docs/07` §4.4.1）**：它就是 `onTimer` 的正式名，同一条派发路径、同一个 `capabilities.timer`；两个名字都写会启动失败。别再按「另起一条路径」实现；
 - 设备完整版：混合 DPI 跨屏拼图、中文以外的 OCR 语言包（按窗口截图 2026-11-20 已落地，见 `docs/09` §11.1）；
-- **Mino 对齐（2026-11-21）**：`tasks`/`docs`/`logs` 三个整页面已落地（见文首 2026-11-21 21:55 补充），没有遗留的「Mino 有、HBot 没有」的页面；
+- **Mino 对齐（2026-11-21）**：`tasks` → 作业看板、`docs` → 设计文档两个整页面已落地；`logs` 面同日被**删掉**并合并进底部日志页签的筛选工具栏（见文首 23:15 补充，理由是同一份缓冲的第二个渲染器）。没有遗留的「Mino 有、HBot 没有」的页面；
 - `E1` npm 打包、云端执行宿主（`docs/08` §9 / ADR-0006）。
 
 ---
@@ -328,7 +336,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：2053 passed / 128 target（web：54 文件 471 用例）
+cargo test -j 2 --workspace                              # 基线：2053 passed / 128 target（web：53 文件 472 用例）
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。

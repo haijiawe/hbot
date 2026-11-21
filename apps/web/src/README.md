@@ -30,7 +30,7 @@
 | `features/search` | 全局搜索 |
 | `features/settings` | 设置 |
 | `features/tryrun` | 本地试跑 |
-| `features/workbench` | bot 工作台九面：六个侧栏面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道）+ 三个整页面（作业看板 / 设计文档 / 开发日志） |
+| `features/workbench` | bot 工作台八面：六个侧栏面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道）+ 两个整页面（作业看板 / 设计文档）；日志只在底部面板一页（筛选工具栏在 `features/run/run-log.tsx`） |
 
 ## 三条硬规则
 
@@ -40,5 +40,5 @@
 
 ## 构建与检查
 
-`pnpm --dir apps/web run check`（= `tsc --noEmit` + biome），`pnpm --dir apps/web test`（vitest，54 文件）。
+`pnpm --dir apps/web run check`（= `tsc --noEmit` + biome），`pnpm --dir apps/web test`（vitest，53 文件）。
 `dist/` 是构建产物，被 `crates/hbot-desktop` 的 `frontendDist` 引用 —— 所以 `cargo check --workspace --all-targets` 之前它必须存在。

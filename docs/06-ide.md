@@ -40,18 +40,20 @@
 
 | 区域 | 内容 | 默认 | 可关闭 |
 |---|---|---|---|
-| 活动栏 | Bot 工作台九面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道 / 作业看板 / 设计文档 / 开发日志）+ 资源管理器 / 搜索 / 运行 / 问题 / 调试 / Agent / 设置 | 左，48px | 否 |
-| 侧栏 | 工作台九面、文件树、搜索结果、运行目标、设置页 | 左，240–420px | 是 |
+| 活动栏 | Bot 工作台八个面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道 / 作业看板 / 设计文档）+ 资源管理器 / Agent / 设置 + 主题切换 | 左，48px | 否 |
+| 侧栏 | 工作台八面、文件树、设置页 | 左，240–420px | 是 |
 | 编辑区 | 标签页、面包屑、Monaco、分栏、Diff 编辑器 | 中，自适应 | 否 |
 | Agent 栏 | 对话、计划、工具卡、审批、Diff 审查 | 右，320–560px | 是 |
-| 底部面板 | 问题 / 输出 / 日志 / 调试控制台 | 下，160–400px | 是 |
+| 底部面板 | 日志 / 问题 / 搜索 / 调试 / 试跑 / 设备 / 回放（七个页签） | 下，160–400px | 是 |
 | 状态栏 | 项目、分支（P1）、沙箱档、模型、队列、行列 | 底，24px | 否 |
 
 **布局只有一个真源**：`apps/web/src/lib/layout.ts` 的 `resolveLayout()`。侧栏与 Agent 栏的宽度、折叠阈值、分隔条宽度都从它来；组件不得各自写死宽度。旧项目踩过的坑：两套布局档位、CSS Grid 与内联宽度叠加 —— 新项目不重复。
 
-### 2.1 Bot 工作台的九个面（2026-11-21 落地）
+### 2.1 Bot 工作台的八个面（2026-11-21 落地，同日收敛）
 
-活动栏上半段是 **bot 视角**的九个面，下半段才是原来的 IDE 视图（资源管理器 / 搜索 / 运行 / 问题 / 调试 / Agent / 设置）。前六个是**侧栏面**（改的只是侧栏「看什么」），后三个是**整页面**：它们要三列看板或整页编辑器的宽度，侧栏最大 420px 装不下，所以正文渲染在编辑区位置（`App.tsx` 的 `renderPage()`），侧栏只放清单与统计。九个面都不动右侧 Agent 栏 —— Agent 始终是同一个循环。
+活动栏上半段是 **bot 视角**的八个面，下半段是 IDE 视图（资源管理器）、Agent 开关、设置与主题。前六个是**侧栏面**（改的只是侧栏「看什么」），后两个（作业看板 / 设计文档）是**整页面**：它们要三列看板或整页编辑器的宽度，侧栏最大 420px 装不下，所以正文渲染在编辑区位置（`App.tsx` 的 `renderPage()`），侧栏只放清单与统计。八个面都不动右侧 Agent 栏 —— Agent 始终是同一个循环。
+
+**2026-11-21 的减法**（用户问「为什么我的项目看起来乱」后的 P0）：删掉了第四个「作业」入口（底部页签，作业与等待现在只在看板出现一次）、删掉了「开发日志」整页面（日志只剩底部一个渲染器，原页面的级别/关键词筛选搬进底部工具栏）、删掉了活动栏搜索 / 运行与日志 / 问题 / 调试四个按钮（它们的唯一作用是把底部页签再镜像一次，命令面板与 Ctrl+Shift+F/M/J 已覆盖）。判据见本节末的「UI 预算表」。
 
 | 面 | 侧栏值 | 回答的问题 | 数据来源 |
 |---|---|---|---|
@@ -59,19 +61,36 @@
 | Bot | `bots` | 有几台 bot、各自什么状态、启停 | `bot_list` / `bot_start` / `bot_stop` |
 | 能力 | `capabilities` | 清单声明了哪 12 项能力、HTTP 源、限额 | `hbot.json`（纯函数解析，见 `lib/bot-manifest.ts`） |
 | 会话 | `conversations` | 已登记哪些会话、各自形态 | `bot_conversations` |
-| 运行态 | `runtime` | 作业在途 / 等待中 / 最近几条 | `bot_jobs` / `bot_waits` |
+| 运行态 | `runtime` | 作业在途 / 等待待回应 / 失败各几个（只报数，明细去作业看板） | `bot_jobs` / `bot_waits`（`COUNT_LIMIT=200`） |
 | 渠道 | `channels` | `bots.json` 里登记了哪些平台与地址 | `fs.read('bots.json')`（**不显示 token / clientSecret**） |
-| 作业看板 | `board` | 排队 / 运行中 / 已结束各有几条，失败的那条错在哪 | `bot_jobs`（只读快照，`BOARD_LIMIT=60`） |
+| 作业看板 | `board` | 排队 / 运行中 / 已结束各有几条、失败的那条错在哪、谁在等回应 | `bot_jobs`（`BOARD_LIMIT=60`）+ `bot_waits`（`WAIT_LIMIT=64`），只读快照 |
 | 设计文档 | `docs` | 项目里的 Markdown / 文本 / JSON 写的是什么、改完存哪 | `workspace.tree` 挑扩展名（`lib/doc-list.ts`）+ `fs.read` / `fs.write` |
-| 开发日志 | `logs` | 这次运行到底打了什么、哪几行是错误 | `runStore` 的 10000 行环形缓冲（`run.log` 事件，与底部「日志」页签同一份）；**渲染已窗口化**，只挂可视区几十个 `li`，窗口数学与底部面板共用 `apps/web/src/lib/log-window.ts` |
 
-四条硬约定：
+六条硬约定：
 
 1. **只显示声明层**。能力面的 ✓ 只代表 `hbot.json` 写了；装配（宿主有没有接上模型 / 设备）与授权（用户批没批）要到运行时才成立（ADR-0005 三层求交）。面板底部把这句话写出来，不让 ✓ 冒充「可以用」。
 2. **凭据不上界面**。渠道面解析 `bots.json` 时压根不读 `token` / `clientSecret` 字段（`lib/bots-file.ts`），不是读到再打码。
 3. **没有项目不发命令**。所有面在 `projectRoot === null` 时直接渲染提示，不发请求 —— 否则首屏状态栏会挂一条 `-32002` 红字（这正是 2026-11-21 修掉的一个真瑕疵）。
-4. **不新增命令**。九面只用现有 `Command`；清单与渠道走 `fs.read`，因为核心没有「返回清单」的命令，而纯函数解析在 Web 侧能直接喂字符串测试。
-5. **整页面不建第二个真相**。作业看板读 `bot_jobs` 快照（只读，不改状态）；设计文档走 `fs.read`/`fs.write`（不建文档库，因为「代码是唯一真源」，AGENTS §0.9）；开发日志直接用 `runStore` 里那份环形缓冲（不再订阅一遍事件、不另存一份）。浏览器 mock 里 `bot_jobs` 是演示行，`run.log` 只在「试跑」注入后才有 —— 面板在 mock 下会显示空态而不是假数据。
+4. **不新增命令**。八面只用现有 `Command`；清单与渠道走 `fs.read`，因为核心没有「返回清单」的命令，而纯函数解析在 Web 侧能直接喂字符串测试。
+5. **整页面不建第二个真相**。作业看板读 `bot_jobs` / `bot_waits` 快照（只读，不改状态）；设计文档走 `fs.read`/`fs.write`（不建文档库，因为「代码是唯一真源」，AGENTS §0.9）。浏览器 mock 里 `bot_jobs` / `bot_waits` 是演示行 —— 面板在 mock 下显示的是演示数据而不是假装连上了核心。
+6. **一个能力只有一个入口**。「作业与等待」只在作业看板出现（运行态面只报数并指路，底部没有作业页签）；日志只在底部面板出现（没有整页日志面）；活动栏不镜像底部页签。同一件事也不许有两个名字（曾经的「运行与日志 / 运行 / 试跑」三词混用已清理：底部页签叫「日志」，bot 启停叫「启动 / 停止」，模拟入站叫「试跑」）。
+
+**UI 预算表**（加面/加按钮前先过这张表；这也是「P2」的落地形态）：
+
+| 面 / 区域 | 唯一职责 | 数据来源 | 允许入口数 |
+|---|---|---|---|
+| 概览 `overview` | 项目是什么、能不能跑 | `hbot.json` + `bot_list` | 1（侧栏） |
+| Bot `bots` | 启停与状态 | `bot_list` / `bot_start` / `bot_stop` | 1 |
+| 能力 `capabilities` | 清单声明了什么 | `hbot.json` | 1 |
+| 会话 `conversations` | 登记了哪些会话 | `bot_conversations` | 1 |
+| 运行态 `runtime` | 三个数字 + 指路 | `bot_jobs` / `bot_waits` | 1（不许再列明细） |
+| 渠道 `channels` | 平台与地址 | `bots.json` | 1 |
+| 作业看板 `board` | 作业与等待的**唯一**明细视图 | `bot_jobs` / `bot_waits` | 1（底部不许有作业页签） |
+| 设计文档 `docs` | 项目里的 md/txt/json | `workspace.tree` + `fs.read`/`fs.write` | 1 |
+| 日志（底部页签） | 运行输出 + 级别/关键词筛选 | `runStore.logs` | 1（不许有整页日志面、活动栏不许有镜像按钮） |
+| 资源管理器 / Agent / 设置 | IDE 原有职责 | — | 各 1 |
+
+判据：**任何一行写不下「唯一职责」，就说明这一面还不该存在**；两个行指向同一数据来源且角色相同 = 重复入口，必须合并。
 
 视觉语言与设计令牌（配色、对比度、17 条不可借用项）见 [11-ui-language-bot-workbench.md](11-ui-language-bot-workbench.md)；面本身没有组件测试，理由写在 `apps/web/src/features/workbench/README.md`。
 
@@ -92,7 +111,7 @@
 
 **刻意没有搬**：侧栏宽度过渡（420ms 会拖 Monaco 重排）、径向渐变光晕、`rise` 入场动画、webfont、大封面图与插画空态、`backdrop-filter` 模糊、按页面 40–200ms 逐条延迟的入场。理由仍是 [11](11-ui-language-bot-workbench.md) §4.2 的三条预算（装饰 / 动效 / 意义），这三条用户没有要求改。
 
-判据：`pnpm --dir apps/web run check` 绿（54 文件 / 471 用例）；浅深两套都能在 headless Edge 里截到（`_recovery/mino-{1,2,3}-*.png`），实测 `documentElement.dataset.theme` 随按钮切换、卡片 `border-radius:18px`、`body` 14px。三个整页面另有截图 `_recovery/face-{board,docs,logs}.png` 与走真流程（试跑注入 → 日志落地）的 `_recovery/face-logs-live.png`。
+判据：`pnpm --dir apps/web run check` 绿（53 文件 / 472 用例）；浅深两套都能在 headless Edge 里截到（`_recovery/mino-{1,2,3}-*.png`），实测 `documentElement.dataset.theme` 随按钮切换、卡片 `border-radius:18px`、`body` 14px。两个整页面另有截图 `_recovery/face2-{board,docs}.png`，底部日志筛选工具栏为 `_recovery/face2-logs-toolbar.png`（走真流程：试跑注入 → 日志落地 → 关键词筛选）。
 
 
 ---
@@ -210,7 +229,7 @@
 - 运行面板：选择 bot（一个项目可有多 bot 配置）、平台适配器、启动/停止、状态、队列深度、最近错误。
 - 本地试跑：平台选 `local`（`bots.json` 里 `"platform": "local"`）即可在**不连任何真实平台**的情况下启动 bot，注入一条消息就能跑刚生成的代码；回复不会真的发出去，只以 `[reply] <文本>` 写进日志面板。
 - Mock 事件：选择平台模板（群消息/私聊/按钮回调/定时），填字段，注入到当前 bot；用于不连真实平台的自测。
-- 日志：底部面板流式显示，按级别过滤；点击栈帧跳到源码；内存里保留最近 10,000 行（`apps/web/src/stores/run-store.ts:21` 的 `MAX_LOG_LINES`），**超出直接丢弃最旧行**（不是"落盘"——日志本来就已经在 SQLite 的 `logs` 表里，要看更早的用 `logs_tail` 回读；首屏另从库里补读 500 行，那是 `LOG_TAIL_LIMIT`，与内存上限无关）。**渲染侧已窗口化（2026-11-20，`3ded642`）**：`run-log.tsx` 只渲染可视区 + 上下各 `LOG_OVERSCAN` 行，行高固定为 `LOG_ROW_HEIGHT`、行用绝对定位摆位，窗口边界由纯函数 `visibleWindow()` / `logWindow()`（`apps/web/src/lib/log-window.ts`，`features/run/run-log-virtual.ts` 只剩 re-export）算出，10,000 行时 DOM 里只有几十个 `<li>`。代价写在 `run-log.tsx` 头注释里：单行不换行、超长消息行内截断（全文仍在 DOM 文本与 `title` 里）。整页面日志面（`features/workbench/logs-view.tsx`）同样窗口化，行高 20px、overscan 12，因最新在上故 `fallbackAnchor: 'start'` 取前若干行（见坑 146）。store 归约仍是 O(n²)（实测 10,000 条 104–167 ms，见 §13），**浏览器帧时间与 300 MB 内存门槛仍没有测量过** —— 窗口化只把「DOM 节点数」这一项从 O(行数) 降到 O(可视行数)，不等于已经达标。
+- 日志：底部面板流式显示，按级别过滤；点击栈帧跳到源码；内存里保留最近 10,000 行（`apps/web/src/stores/run-store.ts:21` 的 `MAX_LOG_LINES`），**超出直接丢弃最旧行**（不是"落盘"——日志本来就已经在 SQLite 的 `logs` 表里，要看更早的用 `logs_tail` 回读；首屏另从库里补读 500 行，那是 `LOG_TAIL_LIMIT`，与内存上限无关）。**渲染侧已窗口化（2026-11-20，`3ded642`）**：`run-log.tsx` 只渲染可视区 + 上下各 `LOG_OVERSCAN` 行，行高固定为 `LOG_ROW_HEIGHT`、行用绝对定位摆位，窗口边界由纯函数 `visibleWindow()` / `logWindow()`（`apps/web/src/lib/log-window.ts`，`features/run/run-log-virtual.ts` 只剩 re-export）算出，10,000 行时 DOM 里只有几十个 `<li>`。代价写在 `run-log.tsx` 头注释里：单行不换行、超长消息行内截断（全文仍在 DOM 文本与 `title` 里）。（历史上还有一个整页面日志面，已于 2026-11-21 删除：日志只在底部面板出现，见 §2.1 的「UI 预算表」；它的筛选能力已搬进底部工具栏 `features/run/run-log.tsx` + `lib/log-filter.ts`。）store 归约仍是 O(n²)（实测 10,000 条 104–167 ms，见 §13），**浏览器帧时间与 300 MB 内存门槛仍没有测量过** —— 窗口化只把「DOM 节点数」这一项从 O(行数) 降到 O(可视行数)，不等于已经达标。
 - 运行结果：每条 mock 事件的输出（回复文本、API 调用、耗时）显示在“运行”页，可复制为测试用例。
 
 ### 6.2 调试（MVP：源码级插桩，不是 V8 Inspector）
