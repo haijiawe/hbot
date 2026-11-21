@@ -63,7 +63,7 @@
 | 渠道 | `channels` | `bots.json` 里登记了哪些平台与地址 | `fs.read('bots.json')`（**不显示 token / clientSecret**） |
 | 作业看板 | `board` | 排队 / 运行中 / 已结束各有几条，失败的那条错在哪 | `bot_jobs`（只读快照，`BOARD_LIMIT=60`） |
 | 设计文档 | `docs` | 项目里的 Markdown / 文本 / JSON 写的是什么、改完存哪 | `workspace.tree` 挑扩展名（`lib/doc-list.ts`）+ `fs.read` / `fs.write` |
-| 开发日志 | `logs` | 这次运行到底打了什么、哪几行是错误 | `runStore` 的 10000 行环形缓冲（`run.log` 事件，与底部「日志」页签同一份） |
+| 开发日志 | `logs` | 这次运行到底打了什么、哪几行是错误 | `runStore` 的 10000 行环形缓冲（`run.log` 事件，与底部「日志」页签同一份）；**渲染已窗口化**，只挂可视区几十个 `li`，窗口数学与底部面板共用 `apps/web/src/lib/log-window.ts` |
 
 四条硬约定：
 
@@ -92,7 +92,7 @@
 
 **刻意没有搬**：侧栏宽度过渡（420ms 会拖 Monaco 重排）、径向渐变光晕、`rise` 入场动画、webfont、大封面图与插画空态、`backdrop-filter` 模糊、按页面 40–200ms 逐条延迟的入场。理由仍是 [11](11-ui-language-bot-workbench.md) §4.2 的三条预算（装饰 / 动效 / 意义），这三条用户没有要求改。
 
-判据：`pnpm --dir apps/web run check` 绿（52 文件 / 462 用例）；浅深两套都能在 headless Edge 里截到（`_recovery/mino-{1,2,3}-*.png`），实测 `documentElement.dataset.theme` 随按钮切换、卡片 `border-radius:18px`、`body` 14px。三个整页面另有截图 `_recovery/face-{board,docs,logs}.png` 与走真流程（试跑注入 → 日志落地）的 `_recovery/face-logs-live.png`。
+判据：`pnpm --dir apps/web run check` 绿（54 文件 / 471 用例）；浅深两套都能在 headless Edge 里截到（`_recovery/mino-{1,2,3}-*.png`），实测 `documentElement.dataset.theme` 随按钮切换、卡片 `border-radius:18px`、`body` 14px。三个整页面另有截图 `_recovery/face-{board,docs,logs}.png` 与走真流程（试跑注入 → 日志落地）的 `_recovery/face-logs-live.png`。
 
 
 ---
@@ -210,7 +210,7 @@
 - 运行面板：选择 bot（一个项目可有多 bot 配置）、平台适配器、启动/停止、状态、队列深度、最近错误。
 - 本地试跑：平台选 `local`（`bots.json` 里 `"platform": "local"`）即可在**不连任何真实平台**的情况下启动 bot，注入一条消息就能跑刚生成的代码；回复不会真的发出去，只以 `[reply] <文本>` 写进日志面板。
 - Mock 事件：选择平台模板（群消息/私聊/按钮回调/定时），填字段，注入到当前 bot；用于不连真实平台的自测。
-- 日志：底部面板流式显示，按级别过滤；点击栈帧跳到源码；内存里保留最近 10,000 行（`apps/web/src/stores/run-store.ts:21` 的 `MAX_LOG_LINES`），**超出直接丢弃最旧行**（不是"落盘"——日志本来就已经在 SQLite 的 `logs` 表里，要看更早的用 `logs_tail` 回读；首屏另从库里补读 500 行，那是 `LOG_TAIL_LIMIT`，与内存上限无关）。**渲染侧已窗口化（2026-11-20，`3ded642`）**：`run-log.tsx` 只渲染可视区 + 上下各 `LOG_OVERSCAN` 行，行高固定为 `LOG_ROW_HEIGHT`、行用绝对定位摆位，窗口边界由纯函数 `logWindow()`（`apps/web/src/features/run/run-log-virtual.ts`）算出，10,000 行时 DOM 里只有几十个 `<li>`。代价写在 `run-log.tsx` 头注释里：单行不换行、超长消息行内截断（全文仍在 DOM 文本与 `title` 里）。store 归约仍是 O(n²)（实测 10,000 条 104–167 ms，见 §13），**浏览器帧时间与 300 MB 内存门槛仍没有测量过** —— 窗口化只把「DOM 节点数」这一项从 O(行数) 降到 O(可视行数)，不等于已经达标。
+- 日志：底部面板流式显示，按级别过滤；点击栈帧跳到源码；内存里保留最近 10,000 行（`apps/web/src/stores/run-store.ts:21` 的 `MAX_LOG_LINES`），**超出直接丢弃最旧行**（不是"落盘"——日志本来就已经在 SQLite 的 `logs` 表里，要看更早的用 `logs_tail` 回读；首屏另从库里补读 500 行，那是 `LOG_TAIL_LIMIT`，与内存上限无关）。**渲染侧已窗口化（2026-11-20，`3ded642`）**：`run-log.tsx` 只渲染可视区 + 上下各 `LOG_OVERSCAN` 行，行高固定为 `LOG_ROW_HEIGHT`、行用绝对定位摆位，窗口边界由纯函数 `visibleWindow()` / `logWindow()`（`apps/web/src/lib/log-window.ts`，`features/run/run-log-virtual.ts` 只剩 re-export）算出，10,000 行时 DOM 里只有几十个 `<li>`。代价写在 `run-log.tsx` 头注释里：单行不换行、超长消息行内截断（全文仍在 DOM 文本与 `title` 里）。整页面日志面（`features/workbench/logs-view.tsx`）同样窗口化，行高 20px、overscan 12，因最新在上故 `fallbackAnchor: 'start'` 取前若干行（见坑 146）。store 归约仍是 O(n²)（实测 10,000 条 104–167 ms，见 §13），**浏览器帧时间与 300 MB 内存门槛仍没有测量过** —— 窗口化只把「DOM 节点数」这一项从 O(行数) 降到 O(可视行数)，不等于已经达标。
 - 运行结果：每条 mock 事件的输出（回复文本、API 调用、耗时）显示在“运行”页，可复制为测试用例。
 
 ### 6.2 调试（MVP：源码级插桩，不是 V8 Inspector）

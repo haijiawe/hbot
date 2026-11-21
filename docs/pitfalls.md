@@ -871,3 +871,26 @@
 但也别急着 `corepack prepare` 重装（要走网络）：先 `where.exe pnpm` 找另一个，
 本机 `D:\node_global\pnpm.cmd`（12.14.0）可正常跑完整闸门。判据是**换一个 pnpm 后同一条命令转绿**，
 而不是去改 `packageManager` 字段或删 `node_modules`。
+
+## 146. 整页面日志不窗口化 = 10000 行全变 DOM 节点
+
+2026-11-21。底部面板的 run-log.tsx 早已窗口化（只渲染可见几十行），但我新写的整页面
+apps/web/src/features/workbench/logs-view.tsx 第一版直接把过滤后的数组全量 map 成 li ——
+runStore 的环形缓冲是 10000 行，于是打开日志面就是一万个节点、滚动时整页重排，表现为「点一下卡半秒」。
+**同一个数据源在两个地方渲染，性能约束必须两边都满足**，一处做了一处没做是最容易漏的形态。
+
+做法：
+
+1. **数学提到共享模块** apps/web/src/lib/log-window.ts，features/run/run-log-virtual.ts 只留
+   `LOG_LIST_GUTTER = 8` 并把它余下的导出整份 re-export。**不许 feature 之间互相 import**（AGENTS.md §6）；
+   lib 是唯一可以共用的位置。既有 run-log-virtual.test.ts 因此一行没改。
+2. 核心是 `visibleWindow(count, scrollTop, viewportHeight, metrics)` → {start, end, totalHeight}：
+   先夹 scrollTop 到 [0, totalHeight - viewportHeight]，再多渲染 overscan 行；行用**绝对定位**
+   （`top: index * rowHeight`），容器高度写 totalHeight，滚动条才是真的。
+3. **日志是倒序显示的**（最新在上），所以首帧 `viewportHeight` 还没量到时，`fallbackAnchor` 必须给
+   `'start'`，否则会先按「末尾 N 行」渲染，用户看到的是最旧的几条然后一抖。
+4. 固定行高换来可预测的窗口数，代价是**单行截断**：.wb-log__text 改 `nowrap + ellipsis`，
+   全文放 `title`。要换行就得改回测量每行高度，那是另一套（run-log 目前也是单行）。
+5. **只测数学不够，必须有一条组件测试**：apps/web/src/features/workbench/logs-view.test.tsx 塞 10000 行、
+   render 后断言 li 数量 >0 且 <=40，并断言首行 textContent 含 'line-9999'。前者钉「真的用了窗口」，
+   后者钉「倒序 + 从最新开始」，缺任一条都可能绿着错。

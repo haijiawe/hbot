@@ -24,7 +24,7 @@
 > - `docs` 设计文档：`workspace.tree` 过滤 `.md/.markdown/.txt/.json`，选中走 `fs.read`、改完 `fs.write`（`lib/doc-list.ts`）。不建文档库 —— 硬规则 9「代码是唯一真源」；源码仍留给资源管理器 + Monaco。
 > - `logs` 开发日志：直接用 `runStore` 那份 10000 行环形缓冲（与底部「日志」页签同一份，不另订阅），整页只多级别/子串过滤与四档计数。
 > - 三面都是**整页面**（`SidebarView` 新增 `board`/`docs`/`logs`，正文由 `App.tsx` 的 `renderPage()` 渲染在编辑区位置，侧栏只放清单与统计）—— 三列看板在 420px 侧栏里会折成三条竖线。
-> - 判据：`pnpm --dir apps/web run check` 绿（**52 文件 / 462 用例**，+2 文件 +19 用例）；headless Edge 截图 `_recovery/face-{board,docs,logs}.png`，日志面另有一张走真流程（试跑注入 → `run.log` 落地）的 `_recovery/face-logs-live.png`。落地口径见 [06-ide.md](06-ide.md) §2.1，映射与理由见 [11](11-ui-language-bot-workbench.md) §2.1.1。
+> - 判据：`pnpm --dir apps/web run check` 绿（**54 文件 / 471 用例**，含窗口化回归 +9 用例）；headless Edge 截图 `_recovery/face-{board,docs,logs}.png`，日志面另有一张走真流程（试跑注入 → `run.log` 落地）的 `_recovery/face-logs-live.png`。落地口径见 [06-ide.md](06-ide.md) §2.1，映射与理由见 [11](11-ui-language-bot-workbench.md) §2.1.1。
 > - **pnpm 环境坑**：corepack 的 `AppData/Local/node/corepack/v1/pnpm/12.21.0/` 里只剩 `pnpm-native.exe`，`pnpm` shim 找不到 `bin/pnpm.mjs` 直接报 `Cannot find module`。改用 `D:\node_global\pnpm.cmd`（12.14.0）可正常跑。与本仓代码无关。
 
 ---
@@ -87,7 +87,7 @@ cargo test -j 2 --workspace              # 当前 2053 passed / 0 failed / 128 t
 pnpm --dir apps/web run check            # 当前 49 文件 / 438 用例
 ```
 
-现状：**六道全绿**（2026-11-21 20:40 实测，`rustc 1.100.0`，2053 passed / 128 target / web 52 文件 462 用例）。
+现状：**六道全绿**（2026-11-21 20:40 实测，`rustc 1.100.0`，2053 passed / 128 target / web 54 文件 471 用例）。
 **Rust 版本已钉死**：`rust-toolchain.toml` 的 `channel = "1.100.0"` 与 `ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`
 必须一起改（原来两处都写 `stable`，导致 CI 的 clippy 比本地新、只报在 CI，见 `docs/pitfalls.md` 坑 115）。
 `apps/web/src/generated/*.ts` **要入库**；
@@ -143,7 +143,7 @@ pnpm --dir apps/web run check            # 当前 49 文件 / 438 用例
 
 ---
 
-## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 145 条）
+## 5. 必须知道的坑（挑最贵的十二条，全表见 `docs/pitfalls.md` 的 146 条）
 
 1. **PowerShell 改 Rust 源码会静默毁文件**。三类事故都发生过：
    `Get-Content -Raw` + `.Replace()` 时双引号里的反引号+字母被当转义（`` `r `` → 回车）；
@@ -328,7 +328,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：2053 passed / 128 target（web：52 文件 462 用例）
+cargo test -j 2 --workspace                              # 基线：2053 passed / 128 target（web：54 文件 471 用例）
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。
