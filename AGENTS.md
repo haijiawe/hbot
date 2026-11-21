@@ -2,7 +2,7 @@
 
 给进入这个仓库的 Agent / 新人。**只写“在哪改、什么不能做、踩过什么坑”**，不重复 README 的产品介绍。
 
-当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`（含附件 `sendImage`/`sendFile`）、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（2048 个 Rust 测试 / 128 个 target / web 427 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
+当前阶段：**M0–M2 主体 + M3/M4/M5 绝大部分已落地，C6 设备能力窄版完成，M7 第 1–5.5 步（`kv`/`history`/`ai`/`onSchedule`（旧名 `onTimer`）/`jobs`/`session`/`sql`）、`C3.send`/`C3.notify`（含附件 `sendImage`/`sendFile`）、`C1.webhook`、`onStart`/`onStop` 与 `C3.file` 全部落地**（2053 个 Rust 测试 / 128 个 target / web 427 用例 / 六道闸门全绿）。最新位置与剩余清单见 [`docs/HANDOFF.md`](docs/HANDOFF.md)（它是快照；冲突以本文件与 `docs/04-implementation-plan.md` 为准）。
 
 ---
 
@@ -63,7 +63,7 @@
 | `crates/hbot-bench` | 性能预算手测台 | 改实现或预算值 | [README](crates/hbot-bench/README.md) |
 | `crates/hbot-parity` | 跨 crate 行为回归（**只有 tests/**） | 任何实现 | [README](crates/hbot-parity/README.md) |
 | `crates/hbot-redteam` | 红队夹具（**只有 tests/** + 夹具库） | 任何实现 | [README](crates/hbot-redteam/README.md) |
-| `crates/xtask` | 代码生成、依赖检查、基准 | 运行时逻辑 | — |
+| `xtask` | 代码生成、依赖检查、基准（**在仓库根，不在 `crates/`**） | 运行时逻辑 | [README](xtask/README.md) |
 | `apps/web/src` | app / components / features / lib / stores / generated | 见各自的边界 | [README](apps/web/src/README.md) |
 | `apps/web/src/features/*` | 12 个功能面板，一目录一份 README | 跨 feature 内部 import | 见各目录 README |
 | `apps/web/src/lib/layout.ts` | 布局唯一真源 | 组件写死宽度 | — |
@@ -72,7 +72,7 @@
 | `apps/web/src/generated` | Rust 生成的 TS | **手改** | — |
 | `tests/integration` | 真 SQLite + mock 平台 | 真实账号 | — |
 | `tests/parity` | 旧项目行为场景 | 逐条搬旧测试 | — |
-| `docs/` | 设计、ADR、体检、计划、spike | 运行日志、临时文件 | 从 [HANDOFF](docs/HANDOFF.md) 进入 |
+| `docs/` | 设计、ADR、体检、计划、spike | 运行日志、临时文件 | [README](docs/README.md)（入口是 [HANDOFF](docs/HANDOFF.md)） |
 
 ---
 

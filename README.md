@@ -70,7 +70,7 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | 技术栈 ADR | Proposed（`0002`；转 Accepted 还差 QuickJS 长跑、真 OneBot 网关、macOS 隔离） |
 | 架构 / 目录 / 计划 / 闸门 / IDE | Draft，已按实现回填实测口径（`02`–`06`） |
 | 代码 | **已落地 M0–M2 主体 + M3/M4/M5 绝大部分 + C6 设备能力窄版（Windows）+ M7 第 1–5.5 步全部（`ctx.kv` / `ctx.history` / `ctx.ai` / `onSchedule`（旧名 `onTimer`）/ `ctx.jobs` / `ctx.session` / `ctx.sql`）+ `ctx.send` / `ctx.notify` / `ctx.webhook`（`onWebhook`）+ `onStart` / `onStop` + `ctx.files` + `ctx.device.screen({ window })`（按窗口截图）**（`crates/` 下 16 个 crate + `xtask`，`apps/web` 可构建） |
-| 测试 | 最近一次 `cargo test --workspace`：**2048 passed / 0 failed**（128 个 target，`rustc 1.100.0`）；`apps/web`：47 文件 427 用例 |
+| 测试 | 最近一次 `cargo test --workspace`：**2053 passed / 0 failed**（128 个 target，`rustc 1.100.0`）；`apps/web`：47 文件 427 用例 |
 | CI | GitHub Actions **全绿**（`haijiawe/hbot`，2026-11-21 起 public）：`gates` / `web` / `bundle (ubuntu)` / `bundle (windows, nsis)` 与 `rust` 的 `fmt`+`clippy`+`test`（ubuntu 与 windows 两平台）全部通过，最近一次 head `c84d04d`（run `44822773155`）也是 workflow 级 success（首次是 head `d0132d2` 的 run `44788353950`）；后续纯文档提交不再逐个登记 run id；`bundle (macos, dmg)` 因这台账号没有 macOS runner 容量改成手动触发，默认 `skipped`（≠ 通过）|
 | 真机验证 | QQ 官方群/私聊被动回复已端到端跑通（`docs/spikes/S9-e2e-qq-official.md`）；Windows NSIS 安装包 9.14 MiB、安装冒烟 11/11；Windows 设备能力（截屏/原生 OCR/输入/多显示器）真机验证；DPI 声明 `unaware → per-monitor-v2` 实测 |
 | 未完成 | M6 迁移/影子（缺测试账号）、云端执行宿主（`M9` 只剩真机那一半：`wss`/多客户端 token/备份/24h 验收；本地可做的一半已落地，见 `docs/08` §9.3.1）、真 NapCat 登录（需扫码且二维码会过期）、Linux/macOS 运行（Landlock 只交叉编译过、一次没真跑）、设备混合 DPI 跨屏拼图/中文以外的 OCR 语言包与手机宿主 |
@@ -81,11 +81,12 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 
 ## 文档地图
 
-> 每个目录一份说明书：每个 `crates/*` 与每个 `apps/web/src/features/*` 都有自己的 `README.md`，写清职责、关键文件、边界、上下游与测试。插件模型见 `docs/10-plugin-model.md`。
+> 每个目录一份说明书：每个 `crates/*`、`xtask/` 与每个 `apps/web/src/features/*` 都有自己的 `README.md`，写清职责、关键文件、边界、上下游与测试；[`docs/README.md`](docs/README.md) 是文档目录的说明书。插件模型见 `docs/10-plugin-model.md`。
 
 | 文件 | 内容 |
 |---|---|
 | [`docs/quickstart-desktop.md`](docs/quickstart-desktop.md) | **五分钟上手（桌面端）**：装包 → 新建项目 → 试跑 → 看到回复；接真 QQ 的最短路径 |
+| [`docs/README.md`](docs/README.md) | **文档目录的说明书**：先读哪份、每份讲什么、什么该进 `docs/` |
 | [`docs/00-assessment.md`](docs/00-assessment.md) | 旧项目实测证据、P0/P1、重写判定、验收不变量 |
 | [`docs/01-requirements.md`](docs/01-requirements.md) | 用户场景、功能/非功能需求、MVP 范围、成功指标 |
 | [`docs/adr/0001-tech-stack.md`](docs/adr/0001-tech-stack.md) | 历史决策（Superseded，不据此实施） |

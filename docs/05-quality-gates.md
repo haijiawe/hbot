@@ -146,7 +146,7 @@ pnpm -C apps/web build           # 产物能构建
 
 | 检查 | 状态 | 证据 |
 |---|---|---|
-| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `128 suites / 2048 passed / 0 failed / 14 ignored`（`rustc 1.100.0`） |
+| Windows 全量 `fmt`/`clippy`/`test --workspace` | ✅ 本地实跑通过 | `128 suites / 2053 passed / 0 failed / 14 ignored`（`rustc 1.100.0`） |
 | `apps/web` 的 `check`/`test` | ✅ 本地实跑通过 | `47 文件 / 427 用例` |
 | `xtask deps` / `gen --check` | ✅ 本地实跑通过 | `0 violation(s)`、生成物一致 |
 | CI `gates` / `web` / `bundle (ubuntu)` / `bundle (windows, nsis)` | ✅ runner 上通过 | run `44730056833` / `44735231807` / `44738414777` / `44747851031` / `44756454957` / `44771911890`(attempt 2) 六次的四个 job 都 success |

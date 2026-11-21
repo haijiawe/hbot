@@ -4,7 +4,7 @@
 - 日期：2026-11-16
 - 目标：一个新人或一个 Agent，**只看路径就能判断该去哪改**；不靠记忆、不靠口头约定。
 
-**每个目录一份说明书**：`crates/*` 与 `apps/web/src/features/*` 下都有 `README.md`，写清职责、关键文件、边界、上下游与测试；本文件讲的是跨目录的规则与依赖方向。插件与组合根模型见 [`docs/10-plugin-model.md`](10-plugin-model.md)。
+**每个目录一份说明书**：`crates/*`、`xtask/` 与 `apps/web/src/features/*` 下都有 `README.md`，写清职责、关键文件、边界、上下游与测试；`docs/` 本身也有一份 [`README.md`](README.md) 讲清哪份文档讲什么。本文件讲的是跨目录的规则与依赖方向。插件与组合根模型见 [`docs/10-plugin-model.md`](10-plugin-model.md)。
 
 ---
 

@@ -27,7 +27,7 @@
 ## 依赖方向
 
 `[dev-dependencies]` 里才有 `hbot-*`，`[dependencies]` 为空 —— 因此它不可能被任何实现 crate 依赖到。
-这是**唯一**允许反向依赖实现 crate 的地方（`crates/xtask/src/deps.rs` 的 `ALLOWED` 已登记）。
+这是**唯一**允许反向依赖实现 crate 的地方（`xtask/src/deps.rs` 的 `ALLOWED` 已登记）。
 
 ## 约定
 

@@ -62,11 +62,11 @@ cargo fmt --all -- --check
 cargo run -q -p xtask -- gen --check     # 生成物一致；注意是 run -p xtask --，没有 cargo xtask 别名
 cargo run -q -p xtask -- deps            # 依赖方向；当前 17 crate / 57 边 / 0 违规
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
-cargo test -j 2 --workspace              # 当前 2048 passed / 0 failed / 128 target
+cargo test -j 2 --workspace              # 当前 2053 passed / 0 failed / 128 target
 pnpm --dir apps/web run check            # 当前 47 文件 / 427 用例
 ```
 
-现状：**六道全绿**（2026-11-21 00:18 实测，`rustc 1.100.0`，2048 passed / 128 target / web 47 文件 427 用例）。
+现状：**六道全绿**（2026-11-21 18:14 实测，`rustc 1.100.0`，2053 passed / 128 target / web 47 文件 427 用例）。
 **Rust 版本已钉死**：`rust-toolchain.toml` 的 `channel = "1.100.0"` 与 `ci.yml` 四处 `dtolnay/rust-toolchain@1.100.0`
 必须一起改（原来两处都写 `stable`，导致 CI 的 clippy 比本地新、只报在 CI，见 `docs/pitfalls.md` 坑 115）。
 `apps/web/src/generated/*.ts` **要入库**；
@@ -305,7 +305,7 @@ JS 数字绑定 SQLite 时整数/浮点要分开（坑 92），写超 10000 行�
 cd E:\HBot-Next
 git log --oneline -5                                     # 确认 HEAD 是 shutdown 那一批或更新
 $env:CARGO_TARGET_DIR='E:\hbot-target\gate'
-cargo test -j 2 --workspace                              # 基线：2048 passed / 128 target
+cargo test -j 2 --workspace                              # 基线：2053 passed / 128 target
 ```
 
 1. 读 `docs/07-bot-runtime-blueprint.md` 的 **§3 能力表 + §3.4 send/notify + §3.5 webhook + §4.5 jobs + §4.6 lifecycle + §5.2 session + §5.3 sql + §11 落地顺序**（这是本轮的施工图）。
