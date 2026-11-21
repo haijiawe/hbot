@@ -71,6 +71,26 @@
 
 视觉语言与设计令牌（配色、对比度、17 条不可借用项）见 [11-ui-language-bot-workbench.md](11-ui-language-bot-workbench.md)；面本身没有组件测试，理由写在 `apps/web/src/features/workbench/README.md`。
 
+### 2.2 视觉重做：把 Mino 的界面搬过来（2026-11-21）
+
+用户看过第一版（只在侧栏加了六个面、外观仍是旧的深色 IDE）后明确要求：**先把 Mino 的界面整套搬过来，再改造**。于是把 `apps/web` 的外观换成 Mino 的语言，右侧 Agent 栏与底部面板的功能一行未动。
+
+| 项 | 落地方式 |
+|---|---|
+| 主题 | 默认**浅色暖调**（`--bg:#f6f3ee` / 卡 `#fffdf9` / 正文 `#211a14`），活动栏底部的 ☀/☾ 按钮切深色；选择存进 `workspace-prefs` 的 `theme` 字段（`apps/web/src/lib/theme.ts` 写 `documentElement.dataset.theme`），`main.tsx` 在首帧前应用，避免深色存档闪白 |
+| 令牌 | `apps/web/src/styles/theme.css` 整份重写，变量名沿用 HBot 的（`--bg/--bg-panel/--fg/--accent…`），新增 `--radius-card:18px` / `--radius-control:11px` / `--shadow-card`；正文 13px → 14px/1.55 |
+| 强调色 | 拆两档：`--accent`（文字，浅底 4.69:1）与 `--accent-fill`（实底白字 5.19:1）。Mino 原色 `#e8742a` 上白字只有 **3.02:1**，不达 AA，只留给品牌渐变等图形 |
+| 外壳 | 活动栏顶部品牌块（34px 橙渐变 + 白字 H）、34px 图标按钮、选中项用 `--accent-soft` 底 + `--accent` 字（去掉左侧竖条）；面容器 `.wb-page`（eyebrow / 标题 / 状态 pill / 卡片栅格） |
+| 页签 | 底部面板页签改成胶囊（`border-radius:999px`，选中 `--accent-soft` 底），去掉了原来的全大写与下划线 |
+| 空状态 | 编辑区与「没有打开项目」都改成 Mino 的 topbar+content 形态：eyebrow + 大标题 + 说明 + 快捷键卡片（`.wb-kbd`） |
+| 编辑器 | Monaco 新增 `hbot-light` 主题；切主题走 `monaco.editor.setTheme`（只换配色，不重建编辑器，保光标与滚动位置） |
+| 样式归属 | 新样式全部写在新文件 `apps/web/src/styles/mino.css`（在 `app.css` 之后 import），`app.css` 只删掉了被取代的旧工作台块与 `.welcome` 块 |
+
+**刻意没有搬**：侧栏宽度过渡（420ms 会拖 Monaco 重排）、径向渐变光晕、`rise` 入场动画、webfont、大封面图与插画空态、`backdrop-filter` 模糊、按页面 40–200ms 逐条延迟的入场。理由仍是 [11](11-ui-language-bot-workbench.md) §4.2 的三条预算（装饰 / 动效 / 意义），这三条用户没有要求改。
+
+判据：`pnpm --dir apps/web run check` 绿（50 文件 / 443 用例）；浅深两套都能在 headless Edge 里截到（`_recovery/mino-{1,2,3}-*.png`），实测 `documentElement.dataset.theme` 随按钮切换、卡片 `border-radius:18px`、`body` 14px。
+
+
 ---
 
 ## 3. 编辑器能力

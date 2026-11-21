@@ -36,7 +36,7 @@
 | Bot | Rust supervisor，每会话串行队列，持久化 inbound/outbound |
 | 平台 | OneBot 11 + 通用 Webhook 优先，适配器 SDK 扩展到其他平台 |
 | 生成代码 | 多文件 TypeScript（相对 import）→ 逐文件 SWC 去类型 → QuickJS 模块加载器 |
-| IDE | **Bot 工作台六面**（概览 / Bot / 能力 / 会话 / 运行态 / 渠道）+ Monaco 编辑器、文件树、搜索、问题、Diff 审查、运行/日志、插桩调试 |
+| IDE | **Bot 工作台六面**（概览 / Bot / 能力 / 会话 / 运行态 / 渠道）+ Monaco 编辑器、文件树、搜索、问题、Diff 审查、运行/日志、插桩调试；外观沿用参考实现 Mino 的浅色暖调（活动栏底部可切深色） |
 | 存储 | SQLite（rusqlite bundled，WAL，单 writer） |
 | 密钥 | OS keychain（`keyring`） |
 | 打包 | Tauri bundler（NSIS / dmg / deb+AppImage） |
@@ -99,7 +99,7 @@ Linux：hbot serve（同一核心，本机 WS RPC，systemd）
 | [`docs/07-bot-runtime-blueprint.md`](docs/07-bot-runtime-blueprint.md) | **起 bot 的架构蓝图**：三层分离、6 组能力、四类 bot 缺什么、状态/定时/作业、设备能力（C6）三道闸、网关顺序 |
 | [`docs/08-multi-host.md`](docs/08-multi-host.md) | **多宿主与运行位置**：桌面/无头/手机能力矩阵、iOS/Android 后台真相、本机/局域网/云端四档、npm 打包、移动端风险 |
 | [`docs/09-device-capability.md`](docs/09-device-capability.md) | **设备能力实现设计**（Draft）：两个消费者一份闸、库表、三层闸落点、`DeviceBackend`、Windows 抓屏/注入选型、会话状态机、契约增量、窄版 vs 完整版 |
-| [`docs/pitfalls.md`](docs/pitfalls.md) | **踩过的坑全表（142 条，编号稳定）**：旧项目的证据 + 新仓库自己实测的坑，AGENTS.md §7 只留摘要 |
+| [`docs/pitfalls.md`](docs/pitfalls.md) | **踩过的坑全表（143 条，编号稳定）**：旧项目的证据 + 新仓库自己实测的坑，AGENTS.md §7 只留摘要 |
 | [`docs/adr/0004-one-core-three-hosts.md`](docs/adr/0004-one-core-three-hosts.md) | 决策：一个核心三宿主、手机不做完整 IDE、为什么 QuickJS 对 iOS 也成立 |
 | [`docs/adr/0005-capability-ceiling-and-device-grant.md`](docs/adr/0005-capability-ceiling-and-device-grant.md) | 决策：能力上限不砍、默认全关、逐项授权（含键鼠注入的三层闸） |
 | [`docs/adr/0006-execution-backend.md`](docs/adr/0006-execution-backend.md) | 决策：运行位置可选（本机/局域网/云端）、单一写者、换位置靠搬家不靠热迁移 |
