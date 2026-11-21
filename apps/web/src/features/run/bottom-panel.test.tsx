@@ -30,10 +30,6 @@ vi.mock('../../lib/ipc', async (importOriginal) => {
       return { path: command.path, content: 'const a = 1\n', version: 1 }
     }
     if (command.type === 'diagnostics') return diagnosticsResponse
-    // 作业面板一挂载就会问 bot 清单与两张快照；这里给空结果，
-    // 它的内容由 `jobs-panel.test.tsx` 负责。
-    if (command.type === 'bot.list') return []
-    if (command.type === 'bot_jobs' || command.type === 'bot_waits') return []
     return null
   })
   return { ...actual, dispatch: stub }
@@ -93,18 +89,6 @@ describe('BottomPanel 页签', () => {
 
     expect(useWorkspaceStore.getState().bottomPanelTab).toBe('problems')
     expect(await screen.findByRole('button', { name: /错误：类型不匹配/ })).toBeTruthy()
-  })
-
-  it('切到作业页签渲染作业与等待面板', async () => {
-    const user = userEvent.setup()
-    render(<BottomPanel />)
-
-    await user.click(screen.getByRole('tab', { name: '作业' }))
-
-    expect(useWorkspaceStore.getState().bottomPanelTab).toBe('jobs')
-    // 面板是真的挂上了（空态文案来自它自己），不是空壳。
-    expect(await screen.findByLabelText('作业与等待')).toBeTruthy()
-    expect(await screen.findByText(/这个 bot 还没有作业记录/)).toBeTruthy()
   })
 
   it('暂停时调试页签挂"已暂停"标记，即使当前在看别的页签', () => {

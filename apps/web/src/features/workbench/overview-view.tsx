@@ -60,24 +60,6 @@ export function OverviewView() {
         </p>
       ) : (
         <>
-          <div className="wb-cards">
-            <div className="wb-card">
-              <div className="wb-card__title">能力</div>
-              <div className="wb-stat__num">{manifest === null ? '—' : manifest.declaredCount}</div>
-              <div className="wb-stat__label">项已声明</div>
-            </div>
-            <div className="wb-card">
-              <div className="wb-card__title">Bot</div>
-              <div className="wb-stat__num">{bots.length}</div>
-              <div className="wb-stat__label">个入口</div>
-            </div>
-            <div className="wb-card">
-              <div className="wb-card__title">HTTP</div>
-              <div className="wb-stat__num">{manifest === null ? '—' : manifest.httpHosts.length}</div>
-              <div className="wb-stat__label">个源已授权</div>
-            </div>
-          </div>
-
           <section className="wb-card" aria-label="运行状态">
             <div className="wb-card__title">运行状态</div>
             {selected === null ? (
@@ -134,6 +116,16 @@ export function OverviewView() {
               <span className="wb-kv__key">限额</span>
               <span className="wb-kv__value">
                 {manifest === null ? '—' : limitsSummary(manifest) || '没有声明限额'}
+              </span>
+            </div>
+            {/* 能力与 HTTP 的明细只在「能力」面出现一次（2026-11-21 UI 收敛）：
+                这里只报一个数并指路，不再重复渲染同一个列表。 */}
+            <div className="wb-kv">
+              <span className="wb-kv__key">能力</span>
+              <span className="wb-kv__value">
+                {manifest === null
+                  ? '—'
+                  : manifest.declaredCount + ' 项已声明 · ' + manifest.httpHosts.length + ' 个 HTTP 源（明细见「能力」面）'}
               </span>
             </div>
             {manifestError !== null ? <p className="wb-error">{manifestError}</p> : null}

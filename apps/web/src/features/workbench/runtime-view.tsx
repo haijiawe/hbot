@@ -1,8 +1,10 @@
 /**
- * 运行态面：作业与等待的活跃数量 + 最近几条（完整列表在底部「作业」页签）。
+ * 运行态面：只给数字（在途作业 / 待回应等待 / 最近作业条数）+ 一个跳到看板的按钮。
  *
- * 为什么要一个面：作业在后台跑，用户看不到"它到底在不在动"。这里只给数：
- * 待跑 / 在跑 / 最近失败，以及下一次派发的时刻。
+ * 为什么不在这里再列一遍作业与等待（2026-11-21 UI 收敛）：这些行在
+ * 「作业看板」整页面里已经有一份完整、分列的版本（`jobs-board-view.tsx`）。
+ * 同一份数据在两个面上各渲染一次，用户既读不出哪份更全，也要两处都看才敢下判断。
+ * 面之间的分工是：**运行态回答「现在有多少」，看板回答「具体是哪几条」**。
  */
 
 import { useCallback, useEffect, useState } from 'react'
@@ -12,21 +14,17 @@ import { dispatch } from '../../lib/ipc'
 import { useRunStore } from '../../stores/run-store'
 import { useWorkspaceStore } from '../../stores/workspace-store'
 
-const VIEW_LIMIT = 20
+/** 统计窗口：够覆盖一个 bot 的全部在途（`MAX_JOBS_PER_BOT` 256 / 等待 64），又不拉全表。 */
+const COUNT_LIMIT = 200
 const ACTIVE_JOB_STATES = new Set(['pending', 'running'])
 const PENDING_WAIT_STATES = new Set(['pending'])
 
-function stateText(job: JobView): string {
-  if (job.lastError !== null && job.state === 'failed') return job.lastError
-  return job.state
-}
-
 export function RuntimeView() {
   const projectRoot = useWorkspaceStore((state) => state.projectRoot)
+  const setSidebarView = useWorkspaceStore((state) => state.setSidebarView)
   const botId = useRunStore((state) => state.botId)
   const bots = useRunStore((state) => state.bots)
   const refresh = useRunStore((state) => state.refresh)
-  const setBottomPanelTab = useWorkspaceStore((state) => state.setBottomPanelTab)
   const [jobs, setJobs] = useState<JobView[]>([])
   const [waits, setWaits] = useState<WaitView[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -39,8 +37,8 @@ export function RuntimeView() {
     }
     try {
       const [nextJobs, nextWaits] = await Promise.all([
-        dispatch({ type: 'bot_jobs', botId, limit: VIEW_LIMIT }),
-        dispatch({ type: 'bot_waits', botId, limit: VIEW_LIMIT }),
+        dispatch({ type: 'bot_jobs', botId, limit: COUNT_LIMIT }),
+        dispatch({ type: 'bot_waits', botId, limit: COUNT_LIMIT }),
       ])
       setJobs(nextJobs)
       setWaits(nextWaits)
@@ -58,6 +56,7 @@ export function RuntimeView() {
 
   const activeJobs = jobs.filter((job) => ACTIVE_JOB_STATES.has(job.state)).length
   const pendingWaits = waits.filter((wait) => PENDING_WAIT_STATES.has(wait.state)).length
+  const failed = jobs.filter((job) => job.state === 'failed').length
 
   return (
     <div className="wb-page">
@@ -69,8 +68,8 @@ export function RuntimeView() {
           <button className="wb-btn" type="button" onClick={() => void load()} disabled={botId.length === 0}>
             刷新
           </button>
-          <button className="wb-btn" type="button" onClick={() => setBottomPanelTab('jobs')}>
-            作业页签
+          <button className="wb-btn" type="button" onClick={() => setSidebarView('board')}>
+            打开看板
           </button>
         </div>
       </header>
@@ -92,46 +91,18 @@ export function RuntimeView() {
               <div className="wb-stat__label">待回应</div>
             </div>
             <div className="wb-card">
-              <div className="wb-card__title">近期</div>
-              <div className="wb-stat__num">{jobs.length}</div>
-              <div className="wb-stat__label">条作业</div>
+              <div className="wb-card__title">失败</div>
+              <div className="wb-stat__num">{failed}</div>
+              <div className="wb-stat__label">本轮已放弃</div>
             </div>
           </div>
-          {jobs.length === 0 && waits.length === 0 ? (
+          {activeJobs === 0 && pendingWaits === 0 && failed === 0 ? (
             <p className="wb-empty">
-              还没有作业或等待。声明 capabilities.jobs / 用 ctx.session.prompt 之后会出现。
+              现在没有在途作业或等待。声明 capabilities.jobs / 用 ctx.session.prompt 之后会出现。
             </p>
-          ) : null}
-          {jobs.length > 0 ? (
-            <section className="wb-card" aria-label="最近作业">
-              <div className="wb-card__title">最近作业</div>
-              <ul className="wb-list">
-                {jobs.slice(0, 6).map((job) => (
-                  <li key={job.id} className="wb-item">
-                    <div className="wb-item__main">
-                      <span className="wb-item__name">{job.name}</span>
-                      <span className="wb-item__meta">{stateText(job)} · 第 {job.attempts} 次</span>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ) : null}
-          {waits.length > 0 ? (
-            <section className="wb-card" aria-label="等待">
-              <div className="wb-card__title">等待</div>
-              <ul className="wb-list">
-                {waits.slice(0, 6).map((wait) => (
-                  <li key={wait.id} className="wb-item">
-                    <div className="wb-item__main">
-                      <span className="wb-item__name">{wait.key}</span>
-                      <span className="wb-item__meta">{wait.state}</span>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ) : null}
+          ) : (
+            <p className="wb-note">具体是哪几条、卡在哪一列，在「作业看板」里看。</p>
+          )}
         </>
       )}
     </div>

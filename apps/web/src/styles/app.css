@@ -2726,149 +2726,6 @@ body.is-resizing {
   color: var(--danger);
 }
 
-/* ---------- 作业与等待（C4.jobs / C2.session 的只读快照） ---------- */
-
-/*
- * 面板挂在底部面板的「作业」页签里：高度来自 `--bottom-panel-height`，滚动交给
- * `.bottom-panel__body`，这里只排内部结构（与 `.replay` / `.device-panel` 同一条纪律，
- * 面板自己再套 overflow 会出现双滚动条）。
- */
-.jobs-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 10px 12px;
-}
-
-/* 「只读快照」那句话是使用前提，不是提示语，所以不靠 tooltip 承载。 */
-.jobs-panel__hint {
-  margin: 0;
-}
-
-.jobs-panel__toolbar {
-  display: flex;
-  flex: 0 0 auto;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 8px;
-}
-
-.jobs-panel__field {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.jobs-panel__label {
-  color: var(--fg-dim);
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.jobs-panel__select {
-  max-width: 240px;
-  padding: 3px 6px;
-  border: 1px solid var(--border-strong);
-  border-radius: 4px;
-  background: var(--bg);
-  color: var(--fg);
-  font-size: 12px;
-  outline: none;
-}
-
-.jobs-panel__select:focus {
-  border-color: var(--accent);
-}
-
-.jobs-panel__check {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--fg-dim);
-  font-size: 11px;
-  padding-bottom: 3px;
-}
-
-/* 计数条与「刷新时刻」：等宽字体让每秒变化的数字不推着同行文字左右跳。 */
-.jobs-panel__meta {
-  color: var(--fg-dim);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  padding-bottom: 3px;
-}
-
-.jobs-panel__error {
-  margin: 0;
-}
-
-/* 两段都是「标题 + 表格」，各自独立滚动的是外层 `.bottom-panel__body`。 */
-.jobs-panel__section {
-  display: flex;
-  flex: 0 0 auto;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.jobs-panel__title {
-  margin: 0;
-  color: var(--fg-dim);
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.06em;
-}
-
-.jobs-panel__table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 11px;
-}
-
-.jobs-panel__table th {
-  color: var(--fg-dim);
-  font-weight: 500;
-  text-align: left;
-  padding: 2px 8px 2px 0;
-  border-bottom: 1px solid var(--border-strong);
-  white-space: nowrap;
-}
-
-.jobs-panel__table td {
-  padding: 2px 8px 2px 0;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top;
-  overflow-wrap: anywhere;
-}
-
-/* 未完成的行左侧留一条淡色条：颜色不是唯一信号（状态列有中文标签）。 */
-.jobs-panel__row--active .jobs-panel__state {
-  color: var(--accent);
-}
-
-.jobs-panel__row--settled {
-  color: var(--fg-dim);
-}
-
-.jobs-panel__mono {
-  font-family: var(--font-mono);
-}
-
-/* 提示文本可能很长（用户写的那句话）：限宽两行，超了省略，别把表格撑出横向滚动。 */
-.jobs-panel__prompt {
-  max-width: 320px;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-/* 错误正文按原文显示（不截断成一句话），它本身就是排障线索。 */
-.jobs-panel__error-cell {
-  max-width: 320px;
-  color: var(--danger);
-}
-
-
 /* ---------- 问题面板的动作按钮（docs/06-ide.md §5.3） ---------- */
 
 /*
@@ -3033,4 +2890,82 @@ body.is-resizing {
   color: var(--fg-dim);
   font-size: 11px;
   line-height: 1.4;
+}
+
+/* ---------- 日志筛选工具栏（底部「日志」页签，2026-11-21 UI 收敛搬进来） ---------- */
+
+/*
+ * 筛选搬进底部日志的原因：整页面日志面与底部日志读的是同一份 `runStore.logs`，
+ * 两套渲染器必然漂移。现在只有这里一处，工具栏是它唯一的附加控件条。
+ * `flex-wrap` 是必须的：底部面板最窄可以拖到 200px，四个级别按钮 + 一个输入框放不下。
+ */
+.logs-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.logs-toolbar__query {
+  flex: 1 1 140px;
+  min-width: 100px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 11px;
+}
+
+.logs-toolbar__query:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.logs-toolbar__level {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.logs-toolbar__level.is-on {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.logs-toolbar__count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+.logs-toolbar__level--error.is-on { border-color: var(--danger); color: var(--danger); }
+.logs-toolbar__level--warn.is-on { border-color: var(--warn); color: var(--warn); }
+.logs-toolbar__level--info.is-on { border-color: var(--accent); color: var(--accent); }
+.logs-toolbar__level--debug.is-on { border-color: var(--fg-muted); }
+
+.logs-toolbar__reset {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.logs-toolbar__meta {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }

@@ -31,7 +31,6 @@ import { ChannelsView } from '../features/workbench/channels-view'
 import { ConversationsView } from '../features/workbench/conversations-view'
 import { DocsSide, DocsView } from '../features/workbench/docs-view'
 import { JobsBoardSide, JobsBoardView } from '../features/workbench/jobs-board-view'
-import { LogsSide, LogsView } from '../features/workbench/logs-view'
 import { OverviewView } from '../features/workbench/overview-view'
 import { RuntimeView } from '../features/workbench/runtime-view'
 import { restoreSessionIfSameProject, startSessionPersistence } from '../lib/session-persistence'
@@ -73,8 +72,6 @@ function renderSidebar(view: SidebarView) {
       return <JobsBoardSide />
     case 'docs':
       return <DocsSide />
-    case 'logs':
-      return <LogsSide />
     case 'settings':
       return <SettingsView />
     case 'explorer':
@@ -83,7 +80,7 @@ function renderSidebar(view: SidebarView) {
 }
 
 /**
- * 三个"要整页宽度"的面（看板 / 文档 / 日志）。返回 null 表示主区域还是编辑器。
+ * 两个"要整页宽度"的面（看板 / 文档）。返回 null 表示主区域还是编辑器。
  *
  * 为什么不分两套导航：侧栏放清单、主区域放正文是同一个面的两半（与 VSCode 的
  * "视图 + 编辑区"一致）。面一旦确定，主区域就不该再猜——所以这里只认 `SidebarView`。
@@ -94,8 +91,6 @@ function renderPage(view: SidebarView) {
       return <JobsBoardView />
     case 'docs':
       return <DocsView />
-    case 'logs':
-      return <LogsView />
     default:
       return null
   }
@@ -259,7 +254,7 @@ export function App() {
                     </li>
                   </ul>
                 </div>
-                <p className="wb-note">打开项目后，侧栏会显示这个 bot 的清单、能力、会话与运行态；作业看板 / 设计文档 / 开发日志三面在编辑区整页打开。</p>
+                <p className="wb-note">打开项目后，侧栏会显示这个 bot 的清单、能力、会话与运行态；作业看板与设计文档两面在编辑区整页打开，日志在底部面板（Ctrl+J）。</p>
               </div>
             </div>
           ) : (

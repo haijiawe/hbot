@@ -260,3 +260,50 @@ describe('RunLog 来源区分', () => {
     expect(screen.getByText('普通 run log')).toBeTruthy()
   })
 })
+
+describe('RunLog 筛选（从已删的整页面日志面搬进来）', () => {
+  it('关键词只留匹配行，并给出匹配/总数', () => {
+    resetStore([
+      { level: 'info', source: 'bot', message: '启动完成', at: 1 },
+      { level: 'error', source: 'bot', message: 'HBOT_JOBS_FAILED: 没有 onJob', at: 2 },
+    ])
+    render(<RunLog />)
+
+    fireEvent.change(screen.getByLabelText('按内容筛选日志'), { target: { value: 'hbot' } })
+
+    expect(document.querySelectorAll('li')).toHaveLength(1)
+    expect(document.querySelector('.logs-toolbar__meta')?.textContent).toContain('1 / 2')
+  })
+
+  it('级别按钮是并集开关；全部关掉等于不按级别过滤', () => {
+    resetStore([
+      { level: 'info', source: 'bot', message: '一', at: 1 },
+      { level: 'error', source: 'bot', message: '二', at: 2 },
+      { level: 'warn', source: 'bot', message: '三', at: 3 },
+    ])
+    render(<RunLog />)
+
+    fireEvent.click(screen.getByRole('button', { name: /^错误/ }))
+    expect(document.querySelectorAll('li')).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: /^警告/ }))
+    expect(document.querySelectorAll('li')).toHaveLength(2)
+
+    // 再点一次错误：取消 -> 只剩警告。
+    fireEvent.click(screen.getByRole('button', { name: /^错误/ }))
+    expect(document.querySelectorAll('li')).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: /^警告/ }))
+    expect(document.querySelectorAll('li')).toHaveLength(3)
+  })
+
+  it('筛选后没有匹配时显示可执行的空态，而不是空白列表', () => {
+    resetStore([{ level: 'info', source: 'bot', message: '一', at: 1 }])
+    render(<RunLog />)
+
+    fireEvent.change(screen.getByLabelText('按内容筛选日志'), { target: { value: 'zzz' } })
+
+    expect(document.querySelector('.panel-empty')?.textContent).toContain('没有匹配的日志')
+    expect(document.querySelectorAll('li')).toHaveLength(0)
+  })
+})

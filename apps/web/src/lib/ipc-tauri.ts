@@ -468,7 +468,7 @@ export async function dispatchViaTauri(command: Command): Promise<unknown> {
         conversationId: command.conversationId,
         text: command.text,
       })
-    // 作业与等待面板（`features/run/jobs-panel.tsx`）：只读快照、新→旧、
+    // 作业看板（`features/workbench/jobs-board-view.tsx`）：只读快照、新→旧、
     // 空数组合法（这个 bot 还没跑过作业），所以走 `callWire` 而不是 void 变体。
     case 'bot_jobs':
       return callWire<JobView[]>('bot_jobs', {

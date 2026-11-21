@@ -23,7 +23,6 @@
 | `channels` | `channels-view.tsx` | `workspace-store.botsFile` 的原文，解析在 `lib/bots-file.ts` |
 | `board` | `jobs-board-view.tsx` | `bot_jobs` 只读快照（`BOARD_LIMIT=60`），分列逻辑在 `lib/job-board.ts` |
 | `docs` | `docs-view.tsx` | `workspace.tree` 挑文档扩展名（`lib/doc-list.ts`）+ `fs.read` / `fs.write` |
-| `logs` | `logs-view.tsx` | `run-store.logs`（与底部「日志」页签同一份缓冲）+ 级别/子串过滤 |
 | 共用 | `bot-status.ts` | 五态标签与状态点类名（颜色不是唯一信号：降级是空心环） |
 
 清单的解析在 `lib/bot-manifest.ts`，bots.json 的解析在 `lib/bots-file.ts` ——

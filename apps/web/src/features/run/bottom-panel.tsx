@@ -1,8 +1,8 @@
 /**
- * 底部面板（lazy chunk）：日志 / 问题 / 搜索 / 调试 / 试跑 / 设备 / 回放 / 作业八个页签 + 启停控制。
+ * 底部面板（lazy chunk）：日志 / 问题 / 搜索 / 调试 / 试跑 / 设备 / 回放 七个页签 + 启停控制。
  *
- * 八个页签共用同一块区域，高度只来自 `lib/layout.ts` 的 `--bottom-panel-height`，
- * 不另起第二套布局常量。默认导出是 React.lazy 的要求；试跑、设备、回放与作业面板同样 **lazy**，
+ * 七个页签共用同一块区域，高度只来自 `lib/layout.ts` 的 `--bottom-panel-height`，
+ * 不另起第二套布局常量。默认导出是 React.lazy 的要求；试跑、设备与回放面板同样 **lazy**，
  * 别改成静态 import（首屏预算被钉住了，见 AGENTS.md §5.6）。
  */
 
@@ -33,13 +33,6 @@ const ReplayPanel = lazy(() =>
   import('../replay/replay-panel').then((module) => ({ default: module.ReplayPanel })),
 )
 
-/**
- * 作业面板：第八个页签，lazy —— 它每 2 秒轮询一次数据库，只有在被看见时才该跑
- * （切走就卸载，定时器跟着清掉；理由写在 `jobs-panel.tsx` 的头部）。
- */
-const JobsPanel = lazy(() =>
-  import('../run/jobs-panel').then((module) => ({ default: module.JobsPanel })),
-)
 
 const TABS: readonly BottomPanelTab[] = [
   'logs',
@@ -49,7 +42,6 @@ const TABS: readonly BottomPanelTab[] = [
   'tryrun',
   'device',
   'replay',
-  'jobs',
 ]
 const TAB_LABEL: Record<BottomPanelTab, string> = {
   logs: '日志',
@@ -59,7 +51,6 @@ const TAB_LABEL: Record<BottomPanelTab, string> = {
   tryrun: '试跑',
   device: '设备',
   replay: '回放',
-  jobs: '作业',
 }
 const TAB_ID: Record<BottomPanelTab, string> = {
   logs: 'bottom-tab-logs',
@@ -69,7 +60,6 @@ const TAB_ID: Record<BottomPanelTab, string> = {
   tryrun: 'bottom-tab-tryrun',
   device: 'bottom-tab-device',
   replay: 'bottom-tab-replay',
-  jobs: 'bottom-tab-jobs',
 }
 
 /** 页签上的计数（`null` = 不显示徽标）。 */
@@ -97,10 +87,6 @@ function tabCount(
       return null
     case 'replay':
       // 回放没有"待办条数"：报告是用户点出来的，挂徽标会把结果说成积压。
-      return null
-    case 'jobs':
-      // 作业条数要靠一次查询才有（不在 store 里），而页签徽标必须零查询可得：
-      // 显示 0 会掩盖真实积压，所以干脆不挂 —— 面板内自带「进行中 N」。
       return null
     default: {
       const exhaustive: never = tab
@@ -141,12 +127,6 @@ function panelBody(tab: BottomPanelTab) {
       return (
         <Suspense fallback={<p className="panel-empty">正在加载回放面板…</p>}>
           <ReplayPanel />
-        </Suspense>
-      )
-    case 'jobs':
-      return (
-        <Suspense fallback={<p className="panel-empty">正在加载作业面板…</p>}>
-          <JobsPanel />
         </Suspense>
       )
     default: {

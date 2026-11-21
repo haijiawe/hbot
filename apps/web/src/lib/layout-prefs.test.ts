@@ -24,7 +24,7 @@ describe('prefs version migration', () => {
     const prefs = sanitizePrefs({
       layout: { sidebarWidth: 300, agentWidth: 420, bottomPanelHeight: 260, sidebarCollapsed: true },
       sidebarView: 'explorer',
-      bottomPanelTab: 'jobs',
+      bottomPanelTab: 'replay',
     })
     expect(prefs.version).toBe(PREFS_VERSION)
     expect(prefs.sidebarView).toBe('overview')
@@ -32,7 +32,7 @@ describe('prefs version migration', () => {
     expect(prefs.layout.agentWidth).toBe(420)
     expect(prefs.layout.bottomPanelHeight).toBe(260)
     expect(prefs.layout.sidebarCollapsed).toBe(true)
-    expect(prefs.bottomPanelTab).toBe('jobs')
+    expect(prefs.bottomPanelTab).toBe('replay')
   })
 
   it('keeps the sidebar face once the save carries the current version', () => {

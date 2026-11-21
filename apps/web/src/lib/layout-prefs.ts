@@ -57,7 +57,6 @@ const SIDEBAR_VIEWS: readonly SidebarView[] = [
   'channels',
   'board',
   'docs',
-  'logs',
   'explorer',
   'settings',
 ]
@@ -69,7 +68,6 @@ const BOTTOM_PANEL_TABS: readonly BottomPanelTab[] = [
   'tryrun',
   'device',
   'replay',
-  'jobs',
 ]
 
 /** 只要求 localStorage 的两个方法，测试可以注入假的（node 环境没有 localStorage）。 */
