@@ -259,7 +259,7 @@ export function App() {
                     </li>
                   </ul>
                 </div>
-                <p className="wb-note">打开项目后，侧栏的六个面会显示这个 bot 的清单、能力、会话与运行态。</p>
+                <p className="wb-note">打开项目后，侧栏会显示这个 bot 的清单、能力、会话与运行态；作业看板 / 设计文档 / 开发日志三面在编辑区整页打开。</p>
               </div>
             </div>
           ) : (

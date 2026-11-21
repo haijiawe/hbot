@@ -30,7 +30,7 @@
 | `features/search` | 全局搜索 |
 | `features/settings` | 设置 |
 | `features/tryrun` | 本地试跑 |
-| `features/workbench` | bot 工作台六个面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道） |
+| `features/workbench` | bot 工作台九面：六个侧栏面（概览 / Bot / 能力 / 会话 / 运行态 / 渠道）+ 三个整页面（作业看板 / 设计文档 / 开发日志） |
 
 ## 三条硬规则
 
