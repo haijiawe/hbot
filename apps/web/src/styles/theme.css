@@ -1,32 +1,47 @@
-/* 设计令牌 + 全局重置。布局数值不在这里写死：宽度/高度由 layout.ts 输出成 CSS 变量。 */
+/* 设计令牌 + 全局重置。布局数值不在这里写死：宽度/高度由 layout.ts 输出成 CSS 变量。
+ *
+ * 两套调色板：
+ * - 默认（`:root`）= 浅色暖调，取自 Mino 的 `--bg/--panel/--accent` 与它的卡片/圆角尺度。
+ *   用户明确要求界面按 Mino 的形态走（见 docs/11），所以浅色是默认值。
+ * - `html[data-theme="dark"]` = Mino 的 dark 段，映射到同一组变量名。
+ * 组件一律只用变量（`app.css` 里没有一个写死的十六进制色），换主题不需要改组件。
+ */
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  --bg: #16181c;
-  --bg-elevated: #1b1d22;
-  --bg-panel: #1e2025;
-  --bg-hover: #26292f;
-  --bg-active: #2c3038;
+  --bg: #f6f3ee;
+  --bg-elevated: #fffdf9;
+  --bg-panel: #fffdf9;
+  --bg-hover: #f1ece4;
+  --bg-active: #f7e3d2;
 
-  --border: #2c2f36;
-  --border-strong: #3a3e47;
+  --border: rgba(84, 60, 40, 0.14);
+  --border-strong: rgba(84, 60, 40, 0.28);
 
-  --fg: #c9cdd4;
-  --fg-muted: #9aa0aa;
-  --fg-dim: #7f8794;
+  --fg: #211a14;
+  --fg-muted: #6f6155;
+  --fg-dim: #7a6c60;
 
-  /* 文字/线条用的强调色（在 --bg 上 5.50，达 AA）。实底按钮另用 --accent-fill：
-     一个色既当文字又当底色，必然有一头不达标（白字压在 #4f8cff 上只有 3.22）。 */
-  --accent: #5b8def;
-  /* 实底（按钮/徽标）的填充色：白字压在上面 4.74，达 AA。 */
-  --accent-fill: #2f6fdc;
-  --accent-fill-hover: #2a67d0;
+  /* 文字/线条用的强调色（在 --bg 上 4.69）。实底按钮另用 --accent-fill：
+     浅色底下白字压在 Mino 的 #e8742a 上只有 3.02，所以填充色取深一档的 #b34f15（白字 5.19）。
+     亮橙仍保留给品牌块与渐变，那里是图形不是文字。 */
+  --accent: #b34f15;
+  --accent-bright: #e8742a;
+  --accent-fill: #b34f15;
+  --accent-fill-hover: #a84914;
   --accent-fg: #ffffff;
-  --ok: #52b788;
-  --warn: #e0b341;
-  --danger: #f06a6a;
-  --focus: #7fb0ff;
+  --accent-soft: rgba(232, 116, 42, 0.13);
+  --ok: #1f7f60;
+  --warn: #8a5f0d;
+  --danger: #c0392b;
+  --focus: #b34f15;
+
+  /* Mino 的尺度：18px 卡片圆角 + 一层很轻的暖色投影。 */
+  --radius-card: 18px;
+  --radius-control: 11px;
+  --shadow-card: 0 18px 40px -28px rgba(60, 35, 15, 0.5);
+  --shadow-pop: 0 24px 60px -20px rgba(60, 35, 15, 0.38);
 
   --font-ui: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
@@ -34,6 +49,38 @@
   /* --activity-bar-width / --status-bar-height / --divider-size /
      --sidebar-width / --agent-width / --bottom-panel-height
      由 lib/layout.ts 的 layoutStyleVars() 写在 .ide 上。 */
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #171513;
+  --bg-elevated: #26221f;
+  --bg-panel: #211e1b;
+  --bg-hover: #292520;
+  --bg-active: #322c26;
+
+  --border: rgba(255, 230, 200, 0.13);
+  --border-strong: rgba(255, 230, 200, 0.24);
+
+  --fg: #f7efe5;
+  --fg-muted: #b6a595;
+  --fg-dim: #9b8a7a;
+
+  --accent: #f39a5c;
+  --accent-bright: #ffb37d;
+  --accent-fill: #f39a5c;
+  --accent-fill-hover: #ffb37d;
+  /* 深色主题下填充是浅橙，白字反而看不清，用深墨色压在上面（10.4）。 */
+  --accent-fg: #191310;
+  --accent-soft: rgba(243, 154, 92, 0.16);
+  --ok: #4ecf9f;
+  --warn: #e8b65c;
+  --danger: #f06a6a;
+  --focus: #ffb37d;
+
+  --shadow-card: 0 20px 50px -30px rgba(0, 0, 0, 0.9);
+  --shadow-pop: 0 28px 70px -24px rgba(0, 0, 0, 0.85);
 }
 
 *,
@@ -52,7 +99,7 @@ body,
 body {
   background: var(--bg);
   color: var(--fg);
-  font: 13px/1.5 var(--font-ui);
+  font: 14px/1.55 var(--font-ui);
   overflow: hidden;
 }
 
@@ -99,17 +146,17 @@ kbd {
 /* 可见焦点：键盘操作必须看得见（docs/06 §11）。 */
 :focus-visible {
   outline: 2px solid var(--focus);
-  outline-offset: -1px;
+  outline-offset: 1px;
 }
 
 ::selection {
-  background: #2f4770;
+  background: var(--accent-soft);
 }
 
 /* 细滚动条，避免面板里出现两条粗滚动条。 */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #3a3e47 transparent;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
 .sr-only {

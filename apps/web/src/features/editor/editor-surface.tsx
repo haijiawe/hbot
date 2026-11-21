@@ -20,7 +20,7 @@ import * as monaco from 'monaco-editor'
 import { useEffect, useRef, useState } from 'react'
 import type { DebugBreakpoint } from '../../generated'
 import { languageForPath } from '../../lib/paths'
-import { setupMonaco } from '../../lib/monaco/setup'
+import { monacoTheme, setupMonaco } from '../../lib/monaco/setup'
 import {
   MAX_CONDITION_CHARS,
   MAX_LOG_CHARS,
@@ -100,6 +100,7 @@ export default function EditorSurface() {
   const openKey = useWorkspaceStore((state) => state.tabs.map((tab) => tab.path).join('\n'))
   const updateContent = useWorkspaceStore((state) => state.updateContent)
   const reveal = useWorkspaceStore((state) => state.reveal)
+  const theme = useWorkspaceStore((state) => state.theme)
   const breakpoints = useDebugStore((state) => state.breakpoints)
   const paused = useDebugStore((state) => state.paused)
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -118,6 +119,12 @@ export default function EditorSurface() {
   const inlineEditRef = useRef<InlineEditState | null>(null)
   inlineEditRef.current = inlineEdit
 
+  // 主题切换（浅/深）只改 Monaco 的配色，重建编辑器会丢光标与滚动位置。
+  useEffect(() => {
+    if (editorRef.current === null) return
+    monaco.editor.setTheme(monacoTheme(theme))
+  }, [theme])
+
   // 只创建一次编辑器实例；真正的 model 在下一个 effect 里挂载。
   useEffect(() => {
     const container = containerRef.current
@@ -125,7 +132,7 @@ export default function EditorSurface() {
     setupMonaco()
 
     const editor = monaco.editor.create(container, {
-      theme: 'hbot-dark',
+      theme: monacoTheme(theme),
       automaticLayout: true,
       fontFamily:
         "'JetBrains Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace",

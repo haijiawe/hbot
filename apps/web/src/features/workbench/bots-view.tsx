@@ -24,42 +24,51 @@ export function BotsView() {
     void refresh()
   }, [projectRoot, refresh])
 
+  const running = bots.filter((bot) => bot.status === 'running' || bot.status === 'starting').length
+
   return (
-    <div className="wb">
-      <header className="wb__header">
-        <h2 className="wb__title">Bot</h2>
-        <button className="button" type="button" onClick={() => void refresh()} disabled={projectRoot === null}>
-          刷新
-        </button>
+    <div className="wb-page">
+      <header className="wb-head">
+        <div className="wb-eyebrow">ENTRIES</div>
+        <h2 className="wb-title">Bot</h2>
+        <span className="wb-pill">{running} / {bots.length} 在跑</span>
+        <div className="wb-actions">
+          <button className="wb-btn" type="button" onClick={() => void refresh()} disabled={projectRoot === null}>
+            刷新
+          </button>
+        </div>
       </header>
       {projectRoot === null ? (
-        <p className="panel-hint">先打开一个项目。</p>
+        <p className="wb-empty">先打开一个项目。</p>
       ) : bots.length === 0 ? (
-        <p className="panel-hint">这个项目没有声明 bot。
-          在项目根的 bots.json 里加一条（platform 写 local 就能本地试跑）。</p>
+        <p className="wb-empty">
+          这个项目没有声明 bot。在项目根的 bots.json 里加一条（platform 写 local 就能本地试跑）。
+        </p>
       ) : (
-        <ul className="wb__list">
+        <ul className="wb-list">
           {bots.map((bot) => {
             const active = bot.botId === botId
-            const running = bot.status === "running" || bot.status === "starting"
+            const isRunning = bot.status === 'running' || bot.status === 'starting'
             return (
-              <li key={bot.botId} className={active ? "wb__item wb__item--active" : "wb__item"}>
-                <button className="wb__item-main" type="button" onClick={() => selectBot(bot.botId)}>
+              <li key={bot.botId} className={active ? 'wb-item wb-item--active' : 'wb-item'}>
+                <button className="wb-item__main" type="button" onClick={() => selectBot(bot.botId)}>
                   <span className={statusDotClass(bot.status)} aria-hidden="true" />
-                  <span className="wb__value">{bot.name}</span>
-                  <span className="wb__meta">{BOT_STATUS_LABEL[bot.status]} · {bot.platform}</span>
+                  <span className="wb-item__name">{bot.name}</span>
+                  <span className="wb-item__meta">
+                    {BOT_STATUS_LABEL[bot.status]} · {bot.platform}
+                  </span>
                 </button>
                 <button
-                  className="button"
+                  className={isRunning ? 'wb-btn' : 'wb-btn wb-btn--primary'}
                   type="button"
                   disabled={busy}
                   onClick={() => {
                     selectBot(bot.botId)
-                    if (running) void stop()
+                    if (isRunning) void stop()
                     else void start()
                   }}
                 >
-                  {running ? "停止" : "启动"}
+                  {isRunning ? '停止' : '启动'}
                 </button>
               </li>
             )

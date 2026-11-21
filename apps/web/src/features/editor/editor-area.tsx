@@ -15,23 +15,30 @@ export function EditorArea() {
       <EditorTabs />
       <div className="editor-area__body">
         {tabCount === 0 ? (
-          <div className="welcome" role="status">
-            <h2 className="welcome__title">HBot IDE</h2>
-            <p className="welcome__hint">从左侧资源管理器打开文件，或者：</p>
-            <ul className="welcome__keys">
-              <li>
-                <kbd>Ctrl</kbd> + <kbd>P</kbd> 快速打开文件
-              </li>
-              <li>
-                <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd> 命令面板
-              </li>
-              <li>
-                <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>A</kbd> 显示 / 隐藏 Agent 栏
-              </li>
-            </ul>
-            <p className="welcome__note">
-              M0 壳：文件读写与 Agent 回复来自 ipc mock，真实实现由 Rust 侧接管。
-            </p>
+          // 空状态照 Mino 的 topbar + content 形态：eyebrow 小标题、大标题、说明、卡片。
+          <div className="wb-page wb-page--center" role="status">
+            <div className="wb-hero">
+              <span className="wb-eyebrow">Editor</span>
+              <h2 className="wb-title">还没有打开文件</h2>
+              <p className="wb-sub">从左侧资源管理器选一个文件，或者用下面的快捷键。</p>
+              <div className="wb-card">
+                <div className="wb-card__title">快捷键</div>
+                <ul className="wb-keys">
+                  <li>
+                    <span className="wb-kbd">Ctrl P</span>快速打开文件
+                  </li>
+                  <li>
+                    <span className="wb-kbd">Ctrl ⇧ P</span>命令面板
+                  </li>
+                  <li>
+                    <span className="wb-kbd">Ctrl ⇧ A</span>显示 / 隐藏 Agent 栏
+                  </li>
+                </ul>
+              </div>
+              <p className="wb-note">
+                打开文件后会在这里看到代码；保存即写盘，热重载由核心负责。
+              </p>
+            </div>
           </div>
         ) : (
           <Suspense

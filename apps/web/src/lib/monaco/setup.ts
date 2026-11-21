@@ -60,6 +60,35 @@ export function setupMonaco(): void {
     },
   })
 
+  // 浅色主题（Mino 的纸面）：与 styles/theme.css 的浅色调色板同源。
+  // base 用 'vs' 而不是自定义全量规则 —— 语法高亮覆盖不全时至少还有可读的默认色。
+  monaco.editor.defineTheme('hbot-light', {
+    base: 'vs',
+    inherit: true,
+    rules: [
+      { token: 'comment', foreground: '8a7a6b', fontStyle: 'italic' },
+      { token: 'string', foreground: '1f7f60' },
+      { token: 'keyword', foreground: 'b34f15' },
+      { token: 'number', foreground: '8a5f0d' },
+      { token: 'type.identifier', foreground: '3f72c9' },
+    ],
+    colors: {
+      'editor.background': '#fffdf9',
+      'editor.foreground': '#211a14',
+      'editorLineNumber.foreground': '#a99a8b',
+      'editorLineNumber.activeForeground': '#211a14',
+      'editor.selectionBackground': '#f7e3d2',
+      'editor.lineHighlightBackground': '#f6f1ea',
+      'editorIndentGuide.background1': '#e7ded2',
+      'editorCursor.foreground': '#b34f15',
+      'editorWidget.background': '#fffdf9',
+      'editorWidget.border': '#e6dbcd',
+      'editorSuggestWidget.background': '#fffdf9',
+      'editorSuggestWidget.selectedBackground': '#f7e3d2',
+    },
+  })
+
+
   // 0.57 把语言服务命名空间提到顶层：monaco.typescript / monaco.json 等。
   monaco.typescript.typescriptDefaults.setCompilerOptions({
     target: monaco.typescript.ScriptTarget.ESNext,
@@ -78,4 +107,9 @@ export function setupMonaco(): void {
 /** Monaco 的 model 是全局资源：tab 关闭时由编辑器层显式 dispose。 */
 export function disposeModel(uri: string): void {
   monaco.editor.getModel(monaco.Uri.parse(uri))?.dispose()
+}
+
+/** 主题名：Monaco 只认自己注册过的名字，所以这里做一次映射而不是把字符串散在组件里。 */
+export function monacoTheme(theme: 'light' | 'dark'): string {
+  return theme === 'dark' ? 'hbot-dark' : 'hbot-light'
 }

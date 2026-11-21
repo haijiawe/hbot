@@ -5,6 +5,7 @@
  * 这个项目声明了什么、bot 在不在跑、下一步该点哪里。
  *
  * 只做只读展示与两个按钮（启停、刷新）；不发新命令，数据都来自既有命令。
+ * 形态照 Mino 的「宽字距小标题 + 大标题 + 卡片 + 列表」，尺寸压到侧栏宽度。
  */
 
 import { useEffect } from 'react'
@@ -35,51 +36,66 @@ export function OverviewView() {
 
   const projectName = manifest?.name ?? projectRoot ?? null
   const selected = bots.find((bot) => bot.botId === botId) ?? null
-  const canStart = selected !== null && status !== "running" && status !== "starting"
-  const canStop = selected !== null && status !== "stopped" && status !== "stopping"
+  const canStart = selected !== null && status !== 'running' && status !== 'starting'
+  const canStop = selected !== null && status !== 'stopped' && status !== 'stopping'
 
   return (
-    <div className="wb">
-      <header className="wb__header">
-        <h2 className="wb__title">概览</h2>
-        <button className="button" type="button" onClick={() => void refresh()} disabled={projectRoot === null}>
-          刷新
-        </button>
+    <div className="wb-page">
+      <header className="wb-head">
+        <div className="wb-eyebrow">{projectRoot === null ? 'NO PROJECT' : 'BOT WORKBENCH'}</div>
+        <h2 className="wb-title">{projectName ?? '概览'}</h2>
+        <span className="wb-pill">
+          {selected === null ? '没有可启动的 bot' : BOT_STATUS_LABEL[status]}
+        </span>
+        <div className="wb-actions">
+          <button className="wb-btn" type="button" onClick={() => void refresh()} disabled={projectRoot === null}>
+            刷新
+          </button>
+        </div>
       </header>
 
       {projectRoot === null ? (
-        <p className="panel-hint">
+        <p className="wb-empty">
           还没有打开项目。按 Ctrl+Shift+P 选「打开项目…」或「新建项目…」。
         </p>
       ) : (
         <>
-          <section className="wb__section" aria-label="项目">
-            <div className="wb__eyebrow">项目</div>
-            <div className="wb__name" title={projectName ?? ""}>{projectName}</div>
-            <div className="wb__meta">
-              {manifest === null ? "清单未读" : manifest.platform.length > 0 ? "平台 " + manifest.platform : "未声明平台"}
-              {manifest === null ? "" : " · " + manifest.declaredCount + " 项能力"}
+          <div className="wb-cards">
+            <div className="wb-card">
+              <div className="wb-card__title">能力</div>
+              <div className="wb-stat__num">{manifest === null ? '—' : manifest.declaredCount}</div>
+              <div className="wb-stat__label">项已声明</div>
             </div>
-            {manifest !== null && manifest.entry.length > 0 ? (
-              <div className="wb__meta">入口 {manifest.entry}</div>
-            ) : null}
-            {manifestError !== null ? <p className="wb__error">{manifestError}</p> : null}
-          </section>
+            <div className="wb-card">
+              <div className="wb-card__title">Bot</div>
+              <div className="wb-stat__num">{bots.length}</div>
+              <div className="wb-stat__label">个入口</div>
+            </div>
+            <div className="wb-card">
+              <div className="wb-card__title">HTTP</div>
+              <div className="wb-stat__num">{manifest === null ? '—' : manifest.httpHosts.length}</div>
+              <div className="wb-stat__label">个源已授权</div>
+            </div>
+          </div>
 
-          <section className="wb__section" aria-label="运行状态">
-            <div className="wb__eyebrow">运行状态</div>
+          <section className="wb-card" aria-label="运行状态">
+            <div className="wb-card__title">运行状态</div>
             {selected === null ? (
-              <p className="panel-hint">这个项目还没有可启动的 bot：检查 bots.json 里的声明。</p>
+              <p className="wb-note">这个项目还没有可启动的 bot：检查 bots.json 里的声明。</p>
             ) : (
               <>
-                <div className="wb__row">
+                <div className="wb-item wb-item--active">
                   <span className={statusDotClass(status)} aria-hidden="true" />
-                  <span className="wb__value">{selected.name}</span>
-                  <span className="wb__meta">{BOT_STATUS_LABEL[status]}</span>
+                  <div className="wb-item__main">
+                    <span className="wb-item__name">{selected.name}</span>
+                    <span className="wb-item__meta">
+                      {BOT_STATUS_LABEL[status]} · {selected.platform}
+                    </span>
+                  </div>
                 </div>
-                <div className="wb__buttons">
+                <div className="wb-actions">
                   <button
-                    className="button button--primary"
+                    className="wb-btn wb-btn--primary"
                     type="button"
                     disabled={busy || !canStart}
                     onClick={() => {
@@ -90,7 +106,7 @@ export function OverviewView() {
                     启动
                   </button>
                   <button
-                    className="button"
+                    className="wb-btn"
                     type="button"
                     disabled={busy || !canStop}
                     onClick={() => void stop()}
@@ -102,21 +118,48 @@ export function OverviewView() {
             )}
           </section>
 
-          <section className="wb__section" aria-label="清单摘要">
-            <div className="wb__eyebrow">清单摘要</div>
-            <div className="wb__meta">{manifest === null ? "—" : limitsSummary(manifest) || "没有声明限额"}</div>
-            <div className="wb__meta">
-              {manifest === null ? "—" : manifest.httpHosts.length === 0 ? "没有授权任何 HTTP 源" : "授权 " + manifest.httpHosts.length + " 个 HTTP 源"}
+          <section className="wb-card" aria-label="清单摘要">
+            <div className="wb-card__title">清单摘要</div>
+            <div className="wb-kv">
+              <span className="wb-kv__key">平台</span>
+              <span className="wb-kv__value">
+                {manifest === null || manifest.platform.length === 0 ? '未声明' : manifest.platform}
+              </span>
             </div>
+            <div className="wb-kv">
+              <span className="wb-kv__key">入口</span>
+              <span className="wb-kv__value">{manifest !== null && manifest.entry.length > 0 ? manifest.entry : '—'}</span>
+            </div>
+            <div className="wb-kv">
+              <span className="wb-kv__key">限额</span>
+              <span className="wb-kv__value">
+                {manifest === null ? '—' : limitsSummary(manifest) || '没有声明限额'}
+              </span>
+            </div>
+            {manifestError !== null ? <p className="wb-error">{manifestError}</p> : null}
           </section>
 
-          <section className="wb__section" aria-label="上手清单">
-            <div className="wb__eyebrow">从这里开始</div>
-            <ol className="wb__checklist">
-              <li className={bots.length > 0 ? "wb__check wb__check--done" : "wb__check"}>项目里有可启动的 bot</li>
-              <li className={status === "running" ? "wb__check wb__check--done" : "wb__check"}>启动 bot（本地平台不需要账号）</li>
-              <li className="wb__check">切到「会话」，发一条模拟消息</li>
-              <li className={manifest !== null && manifest.declaredCount > 0 ? "wb__check wb__check--done" : "wb__check"}>在 hbot.json 里声明要用的能力</li>
+          <section className="wb-card" aria-label="上手清单">
+            <div className="wb-card__title">从这里开始</div>
+            <ol className="wb-list">
+              <li className={bots.length > 0 ? 'wb-check wb-check--done' : 'wb-check'}>
+                <span className="wb-check__mark" aria-hidden="true">{bots.length > 0 ? '✓' : '○'}</span>
+                项目里有可启动的 bot
+              </li>
+              <li className={status === 'running' ? 'wb-check wb-check--done' : 'wb-check'}>
+                <span className="wb-check__mark" aria-hidden="true">{status === 'running' ? '✓' : '○'}</span>
+                启动 bot（本地平台不需要账号）
+              </li>
+              <li className="wb-check">
+                <span className="wb-check__mark" aria-hidden="true">○</span>
+                切到「会话」，发一条模拟消息
+              </li>
+              <li className={manifest !== null && manifest.declaredCount > 0 ? 'wb-check wb-check--done' : 'wb-check'}>
+                <span className="wb-check__mark" aria-hidden="true">
+                  {manifest !== null && manifest.declaredCount > 0 ? '✓' : '○'}
+                </span>
+                在 hbot.json 里声明要用的能力
+              </li>
             </ol>
           </section>
         </>

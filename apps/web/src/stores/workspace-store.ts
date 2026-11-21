@@ -22,6 +22,7 @@ import { PREFS_VERSION, readPrefs, writePrefs, type WorkspacePrefs } from '../li
 import type { ManifestView } from '../lib/bot-manifest'
 import { parseManifest } from '../lib/bot-manifest'
 import type { SessionSnapshot } from '../lib/session-journal'
+import type { Theme } from '../lib/theme'
 
 /**
  * 底部面板页签。搜索结果、问题、调试暂停现场共用这一块区域
@@ -94,6 +95,8 @@ export interface WorkspaceState {
   /** 每个打开文件的光标位置（编辑器上报，恢复会话时写回）。 */
   cursors: Record<string, CursorPosition>
   layout: LayoutState
+  /** 浅色 / 深色。写进 `<html data-theme>`，见 lib/theme.ts。 */
+  theme: Theme
   sidebarView: SidebarView
   bottomPanelTab: BottomPanelTab
   error: string | null
@@ -218,6 +221,7 @@ export interface WorkspaceState {
   saveActive: () => Promise<void>
   saveAll: () => Promise<void>
   setSidebarView: (view: SidebarView) => void
+  setTheme: (theme: Theme) => void
   setBottomPanelTab: (tab: BottomPanelTab) => void
   setSidebarWidth: (width: number) => void
   setAgentWidth: (width: number) => void
@@ -296,10 +300,11 @@ function savePrefsError(next: WorkspacePrefs): string | null {
 /** 处理"改了布局的一部分，顺手落盘"的公共壳子。 */
 function withPrefs(
   state: WorkspaceState,
-  patch: Partial<Pick<WorkspaceState, 'layout' | 'sidebarView' | 'bottomPanelTab'>>,
+  patch: Partial<Pick<WorkspaceState, 'layout' | 'sidebarView' | 'bottomPanelTab' | 'theme'>>,
 ): Partial<WorkspaceState> {
   const error = savePrefsError({
     version: PREFS_VERSION,
+    theme: patch.theme ?? state.theme,
     layout: patch.layout ?? state.layout,
     sidebarView: patch.sidebarView ?? state.sidebarView,
     bottomPanelTab: patch.bottomPanelTab ?? state.bottomPanelTab,
@@ -321,6 +326,7 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
   activePath: null,
   cursors: {},
   layout: initialPrefs.layout,
+  theme: initialPrefs.theme,
   sidebarView: initialPrefs.sidebarView,
   bottomPanelTab: initialPrefs.bottomPanelTab,
   error: null,
@@ -646,6 +652,10 @@ export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
         set({ error: `保存 ${path} 失败：${errorMessage(error)}` })
       }
     }
+  },
+
+  setTheme(theme) {
+    set((state) => withPrefs(state, { theme }))
   },
 
   setSidebarView(view) {

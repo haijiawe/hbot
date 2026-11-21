@@ -15,6 +15,7 @@ import {
   type LayoutState,
   type SidebarView,
 } from './layout'
+import { DEFAULT_THEME, isTheme, type Theme } from './theme'
 
 /** 存储键：布局 + 侧栏视图 + 底部页签。 */
 export const LAYOUT_STORAGE_KEY = 'hbot.ide.workspace-prefs'
@@ -32,6 +33,8 @@ export const PREFS_VERSION = 2
 /** 可持久化的工作区偏好（标签页与未保存缓冲区不在这里，见 journal）。 */
 export interface WorkspacePrefs {
   version: number
+  /** 浅色是默认（Mino 的形态）；深色是同一套变量的另一组取值。 */
+  theme: Theme
   layout: LayoutState
   sidebarView: SidebarView
   bottomPanelTab: BottomPanelTab
@@ -39,6 +42,7 @@ export interface WorkspacePrefs {
 
 export const DEFAULT_WORKSPACE_PREFS: WorkspacePrefs = {
   version: PREFS_VERSION,
+  theme: DEFAULT_THEME,
   layout: DEFAULT_LAYOUT,
   sidebarView: 'overview',
   bottomPanelTab: 'logs',
@@ -94,6 +98,8 @@ export function sanitizePrefs(raw: unknown): WorkspacePrefs {
   const bottomPanelTab = BOTTOM_PANEL_TABS.find((tab) => tab === raw.bottomPanelTab)
   return {
     version: PREFS_VERSION,
+    // 主题不跟版本门：老存档没有这个字段就是浅色，有就照办（深色是新选项，不存在"旧界面的默认值"）。
+    theme: isTheme(raw.theme) ? raw.theme : DEFAULT_THEME,
     layout: {
       sidebarWidth: readWidth(layout.sidebarWidth, DEFAULT_LAYOUT.sidebarWidth, clampSidebarWidth),
       agentWidth: readWidth(layout.agentWidth, DEFAULT_LAYOUT.agentWidth, clampAgentWidth),

@@ -24,38 +24,44 @@ export function ChannelsView() {
   const channels = botsFile === null ? [] : parseChannels(botsFile)
 
   return (
-    <div className="wb">
-      <header className="wb__header">
-        <h2 className="wb__title">渠道</h2>
-        <button className="button" type="button" onClick={() => void refreshBotsFile()} disabled={projectRoot === null}>
-          重读
-        </button>
+    <div className="wb-page">
+      <header className="wb-head">
+        <div className="wb-eyebrow">CHANNELS</div>
+        <h2 className="wb-title">渠道</h2>
+        <span className="wb-pill">{channels.length} 条声明</span>
+        <div className="wb-actions">
+          <button className="wb-btn" type="button" onClick={() => void refreshBotsFile()} disabled={projectRoot === null}>
+            重读 bots.json
+          </button>
+        </div>
       </header>
       {projectRoot === null ? (
-        <p className="panel-hint">先打开一个项目。</p>
+        <p className="wb-empty">先打开一个项目。</p>
       ) : botsFileError !== null ? (
-        <p className="wb__error">{botsFileError}</p>
+        <p className="wb-error">{botsFileError}</p>
       ) : channels.length === 0 ? (
-        <p className="panel-hint">
-          bots.json 里没有可读的 bot 声明。新建项目会自动写一条 local 平台条目；
-          接真平台时把 platform 改成 onebot11 或 qq_official。
+        <p className="wb-empty">
+          bots.json 里没有可读的 bot 声明。新建项目会自动写一条 local 平台条目；接真平台时把 platform 改成 onebot11 或 qq_official。
         </p>
       ) : (
         <>
-          <ul className="wb__list">
+          <ul className="wb-list">
             {channels.map((row, index) => (
-              <li key={row.id.length > 0 ? row.id : String(index)} className="wb__item">
-                <div className="wb__item-main wb__item-main--static">
-                  <span className="wb__value">{row.name.length > 0 ? row.name : row.id}</span>
-                  <span className="wb__meta">
-                    {row.platform.length > 0 ? row.platform : "未声明平台"}
-                    {row.ws.length > 0 ? " · " + row.ws : ""}
+              <li key={row.id.length > 0 ? row.id : String(index)} className="wb-item">
+                <div className="wb-item__main">
+                  <span className="wb-item__name">{row.name.length > 0 ? row.name : row.id}</span>
+                  <span className="wb-item__meta">
+                    {row.platform.length > 0 ? row.platform : '未声明平台'}
+                    {row.ws.length > 0 ? ' · ' + row.ws : ''}
                   </span>
                 </div>
+                {row.platform.length > 0 ? <span className="wb-tag">{row.platform}</span> : null}
               </li>
             ))}
           </ul>
-          <p className="wb__note">凭据（token / clientSecret）不在界面上显示；它们只在核心与 keyring 之间流动。</p>
+          <p className="wb-note">
+            凭据（token / clientSecret）不在界面上显示；它们只在核心与 keyring 之间流动。
+          </p>
         </>
       )}
     </div>

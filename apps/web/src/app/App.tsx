@@ -18,6 +18,7 @@ import {
   type SidebarView,
 } from '../lib/layout'
 import { AgentPanel } from '../features/agent/agent-panel'
+import { applyTheme } from '../lib/theme'
 import { EditorArea } from '../features/editor/editor-area'
 import { ExplorerView } from '../features/explorer/explorer-view'
 import { openSearch } from '../features/search/open-search'
@@ -75,6 +76,7 @@ function renderSidebar(view: SidebarView) {
 export function App() {
   const layout = useWorkspaceStore((state) => state.layout)
   const sidebarView = useWorkspaceStore((state) => state.sidebarView)
+  const theme = useWorkspaceStore((state) => state.theme)
   const projectRoot = useWorkspaceStore((state) => state.projectRoot)
   const projectDialog = useWorkspaceStore((state) => state.projectDialog)
   const loadTree = useWorkspaceStore((state) => state.loadTree)
@@ -111,6 +113,11 @@ export function App() {
     if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current)
     noticeTimer.current = window.setTimeout(() => setNotice(null), NOTICE_DURATION_MS)
   }, [])
+
+  // 主题写到 <html data-theme>：两套调色板都在 styles/theme.css，组件只管用变量。
+  useEffect(() => {
+    applyTheme(theme)
+  }, [theme])
 
   useEffect(() => {
     return () => {
@@ -201,16 +208,30 @@ export function App() {
             // 真桌面壳启动时 `projectRoot` 是 null（要等用户打开/新建项目）；
             // mock 模式由 `startSessionPersistence` 先定成 `mock://project`，所以这条
             // 空状态在浏览器 dev 里不会挡住演示。
-            <section className="welcome" role="status" aria-label="还没有打开项目">
-              <h2 className="welcome__title">还没有打开项目</h2>
-              <p className="welcome__hint">
-                按 <kbd>Ctrl</kbd> / <kbd>Cmd</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd> 打开命令面板，
-                选「打开项目…」，粘贴项目根的绝对路径。
-              </p>
-              <p className="welcome__note">
-                想从空目录开始？同一面板里的「新建项目…」会交给核心 scaffold。
-              </p>
-            </section>
+            <div className="wb-page wb-page--center" role="status" aria-label="还没有打开项目">
+              <div className="wb-hero">
+                <span className="wb-eyebrow">BOT WORKBENCH</span>
+                <h2 className="wb-title">还没有打开项目</h2>
+                <p className="wb-sub">
+                  按 Ctrl / Cmd + Shift + P 打开命令面板，选「打开项目…」，粘贴项目根的绝对路径。
+                </p>
+                <div className="wb-card">
+                  <div className="wb-card__title">从这里开始</div>
+                  <ul className="wb-keys">
+                    <li>
+                      <span className="wb-kbd">Ctrl ⇧ P</span>打开命令面板
+                    </li>
+                    <li>
+                      <span className="wb-kbd">打开项目…</span>粘贴项目根的绝对路径
+                    </li>
+                    <li>
+                      <span className="wb-kbd">新建项目…</span>交给核心 scaffold（含 hbot.json / bots.json）
+                    </li>
+                  </ul>
+                </div>
+                <p className="wb-note">打开项目后，侧栏的六个面会显示这个 bot 的清单、能力、会话与运行态。</p>
+              </div>
+            </div>
           ) : (
             <ErrorBoundary name="编辑器">
               <EditorArea />

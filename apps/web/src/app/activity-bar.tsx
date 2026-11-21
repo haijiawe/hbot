@@ -24,6 +24,8 @@ export function ActivityBar() {
   const setBottomPanelTab = useWorkspaceStore((state) => state.setBottomPanelTab)
   const toggleAgent = useWorkspaceStore((state) => state.toggleAgent)
   const toggleBottomPanel = useWorkspaceStore((state) => state.toggleBottomPanel)
+  const theme = useWorkspaceStore((state) => state.theme)
+  const setTheme = useWorkspaceStore((state) => state.setTheme)
 
   // 上半是 bot 工作台的面（这个 bot 是什么、在做什么），下半是 IDE 视图。
   // 面的顺序与 Mino 侧栏一致：概览在最上，其余按「从身份到运行」排列。
@@ -125,6 +127,10 @@ export function ActivityBar() {
 
   return (
     <nav className="activity-bar" aria-label="活动栏">
+      {/* 品牌块：Mino 的 .brand-mark。只有装饰作用，所以 aria-hidden。 */}
+      <div className="activity-bar__brand" aria-hidden="true">
+        H
+      </div>
       {items.map((item) => (
         <div key={item.id} className="activity-bar__slot">
           {item.separatorBefore === true ? (
@@ -149,6 +155,18 @@ export function ActivityBar() {
           </button>
         </div>
       ))}
+      {/* 主题切换贴在底部：它是"这台机器怎么显示"，不属于任何一个面。 */}
+      <div className="activity-bar__footer">
+        <button
+          type="button"
+          className="activity-bar__button"
+          aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+          title={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+        >
+          <span aria-hidden="true">{theme === 'dark' ? '☾' : '☀'}</span>
+        </button>
+      </div>
     </nav>
   )
 }
